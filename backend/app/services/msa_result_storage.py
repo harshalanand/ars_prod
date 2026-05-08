@@ -519,7 +519,19 @@ class MSAResultStorageService:
                 except Exception as e:
                     storage_info['errors'].append(f"Color variant storage error: {str(e)}")
                     logger.error(f"❌ Error storing color variant data: {e}")
-            
+
+            # ── Bootstrap PEND_QTY/FNL_Q from open ARS_PEND_ALC rows. The MSA
+            # pivot writes STK_QTY/HOLD_QTY but not the running pending tally
+            # — without this reseed, freshly-rebuilt MSA would forget every
+            # open manual allocation. Idempotent + non-fatal on failure.
+            try:
+                from app.services.pend_alc_service import bootstrap_msa_pend_sync
+                bs = bootstrap_msa_pend_sync(self.db)
+                storage_info['pend_alc_bootstrap'] = bs
+            except Exception as e:
+                logger.warning(f"⚠️  bootstrap_msa_pend_sync skipped: {e}")
+                storage_info['pend_alc_bootstrap'] = {"error": str(e)}
+
             logger.info(f"✅ Result storage complete: sequence {sequence_id}")
             return storage_info
         except Exception as e:

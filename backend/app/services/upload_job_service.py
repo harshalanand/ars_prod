@@ -68,7 +68,11 @@ def create_upload_job(
     ext = os.path.splitext(file_name)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise ValueError(f"Unsupported file type: {ext}")
-    
+
+    # Sweep stale files from previous days before saving the new one
+    from app.services.file_upload_service import cleanup_old_uploads
+    cleanup_old_uploads()
+
     # Save file
     file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file_name}")
     with open(file_path, 'wb') as f:

@@ -20,7 +20,7 @@ const navItems = [
 
 // Data Management submenu
 const dataManagementItems = [
-  { label: 'All Tables', path: '/tables', icon: Table2, permission: 'DATA_VIEW' },
+  { label: 'All Tables', path: '/tables', icon: Table2, permission: 'DATA_VIEW', end: true },
   { label: 'Create Table', path: '/tables/create', icon: FilePlus, permission: 'TABLE_CREATE' },
   { label: 'Upload Data', path: '/upload', icon: FileUp, permission: 'DATA_UPLOAD' },
   { label: 'Export Data', path: '/export', icon: FileDown, permission: 'DATA_EXPORT' },
@@ -70,14 +70,14 @@ const dataValidationItems = [
 
 // Project Tracker submenu — enterprise-style task management
 const projectTrackerItems = [
-  { label: 'Dashboard',     path: '/pt',          icon: LayoutDashboard },
+  { label: 'Dashboard',     path: '/pt',          icon: LayoutDashboard, end: true },
   { label: 'All Projects',  path: '/pt/projects', icon: FolderKanban },
   { label: 'My Tasks',      path: '/pt/my-tasks', icon: ListTodo },
 ]
 
 // Settings submenu (admin features)
 const settingsItems = [
-  { label: 'App Settings', path: '/settings', icon: Cog, permission: 'ADMIN_SETTINGS' },
+  { label: 'App Settings', path: '/settings', icon: Cog, permission: 'ADMIN_SETTINGS', end: true },
   { label: 'Table Management', path: '/settings/tables', icon: Columns, permission: 'TABLE_ALTER' },
   { label: 'Users', path: '/settings/users', icon: Users, permission: 'ADMIN_USERS_READ' },
   { label: 'Roles', path: '/settings/roles', icon: Shield, permission: 'ADMIN_ROLES_MANAGE' },
@@ -157,6 +157,7 @@ function SubMenu({ title, icon: Icon, items, collapsed, hasPermission, isSuperAd
               <NavLink
                 key={item.path}
                 to={item.path}
+                end={item.end}
                 className={({ isActive }) => clsx(
                   'flex items-center gap-2 px-3 py-1.5 text-[11px] transition-all duration-150',
                   isActive
@@ -196,6 +197,7 @@ function SubMenu({ title, icon: Icon, items, collapsed, hasPermission, isSuperAd
             <NavLink
               key={item.path}
               to={item.path}
+              end={item.end}
               className={({ isActive }) => clsx(
                 'flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[11px] transition-all duration-150',
                 isActive
@@ -232,11 +234,13 @@ export default function Sidebar({ collapsed, onToggle }) {
 
       {/* Nav */}
       <nav className="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
-        {/* Top-level items: hide superadmin-only ones for non-superadmins;
-            permission gating on top-level was historically not enforced here,
-            so keep that behaviour to avoid regressing existing access. */}
+        {/* Top-level items: hide superadmin-only entries from non-superadmins,
+            and respect each item's `permission` flag so users without the
+            required permission don't see broken links (e.g. Viewer without
+            ALLOC_READ should not see "Allocations"). */}
         {navItems
           .filter(item => !(item.superadminOnly && !superadmin))
+          .filter(item => !item.permission || hasPermission(item.permission))
           .map(item => <SideLink key={item.path} item={item} collapsed={collapsed} />)}
         
         {/* Data Management submenu */}

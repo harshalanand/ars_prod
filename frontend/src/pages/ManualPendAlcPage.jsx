@@ -37,7 +37,7 @@ const BULK_THRESHOLD = 100
 // Network payload chunking — submit large bulk uploads in batches so the
 // browser doesn't try to encode 30+ MB of JSON in one go and the user sees
 // progress instead of a frozen tab.
-const SUBMIT_CHUNK = 5000
+const SUBMIT_CHUNK = 10000
 
 function parseCsv(text) {
   const lines = text.trim().split('\n')

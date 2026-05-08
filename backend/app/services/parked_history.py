@@ -40,7 +40,11 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.database.session import get_data_engine
-from app.services.pend_alc_service import write_pend_alc, adjust_msa_after_pend_insert
+from app.services.pend_alc_service import (
+    write_pend_alc,
+    adjust_msa_after_pend_insert,
+    apply_pend_alc_delta_by_session,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -531,11 +535,13 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 logger.warning(f"[pend_alc] write failed for {session_id}: {pe}")
                 approved_by_table["pend_alc_rows"] = 0
 
-            # Immediately adjust ARS_MSA_TOTAL/GEN_ART/VAR_ART FNL_Q so the
-            # next alloc run sees the updated available stock without requiring
-            # a full MSA recalculation. Only runs after PEND_ALC INSERTs.
+            # Immediately adjust MSA + Grid so the next alloc run sees the
+            # updated available stock without requiring a full MSA / grid
+            # rebuild. Symmetric +1 delta — the revert path passes -1.
             try:
-                msa_adjusted = adjust_msa_after_pend_insert(conn, session_id=session_id)
+                msa_adjusted = apply_pend_alc_delta_by_session(
+                    conn, session_id, sign=+1,
+                )
                 logger.info(
                     f"[pend_alc] msa_adjusted session={session_id}: "
                     f"total={msa_adjusted['msa_total']} "

@@ -35,6 +35,7 @@ from app.security.dependencies import get_current_user
 from app.models.rbac import User
 from app.services.pend_alc_service import (
     adjust_msa_after_pend_insert,
+    apply_pend_alc_delta,
     apply_do_deductions,
     backfill_bdc_operations,
     delete_schedule,
@@ -1158,9 +1159,9 @@ def pend_alc_manual_upload(
         ]
         with _engine().connect() as conn:
             res = write_manual_pend_alc(conn, rows)
-            msa_adjusted = adjust_msa_after_pend_insert(
-                conn, article_rdc_pairs=article_rdc_pairs,
-            )
+            # Apply +1 delta to MSA + Grid in one call. Replaces the old
+            # adjust_msa_after_pend_insert (which only patched MSA, not Grid).
+            msa_adjusted = apply_pend_alc_delta(conn, rows, sign=+1)
             # Log the manual upload for revert support
             total_alloc = sum(float(r.get("alloc_qty") or 0) for r in rows)
             log_operation(
