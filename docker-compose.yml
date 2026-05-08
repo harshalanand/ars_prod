@@ -1,0 +1,36 @@
+# ARS Docker Compose — local development / testing
+# Usage: docker-compose up --build
+# Frontend: http://localhost:3000 | API docs: http://localhost:8000/docs
+
+services:
+  backend:
+    build: ./backend
+    container_name: ars-backend
+    ports:
+      - "8000:8000"
+    env_file: ./backend/.env
+    environment:
+      - APP_ENV=development
+      - LOG_TO_FILE=false
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/exports:/app/exports
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api/v1
+    container_name: ars-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

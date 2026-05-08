@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V2 Retail — Allocation Engine</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#f8fafc;--bg2:#ffffff;--bg3:#f1f5f9;--bg4:#e2e8f0;--tx:#0f172a;--tx2:#475569;--tx3:#94a3b8;--acc:#2563eb;--acc2:#1d4ed8;--acc-g:#059669;--acc-y:#d97706;--acc-r:#dc2626;--acc-p:#7c3aed;--brd:#e2e8f0;--brd2:#cbd5e1;--radius:10px;--radius-sm:6px}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;overflow-x:hidden}
+.header{background:var(--bg2);border-bottom:1px solid var(--brd);box-shadow:0 1px 4px rgba(0,0,0,.06);padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.header-left{display:flex;align-items:center;gap:16px}
+.logo{width:36px;height:36px;background:linear-gradient(135deg,var(--acc),var(--acc-p));border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff}
+.header-title h1{font-size:17px;font-weight:700;letter-spacing:-.3px}
+.header-title p{font-size:11px;color:var(--tx3);margin-top:1px}
+.header-right{display:flex;gap:10px;align-items:center}
+.hbadge{font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;cursor:pointer}
+.hbadge.live{background:rgba(5,150,105,.15);color:#059669;border:1px solid rgba(5,150,105,.3);animation:plive 2s infinite}
+.hbadge.supa{background:rgba(5,150,105,.1);color:var(--acc-g);border:1px solid rgba(5,150,105,.25)}
+.hbadge.api{background:rgba(37,99,235,.1);color:var(--acc2);border:1px solid rgba(37,99,235,.15)}
+@keyframes plive{0%,100%{opacity:1}50%{opacity:.6}}
+.tab-bar{background:var(--bg2);border-bottom:1px solid var(--brd);padding:0 28px;display:flex;gap:0}
+.tab{padding:12px 22px;font-size:13px;font-weight:500;color:var(--tx3);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s}
+.tab:hover{color:var(--tx2)}.tab.active{color:var(--acc2);border-bottom-color:var(--acc)}
+.tab .cnt{font-size:10px;background:var(--bg4);color:var(--tx2);padding:1px 6px;border-radius:10px;margin-left:6px}
+.tab.active .cnt{background:rgba(59,130,246,.2);color:var(--acc2)}
+.main{padding:24px 28px;max-width:1600px;margin:0 auto}
+.panel{background:var(--bg2);border:1px solid var(--brd);box-shadow:0 1px 3px rgba(0,0,0,.04);border-radius:var(--radius);overflow:hidden;margin-bottom:16px}
+.panel-head{padding:14px 18px;border-bottom:1px solid var(--brd);display:flex;align-items:center;justify-content:space-between}
+.panel-head h3{font-size:13px;font-weight:600}
+.panel-body{padding:16px 18px}
+.kpi-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:20px}
+.kpi{background:var(--bg2);border:1px solid var(--brd);box-shadow:0 1px 3px rgba(0,0,0,.04);border-radius:var(--radius);padding:18px 20px;position:relative;overflow:hidden}
+.kpi-label{font-size:11px;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.kpi-value{font-size:26px;font-weight:700;font-family:'JetBrains Mono',monospace;letter-spacing:-1px}
+.kpi-sub{font-size:11px;color:var(--tx3);margin-top:4px}
+.kpi-glow{position:absolute;top:-20px;right:-20px;width:80px;height:80px;border-radius:50%;opacity:.08;pointer-events:none}
+.kpi.blue .kpi-value{color:var(--acc2)}.kpi.blue .kpi-glow{background:var(--acc)}
+.kpi.green .kpi-value{color:var(--acc-g)}.kpi.green .kpi-glow{background:var(--acc-g)}
+.kpi.yellow .kpi-value{color:var(--acc-y)}.kpi.yellow .kpi-glow{background:var(--acc-y)}
+.kpi.purple .kpi-value{color:var(--acc-p)}.kpi.purple .kpi-glow{background:var(--acc-p)}
+
+.run-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:14px;align-items:end}
+.form-group label{display:block;font-size:11px;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.form-group input,.form-group select{width:100%;background:var(--bg);border:1px solid var(--brd);color:var(--tx);padding:10px 14px;border-radius:var(--radius-sm);font-size:13px;font-family:'DM Sans',sans-serif;outline:none}
+.form-group input:focus,.form-group select:focus{border-color:var(--acc)}
+.form-group select{cursor:pointer}
+.majcat-input{position:relative}
+.majcat-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;min-height:28px}
+.majcat-tag{background:rgba(37,99,235,.1);color:var(--acc2);font-size:11px;padding:3px 10px;border-radius:14px;display:flex;align-items:center;gap:4px;border:1px solid rgba(37,99,235,.2)}
+.majcat-tag .rm{cursor:pointer;opacity:.7;font-size:14px;line-height:1}.majcat-tag .rm:hover{opacity:1}
+.btn{padding:10px 20px;border-radius:var(--radius-sm);font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s;font-family:'DM Sans',sans-serif;display:inline-flex;align-items:center;gap:8px}
+.btn-primary{background:var(--acc);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-primary:disabled{background:var(--bg4);color:var(--tx3);cursor:not-allowed}
+.btn-secondary{background:var(--bg3);color:var(--tx2);border:1px solid var(--brd)}.btn-secondary:hover{border-color:var(--brd2);color:var(--tx)}
+.btn-sm{padding:6px 14px;font-size:11px}
+.progress-bar{height:3px;background:var(--bg);border-radius:2px;overflow:hidden;margin-top:12px;display:none}
+.progress-bar.active{display:block}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc-p));border-radius:2px;width:0;transition:width .3s;animation:pa 2s ease-in-out infinite}
+@keyframes pa{0%{opacity:.6}50%{opacity:1}100%{opacity:.6}}
+.run-status{font-size:12px;color:var(--tx3);margin-top:8px;min-height:18px}
+.run-status.error{color:var(--acc-r)}.run-status.success{color:var(--acc-g)}
+
+.data-table{width:100%;border-collapse:collapse}
+.data-table th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx3);padding:10px 14px;text-align:left;border-bottom:1px solid var(--brd);font-weight:500;position:sticky;top:0;background:var(--bg2)}
+.data-table td{padding:9px 14px;font-size:12px;border-bottom:1px solid rgba(226,232,240,.6);font-family:'JetBrains Mono',monospace}
+.data-table tr:hover td{background:rgba(37,99,235,.04)}
+.table-scroll{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--brd2) transparent}
+.badge{font-size:10px;padding:3px 10px;border-radius:12px;font-weight:600;display:inline-block;text-align:center;min-width:40px}
+.badge-score{background:rgba(37,99,235,.1);color:var(--acc2);border:1px solid rgba(37,99,235,.2)}
+.badge-mix{background:rgba(217,119,6,.1);color:var(--acc-y);border:1px solid rgba(217,119,6,.2)}
+.badge-completed{background:rgba(5,150,105,.1);color:var(--acc-g)}.badge-running{background:rgba(37,99,235,.1);color:var(--acc2)}.badge-failed{background:rgba(220,38,38,.1);color:var(--acc-r)}
+
+.h-bar{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.h-bar-label{font-size:12px;color:var(--tx2);width:60px;text-align:right;flex-shrink:0}
+.h-bar-track{flex:1;height:24px;background:var(--bg);border-radius:4px;overflow:hidden}
+.h-bar-fill{height:100%;border-radius:4px;transition:width .6s ease-out;display:flex;align-items:center;padding:0 8px}
+.h-bar-fill span{font-size:10px;color:#fff;font-weight:600;font-family:'JetBrains Mono',monospace}
+.h-bar-value{font-size:12px;color:var(--tx);font-family:'JetBrains Mono',monospace;width:50px;text-align:right;flex-shrink:0}
+
+.chart-container{position:relative;height:200px;display:flex;align-items:flex-end;gap:2px;padding:0 4px}
+.chart-bar{flex:1;background:linear-gradient(180deg,var(--acc),rgba(37,99,235,.15));border-radius:3px 3px 0 0;min-height:2px;transition:all .3s;position:relative;cursor:pointer}
+.chart-bar:hover{background:linear-gradient(180deg,var(--acc2),rgba(29,78,216,.3))}
+.chart-bar .tip{display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:var(--bg);border:1px solid var(--brd2);padding:4px 8px;border-radius:4px;font-size:10px;white-space:nowrap;z-index:10;color:var(--tx)}
+.chart-bar:hover .tip{display:block}
+.chart-axis{display:flex;justify-content:space-between;padding:6px 4px 0;font-size:10px;color:var(--tx3)}
+
+.weight-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.weight-item{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--bg);border-radius:var(--radius-sm);border:1px solid var(--brd)}
+.weight-item label{font-size:12px;color:var(--tx2)}
+.weight-item input{width:60px;background:var(--bg2);border:1px solid var(--brd);color:var(--tx);padding:5px 8px;border-radius:4px;font-size:13px;font-family:'JetBrains Mono',monospace;text-align:center}
+.settings-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.setting-row{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--bg);border-radius:var(--radius-sm);border:1px solid var(--brd)}
+.setting-row .key{font-size:11px;color:var(--tx3);text-transform:uppercase;letter-spacing:.3px}
+.setting-row .val{font-size:12px;color:var(--tx);font-family:'JetBrains Mono',monospace}
+.filter-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.filter-bar input,.filter-bar select{background:var(--bg);border:1px solid var(--brd);color:var(--tx);padding:7px 12px;border-radius:var(--radius-sm);font-size:12px;font-family:'DM Sans',sans-serif;outline:none}
+.filter-bar input{min-width:200px}
+.empty-state{text-align:center;padding:60px 20px;color:var(--tx3)}
+.empty-state .icon{font-size:48px;margin-bottom:12px;opacity:.3}
+.empty-state h3{font-size:16px;color:var(--tx2);margin-bottom:6px}
+.empty-state p{font-size:13px;max-width:400px;margin:0 auto}
+.store-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.store-card{background:var(--bg);border:1px solid var(--brd);border-radius:var(--radius-sm);padding:14px 16px}
+.store-card:hover{border-color:var(--brd2)}
+.store-card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.store-card-head .code{font-size:14px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--acc2)}
+.store-card-head .mbq{font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(217,119,6,.1);color:var(--acc-y)}
+.store-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.store-stat{text-align:center}
+.store-stat .num{font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.store-stat .lbl{font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:.3px}
+.tab-content{display:none}.tab-content.active{display:block}
+.pipeline{display:flex;gap:0;margin:16px 0;align-items:center}
+.pipeline-step{flex:1;text-align:center;padding:12px 8px;background:var(--bg);border:1px solid var(--brd);position:relative}
+.pipeline-step:first-child{border-radius:var(--radius-sm) 0 0 var(--radius-sm)}
+.pipeline-step:last-child{border-radius:0 var(--radius-sm) var(--radius-sm) 0}
+.pipeline-step .num{font-size:10px;color:var(--tx3)}
+.pipeline-step .name{font-size:11px;font-weight:600;margin-top:2px}
+.pipeline-step .detail{font-size:10px;color:var(--tx3);margin-top:2px}
+.pipeline-step.done{background:rgba(5,150,105,.06);border-color:rgba(5,150,105,.15)}.pipeline-step.done .name{color:var(--acc-g)}
+.pipeline-step.running{background:rgba(37,99,235,.05);border-color:rgba(37,99,235,.15)}.pipeline-step.running .name{color:var(--acc2)}
+.pipeline-arrow{color:var(--tx3);font-size:16px;flex-shrink:0;margin:0 -1px;z-index:1}
+.dropdown-list{box-shadow:0 4px 16px rgba(0,0,0,.1);position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--brd2);border-radius:var(--radius-sm);max-height:300px;overflow-y:auto;z-index:50;display:none;margin-top:4px;scrollbar-width:thin;scrollbar-color:var(--brd2) transparent}
+.dropdown-list.show{display:block}
+.dropdown-item{padding:8px 14px;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace}
+.dropdown-item:hover{background:var(--bg3)}
+.dropdown-item.selected{background:rgba(37,99,235,.08);color:var(--acc2)}
+.dropdown-item .ck{width:16px;height:16px;border:1px solid var(--brd2);border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:10px;flex-shrink:0}
+.dropdown-item.selected .ck{background:var(--acc);border-color:var(--acc);color:#fff}
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.pagination{display:flex;align-items:center;justify-content:space-between;padding:12px 0;margin-top:8px}
+.page-info{font-size:12px;color:var(--tx3)}
+.page-btns{display:flex;gap:6px}
+.page-btn{padding:6px 12px;background:var(--bg3);border:1px solid var(--brd);border-radius:4px;color:var(--tx2);font-size:11px;cursor:pointer}
+.page-btn:hover{border-color:var(--acc);color:var(--acc2)}
+.page-btn:disabled{opacity:.4;cursor:not-allowed}
+@media(max-width:1200px){.kpi-strip{grid-template-columns:repeat(3,1fr)}.panels{grid-template-columns:1fr}.run-grid{grid-template-columns:1fr 1fr}.weight-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:768px){.kpi-strip{grid-template-columns:repeat(2,1fr)}.run-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-left">
+    <div class="logo">V2</div>
+    <div class="header-title"><h1>Allocation Engine</h1><p>Score-based • 5 engines • 320+ stores</p></div>
+  </div>
+  <div class="header-right">
+    <span class="hbadge live">● Connected</span>
+    <span class="hbadge supa" onclick="checkSources()">Supabase</span>
+    <span class="hbadge api" onclick="window.open('/docs','_blank')">API Docs</span>
+  </div>
+</div>
+<div class="tab-bar">
+  <div class="tab active" data-tab="run" onclick="switchTab('run')">▶ Run</div>
+  <div class="tab" data-tab="results" onclick="switchTab('results')">📊 Results <span class="cnt" id="resultCount">0</span></div>
+  <div class="tab" data-tab="stores" onclick="switchTab('stores')">🏪 Stores <span class="cnt" id="storeCount">0</span></div>
+  <div class="tab" data-tab="variants" onclick="switchTab('variants')">📦 Variants <span class="cnt" id="variantCount">0</span></div>
+  <div class="tab" data-tab="weights" onclick="switchTab('weights')">⚙ Weights</div>
+  <div class="tab" data-tab="history" onclick="switchTab('history')">📋 History <span class="cnt" id="historyCount">0</span></div>
+</div>
+<div class="main">
+
+<!-- TAB: RUN -->
+<div class="tab-content active" id="tab-run">
+  <div class="panel">
+    <div class="panel-head"><h3>🚀 Run Configuration</h3><button class="btn btn-sm btn-secondary" onclick="loadMajcats()">↻ Refresh MAJCATs</button></div>
+    <div class="panel-body">
+      <div class="run-grid">
+        <div class="form-group majcat-input">
+          <label>Major Categories</label>
+          <input type="text" id="majcatSearch" placeholder="Search & select MAJCATs..." oninput="filterMajcats()" onfocus="showDD()" autocomplete="off">
+          <div class="dropdown-list" id="majcatDD"></div>
+          <div class="majcat-tags" id="majcatTags"></div>
+        </div>
+        <div class="form-group"><label>RDC Code</label><input type="text" id="rdcCode" value="DH24"></div>
+        <div class="form-group"><label>Month</label>
+          <select id="runMonth"><option value="1">January</option><option value="2">February</option><option value="3">March</option><option value="4" selected>April</option><option value="5">May</option><option value="6">June</option><option value="7">July</option><option value="8">August</option><option value="9">September</option><option value="10">October</option><option value="11">November</option><option value="12">December</option></select>
+        </div>
+        <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" id="runBtn" onclick="runAllocation()" style="width:100%">▶ Run Allocation</button></div>
+      </div>
+      <div class="progress-bar" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="run-status" id="runStatus"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><h3>⚡ Engine Pipeline</h3><span style="font-size:11px;color:var(--tx3)" id="pipelineTime"></span></div>
+    <div class="panel-body">
+      <div class="pipeline">
+        <div class="pipeline-step" id="pipe-1"><div class="num">Engine 1</div><div class="name">Budget Cascade</div><div class="detail">MBQ from Supabase</div></div><div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="pipe-2"><div class="num">Engine 2</div><div class="name">Article Scoring</div><div class="detail">14 weighted factors</div></div><div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="pipe-3"><div class="num">Engine 3</div><div class="name">Greedy Filler</div><div class="detail">Fill rate optimization</div></div><div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="pipe-4"><div class="num">Engine 4</div><div class="name">Size Allocator</div><div class="detail">Supabase cont%</div></div><div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="pipe-5"><div class="num">Engine 5</div><div class="name">Delivery Orders</div><div class="detail">Final output</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><h3>🔗 Data Sources</h3></div>
+    <div class="panel-body"><div id="dataSources" class="settings-grid"></div></div>
+  </div>
+</div>
+
+<!-- TAB: RESULTS -->
+<div class="tab-content" id="tab-results">
+  <div id="resultsEmpty" class="empty-state"><div class="icon">📊</div><h3>No Results Yet</h3><p>Run an allocation from the Run tab, or select a past run from History.</p></div>
+  <div id="resultsContent" style="display:none">
+    <div class="kpi-strip">
+      <div class="kpi blue"><div class="kpi-glow"></div><div class="kpi-label">Articles Scored</div><div class="kpi-value" id="kpiScored">—</div><div class="kpi-sub" id="kpiScoredSub"></div></div>
+      <div class="kpi green"><div class="kpi-glow"></div><div class="kpi-label">Slots Filled</div><div class="kpi-value" id="kpiSlots">—</div><div class="kpi-sub" id="kpiSlotsSub"></div></div>
+      <div class="kpi purple"><div class="kpi-glow"></div><div class="kpi-label">Variants</div><div class="kpi-value" id="kpiVariants">—</div><div class="kpi-sub" id="kpiVariantsSub"></div></div>
+      <div class="kpi yellow"><div class="kpi-glow"></div><div class="kpi-label">Fill Rate</div><div class="kpi-value" id="kpiFill">—</div><div class="kpi-sub" id="kpiFillSub"></div></div>
+      <div class="kpi blue"><div class="kpi-glow"></div><div class="kpi-label">Stores</div><div class="kpi-value" id="kpiStores">—</div><div class="kpi-sub" id="kpiStoresSub"></div></div>
+      <div class="kpi green"><div class="kpi-glow"></div><div class="kpi-label">Duration</div><div class="kpi-value" id="kpiDuration">—</div><div class="kpi-sub" id="kpiDurationSub"></div></div>
+    </div>
+    <div class="panels">
+      <div class="panel"><div class="panel-head"><h3>📈 Score Distribution</h3></div><div class="panel-body"><div class="chart-container" id="scoreChart"></div><div class="chart-axis" id="scoreAxis"></div></div></div>
+      <div class="panel"><div class="panel-head"><h3>📐 Size Breakdown</h3></div><div class="panel-body" id="sizeBreakdown"><div class="empty-state" style="padding:30px"><p>Run allocation to see sizes</p></div></div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>📋 Per-Category Summary</h3></div>
+      <div class="panel-body"><div class="table-scroll" style="max-height:300px"><table class="data-table" id="majcatSummary"><thead><tr><th>MAJCAT</th><th>SEG</th><th>Scored</th><th>Slots</th><th>Variants</th><th>Fill Rate</th><th>Avg Score</th><th>MBQ Range</th><th>Duration</th></tr></thead><tbody></tbody></table></div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>🎯 Option Assignments <span class="cnt" id="optionTotal">0</span></h3><button class="btn btn-sm btn-secondary" onclick="exportCSV('options')">⬇ Export CSV</button></div>
+      <div class="panel-body">
+        <div class="filter-bar"><input type="text" placeholder="Filter by store, article..." id="optionFilter" oninput="filterOpt()"><select id="optionMajcatF" onchange="filterOpt()"><option value="">All MAJCATs</option></select><select id="optionStoreF" onchange="filterOpt()"><option value="">All Stores</option></select></div>
+        <div class="table-scroll"><table class="data-table" id="optionTable"><thead><tr><th>Store</th><th>MAJCAT</th><th>SEG</th><th>Opt#</th><th>Article+Color</th><th>Gen Art</th><th>Score</th><th>Status</th><th>MBQ</th><th>DC Stock</th></tr></thead><tbody></tbody></table></div>
+        <div class="pagination" id="optionPag"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TAB: STORES -->
+<div class="tab-content" id="tab-stores">
+  <div id="storesEmpty" class="empty-state"><div class="icon">🏪</div><h3>No Store Data</h3><p>Run an allocation to see store breakdown.</p></div>
+  <div id="storesContent" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px"><h2 style="font-size:15px;font-weight:600">Store Allocation Summary</h2><input type="text" placeholder="Search stores..." id="storeSearch" oninput="filterStores()" style="background:var(--bg);border:1px solid var(--brd);color:var(--tx);padding:7px 12px;border-radius:var(--radius-sm);font-size:12px;width:200px"></div>
+    <div class="store-grid" id="storeGrid"></div>
+  </div>
+</div>
+
+<!-- TAB: VARIANTS -->
+<div class="tab-content" id="tab-variants">
+  <div id="variantsEmpty" class="empty-state"><div class="icon">📦</div><h3>No Variant Data</h3><p>Run an allocation to see variant-level allocations.</p></div>
+  <div id="variantsContent" style="display:none">
+    <div class="panel">
+      <div class="panel-head"><h3>📦 Variant Allocations <span class="cnt" id="variantTotal">0</span></h3><button class="btn btn-sm btn-secondary" onclick="exportCSV('variants')">⬇ Export CSV</button></div>
+      <div class="panel-body">
+        <div class="filter-bar"><input type="text" placeholder="Filter by store, article, size..." id="variantFilter" oninput="filterVar()"><select id="variantStoreF" onchange="filterVar()"><option value="">All Stores</option></select><select id="variantSizeF" onchange="filterVar()"><option value="">All Sizes</option></select></div>
+        <div class="table-scroll"><table class="data-table" id="variantTable"><thead><tr><th>Store</th><th>MAJCAT</th><th>Article+Color</th><th>Size</th><th>Qty</th><th>MRP</th><th>Value</th></tr></thead><tbody></tbody></table></div>
+        <div class="pagination" id="variantPag"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TAB: WEIGHTS -->
+<div class="tab-content" id="tab-weights">
+  <div class="panel">
+    <div class="panel-head"><h3>⚖ Score Weights (14 factors)</h3><div><button class="btn btn-sm btn-secondary" onclick="loadWeights()">↻ Reload</button>&nbsp;<button class="btn btn-sm btn-primary" onclick="saveWeights()">💾 Save</button></div></div>
+    <div class="panel-body"><div class="weight-grid" id="weightGrid"></div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><h3>🔧 Engine Settings</h3></div>
+    <div class="panel-body"><div class="settings-grid" id="settingsGrid"></div></div>
+  </div>
+</div>
+
+<!-- TAB: HISTORY -->
+<div class="tab-content" id="tab-history">
+  <div class="panel">
+    <div class="panel-head"><h3>📋 Run History</h3><button class="btn btn-sm btn-secondary" onclick="loadHistory()">↻ Refresh</button></div>
+    <div class="panel-body"><div class="table-scroll" style="max-height:600px"><table class="data-table" id="historyTable"><thead><tr><th>Run ID</th><th>MAJCATs</th><th>Status</th><th>Scored</th><th>Slots</th><th>Variants</th><th>Duration</th><th>Date</th><th>Actions</th></tr></thead><tbody></tbody></table></div></div>
+  </div>
+</div>
+
+</div>
+
+<script>
+const API='/api/v1/allocation-engine';
+let TOKEN=localStorage.getItem('ars_token')||'';
+let allMajcats=[],selectedMajcats=[],currentRunId=null,currentResults={options:[],variants:[]};
+const PS=100;
+
+async function login(){try{const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:'superadmin',password:'Admin@12345'})});const d=await r.json();if(d.access_token){TOKEN=d.access_token;localStorage.setItem('ars_token',TOKEN)}}catch(e){console.error(e)}}
+function hdr(){return{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}}
+async function apiFetch(url,opts={}){opts.headers=hdr();let r=await fetch(url,opts);if(r.art_status===401||r.art_status===403){await login();opts.headers=hdr();r=await fetch(url,opts)}return r.json()}
+
+function switchTab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active',e.dataset.tab===t));document.querySelectorAll('.tab-content').forEach(c=>c.classList.toggle('active',c.id==='tab-'+t));if(t==='history')loadHistory();if(t==='weights')loadWeights()}
+
+async function loadMajcats(){try{const d=await apiFetch(API+'/majcats');allMajcats=d.data||[];renderDD(allMajcats)}catch(e){console.error(e)}}
+function renderDD(items){document.getElementById('majcatDD').innerHTML=items.map(m=>'<div class="dropdown-item '+(selectedMajcats.includes(m)?'selected':'')+'" onclick="toggleMC(\''+m+'\')"><span class="ck">'+(selectedMajcats.includes(m)?'✓':'')+'</span>'+m+'</div>').join('')}
+function showDD(){document.getElementById('majcatDD').classList.add('show')}
+function filterMajcats(){const q=document.getElementById('majcatSearch').value.toLowerCase();renderDD(allMajcats.filter(m=>m.toLowerCase().includes(q)));showDD()}
+function toggleMC(m){const i=selectedMajcats.indexOf(m);if(i>=0)selectedMajcats.splice(i,1);else selectedMajcats.push(m);renderTags();renderDD(allMajcats.filter(mc=>mc.toLowerCase().includes(document.getElementById('majcatSearch').value.toLowerCase())))}
+function renderTags(){document.getElementById('majcatTags').innerHTML=selectedMajcats.map(m=>'<span class="majcat-tag">'+m+'<span class="rm" onclick="event.stopPropagation();toggleMC(\''+m+'\')">×</span></span>').join('')}
+document.addEventListener('click',e=>{if(!e.target.closest('.majcat-input'))document.getElementById('majcatDD').classList.remove('show')});
+
+async function runAllocation(){
+  if(!selectedMajcats.length){document.getElementById('runStatus').textContent='⚠ Select at least one MAJCAT';document.getElementById('runStatus').className='run-status error';return}
+  const btn=document.getElementById('runBtn');btn.disabled=true;btn.innerHTML='⏳ Running...';
+  const pb=document.getElementById('progressBar');pb.classList.add('active');
+  const pf=document.getElementById('progressFill');pf.style.width='30%';
+  const st=document.getElementById('runStatus');st.className='run-status';st.textContent='Running '+selectedMajcats.length+' MAJCAT(s)...';
+  animPipe('running');
+  try{
+    const payload={majcats:selectedMajcats,rdc_code:document.getElementById('rdcCode').value||'DH24',current_month:parseInt(document.getElementById('runMonth').value)};
+    pf.style.width='60%';
+    const d=await apiFetch(API+'/run',{method:'POST',body:JSON.stringify(payload)});
+    pf.style.width='100%';
+    if(d.data&&d.data.run_id){
+      currentRunId=d.data.run_id;st.className='run-status success';
+      st.textContent='✅ Completed in '+(d.data.duration_ms/1000).toFixed(1)+'s — Run: '+currentRunId;
+      animPipe('done');document.getElementById('pipelineTime').textContent=(d.data.duration_ms/1000).toFixed(1)+'s';
+      await loadResults(currentRunId,d.data);switchTab('results');
+    }else{st.className='run-status error';st.textContent='❌ '+(d.detail||d.error||'Error');animPipe('')}
+  }catch(e){st.className='run-status error';st.textContent='❌ '+e.message;animPipe('')}
+  btn.disabled=false;btn.innerHTML='▶ Run Allocation';setTimeout(()=>pb.classList.remove('active'),2000);
+}
+function animPipe(s){for(let i=1;i<=5;i++){const e=document.getElementById('pipe-'+i);e.className='pipeline-step';if(s)e.classList.add(s)}}
+
+async function loadResults(runId,summary){
+  document.getElementById('resultsEmpty').style.display='none';document.getElementById('resultsContent').style.display='block';
+  const pm=summary.per_majcat||{};let ts=0,tsl=0,tv=0;
+  Object.values(pm).forEach(m=>{ts+=m.articles_scored||0;tsl+=m.slots_filled||0;tv+=m.variants_allocated||0});
+  const tst=summary.total_stores||Object.values(pm).reduce((a,m)=>Math.max(a,m.stores||0),0);
+  const dur=summary.duration_ms||0;
+  document.getElementById('kpiScored').textContent=ts.toLocaleString();document.getElementById('kpiScoredSub').textContent=Object.keys(pm).length+' categories';
+  document.getElementById('kpiSlots').textContent=tsl.toLocaleString();document.getElementById('kpiSlotsSub').textContent='across '+tst+' stores';
+  document.getElementById('kpiVariants').textContent=tv.toLocaleString();document.getElementById('kpiVariantsSub').textContent='size × color combos';
+  document.getElementById('kpiFill').textContent=tsl>0?'100%':'0%';document.getElementById('kpiFillSub').textContent='option slots used';
+  document.getElementById('kpiStores').textContent=tst.toLocaleString();document.getElementById('kpiStoresSub').textContent='active stores';
+  document.getElementById('kpiDuration').textContent=(dur/1000).toFixed(1)+'s';document.getElementById('kpiDurationSub').textContent=(dur/1000/Math.max(Object.keys(pm).length,1)).toFixed(1)+'s/cat';
+  document.getElementById('resultCount').textContent=tsl.toLocaleString();
+  const tb=document.querySelector('#majcatSummary tbody');
+  tb.innerHTML=Object.entries(pm).map(([mc,d])=>'<tr><td style="font-weight:600;color:var(--acc2)">'+mc+'</td><td>'+(d.seg||'APP')+'</td><td>'+(d.articles_scored||0).toLocaleString()+'</td><td>'+(d.slots_filled||0).toLocaleString()+'</td><td>'+(d.variants_allocated||0).toLocaleString()+'</td><td><span class="badge badge-score">'+(d.slots_filled>0?'100%':'0%')+'</span></td><td><span class="badge badge-score">'+(d.avg_score||80)+'</span></td><td>'+(d.mbq_min||0)+'–'+(d.mbq_max||0)+'</td><td>'+((d.duration_ms||0)/1000).toFixed(1)+'s</td></tr>').join('');
+  await loadOptions(runId);await loadVariants(runId);
+}
+
+async function loadOptions(runId,page=0){
+  try{const d=await apiFetch(API+'/results/'+runId+'/assignments?limit='+PS+'&offset='+(page*PS));
+  currentResults.options=d.data||[];document.getElementById('optionTotal').textContent=d.total||currentResults.options.length;
+  renderOpt(currentResults.options);renderScoreChart(currentResults.options);buildOptFilters(currentResults.options);
+  renderPag('optionPag',d.total||0,page,p=>'loadOptions("'+runId+'",'+p+')')}catch(e){console.error(e)}
+}
+function renderOpt(data){document.querySelector('#optionTable tbody').innerHTML=data.map(r=>'<tr><td style="font-weight:600;color:var(--acc2)">'+(r.st_cd||'')+'</td><td>'+(r.majcat||'')+'</td><td>'+(r.seg||'APP')+'</td><td style="text-align:center">'+(r.opt_no||'')+'</td><td>'+(r.gen_art_color||'')+'</td><td>'+(r.gen_art||'')+'</td><td><span class="badge badge-score">'+(r.total_score||0)+'</span></td><td><span class="badge badge-mix">'+(r.art_status||'MIX')+'</span></td><td>'+(r.mbq||0)+'</td><td>'+(r.dc_stock_before||0).toLocaleString()+'</td></tr>').join('')}
+function buildOptFilters(data){const mcs=[...new Set(data.map(r=>r.majcat))].sort();const sts=[...new Set(data.map(r=>r.st_cd))].sort();document.getElementById('optionMajcatF').innerHTML='<option value="">All MAJCATs</option>'+mcs.map(m=>'<option>'+m+'</option>').join('');document.getElementById('optionStoreF').innerHTML='<option value="">All Stores</option>'+sts.map(s=>'<option>'+s+'</option>').join('')}
+function filterOpt(){const q=document.getElementById('optionFilter').value.toLowerCase();const mc=document.getElementById('optionMajcatF').value;const st=document.getElementById('optionStoreF').value;renderOpt(currentResults.options.filter(r=>(!q||(r.st_cd||'').toLowerCase().includes(q)||(r.gen_art_color||'').toLowerCase().includes(q))&&(!mc||r.majcat===mc)&&(!st||r.st_cd===st)))}
+
+async function loadVariants(runId,page=0){
+  try{const d=await apiFetch(API+'/results/'+runId+'/variants?limit='+PS+'&offset='+(page*PS));
+  currentResults.variants=d.data||[];document.getElementById('variantTotal').textContent=d.total||currentResults.variants.length;
+  document.getElementById('variantCount').textContent=(d.total||currentResults.variants.length).toLocaleString();
+  renderVar(currentResults.variants);renderSizeBreakdown(currentResults.variants);buildVarFilters(currentResults.variants);buildStoreCards(currentResults.variants);
+  renderPag('variantPag',d.total||0,page,p=>'loadVariants("'+runId+'",'+p+')')}catch(e){console.error(e)}
+}
+function renderVar(data){document.querySelector('#variantTable tbody').innerHTML=data.map(r=>{const v=(r.alloc_qty||0)*(r.mrp||0);return'<tr><td style="font-weight:600;color:var(--acc2)">'+(r.st_cd||'')+'</td><td>'+(r.majcat||'')+'</td><td>'+(r.gen_art_color||'')+'</td><td><span class="badge badge-mix">'+(r.sz||'')+'</span></td><td style="font-weight:700;color:var(--acc-g)">'+(r.alloc_qty||0)+'</td><td>₹'+(r.mrp||0).toLocaleString()+'</td><td>₹'+v.toLocaleString()+'</td></tr>'}).join('')}
+function buildVarFilters(data){const sts=[...new Set(data.map(r=>r.st_cd))].sort();const szs=[...new Set(data.map(r=>r.sz))].sort();document.getElementById('variantStoreF').innerHTML='<option value="">All Stores</option>'+sts.map(s=>'<option>'+s+'</option>').join('');document.getElementById('variantSizeF').innerHTML='<option value="">All Sizes</option>'+szs.map(s=>'<option>'+s+'</option>').join('')}
+function filterVar(){const q=document.getElementById('variantFilter').value.toLowerCase();const st=document.getElementById('variantStoreF').value;const sz=document.getElementById('variantSizeF').value;renderVar(currentResults.variants.filter(r=>(!q||(r.st_cd||'').toLowerCase().includes(q)||(r.gen_art_color||'').toLowerCase().includes(q)||(r.sz||'').toLowerCase().includes(q))&&(!st||r.st_cd===st)&&(!sz||r.sz===sz)))}
+
+function renderScoreChart(data){const scores=data.map(r=>r.total_score||0);if(!scores.length)return;const mn=Math.min(...scores),mx=Math.max(...scores),bk={},step=Math.max(1,Math.ceil((mx-mn+1)/20));scores.forEach(s=>{const b=Math.floor((s-mn)/step)*step+mn;bk[b]=(bk[b]||0)+1});const mc=Math.max(...Object.values(bk));document.getElementById('scoreChart').innerHTML=Object.entries(bk).sort((a,b)=>a[0]-b[0]).map(([s,c])=>{const h=c/mc*190+4;return'<div class="chart-bar" style="height:'+h+'px"><div class="tip">Score '+s+': '+c+' articles</div></div>'}).join('');const ks=Object.keys(bk).sort((a,b)=>a-b);document.getElementById('scoreAxis').innerHTML='<span>'+ks[0]+'</span><span>'+ks[Math.floor(ks.length/2)]+'</span><span>'+ks[ks.length-1]+'</span>'}
+function renderSizeBreakdown(data){const st={};data.forEach(r=>{st[r.sz||'?']=(st[r.sz||'?']||0)+(r.alloc_qty||0)});const tot=Object.values(st).reduce((a,b)=>a+b,0);if(!tot)return;const sorted=Object.entries(st).sort((a,b)=>b[1]-a[1]);const colors=['#3b82f6','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16','#f97316'];document.getElementById('sizeBreakdown').innerHTML=sorted.map(([sz,qty],i)=>{const pct=(qty/tot*100).toFixed(1);return'<div class="h-bar"><div class="h-bar-label">'+sz+'</div><div class="h-bar-track"><div class="h-bar-fill" style="width:'+pct+'%;background:'+colors[i%colors.length]+'"><span>'+pct+'%</span></div></div><div class="h-bar-value">'+qty.toLocaleString()+'</div></div>'}).join('')}
+
+function buildStoreCards(variants){const stores={};variants.forEach(v=>{const s=v.st_cd||'?';if(!stores[s])stores[s]={options:new Set(),totalQty:0,sizes:new Set(),mbq:v.mbq||0};stores[s].options.add(v.gen_art_color);stores[s].totalQty+=v.alloc_qty||0;stores[s].sizes.add(v.sz)});
+const sorted=Object.entries(stores).sort((a,b)=>b[1].totalQty-a[1].totalQty);
+document.getElementById('storeGrid').innerHTML=sorted.map(([code,data])=>'<div class="store-card"><div class="store-card-head"><span class="code">'+code+'</span><span class="mbq">MBQ '+data.mbq+'</span></div><div class="store-stats"><div class="store-stat"><div class="num" style="color:var(--acc2)">'+data.options.size+'</div><div class="lbl">Options</div></div><div class="store-stat"><div class="num" style="color:var(--acc-g)">'+data.totalQty+'</div><div class="lbl">Total Qty</div></div><div class="store-stat"><div class="num" style="color:var(--acc-y)">'+data.sizes.size+'</div><div class="lbl">Sizes</div></div></div></div>').join('');
+document.getElementById('storeCount').textContent=sorted.length;
+if(sorted.length>0){document.getElementById('storesEmpty').style.display='none';document.getElementById('storesContent').style.display='block'}
+if(variants.length>0){document.getElementById('variantsEmpty').style.display='none';document.getElementById('variantsContent').style.display='block'}}
+function filterStores(){const q=document.getElementById('storeSearch').value.toLowerCase();document.querySelectorAll('.store-card').forEach(c=>{c.style.display=c.querySelector('.code').textContent.toLowerCase().includes(q)?'':'none'})}
+
+function renderPag(id,total,page,cbStr){const tp=Math.ceil(total/PS);if(tp<=1){document.getElementById(id).innerHTML='';return}document.getElementById(id).innerHTML='<span class="page-info">Page '+(page+1)+' of '+tp+' ('+total.toLocaleString()+' rows)</span><div class="page-btns"><button class="page-btn" '+(page===0?'disabled':'')+' onclick="'+cbStr.replace(')','').replace(/"/g,"'")+")\"'>← Prev</button><button class=\"page-btn\" '+(page>=tp-1?'disabled':'')+' onclick=\"'+cbStr.replace(')','').replace(/"/g,"'")+")\"'>Next →</button></div>'}
+
+async function loadWeights(){try{const d=await apiFetch(API+'/config');const cfg=d.data||{};const weights=cfg.weights||[];const settings=cfg.settings||[];
+document.getElementById('weightGrid').innerHTML=weights.map(w=>'<div class="weight-item"><label>'+w.setting_key.replace('weight_','').replace(/_/g,' ').toUpperCase()+'</label><input type="number" id="w_'+w.setting_key+'" value="'+w.setting_value+'" min="0" max="100"></div>').join('');
+document.getElementById('settingsGrid').innerHTML=settings.filter(s=>!s.setting_key.startsWith('weight_')).map(s=>'<div class="setting-row"><span class="key">'+s.setting_key+'</span><span class="val">'+(s.setting_value||'').substring(0,50)+'</span></div>').join('')}catch(e){console.error(e)}}
+async function saveWeights(){const inputs=document.querySelectorAll('#weightGrid input');const w={};inputs.forEach(i=>{w[i.id.replace('w_','')]=parseInt(i.value)});try{await apiFetch(API+'/config',{method:'PUT',body:JSON.stringify({weights:w})});alert('Weights saved!')}catch(e){alert('Error: '+e.message)}}
+
+async function loadHistory(){try{const d=await apiFetch(API+'/runs?limit=50');const runs=d.data||[];document.getElementById('historyCount').textContent=runs.length;
+document.querySelector('#historyTable tbody').innerHTML=runs.map(r=>{const sc=r.art_status==='completed'?'completed':r.art_status==='running'?'running':'failed';return'<tr><td style="font-family:JetBrains Mono,monospace;font-size:11px">'+(r.run_id||'').substring(0,12)+'...</td><td>'+(r.majcats||[]).join(', ')+'</td><td><span class="badge badge-'+sc+'">'+(r.art_status||'')+'</span></td><td>'+(r.total_articles_scored||0).toLocaleString()+'</td><td>'+(r.total_slots_filled||0).toLocaleString()+'</td><td>'+(r.total_variants_allocated||0).toLocaleString()+'</td><td>'+((r.duration_ms||0)/1000).toFixed(1)+'s</td><td style="font-size:11px;color:var(--tx3)">'+(r.created_at?new Date(r.created_at).toLocaleString():'')+'</td><td><button class="btn btn-sm btn-secondary" onclick="viewRun(\''+r.run_id+'\')">View</button></td></tr>'}).join('')}catch(e){console.error(e)}}
+async function viewRun(runId){currentRunId=runId;try{const d=await apiFetch(API+'/runs/'+runId);if(d.data){await loadResults(runId,d.data);switchTab('results')}}catch(e){await loadResults(runId,{per_majcat:{},duration_ms:0});switchTab('results')}}
+
+function checkSources(){document.getElementById('dataSources').innerHTML=[
+  ['Azure SQL','● Connected','var(--acc-g)'],['Articles','ALLOCATION_MRDC_RAW_DATA','var(--tx)'],
+  ['Budget Source','Supabase (387K rows)','var(--acc-g)'],['DC Stock','Supabase (49.5M units)','var(--acc-g)'],
+  ['Size Contribution','Supabase (1,512 rows)','var(--acc-g)'],['Fixture Density','Supabase (558 MAJCATs)','var(--acc-g)'],
+  ['Hero/Focus','○ Not loaded (optional)','var(--tx3)'],['Store Specific','○ Not loaded (optional)','var(--tx3)']
+].map(([k,v,c])=>'<div class="setting-row"><span class="key">'+k+'</span><span class="val" style="color:'+c+'">'+v+'</span></div>').join('')}
+
+function exportCSV(type){const data=type==='options'?currentResults.options:currentResults.variants;if(!data.length)return alert('No data');const ks=Object.keys(data[0]);let csv=ks.join(',')+'\n';data.forEach(r=>{csv+=ks.map(k=>'"'+((r[k]||'').toString().replace(/"/g,'""'))+'"').join(',')+'\n'});const b=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='allocation_'+type+'_'+(currentRunId||'export')+'.csv';a.click()}
+
+async function init(){await login();loadMajcats();checkSources()}
+init();
+</script>
+</body>
+</html>

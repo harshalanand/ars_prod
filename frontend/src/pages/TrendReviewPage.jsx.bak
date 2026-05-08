@@ -1,0 +1,281 @@
+/**
+ * TrendReviewPage — Review & filter data from Trend_* tables
+ */
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { trendsAPI } from '@/services/api'
+import { AgGridReact } from 'ag-grid-react'
+import 'ag-grid-community/styles/ag-grid.css'
+import 'ag-grid-community/styles/ag-theme-alpine.css'
+import toast from 'react-hot-toast'
+import {
+  TrendingUp, Download, RefreshCw,
+  ChevronDown, CheckCircle2,
+  X, Search, Filter, Loader2
+} from 'lucide-react'
+
+const C = {
+  cardBg:'#fff', cardBorder:'#e2e8f0', headerBg:'#f8fafc', rowAlt:'#fafbfc',
+  inputBorder:'#cbd5e1',
+  text:'#0f172a', textSub:'#475569', textMuted:'#94a3b8',
+  primary:'#4f46e5', primaryLight:'#eef2ff', primaryBd:'#c7d2fe',
+  green:'#059669', greenBg:'#ecfdf5', greenBd:'#a7f3d0',
+  red:'#dc2626', redBg:'#fef2f2', redBd:'#fecaca',
+  amber:'#d97706', amberBg:'#fffbeb', amberBd:'#fde68a',
+}
+const sInput = { height:28, fontSize:11, padding:'0 8px', borderRadius:5, border:`1px solid ${C.inputBorder}`, outline:'none', color:C.text, background:'#fff' }
+const sSelect = { ...sInput, paddingRight:20, cursor:'pointer' }
+const sBtn = (bg,color,bd) => ({ display:'inline-flex', alignItems:'center', gap:4, height:28, padding:'0 10px', fontSize:11, fontWeight:600, borderRadius:5, border:`1px solid ${bd||bg}`, background:bg, color, cursor:'pointer', whiteSpace:'nowrap' })
+const sCard = { background:C.cardBg, border:`1px solid ${C.cardBorder}`, borderRadius:8, overflow:'hidden' }
+const sSection = { padding:'10px 14px' }
+const sLabel = { fontSize:10, fontWeight:600, color:C.textSub, marginBottom:3, display:'block' }
+
+export default function TrendReviewPage() {
+  const [tables, setTables] = useState([])
+  const [selectedTable, setSelectedTable] = useState('')
+  const [schema, setSchema] = useState(null)
+  const [filters, setFilters] = useState({})
+  const [filterOpen, setFilterOpen] = useState({})
+  const [distinctVals, setDistinctVals] = useState({})
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [rowLimit, setRowLimit] = useState(1000)
+  const [rowData, setRowData] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [fetched, setFetched] = useState(false)
+  const gridRef = useRef()
+
+  useEffect(() => {
+    trendsAPI.listTables().then(r => setTables(r.data?.data || r.data || [])).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (!selectedTable) { setSchema(null); setFilters({}); setRowData([]); setFetched(false); return }
+    trendsAPI.getSchema(selectedTable).then(r => {
+      setSchema(r.data?.data || r.data)
+      setFilters({}); setFilterOpen({}); setDistinctVals({}); setRowData([]); setFetched(false)
+    }).catch(() => toast.error('Failed to load schema'))
+  }, [selectedTable])
+
+  const loadDistinct = async (col) => {
+    if (distinctVals[col]) return
+    try {
+      const r = await trendsAPI.getDistinct(selectedTable, col)
+      setDistinctVals(prev => ({ ...prev, [col]: r.data?.data || r.data || [] }))
+    } catch { toast.error(`Failed to load values for ${col}`) }
+  }
+
+  const toggleFilter = async (col) => {
+    const isOpen = filterOpen[col]
+    setFilterOpen(prev => ({ ...prev, [col]: !isOpen }))
+    if (!isOpen) await loadDistinct(col)
+  }
+
+  const toggleFilterValue = (col, val) => {
+    setFilters(prev => {
+      const curr = prev[col] || []
+      const next = curr.includes(val) ? curr.filter(v => v !== val) : [...curr, val]
+      if (next.length === 0) { const { [col]: _, ...rest } = prev; return rest }
+      return { ...prev, [col]: next }
+    })
+  }
+
+  const removeFilter = (col) => {
+    setFilters(prev => { const { [col]: _, ...rest } = prev; return rest })
+    setFilterOpen(prev => ({ ...prev, [col]: false }))
+  }
+
+  const fetchData = async () => {
+    if (!selectedTable) { toast.error('Select a table'); return }
+    setLoading(true)
+    try {
+      const payload = { table_name: selectedTable, filters, date_from: dateFrom || undefined, date_to: dateTo || undefined, limit: rowLimit }
+      const r = await trendsAPI.review(payload)
+      const data = r.data?.data || r.data || []
+      setRowData(Array.isArray(data) ? data : data.rows || [])
+      setFetched(true)
+      toast.success(`Loaded ${(Array.isArray(data)?data:data.rows||[]).length} rows`)
+    } catch { toast.error('Fetch failed') }
+    finally { setLoading(false) }
+  }
+
+  const downloadCSV = async () => {
+    if (!selectedTable) return
+    try {
+      const r = await trendsAPI.downloadReview(selectedTable, {
+        filters: JSON.stringify(filters),
+        date_from: dateFrom || undefined, date_to: dateTo || undefined, limit: rowLimit,
+      })
+      const blob = new Blob([r.data], { type:'text/csv' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob); a.download = `${selectedTable}_review.csv`; a.click()
+      toast.success('CSV downloaded')
+    } catch { toast.error('Download failed') }
+  }
+
+  const columns = useMemo(() => schema?.columns || schema || [], [schema])
+  const colNames = useMemo(() => columns.map(c => typeof c === 'string' ? c : c.column_name || c.name), [columns])
+
+  const columnDefs = useMemo(() =>
+    colNames.map(col => ({ field: col, headerName: col, sortable: true, filter: true, resizable: true, minWidth: 90 }))
+  , [colNames])
+
+  const defaultColDef = useMemo(() => ({
+    flex: 1, minWidth: 90, filter: 'agTextColumnFilter', floatingFilter: true,
+  }), [])
+
+  const activeFilterCols = Object.keys(filters)
+
+  return (
+    <div style={{ padding:'0 4px' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:10 }}>
+        <TrendingUp size={15} style={{ color:C.primary }}/>
+        <span style={{ fontSize:14, fontWeight:700, color:C.text }}>Trend Review</span>
+      </div>
+
+      <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+        {/* Controls */}
+        <div style={{ ...sCard }}>
+          <div style={{ ...sSection, display:'flex', gap:10, flexWrap:'wrap', alignItems:'flex-end' }}>
+            <div style={{ flex:'1 1 200px' }}>
+              <label style={sLabel}>Table</label>
+              <select value={selectedTable} onChange={e=>setSelectedTable(e.target.value)}
+                style={{ ...sSelect, width:'100%' }}>
+                <option value="">-- select --</option>
+                {tables.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div style={{ flex:'0 0 130px' }}>
+              <label style={sLabel}>Date From</label>
+              <input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{ ...sInput, width:'100%' }}/>
+            </div>
+            <div style={{ flex:'0 0 130px' }}>
+              <label style={sLabel}>Date To</label>
+              <input type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{ ...sInput, width:'100%' }}/>
+            </div>
+            <div style={{ flex:'0 0 90px' }}>
+              <label style={sLabel}>Limit</label>
+              <select value={rowLimit} onChange={e=>setRowLimit(Number(e.target.value))} style={{ ...sSelect, width:'100%' }}>
+                {[100,500,1000,2000,5000].map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </div>
+            <button onClick={fetchData} disabled={loading||!selectedTable}
+              style={{ ...sBtn(C.primary,'#fff'), height:28, opacity:(loading||!selectedTable)?0.5:1 }}>
+              {loading ? <Loader2 size={11} className="animate-spin"/> : <Search size={11}/>}
+              Fetch
+            </button>
+            {fetched && (
+              <button onClick={downloadCSV} style={sBtn(C.greenBg,C.green,C.greenBd)}>
+                <Download size={11}/> CSV
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Column filters */}
+        {colNames.length > 0 && (
+          <div style={{ ...sCard }}>
+            <div style={{ ...sSection }}>
+              <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6 }}>
+                <Filter size={11} style={{ color:C.textMuted }}/>
+                <span style={{ fontSize:10, fontWeight:600, color:C.textSub }}>Column Filters</span>
+                {activeFilterCols.length > 0 && (
+                  <span style={{ fontSize:9, padding:'1px 6px', borderRadius:10, background:C.primaryLight, color:C.primary, fontWeight:700 }}>
+                    {activeFilterCols.length} active
+                  </span>
+                )}
+              </div>
+              <div style={{ display:'flex', gap:4, flexWrap:'wrap' }}>
+                {colNames.map(col => {
+                  const active = !!filters[col]
+                  const isOpen = filterOpen[col]
+                  return (
+                    <div key={col} style={{ position:'relative' }}>
+                      <button onClick={()=>toggleFilter(col)} style={{
+                        ...sBtn(active?C.primaryLight:'#fff', active?C.primary:C.textMuted, active?C.primaryBd:C.inputBorder),
+                        fontSize:9, height:22, padding:'0 6px',
+                      }}>
+                        {col} {active && <span style={{ fontSize:8 }}>({filters[col].length})</span>}
+                        <ChevronDown size={8}/>
+                      </button>
+                      {active && (
+                        <span onClick={()=>removeFilter(col)} style={{
+                          position:'absolute', top:-4, right:-4, width:12, height:12,
+                          borderRadius:6, background:C.red, color:'#fff', fontSize:8,
+                          display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer',
+                        }}><X size={7}/></span>
+                      )}
+                      {isOpen && (
+                        <div style={{
+                          position:'absolute', top:'100%', left:0, zIndex:999, marginTop:2,
+                          background:'#fff', border:`1px solid ${C.cardBorder}`, borderRadius:6,
+                          boxShadow:'0 4px 12px rgba(0,0,0,.12)', maxHeight:200, width:180, overflowY:'auto',
+                        }}>
+                          {!distinctVals[col] ? (
+                            <div style={{ padding:8, fontSize:10, color:C.textMuted, textAlign:'center' }}>
+                              <Loader2 size={12} className="animate-spin" style={{ margin:'0 auto' }}/>
+                            </div>
+                          ) : distinctVals[col].length === 0 ? (
+                            <div style={{ padding:8, fontSize:10, color:C.textMuted, textAlign:'center' }}>No values</div>
+                          ) : distinctVals[col].map((val,i) => {
+                            const sel = (filters[col]||[]).includes(val)
+                            return (
+                              <div key={i} onClick={()=>toggleFilterValue(col,val)} style={{
+                                padding:'3px 8px', fontSize:10, cursor:'pointer',
+                                background:sel?C.primaryLight:'transparent', color:sel?C.primary:C.text,
+                                display:'flex', alignItems:'center', gap:5,
+                              }}>
+                                <span style={{
+                                  width:12, height:12, borderRadius:3, flexShrink:0,
+                                  border:`1px solid ${sel?C.primary:C.inputBorder}`,
+                                  background:sel?C.primary:'#fff', display:'flex',
+                                  alignItems:'center', justifyContent:'center',
+                                }}>
+                                  {sel && <CheckCircle2 size={8} style={{ color:'#fff' }}/>}
+                                </span>
+                                <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                                  {val == null ? '(null)' : String(val)}
+                                </span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Grid */}
+        {fetched && (
+          <div style={{ ...sCard }}>
+            <div style={{
+              ...sSection, background:C.headerBg, borderBottom:`1px solid ${C.cardBorder}`,
+              display:'flex', alignItems:'center', justifyContent:'space-between',
+            }}>
+              <span style={{ fontSize:11, fontWeight:600, color:C.text }}>
+                Showing {rowData.length.toLocaleString()} rows
+              </span>
+            </div>
+            <div className="ag-theme-alpine" style={{ width:'100%', height:Math.min(600, Math.max(250, rowData.length*28+60)) }}>
+              <AgGridReact
+                ref={gridRef}
+                rowData={rowData}
+                columnDefs={columnDefs}
+                defaultColDef={defaultColDef}
+                animateRows
+                pagination
+                paginationPageSize={100}
+                paginationPageSizeSelector={[50,100,500]}
+                suppressRowClickSelection
+                loading={loading}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

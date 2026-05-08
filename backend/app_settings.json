@@ -1,0 +1,38 @@
+{
+  "database": {
+    "server": "hopc560",
+    "system_database": "Claude",
+    "data_database": "Rep_data",
+    "username": "sa",
+    "password": "vrl@55555",
+    "driver": "ODBC Driver 18 for SQL Server",
+    "trust_cert": "yes",
+    "encrypt": "no",
+    "port": ""
+  },
+  "email": {
+    "smtp_server": "smtp.office365.com",
+    "smtp_port": 587,
+    "smtp_username": "santosh@v2kart.com",
+    "smtp_password": "vrl@1234",
+    "from_address": "santosh@v2kart.com",
+    "use_tls": true,
+    "notifications_enabled": false
+  },
+  "application": {
+    "app_name": "ARS",
+    "max_upload_size_mb": 100,
+    "session_timeout_minutes": 60,
+    "enable_audit_logging": true,
+    "enable_row_level_security": true,
+    "default_page_size": 50,
+    "max_export_rows": 500000
+  },
+  "ui": {
+    "primary_color": "#cccbd7",
+    "sidebar_collapsed": true,
+    "show_row_numbers": true,
+    "date_format": "YYYY-MM-DD",
+    "number_format": "en-IN"
+  }
+}

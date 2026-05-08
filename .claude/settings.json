@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from app.services.upsert_engine import UpsertEngine; print\\('upsert_engine: OK'\\)\")",
+      "Bash(python -c \"from app.services.upload_job_service import get_job_status; print\\('upload_job_service: OK'\\)\")",
+      "Bash(python -c \"from app.services.tempdb_cleanup_service import tempdb_cleaner; print\\('tempdb_cleanup: OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(backend/venv/Scripts/python.exe -c ' *)",
+      "Bash(backend/venv/Scripts/python.exe scripts/check_alloc2.py)",
+      "Bash(backend/venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('backend/app/services/rule_engine_pandas.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(/e/ARS/backend/venv/Scripts/python.exe -c ' *)",
+      "Bash(where python *)",
+      "Bash(where python3 *)",
+      "Bash(py --version)",
+      "Bash(venv/Scripts/python -c ' *)",
+      "Bash(e:/ARS/backend/venv/Scripts/python.exe)",
+      "Bash(e:/ARS/backend/venv/Scripts/python.exe e:/ARS/backend/scripts/seed_dictionary.py)",
+      "Bash(az account *)",
+      "PowerShell($set = [bool]$env:AZURE_SECRET -or [bool]$env:AZURE_CLIENT_SECRET; \"AZURE_SECRET set: $set\"; if \\($env:AZURE_SECRET\\) { \"len=$\\($env:AZURE_SECRET.Length\\)\" }; if \\($env:AZURE_CLIENT_SECRET\\) { \"alt name set, len=$\\($env:AZURE_CLIENT_SECRET.Length\\)\" })",
+      "Bash(e:/ARS/backend/venv/Scripts/python.exe -c ' *)",
+      "Bash(ls backend/app/api/v1/endpoints/dictionary.py)",
+      "Bash(ls backend/scripts/seed_dictionary.py)",
+      "Bash(ls frontend/src/pages/DictionaryPage.jsx)",
+      "Bash(grep -l \"dictionary\" backend/app/api/v1/router.py)",
+      "Bash(grep -l \"DictionaryPage\\\\|dictionary\" frontend/src/App.jsx)",
+      "Bash(venv/Scripts/python.exe scripts/test_alloc_determinism.py)",
+      "Bash(node -e ' *)",
+      "Bash(node --experimental-vm-modules -e ' *)",
+      "Bash(/e/ARS/backend/venv/Scripts/python.exe -c \"import docx; print\\('python-docx', docx.__version__\\)\")",
+      "Bash(/e/ARS/backend/venv/Scripts/python.exe /e/ARS/docs/generate_project_tracker_brd.py)",
+      "Bash(e:/ARS/backend/venv/Scripts/python.exe e:/ARS/scripts/load_review_findings.py)"
+    ]
+  }
+}

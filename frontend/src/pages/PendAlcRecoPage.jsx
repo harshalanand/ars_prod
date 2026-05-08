@@ -1,0 +1,624 @@
+/**
+ * PendAlcRecoPage — Full reconciliation view for ARS_PEND_ALC
+ * Shows aging, mode/source breakdown, per-RDC, BDC-unconfirmed, and filterable detail.
+ * Actions: Generate BDC (download Excel), trigger MSA patch.
+ */
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { pendAlcAPI } from '@/services/api'
+import toast from 'react-hot-toast'
+import { RefreshCw, BarChart2, Download, AlertTriangle } from 'lucide-react'
+import DataGrid from '@/components/DataGrid'
+
+const C = {
+  primary: '#4f46e5', blue: '#0891b2', green: '#16a34a',
+  amber: '#d97706', red: '#dc2626', text: '#1e293b',
+  textSub: '#64748b', textMuted: '#94a3b8', border: '#e2e8f0',
+  bg: '#f8fafc', card: '#ffffff',
+}
+
+const AGING_ACCENT = { '0-7d': C.green, '8-30d': C.blue, '31-60d': C.amber, '60d+': C.red }
+
+function fmt(n) {
+  return typeof n === 'number' ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'
+}
+
+function AgingTile({ band, rows, pend_qty, alloc_qty }) {
+  const accent = AGING_ACCENT[band] || C.textSub
+  const pct = alloc_qty > 0 ? (100 * pend_qty / alloc_qty).toFixed(0) : '—'
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
+                  padding: '12px 14px', borderLeft: `3px solid ${accent}` }}>
+      <div style={{ fontSize: 9, fontWeight: 700, color: accent, letterSpacing: '.06em',
+                    marginBottom: 4 }}>{band}</div>
+      <div style={{ fontSize: 20, fontWeight: 800, color: C.text, lineHeight: 1 }}>
+        {fmt(pend_qty)}
+      </div>
+      <div style={{ fontSize: 9, color: C.textMuted, marginTop: 3 }}>
+        {rows} rows · {pct}% of alloc
+      </div>
+    </div>
+  )
+}
+
+function StatusTile({ color, label, rows, qty, hint }) {
+  return (
+    <div title={hint || ''}
+      style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
+               padding: '10px 12px', borderTop: `3px solid ${color}` }}>
+      <div style={{ fontSize: 9, fontWeight: 700, color, letterSpacing: '.06em',
+                    marginBottom: 3 }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+        <div style={{ fontSize: 18, fontWeight: 800, color: C.text, lineHeight: 1 }}>{fmt(rows)}</div>
+        <div style={{ fontSize: 9, color: C.textMuted }}>rows</div>
+      </div>
+      <div style={{ fontSize: 9, color: C.textMuted, marginTop: 3 }}>
+        {fmt(qty)} units
+      </div>
+    </div>
+  )
+}
+
+function ModeBadge({ value }) {
+  const color = value === 'MANUAL' ? C.amber : C.primary
+  return (
+    <span style={{ fontSize: 8, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
+                   background: color + '22', color }}>
+      {value || 'AUTO'}
+    </span>
+  )
+}
+
+function StatusBadge({ closed }) {
+  return (
+    <span style={{ fontSize: 8, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
+                   background: closed ? '#dcfce7' : '#fef3c7',
+                   color: closed ? C.green : C.amber }}>
+      {closed ? 'CLOSED' : 'OPEN'}
+    </span>
+  )
+}
+
+function BdcStatusBadge({ value }) {
+  if (!value) return <span style={{color:C.textMuted}}>—</span>
+  const map = {
+    NEVER_SENT: { bg:'#f1f5f9',  fg:C.textMuted, label:'NEVER SENT' },
+    OPEN:       { bg:'#fef3c7',  fg:C.amber,     label:'OPEN'       },
+    PARTIAL:    { bg:'#dbeafe',  fg:C.blue,      label:'PARTIAL'    },
+    CONFIRMED:  { bg:'#dcfce7',  fg:C.green,     label:'CONFIRMED'  },
+  }
+  const s = map[value] || { bg:'#f1f5f9', fg:C.textSub, label:value }
+  return (
+    <span style={{ fontSize:8, fontWeight:700, padding:'2px 6px', borderRadius:3,
+                   background:s.bg, color:s.fg }}>
+      {s.label}
+    </span>
+  )
+}
+
+const TH = ({ children, right }) => (
+  <th style={{ padding: '7px 10px', textAlign: right ? 'right' : 'left',
+               fontSize: 9, fontWeight: 700, color: C.textSub, letterSpacing: '.05em',
+               borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>
+    {children}
+  </th>
+)
+
+export default function PendAlcRecoPage() {
+  const [recoSummary, setRecoSummary] = useState(null)
+  const [summaryLoading, setSummaryLoading] = useState(false)
+
+  // The grid manages its own data + loading internally; we only bump
+  // `gridBumpKey` to force a refresh.
+  const [gridBumpKey, setGridBumpKey] = useState(0)
+
+  // Filters
+  const [fDateFrom, setFDateFrom] = useState('')
+  const [fDateTo,   setFDateTo]   = useState('')
+  const [fRdc,      setFRdc]      = useState('')
+  const [fMajCat,   setFMajCat]   = useState('')
+  const [fMode,     setFMode]     = useState('')
+  const [fClosed,   setFClosed]   = useState('open') // 'open' | 'closed' | 'all'
+  const [fSession,  setFSession]  = useState('')
+
+  // BDC
+  const [bdcLoading, setBdcLoading] = useState(false)
+  const [bdcModalOpen, setBdcModalOpen] = useState(false)
+  const [bdcDate, setBdcDate] = useState(() => {
+    // Default = tomorrow if today is Mon-Fri, else next Monday
+    const d = new Date(); d.setDate(d.getDate() + 1)
+    while (d.getDay() === 0) d.setDate(d.getDate() + 1) // skip Sunday
+    return d.toISOString().slice(0, 10)
+  })
+  const [bdcScheduleStores, setBdcScheduleStores] = useState([])
+  const [bdcSelectedStores, setBdcSelectedStores] = useState(new Set())
+  const [bdcWeekday, setBdcWeekday] = useState('')
+  const [bdcDateLoading, setBdcDateLoading] = useState(false)
+
+  const loadSummary = useCallback(async () => {
+    setSummaryLoading(true)
+    try {
+      const { data } = await pendAlcAPI.recoSummary()
+      setRecoSummary(data?.data || null)
+    } catch {
+      toast.error('Failed to load reco summary')
+    } finally {
+      setSummaryLoading(false)
+    }
+  }, [])
+
+  // The DataGrid component drives its own pagination/sort/per-column filter
+  // and calls this fetcher whenever any of those change. The top-bar filters
+  // (date range, RDC, etc.) are merged in here and changes bump `refreshKey`
+  // so the grid re-fetches.
+  const fetchReco = useCallback(async (gridParams) => {
+    const params = { ...gridParams }
+    if (fDateFrom) params.date_from  = fDateFrom
+    if (fDateTo)   params.date_to    = fDateTo
+    if (fRdc)      params.rdc        = fRdc
+    if (fMajCat)   params.maj_cat    = fMajCat
+    if (fMode)     params.alloc_mode = fMode
+    if (fSession)  params.session_id = fSession
+    if (fClosed === 'open')   params.closed = false
+    if (fClosed === 'closed') params.closed = true
+    return pendAlcAPI.reco(params)
+  }, [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession])
+
+  // Bump this to make the grid re-fetch from page 1.
+  const recoRefreshKey = useMemo(
+    () => `${fDateFrom}|${fDateTo}|${fRdc}|${fMajCat}|${fMode}|${fClosed}|${fSession}`,
+    [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession]
+  )
+
+  useEffect(() => { loadSummary() }, [loadSummary])
+
+  // Load stores scheduled for the picked date (Mon-Sat schedule lookup)
+  const loadScheduleForDate = useCallback(async (dateStr) => {
+    if (!dateStr) return
+    setBdcDateLoading(true)
+    try {
+      const { data } = await pendAlcAPI.scheduleStoresFor(dateStr)
+      const stores = data?.stores || []
+      setBdcScheduleStores(stores)
+      setBdcSelectedStores(new Set(stores))      // pre-select all
+      setBdcWeekday(data?.weekday || '')
+    } catch {
+      setBdcScheduleStores([]); setBdcSelectedStores(new Set()); setBdcWeekday('')
+    } finally {
+      setBdcDateLoading(false)
+    }
+  }, [])
+
+  const openBdcModal = () => {
+    setBdcModalOpen(true)
+    loadScheduleForDate(bdcDate)
+  }
+
+  const toggleStore = (st) => {
+    setBdcSelectedStores(prev => {
+      const next = new Set(prev)
+      next.has(st) ? next.delete(st) : next.add(st)
+      return next
+    })
+  }
+
+  const handleBdcGenerate = async () => {
+    setBdcLoading(true)
+    try {
+      const params = {}
+      if (fRdc)    params.rdc     = fRdc
+      if (fMajCat) params.maj_cat = fMajCat
+      if (bdcDate) params.target_date = bdcDate
+      // Send only the user-selected subset (lets users de-select stores)
+      if (bdcScheduleStores.length > 0) {
+        params.st_cd_list = [...bdcSelectedStores]
+        if (params.st_cd_list.length === 0) {
+          toast.error('Select at least one store')
+          setBdcLoading(false); return
+        }
+      }
+      const resp = await pendAlcAPI.bdcGenerate(params)
+      const url = URL.createObjectURL(new Blob([resp.data],
+        { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
+      const a = document.createElement('a')
+      const stamp = (bdcDate || new Date().toISOString().slice(0, 10)).replace(/-/g, '')
+      a.href = url; a.download = `ARS_BDC_${stamp}.xlsx`
+      document.body.appendChild(a); a.click()
+      document.body.removeChild(a); URL.revokeObjectURL(url)
+      toast.success(`BDC downloaded — ${[...bdcSelectedStores].length || 'all'} store(s)`)
+      setBdcModalOpen(false)
+      loadSummary(); setGridBumpKey(k => k + 1)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'BDC generate failed')
+    } finally {
+      setBdcLoading(false)
+    }
+  }
+
+  const _btn = (variant = 'default') => {
+    if (variant === 'primary') return {
+      fontSize: 10, fontWeight: 700, padding: '5px 14px', borderRadius: 4,
+      border: 'none', background: C.primary, color: '#fff', cursor: 'pointer',
+      display: 'flex', alignItems: 'center', gap: 5,
+    }
+    if (variant === 'amber') return {
+      fontSize: 10, fontWeight: 700, padding: '5px 14px', borderRadius: 4,
+      border: `1px solid ${C.amber}`, background: C.amber + '10', color: C.amber,
+      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5,
+    }
+    return {
+      fontSize: 10, padding: '4px 10px', borderRadius: 4,
+      border: `1px solid ${C.border}`, background: '#fff', color: C.textSub,
+      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4,
+    }
+  }
+
+  const inp = {
+    fontSize: 10, padding: '4px 8px', border: `1px solid ${C.border}`,
+    borderRadius: 4, outline: 'none', background: '#fff',
+  }
+
+  const s = recoSummary
+
+  return (
+    <div style={{ padding: '16px 20px', fontFamily: 'Inter,system-ui,sans-serif',
+                  fontSize: 11, color: C.text, background: C.bg, minHeight: '100vh' }}>
+
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+        <BarChart2 size={16} color={C.primary}/>
+        <div style={{ fontSize: 13, fontWeight: 800, color: C.text }}>PEND_ALC Reconciliation</div>
+        <div style={{ fontSize: 10, color: C.textMuted, marginLeft: 4 }}>
+          RDC = source warehouse · ST_CD = destination store · Aging · BDC tracking · MSA sync
+        </div>
+        <div style={{ flex: 1 }}/>
+        <button style={_btn()}
+          onClick={() => { loadSummary(); setGridBumpKey(k => k + 1) }}
+          disabled={summaryLoading}>
+          <RefreshCw size={11}
+            style={{ animation: summaryLoading ? 'spin 1s linear infinite' : 'none' }}/>
+          Refresh
+        </button>
+        <button style={_btn('primary')} onClick={openBdcModal} disabled={bdcLoading}>
+          <Download size={11} style={{ animation: bdcLoading ? 'spin 1s linear infinite' : 'none' }}/>
+          {bdcLoading ? 'Generating…' : 'Generate BDC'}
+        </button>
+      </div>
+
+      {/* BDC Generate modal — date + scheduled stores */}
+      {bdcModalOpen && (
+        <div onClick={() => !bdcLoading && setBdcModalOpen(false)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)',
+                   display: 'flex', alignItems: 'center', justifyContent: 'center',
+                   zIndex: 50 }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ background: '#fff', borderRadius: 8, width: 580, maxWidth: '92vw',
+                     maxHeight: '85vh', overflowY: 'auto', boxShadow: '0 12px 32px rgba(0,0,0,.2)' }}>
+            <div style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}`,
+                          display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Download size={14} color={C.primary}/>
+              <div style={{ fontSize: 13, fontWeight: 800 }}>Generate BDC for date</div>
+              <div style={{ flex: 1 }}/>
+              <button onClick={() => setBdcModalOpen(false)} disabled={bdcLoading}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16,
+                         color: C.textMuted }}>×</button>
+            </div>
+
+            <div style={{ padding: 16 }}>
+              {/* Date picker */}
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub,
+                              letterSpacing: '.05em', marginBottom: 6 }}>
+                  TARGET DATE
+                </div>
+                <input type="date" value={bdcDate}
+                  onChange={e => { setBdcDate(e.target.value); loadScheduleForDate(e.target.value) }}
+                  style={{ fontSize: 12, padding: '6px 10px', borderRadius: 4,
+                           border: `1px solid ${C.border}`, fontFamily: 'inherit' }}/>
+                {bdcWeekday && (
+                  <span style={{ fontSize: 11, color: C.textSub, marginLeft: 10, fontWeight: 600 }}>
+                    {bdcWeekday}
+                  </span>
+                )}
+              </div>
+
+              {/* Scheduled stores */}
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center',
+                              marginBottom: 6 }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub,
+                                letterSpacing: '.05em' }}>
+                    SCHEDULED STORES ({bdcScheduleStores.length})
+                  </div>
+                  <div style={{ flex: 1 }}/>
+                  {bdcScheduleStores.length > 0 && (
+                    <>
+                      <button onClick={() => setBdcSelectedStores(new Set(bdcScheduleStores))}
+                        style={{ fontSize: 9, padding: '3px 8px', borderRadius: 3,
+                                 border: `1px solid ${C.primary}`, background: '#fff',
+                                 color: C.primary, cursor: 'pointer', marginRight: 6 }}>
+                        Select All
+                      </button>
+                      <button onClick={() => setBdcSelectedStores(new Set())}
+                        style={{ fontSize: 9, padding: '3px 8px', borderRadius: 3,
+                                 border: `1px solid ${C.border}`, background: '#fff',
+                                 color: C.textSub, cursor: 'pointer' }}>
+                        Clear
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {bdcDateLoading ? (
+                  <div style={{ padding: 20, textAlign: 'center', color: C.textMuted, fontSize: 11 }}>
+                    Loading schedule…
+                  </div>
+                ) : bdcScheduleStores.length === 0 ? (
+                  <div style={{ padding: 14, textAlign: 'center', fontSize: 11,
+                                background: C.amber + '15', border: `1px solid ${C.amber}40`,
+                                borderRadius: 4, color: C.amber, fontWeight: 600 }}>
+                    No stores scheduled for {bdcWeekday || 'this date'}.
+                    The BDC will include <b>all stores with open pending qty</b>.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5,
+                                maxHeight: 220, overflowY: 'auto', padding: 6,
+                                background: C.bg, border: `1px solid ${C.border}`, borderRadius: 4 }}>
+                    {bdcScheduleStores.map(st => {
+                      const sel = bdcSelectedStores.has(st)
+                      return (
+                        <button key={st} onClick={() => toggleStore(st)}
+                          style={{ fontSize: 10, padding: '4px 10px', borderRadius: 12,
+                                   border: `1px solid ${sel ? C.primary : C.border}`,
+                                   background: sel ? C.primary : '#fff',
+                                   color: sel ? '#fff' : C.textSub,
+                                   cursor: 'pointer', fontWeight: 600 }}>
+                          {sel && '✓ '}{st}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+
+                {bdcScheduleStores.length > 0 && (
+                  <div style={{ marginTop: 6, fontSize: 10, color: C.textMuted }}>
+                    {bdcSelectedStores.size} of {bdcScheduleStores.length} selected
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div style={{ padding: '10px 16px', borderTop: `1px solid ${C.border}`,
+                          display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={() => setBdcModalOpen(false)} disabled={bdcLoading}
+                style={{ ..._btn(), border: `1px solid ${C.border}` }}>Cancel</button>
+              <button onClick={handleBdcGenerate} disabled={bdcLoading || bdcDateLoading}
+                style={_btn('primary')}>
+                <Download size={11} style={{ animation: bdcLoading ? 'spin 1s linear infinite' : 'none' }}/>
+                {bdcLoading ? 'Generating…' : 'Generate BDC'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Status tiles — Awaiting BDC / Awaiting DO / Partial / Closed */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 8 }}>
+        {summaryLoading ? (
+          <div style={{ gridColumn: '1/-1', padding: 16, textAlign: 'center',
+                        color: C.textMuted, fontSize: 11 }}>Loading…</div>
+        ) : (
+          <>
+            <StatusTile color={C.red}    label="Awaiting BDC"
+              hint="No BDC sent yet — generate to request from SAP"
+              {...(s?.by_status?.awaiting_bdc || { rows: 0, qty: 0 })}/>
+            <StatusTile color={C.amber}  label="Awaiting DO"
+              hint="BDC sent — waiting for SAP to confirm"
+              {...(s?.by_status?.awaiting_do  || { rows: 0, qty: 0 })}/>
+            <StatusTile color={C.primary} label="Partial / Re-BDC needed"
+              hint="DO short — needs another BDC for the gap"
+              {...(s?.by_status?.partial      || { rows: 0, qty: 0 })}/>
+            <StatusTile color={C.green}  label="Closed"
+              hint="DO ≥ ALLOC — fully covered"
+              {...(s?.by_status?.closed       || { rows: 0, qty: 0 })}/>
+          </>
+        )}
+      </div>
+
+      {/* Aging tiles */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 14 }}>
+        {summaryLoading ? (
+          <div style={{ gridColumn: '1/-1', padding: 20, textAlign: 'center', color: C.textMuted }}>
+            Loading…
+          </div>
+        ) : (s?.by_aging || []).length ? (
+          ['0-7d','8-30d','31-60d','60d+'].map(band => {
+            const b = s.by_aging.find(x => x.aging_band === band) || { rows: 0, pend_qty: 0, alloc_qty: 0 }
+            return <AgingTile key={band} band={band} {...b}/>
+          })
+        ) : (
+          <div style={{ gridColumn: '1/-1', padding: 20, textAlign: 'center', color: C.textMuted }}>
+            No open pending rows.
+          </div>
+        )}
+      </div>
+
+      {/* Mode + RDC breakdown */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+
+        {/* By Mode */}
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
+          <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`,
+                        fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
+            BY MODE (open rows)
+          </div>
+          {summaryLoading ? (
+            <div style={{ padding: 20, textAlign: 'center', color: C.textMuted }}>Loading…</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead><tr style={{ background: C.bg }}>
+                <TH>MODE</TH><TH right>ALLOC</TH><TH right>BDC</TH>
+                <TH right>DO</TH><TH right>PEND</TH><TH right>ROWS</TH>
+              </tr></thead>
+              <tbody>
+                {(s?.by_mode || []).map((r, i) => (
+                  <tr key={r.mode} style={{ borderBottom: `1px solid ${C.border}`,
+                                            background: i % 2 === 0 ? '#fff' : C.bg }}>
+                    <td style={{ padding: '6px 10px' }}><ModeBadge value={r.mode}/></td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right' }}>{fmt(r.alloc_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.blue }}>{fmt(r.bdc_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.green }}>{fmt(r.do_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700,
+                                 color: r.pend_qty > 0 ? C.amber : C.green }}>{fmt(r.pend_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.textMuted }}>{r.rows}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* By RDC */}
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
+          <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`,
+                        fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
+            BY RDC (open rows)
+          </div>
+          {summaryLoading ? (
+            <div style={{ padding: 20, textAlign: 'center', color: C.textMuted }}>Loading…</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead><tr style={{ background: C.bg }}>
+                <TH>RDC</TH><TH right>ALLOC</TH><TH right>BDC</TH>
+                <TH right>DO</TH><TH right>PEND</TH><TH right>ROWS</TH>
+              </tr></thead>
+              <tbody>
+                {(s?.by_rdc || []).map((r, i) => (
+                  <tr key={r.rdc} style={{ borderBottom: `1px solid ${C.border}`,
+                                           background: i % 2 === 0 ? '#fff' : C.bg }}>
+                    <td style={{ padding: '6px 10px', fontWeight: 600 }}>{r.rdc}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right' }}>{fmt(r.alloc_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.blue }}>{fmt(r.bdc_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.green }}>{fmt(r.do_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700,
+                                 color: r.pend_qty > 0 ? C.amber : C.green }}>{fmt(r.pend_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.textMuted }}>{r.rows}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
+                    padding: '10px 12px', marginBottom: 10 }}>
+        <div style={{ fontSize: 9, fontWeight: 700, color: C.textSub,
+                      letterSpacing: '.05em', marginBottom: 8 }}>FILTERS</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <label style={{ fontSize: 9, color: C.textMuted }}>From</label>
+            <input type="date" value={fDateFrom} onChange={e => setFDateFrom(e.target.value)}
+              style={{ ...inp, fontSize: 9 }}/>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <label style={{ fontSize: 9, color: C.textMuted }}>To</label>
+            <input type="date" value={fDateTo} onChange={e => setFDateTo(e.target.value)}
+              style={{ ...inp, fontSize: 9 }}/>
+          </div>
+          <input value={fRdc} onChange={e => setFRdc(e.target.value)}
+            placeholder="RDC…" style={{ ...inp, width: 80 }}/>
+          <input value={fMajCat} onChange={e => setFMajCat(e.target.value)}
+            placeholder="MAJ_CAT…" style={{ ...inp, width: 100 }}/>
+          <select value={fMode} onChange={e => setFMode(e.target.value)} style={inp}>
+            <option value="">All Modes</option>
+            <option value="AUTO">AUTO</option>
+            <option value="MANUAL">MANUAL</option>
+          </select>
+          <select value={fClosed} onChange={e => setFClosed(e.target.value)} style={inp}>
+            <option value="open">Open only</option>
+            <option value="closed">Closed only</option>
+            <option value="all">All rows</option>
+          </select>
+          <input value={fSession} onChange={e => setFSession(e.target.value)}
+            placeholder="Session ID…" style={{ ...inp, width: 160 }}/>
+          <button style={_btn()}
+            onClick={() => setGridBumpKey(k => k + 1)}>
+            <RefreshCw size={10}/> Apply
+          </button>
+        </div>
+      </div>
+
+      {/* Detail grid — paged + sortable + per-column filter */}
+      <DataGrid
+        fetcher={fetchReco}
+        refreshKey={`${recoRefreshKey}|${gridBumpKey}`}
+        defaultPageSize={100}
+        defaultSortBy="approved_at"
+        defaultSortDir="desc"
+        compact
+        emptyText="No rows match the current filters."
+        columns={[
+          { key:'rdc', label:'RDC', sortable:true, filterType:'multi',
+            filterOptions:['DH24','DH26','DW01'],
+            render:r => <span style={{fontWeight:600}}>{r.rdc}</span> },
+          { key:'st_cd', label:'ST_CD', sortable:true, filterType:'text',
+            render:r => <span style={{color:C.textSub}}>{r.st_cd || '—'}</span> },
+          { key:'article_number', label:'ARTICLE', sortable:true, filterType:'text',
+            render:r => <span style={{fontFamily:'monospace', fontSize:9}}>{r.article_number}</span> },
+          { key:'maj_cat', label:'MAJ_CAT', sortable:true, filterType:'text',
+            render:r => r.maj_cat || '—' },
+          { key:'clr', label:'CLR', sortable:true,
+            render:r => <span style={{color:C.textSub}}>{r.clr || '—'}</span> },
+          { key:'alloc_mode', label:'MODE', sortable:true, filterType:'multi',
+            filterOptions:['AUTO','MANUAL','RL','TBL','NL'],
+            render:r => <ModeBadge value={r.alloc_mode}/> },
+          { key:'alloc_qty', label:'ALLOC', sortable:true, align:'right',
+            render:r => fmt(r.alloc_qty) },
+          { key:'bdc_qty', label:'BDC', sortable:true, align:'right',
+            render:r => <span style={{color:C.blue}}>{fmt(r.bdc_qty)}</span> },
+          { key:'bdc_unconfirmed', label:'BDC UNCONF', sortable:true, align:'right',
+            render:r => r.bdc_unconfirmed > 0
+              ? <span style={{display:'inline-flex', alignItems:'center', gap:3, color:C.amber}}>
+                  <AlertTriangle size={9}/>{fmt(r.bdc_unconfirmed)}
+                </span>
+              : <span style={{color:C.textMuted}}>—</span> },
+          { key:'do_qty', label:'DO', sortable:true, align:'right',
+            render:r => <span style={{color:C.green}}>{fmt(r.do_qty)}</span> },
+          { key:'pend_qty', label:'PEND', sortable:true, align:'right',
+            render:r => <span style={{fontWeight:700, color:r.pend_qty>0?C.amber:C.green}}>
+              {fmt(r.pend_qty)}</span> },
+          { key:'bdc_alloc_no', label:'BDC ALLOC #', sortable:true, filterType:'text',
+            render:r => r.bdc_alloc_no
+              ? <span style={{fontFamily:'monospace', fontSize:9, color:C.primary}}>{r.bdc_alloc_no}</span>
+              : <span style={{color:C.textMuted}}>—</span> },
+          { key:'bdc_status', label:'BDC STATUS', sortable:true, filterType:'multi',
+            filterOptions:['NEVER_SENT','OPEN','PARTIAL','CONFIRMED'],
+            render:r => <BdcStatusBadge value={r.bdc_status}/> },
+          { key:'do_received', label:'DO RECVD', sortable:true, align:'right',
+            render:r => r.do_received != null
+              ? <span style={{color:C.green}}>{fmt(r.do_received)}</span>
+              : <span style={{color:C.textMuted}}>—</span> },
+          { key:'aging_band', label:'AGING', sortable:true, filterType:'multi',
+            filterOptions:['0-7d','8-30d','31-60d','60d+'],
+            render:r => {
+              const accent = AGING_ACCENT[r.aging_band] || C.textSub
+              return <span style={{fontSize:8, fontWeight:700, padding:'2px 5px',
+                                   borderRadius:3, background:accent+'22', color:accent}}>
+                {r.aging_band} ({r.aging_days}d)</span>
+            }},
+          { key:'do_number', label:'DO NUMBER', sortable:true,
+            render:r => <span style={{fontFamily:'monospace', fontSize:9, color:C.textSub}}>
+              {r.do_number || '—'}</span> },
+          { key:'approved_at', label:'APPROVED', sortable:true,
+            render:r => <span style={{fontSize:9, color:C.textMuted}}>
+              {r.approved_at ? r.approved_at.slice(0,16).replace('T',' ') : '—'}</span> },
+          { key:'is_closed', label:'STATUS', sortable:true,
+            render:r => <StatusBadge closed={r.is_closed}/> },
+        ]}
+      />
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+    </div>
+  )
+}
