@@ -34,5 +34,8 @@
     "show_row_numbers": true,
     "date_format": "YYYY-MM-DD",
     "number_format": "en-IN"
+  },
+  "allocation": {
+    "history_retention_days": 30
   }
 }

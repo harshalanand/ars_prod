@@ -109,8 +109,8 @@ export default function LookupArtMasterPage() {
       fd.append('file', file); fd.append('join_column', joinColumn)
       fd.append('master_column', masterColumn); fd.append('select_columns', JSON.stringify(selectedCols))
       const res = await lookupArtMasterAPI.download(fd)
-      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([res.data]))
-      a.download = 'lookup_result.xlsx'; a.click(); toast.success('Download started')
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([res.data], { type: 'text/csv' }))
+      a.download = 'lookup_result.csv'; a.click(); toast.success('Download started')
     } catch { toast.error('Download failed') }
     finally { setDownloading(false) }
   }
@@ -279,7 +279,7 @@ export default function LookupArtMasterPage() {
                   border:`2px solid ${C.greenBd}`, background:C.greenBg, color:C.green,
                   opacity:downloading?0.6:1, transition:'all .15s',
                 }}>
-                  <Download size={15}/> {downloading ? 'Downloading…' : 'Download Excel'}
+                  <Download size={15}/> {downloading ? 'Downloading…' : 'Download CSV'}
                 </button>
               )}
 

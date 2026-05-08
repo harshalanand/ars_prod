@@ -306,7 +306,7 @@ def download_lookup(
     sheet_name: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
 ):
-    """Same as /run but returns the full result as an Excel download."""
+    """Same as /run but returns the full result as a CSV download."""
     content = file.file.read()
     try:
         df_upload = _read_upload(content, file.filename, sheet_name)
@@ -330,13 +330,13 @@ def download_lookup(
     if "_lookup_match" in df_result.columns:
         df_result = df_result.drop(columns=["_lookup_match"])
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_result.to_excel(writer, index=False, sheet_name="Lookup_Result")
-    buf.seek(0)
+    # utf-8-sig emits a BOM so Excel opens the CSV with the correct encoding
+    # (avoids garbled non-ASCII characters when users double-click the file).
+    csv_bytes = df_result.to_csv(index=False).encode("utf-8-sig")
+    buf = io.BytesIO(csv_bytes)
 
     return StreamingResponse(
         buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=lookup_result.xlsx"},
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=lookup_result.csv"},
     )

@@ -6,8 +6,84 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
   <title>ARS - Auto Replenishment System</title>
+  <style>
+    /* ARS preloader — visible from first paint until React mounts */
+    #ars-preloader {
+      position: fixed;
+      inset: 0;
+      z-index: 99999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      transition: opacity 320ms ease;
+    }
+    #ars-preloader.fade-out { opacity: 0; pointer-events: none; }
+    #ars-preloader .ars-logo-box {
+      width: 64px;
+      height: 64px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 10px 30px rgba(37, 99, 235, 0.35);
+      animation: ars-pulse 1.6s ease-in-out infinite;
+    }
+    #ars-preloader .ars-logo-box svg { width: 32px; height: 32px; color: #fff; }
+    #ars-preloader .ars-title {
+      margin-top: 22px;
+      color: #fff;
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    #ars-preloader .ars-subtitle {
+      margin-top: 6px;
+      color: #94a3b8;
+      font-size: 13px;
+      font-weight: 400;
+      letter-spacing: 0.02em;
+    }
+    #ars-preloader .ars-dots {
+      margin-top: 28px;
+      display: flex;
+      gap: 6px;
+    }
+    #ars-preloader .ars-dots span {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #3b82f6;
+      animation: ars-bounce 1.6s ease-in-out infinite;
+    }
+    #ars-preloader .ars-dots span:nth-child(2) { animation-delay: 0.2s; }
+    #ars-preloader .ars-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes ars-pulse {
+      0%, 100% { transform: scale(1); box-shadow: 0 10px 30px rgba(37, 99, 235, 0.35); }
+      50% { transform: scale(1.05); box-shadow: 0 14px 40px rgba(37, 99, 235, 0.55); }
+    }
+    @keyframes ars-bounce {
+      0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+      40% { transform: scale(1); opacity: 1; }
+    }
+  </style>
 </head>
 <body class="antialiased">
+  <div id="ars-preloader">
+    <div class="ars-logo-box">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/>
+        <path d="m3.3 7 8.7 5 8.7-5"/>
+        <path d="M12 22V12"/>
+      </svg>
+    </div>
+    <div class="ars-title">ARS</div>
+    <div class="ars-subtitle">Auto Replenishment System</div>
+    <div class="ars-dots"><span></span><span></span><span></span></div>
+  </div>
   <div id="root"></div>
   <script type="module" src="/src/main.jsx"></script>
 </body>
