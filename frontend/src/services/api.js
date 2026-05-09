@@ -533,7 +533,14 @@ export const pendAlcAPI = {
                                     { params, responseType: 'blob', timeout: 120000,
                                       paramsSerializer: { indexes: null } }),
   bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
-  manualUpload:(rows)           => api.post('/pend-alc/manual-upload', { rows }),
+  manualUpload:(payload)        => api.post('/pend-alc/manual-upload',
+    // Accept either a raw rows array (legacy callers) or the full request
+    // body { rows, session_id, is_first_chunk, is_last_chunk } (new callers).
+    Array.isArray(payload) ? { rows: payload } : payload,
+    // The last chunk runs the deferred MSA+grid delta which can take 30-60
+    // seconds on big uploads, so allow up to 5 minutes per request before we
+    // bail. Avoids indefinite hangs while still catching truly stuck calls.
+    { timeout: 5 * 60 * 1000, quiet: true }),
   reco:        (params = {})    => api.get('/pend-alc/reco', { params }),
   recoSummary: ()               => api.get('/pend-alc/reco-summary'),
 

@@ -11,7 +11,7 @@
  *             head/tail preview. Required because rendering 200k <input>s
  *             freezes the browser.
  */
-import { useState, useRef, useMemo } from 'react'
+import { useState, useRef, useMemo, useEffect } from 'react'
 import { pendAlcAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
@@ -42,16 +42,37 @@ const SUBMIT_CHUNK = 10000
 function parseCsv(text) {
   const lines = text.trim().split('\n')
   if (lines.length < 2) return []
-  const hdr = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/^﻿/, ''))
+  // Strip BOM, lowercase, normalise spaces/dashes/dots → underscore.  This
+  // turns "Gen Art Number", "gen-art-no", "gen.art_number" all into the same
+  // canonical form so the synonym list below can be small and exact.
+  const norm = h => h.trim().toLowerCase()
+                     .replace(/^﻿/, '')
+                     .replace(/[\s\-.]+/g, '_')
+                     .replace(/_+/g, '_')
+  const hdr = lines[0].split(',').map(norm)
   const idx = (...names) => hdr.findIndex(h => names.includes(h))
-  const rdcIdx  = idx('rdc','source warehouse','source wh','warehouse','wh')
-  const stIdx   = idx('st_cd','st code','store','store code','dest store','destination store','werks')
-  const artIdx  = idx('article_number','material no','material','matnr','var_art')
-  const qtyIdx  = idx('alloc_qty','allocation qty','qty','quantity','alloc')
-  const mcIdx   = idx('maj_cat','major category','majcat')
-  const ganIdx  = idx('gen_art_number','gen art','generic article','gen_art')
+  const rdcIdx  = idx('rdc','source_warehouse','source_wh','warehouse','wh')
+  const stIdx   = idx('st_cd','st_code','store','store_code','dest_store','destination_store','werks')
+  const artIdx  = idx('article_number','article','material_no','material','matnr','var_art')
+  const qtyIdx  = idx('alloc_qty','allocation_qty','qty','quantity','alloc')
+  const mcIdx   = idx('maj_cat','major_category','majcat')
+  // gen_art_number / gen_art / gen_art_no / generic_article / etc. — the
+  // backend column is GEN_ART_NUMBER but in user CSVs we accept any of these.
+  const ganIdx  = idx(
+    'gen_art_number','gen_art','genart','gen_art_no','gen_art_id',
+    'gen_article','gen_article_number','generic_article','generic_article_number'
+  )
   const clrIdx  = idx('clr','colour','color')
   const remIdx  = idx('remarks','remark','notes','note','comment')
+
+  // Soft warn so users can see what didn't match in DevTools without breaking
+  // the upload (other columns might still be sufficient).
+  if (ganIdx < 0) {
+    console.warn(
+      `[ManualEntry] No GEN_ART column matched in CSV. Headers seen: ${hdr.join(', ')} — ` +
+      `accepted names: gen_art_number / gen_art / genart / generic_article / ...`
+    )
+  }
   if (rdcIdx < 0 || artIdx < 0 || qtyIdx < 0) return null
   const out = []
   for (let i = 1; i < lines.length; i++) {
@@ -99,6 +120,19 @@ export default function ManualPendAlcPage() {
   const [result, setResult]         = useState(null)
   const fileRef = useRef()
 
+  // Warn before tab close / refresh while an upload is in flight. Browser
+  // handles the rest — message text is no longer customisable in modern
+  // browsers (security), but the prompt still appears.
+  useEffect(() => {
+    if (!submitting) return
+    const onBeforeUnload = (e) => {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [submitting])
+
   const setRow = (i, field, val) => {
     setRows(prev => prev.map((r, idx) => idx === i ? { ...r, [field]: val } : r))
   }
@@ -120,7 +154,7 @@ export default function ManualPendAlcPage() {
     reader.onload = ev => {
       const parsed = parseCsv(ev.target.result)
       if (!parsed) {
-        toast.error('CSV must have columns: RDC, Article_Number, Alloc_Qty (optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR, Remarks)')
+        toast.error('CSV must have columns: RDC, Article_Number, Alloc_Qty (optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER or GEN_ART, CLR, Remarks)')
         return
       }
       if (parsed.length === 0) {
@@ -173,28 +207,67 @@ export default function ManualPendAlcPage() {
     setResult(null)
     setProgress({ sent: 0, total: valid.length })
 
-    try {
-      let totalInserted = 0
-      // Chunk submission — for huge uploads this gives progress feedback
-      // and keeps any single request under typical body-size limits.
-      for (let i = 0; i < valid.length; i += SUBMIT_CHUNK) {
-        const slice = valid.slice(i, i + SUBMIT_CHUNK)
-        const payload = slice.map(buildPayload)
+    // Generate ONE session_id for the entire upload so every chunk lands under
+    // the same SESSION_ID and rolls up to a single operations_log row → one
+    // revert click undoes the whole upload.
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+    const uploadSessionId = `MANUAL-${dateStr}-${Math.random().toString(16).slice(2, 8)}`
+
+    let totalInserted = 0
+    const failedChunks = []   // [{ chunk, range, error }]
+    // Chunk submission — for huge uploads this gives progress feedback
+    // and keeps any single request under typical body-size limits. Every
+    // chunk shares the same session_id; chunk 1 is_first_chunk=true creates
+    // the ops_log row, chunks 2..N-1 update it. The last chunk also
+    // triggers the deferred MSA+grid delta on the entire session.
+    //
+    // Per-chunk try/catch so one failure (timeout, network blip) doesn't
+    // kill the whole upload — we collect failures and report them at the
+    // end. The user can re-upload just the failed chunks if needed.
+    const chunkCount = Math.ceil(valid.length / SUBMIT_CHUNK)
+    for (let i = 0, chunkIdx = 0; i < valid.length; i += SUBMIT_CHUNK, chunkIdx++) {
+      const slice = valid.slice(i, i + SUBMIT_CHUNK)
+      const payload = {
+        rows: slice.map(buildPayload),
+        session_id:     uploadSessionId,
+        is_first_chunk: i === 0,
+        is_last_chunk:  i + SUBMIT_CHUNK >= valid.length,
+      }
+      try {
         const { data } = await pendAlcAPI.manualUpload(payload)
         totalInserted += (data.inserted_rows || 0)
-        setProgress({ sent: Math.min(i + slice.length, valid.length), total: valid.length })
+      } catch (e) {
+        failedChunks.push({
+          chunk: chunkIdx + 1,
+          range: `${i + 1}-${Math.min(i + slice.length, valid.length)}`,
+          error: e.response?.data?.detail || e.message || 'unknown',
+        })
+        // keep going — don't let one bad chunk kill the rest
       }
-      setResult({ submitted: valid.length, inserted: totalInserted })
-      toast.success(`Manual allocation submitted — ${totalInserted.toLocaleString()} rows inserted`)
-      // Reset
+      setProgress({ sent: Math.min(i + slice.length, valid.length), total: valid.length })
+    }
+
+    setResult({
+      submitted: valid.length,
+      inserted: totalInserted,
+      session_id: uploadSessionId,
+      failed_chunks: failedChunks,
+    })
+
+    if (failedChunks.length === 0) {
+      toast.success(`Manual allocation submitted — ${totalInserted.toLocaleString()} rows inserted (session ${uploadSessionId})`)
       if (bulkMode) exitBulkMode()
       else setRows([{ ...EMPTY_ROW }])
-    } catch (e) {
-      toast.error(e.response?.data?.detail || 'Manual upload failed')
-    } finally {
-      setSubmitting(false)
-      setProgress(null)
+    } else {
+      toast.error(
+        `Upload partial: ${totalInserted.toLocaleString()} of ${valid.length.toLocaleString()} rows inserted. ` +
+        `${failedChunks.length} of ${chunkCount} chunks failed — see result panel for details.`,
+        { duration: 10000 },
+      )
+      // Don't reset rows — user may want to retry
     }
+    setSubmitting(false)
+    setProgress(null)
   }
 
   const _inp = {
@@ -228,7 +301,7 @@ export default function ManualPendAlcPage() {
             IMPORT FROM CSV
           </div>
           <div style={{ fontSize: 9, color: C.textMuted }}>
-            Required: RDC, Article_Number, Alloc_Qty — optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR, Remarks
+            Required: RDC, Article_Number, Alloc_Qty — optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER (or GEN_ART), CLR, Remarks
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>

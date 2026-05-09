@@ -58,7 +58,13 @@
       "Bash(/e/ARS/backend/venv/Scripts/python *)",
       "Bash(npx --no-install esbuild --loader:.jsx=jsx --bundle=false --log-level=error /e/ARS/frontend/src/pages/ListingPage.jsx)",
       "Bash(/e/ARS/frontend/node_modules/.bin/esbuild --loader:.jsx=jsx --bundle=false --log-level=error /e/ARS/frontend/src/pages/ListingPage.jsx)",
-      "Bash(echo \"JSX exit=$?\")"
+      "Bash(echo \"JSX exit=$?\")",
+      "Bash(netstat -ano)",
+      "Bash(findstr \":3000 :8000 :8080\")",
+      "Bash(curl -s -m 15 \"http://localhost:8000/health\")",
+      "Bash(curl -s -m 15 \"http://localhost:8000/api/v1/msa/distinct?column=SLOC&date=2026-05-07&filters=%7B%22ST_CD%22:%5B%22DH24%22,%22DW01%22%5D%7D\")",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "Bash(backend/venv/Scripts/python.exe -c ' *)"
     ]
   }
 }
