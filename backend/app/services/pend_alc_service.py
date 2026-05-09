@@ -2720,6 +2720,142 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
     return result
 
 
+def bootstrap_msa_hold_sync(conn) -> Dict:
+    """Reseed HOLD_QTY in ARS_MSA_TOTAL/VAR_ART/GEN_ART from currently-open
+    ARS_NL_TBL_HOLD_TRACKING rows, then recompute FNL_Q from the canonical
+    formula max(STK_QTY − PEND_QTY − HOLD_QTY, 0).
+
+    Mirror of bootstrap_msa_pend_sync but for the HOLD axis. Idempotent.
+
+    RDC resolution: prefers ARS_NL_TBL_HOLD_TRACKING.RDC if present (added
+    by listing.py Part 8.6 setup). Falls back to a Master_ALC_INPUT_ST_MASTER
+    join for older rows where RDC is still NULL.
+
+    Call from:
+      • approve_parked, after the PEND delta — keeps HOLD in step with the
+        same lifecycle event that updates PEND.
+      • listing.py Part 8.6, after the hold-tracking MERGE — keeps MSA in
+        sync the moment new holds land, before approval.
+      • msa_result_storage.store_results — defensive double-check after a
+        full MSA build.
+    """
+    result: Dict = {"msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0, "error": None}
+    try:
+        msa_total_art   = _probe_col(conn, "ARS_MSA_TOTAL",
+                                     "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_var_art_col = _probe_col(conn, "ARS_MSA_VAR_ART",
+                                     "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART",
+                                     "GEN_ART_NUMBER", "GEN_ART")
+
+        # Detect whether ARS_NL_TBL_HOLD_TRACKING already has the RDC column
+        # (added by listing.py Part 8.6 setup). If not, fall back to joining
+        # the store master so this still works on older deployments.
+        has_rdc_col = (conn.execute(text("""
+            SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_NAME = 'ARS_NL_TBL_HOLD_TRACKING' AND COLUMN_NAME = 'RDC'
+        """)).scalar() or 0) > 0
+
+        if has_rdc_col:
+            # Native RDC column — direct aggregation, no store-master join.
+            # COALESCE handles backfilled-NULL rows by joining store master
+            # only for those.
+            hold_cte = """
+                ;WITH H AS (
+                    SELECT COALESCE(NULLIF(H.RDC, ''), SM.RDC) AS rdc,
+                           CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                           SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
+                    FROM ARS_NL_TBL_HOLD_TRACKING H
+                    LEFT JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
+                    WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                      AND ISNULL(H.HOLD_REM, 0) > 0
+                    GROUP BY COALESCE(NULLIF(H.RDC, ''), SM.RDC),
+                             CAST(H.VAR_ART AS NVARCHAR(30))
+                )
+            """
+        else:
+            hold_cte = """
+                ;WITH H AS (
+                    SELECT SM.RDC AS rdc,
+                           CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                           SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
+                    FROM ARS_NL_TBL_HOLD_TRACKING H
+                    INNER JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
+                    WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                      AND ISNULL(H.HOLD_REM, 0) > 0
+                    GROUP BY SM.RDC, CAST(H.VAR_ART AS NVARCHAR(30))
+                )
+            """
+
+        # 1. Reseed MSA_TOTAL.HOLD_QTY + recompute FNL_Q
+        try:
+            r1 = conn.execute(text(f"""
+                {hold_cte}
+                UPDATE T SET
+                    T.HOLD_QTY = ISNULL(H.hold_qty, 0),
+                    T.FNL_Q = CASE
+                        WHEN ISNULL(T.STK_QTY, 0) - ISNULL(T.PEND_QTY, 0)
+                             - ISNULL(H.hold_qty, 0) < 0 THEN 0
+                        ELSE ISNULL(T.STK_QTY, 0) - ISNULL(T.PEND_QTY, 0)
+                             - ISNULL(H.hold_qty, 0)
+                    END
+                FROM ARS_MSA_TOTAL T
+                LEFT JOIN H ON H.rdc = T.RDC AND H.art = T.[{msa_total_art}]
+            """))
+            result["msa_total"] = int(r1.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[bootstrap_hold] MSA_TOTAL skipped: {e}")
+
+        # 2. Mirror to MSA_VAR_ART (variant grain — 1:1 with MSA_TOTAL)
+        try:
+            r2 = conn.execute(text(f"""
+                UPDATE V SET V.HOLD_QTY = T.HOLD_QTY, V.FNL_Q = T.FNL_Q
+                FROM ARS_MSA_VAR_ART V
+                JOIN ARS_MSA_TOTAL T
+                  ON T.RDC = V.RDC
+                 AND T.[{msa_total_art}] = V.[{msa_var_art_col}]
+            """))
+            result["msa_var_art"] = int(r2.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[bootstrap_hold] MSA_VAR_ART skipped: {e}")
+
+        # 3. Roll up to MSA_GEN_ART — sum HOLD_QTY and FNL_Q from MSA_TOTAL
+        # by gen_art group (sum of FNL_Q is the correct rollup, NOT
+        # max(STK − PEND − HOLD) — see comment in apply_pend_alc_delta).
+        try:
+            r3 = conn.execute(text(f"""
+                UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
+                FROM ARS_MSA_GEN_ART G
+                JOIN (
+                    SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                           SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
+                           SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
+                    FROM ARS_MSA_TOTAL T
+                    GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                ) agg
+                  ON G.RDC = agg.RDC
+                 AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+                 AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
+                 AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+            """))
+            result["msa_gen_art"] = int(r3.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[bootstrap_hold] MSA_GEN_ART skipped: {e}")
+
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[bootstrap_hold] failed (non-fatal): {e}")
+        result["error"] = str(e)
+        try: conn.rollback()
+        except Exception: pass
+
+    logger.info(
+        f"[bootstrap_hold] reseeded: total={result['msa_total']} "
+        f"var={result['msa_var_art']} gen={result['msa_gen_art']}"
+    )
+    return result
+
+
 def bootstrap_grid_pend_sync(conn) -> Dict:
     """Reseed PEND_ALC on the grid family from a fresh scan of ARS_PEND_ALC.
     Skips silently if a grid table doesn't exist on this deployment. Safe to

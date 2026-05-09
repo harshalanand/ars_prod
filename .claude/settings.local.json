@@ -64,7 +64,21 @@
       "Bash(curl -s -m 15 \"http://localhost:8000/health\")",
       "Bash(curl -s -m 15 \"http://localhost:8000/api/v1/msa/distinct?column=SLOC&date=2026-05-07&filters=%7B%22ST_CD%22:%5B%22DH24%22,%22DW01%22%5D%7D\")",
       "Bash(venv/Scripts/python.exe -c ' *)",
-      "Bash(backend/venv/Scripts/python.exe -c ' *)"
+      "Bash(backend/venv/Scripts/python.exe -c ' *)",
+      "mcp__claude_ai_sap_hht__v2_sql_query",
+      "Bash(backend/venv/Scripts/python.exe --version)",
+      "Bash(venv/Scripts/python.exe check_hold_sync.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe check_hold_sync.py)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; & 'E:\\\\projects\\\\ARS_V2\\\\backend\\\\venv\\\\Scripts\\\\python.exe' 'E:\\\\projects\\\\ARS_V2\\\\backend\\\\check_hold_sync.py' 2>&1 | Select-Object -Last 100)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; & 'E:\\\\projects\\\\ARS_V2\\\\backend\\\\venv\\\\Scripts\\\\python.exe' 'E:\\\\projects\\\\ARS_V2\\\\backend\\\\check_hold_sync.py' --bootstrap 2>&1 | Select-Object -Last 30)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; & 'E:\\\\projects\\\\ARS_V2\\\\backend\\\\venv\\\\Scripts\\\\python.exe' 'E:\\\\projects\\\\ARS_V2\\\\backend\\\\check_hold_sync.py' 2>&1 | Select-Object -Last 30)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_add_rdc_to_hold.py' 2>&1)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' check_hold_sync.py 2>&1 | Select-Object -Last 50)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_check_alloc_schema.py' 2>&1)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' check_hold_sync.py 2>&1 | Select-Object -Last 30)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_hold_approve.py' 2>&1 | Select-Object -Last 80)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_undo_test_side_effect.py' 2>&1 | Select-Object -Last 15)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' check_hold_sync.py 2>&1 | Select-Object -Last 20)"
     ]
   }
 }
