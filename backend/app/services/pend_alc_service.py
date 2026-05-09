@@ -2288,7 +2288,9 @@ def _build_rollup_delta_sql(
         """
 
     return f"""
-        UPDATE X SET X.PEND_ALC = ISNULL(X.PEND_ALC, 0) + d.qty
+        UPDATE X SET
+            X.PEND_ALC = ISNULL(X.PEND_ALC, 0) + d.qty,
+            X.STK_TTL  = ISNULL(X.STK_TTL,  0) + d.qty
         FROM [{grid_table}] X
         JOIN (
             SELECT {', '.join(select_parts)}
@@ -2517,9 +2519,16 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
             logger.warning(f"[delta] MSA_GEN_ART skipped: {e}")
 
         # ── Grid: ARS_GRID_MJ_VAR_ART — variant grain ───────────────────
+        # PEND_ALC is incremented by d.qty (the pending allocation that's
+        # been approved). STK_TTL is also incremented by the same qty so
+        # the planner-facing total reflects the incoming pending shipment
+        # — without this, STK_TTL would only track physical store stock
+        # and lag the pending pipeline until the next grid rebuild.
         try:
             r4 = conn.execute(text(f"""
-                UPDATE V SET V.PEND_ALC = ISNULL(V.PEND_ALC, 0) + d.qty
+                UPDATE V SET
+                    V.PEND_ALC = ISNULL(V.PEND_ALC, 0) + d.qty,
+                    V.STK_TTL  = ISNULL(V.STK_TTL,  0) + d.qty
                 FROM ARS_GRID_MJ_VAR_ART V
                 JOIN (
                     SELECT st_cd, maj_cat, gen_art, clr, art, SUM(qty) AS qty
@@ -2537,9 +2546,12 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
             logger.warning(f"[delta] GRID_VAR_ART skipped: {e}")
 
         # ── Grid: ARS_GRID_MJ_GEN_ART — gen_art grain ───────────────────
+        # Same dual update — PEND_ALC + STK_TTL track the pending shipment.
         try:
             r5 = conn.execute(text(f"""
-                UPDATE G SET G.PEND_ALC = ISNULL(G.PEND_ALC, 0) + d.qty
+                UPDATE G SET
+                    G.PEND_ALC = ISNULL(G.PEND_ALC, 0) + d.qty,
+                    G.STK_TTL  = ISNULL(G.STK_TTL,  0) + d.qty
                 FROM ARS_GRID_MJ_GEN_ART G
                 JOIN (
                     SELECT st_cd, maj_cat, gen_art, clr, SUM(qty) AS qty
@@ -2720,12 +2732,21 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
     return result
 
 
-def bootstrap_msa_hold_sync(conn) -> Dict:
+def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
     """Reseed HOLD_QTY in ARS_MSA_TOTAL/VAR_ART/GEN_ART from currently-open
     ARS_NL_TBL_HOLD_TRACKING rows, then recompute FNL_Q from the canonical
     formula max(STK_QTY − PEND_QTY − HOLD_QTY, 0).
 
     Mirror of bootstrap_msa_pend_sync but for the HOLD axis. Idempotent.
+
+    Args:
+        session_id: Optional. If provided, scope the reseed to ONLY the
+            (RDC, ARTICLE) keys touched by this session in ARS_ALLOC_HISTORY
+            — turns a 100K-row full-table update into a few-hundred-row
+            scoped update. Major win on approve where the affected article
+            set is small.
+            Pass None to reseed every row (used by msa_result_storage,
+            full MSA builds, and the diagnostic script).
 
     RDC resolution: prefers ARS_NL_TBL_HOLD_TRACKING.RDC if present (added
     by listing.py Part 8.6 setup). Falls back to a Master_ALC_INPUT_ST_MASTER
@@ -2733,13 +2754,14 @@ def bootstrap_msa_hold_sync(conn) -> Dict:
 
     Call from:
       • approve_parked, after the PEND delta — keeps HOLD in step with the
-        same lifecycle event that updates PEND.
-      • listing.py Part 8.6, after the hold-tracking MERGE — keeps MSA in
-        sync the moment new holds land, before approval.
+        same lifecycle event that updates PEND. PASS session_id for speed.
       • msa_result_storage.store_results — defensive double-check after a
-        full MSA build.
+        full MSA build. Pass None.
     """
-    result: Dict = {"msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0, "error": None}
+    result: Dict = {
+        "msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0,
+        "scoped": session_id is not None, "error": None,
+    }
     try:
         msa_total_art   = _probe_col(conn, "ARS_MSA_TOTAL",
                                      "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
@@ -2748,49 +2770,70 @@ def bootstrap_msa_hold_sync(conn) -> Dict:
         msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART",
                                      "GEN_ART_NUMBER", "GEN_ART")
 
+        # Build a scope-filter CTE that resolves the (RDC, ARTICLE) keys
+        # touched by this session — used to limit MSA_TOTAL row updates
+        # below. Empty / null when running unscoped.
+        scope_cte = ""
+        scope_join = ""
+        sql_params: Dict = {}
+        if session_id:
+            # Resolve affected (RDC, ARTICLE) keys via the alloc history for
+            # this session, joined through store master to map WERKS→RDC.
+            scope_cte = f"""
+                , ScopedKeys AS (
+                    SELECT DISTINCT
+                           SM.RDC AS rdc,
+                           CAST(A.[VAR_ART] AS NVARCHAR(30)) AS art
+                    FROM [ARS_ALLOC_HISTORY] A
+                    INNER JOIN [Master_ALC_INPUT_ST_MASTER] SM
+                        ON SM.[ST_CD] = A.[WERKS]
+                    WHERE A.[SESSION_ID] = :sid
+                      AND A.[OPT_TYPE] IN ('RL','TBC','TBL','NL')
+                )
+            """
+            scope_join = (
+                "INNER JOIN ScopedKeys SK "
+                "ON SK.rdc = T.RDC AND SK.art = T.[{}]".format(msa_total_art)
+            )
+            sql_params["sid"] = session_id
+
         # Detect whether ARS_NL_TBL_HOLD_TRACKING already has the RDC column
-        # (added by listing.py Part 8.6 setup). If not, fall back to joining
-        # the store master so this still works on older deployments.
         has_rdc_col = (conn.execute(text("""
             SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
              WHERE TABLE_NAME = 'ARS_NL_TBL_HOLD_TRACKING' AND COLUMN_NAME = 'RDC'
         """)).scalar() or 0) > 0
 
         if has_rdc_col:
-            # Native RDC column — direct aggregation, no store-master join.
-            # COALESCE handles backfilled-NULL rows by joining store master
-            # only for those.
-            hold_cte = """
-                ;WITH H AS (
-                    SELECT COALESCE(NULLIF(H.RDC, ''), SM.RDC) AS rdc,
-                           CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
-                           SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
-                    FROM ARS_NL_TBL_HOLD_TRACKING H
-                    LEFT JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
-                    WHERE ISNULL(H.IS_CLOSED, 0) = 0
-                      AND ISNULL(H.HOLD_REM, 0) > 0
-                    GROUP BY COALESCE(NULLIF(H.RDC, ''), SM.RDC),
-                             CAST(H.VAR_ART AS NVARCHAR(30))
-                )
+            hold_cte_inner = """
+                SELECT COALESCE(NULLIF(H.RDC, ''), SM.RDC) AS rdc,
+                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                       SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
+                FROM ARS_NL_TBL_HOLD_TRACKING H
+                LEFT JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
+                WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                  AND ISNULL(H.HOLD_REM, 0) > 0
+                GROUP BY COALESCE(NULLIF(H.RDC, ''), SM.RDC),
+                         CAST(H.VAR_ART AS NVARCHAR(30))
             """
         else:
-            hold_cte = """
-                ;WITH H AS (
-                    SELECT SM.RDC AS rdc,
-                           CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
-                           SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
-                    FROM ARS_NL_TBL_HOLD_TRACKING H
-                    INNER JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
-                    WHERE ISNULL(H.IS_CLOSED, 0) = 0
-                      AND ISNULL(H.HOLD_REM, 0) > 0
-                    GROUP BY SM.RDC, CAST(H.VAR_ART AS NVARCHAR(30))
-                )
+            hold_cte_inner = """
+                SELECT SM.RDC AS rdc,
+                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                       SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
+                FROM ARS_NL_TBL_HOLD_TRACKING H
+                INNER JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
+                WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                  AND ISNULL(H.HOLD_REM, 0) > 0
+                GROUP BY SM.RDC, CAST(H.VAR_ART AS NVARCHAR(30))
             """
 
-        # 1. Reseed MSA_TOTAL.HOLD_QTY + recompute FNL_Q
+        # 1. Reseed MSA_TOTAL.HOLD_QTY + recompute FNL_Q.  When session_id
+        # is provided, ScopedKeys filters MSA_TOTAL rows so only those
+        # touched by this session get re-written.
         try:
             r1 = conn.execute(text(f"""
-                {hold_cte}
+                ;WITH H AS ({hold_cte_inner})
+                {scope_cte}
                 UPDATE T SET
                     T.HOLD_QTY = ISNULL(H.hold_qty, 0),
                     T.FNL_Q = CASE
@@ -2800,13 +2843,23 @@ def bootstrap_msa_hold_sync(conn) -> Dict:
                              - ISNULL(H.hold_qty, 0)
                     END
                 FROM ARS_MSA_TOTAL T
+                {scope_join}
                 LEFT JOIN H ON H.rdc = T.RDC AND H.art = T.[{msa_total_art}]
-            """))
+            """), sql_params)
             result["msa_total"] = int(r1.rowcount or 0)
         except Exception as e:
             logger.warning(f"[bootstrap_hold] MSA_TOTAL skipped: {e}")
 
-        # 2. Mirror to MSA_VAR_ART (variant grain — 1:1 with MSA_TOTAL)
+        # 2. Mirror to MSA_VAR_ART (variant grain — 1:1 with MSA_TOTAL).
+        # Same scope filter to avoid scanning the entire VAR_ART.
+        var_scope_join = ""
+        if session_id:
+            var_scope_join = (
+                "INNER JOIN [ARS_ALLOC_HISTORY] AH "
+                "ON AH.[SESSION_ID] = :sid "
+                "AND CAST(AH.[VAR_ART] AS NVARCHAR(30)) = "
+                f"CAST(V.[{msa_var_art_col}] AS NVARCHAR(30))"
+            )
         try:
             r2 = conn.execute(text(f"""
                 UPDATE V SET V.HOLD_QTY = T.HOLD_QTY, V.FNL_Q = T.FNL_Q
@@ -2814,7 +2867,8 @@ def bootstrap_msa_hold_sync(conn) -> Dict:
                 JOIN ARS_MSA_TOTAL T
                   ON T.RDC = V.RDC
                  AND T.[{msa_total_art}] = V.[{msa_var_art_col}]
-            """))
+                {var_scope_join}
+            """), sql_params)
             result["msa_var_art"] = int(r2.rowcount or 0)
         except Exception as e:
             logger.warning(f"[bootstrap_hold] MSA_VAR_ART skipped: {e}")
@@ -2822,22 +2876,56 @@ def bootstrap_msa_hold_sync(conn) -> Dict:
         # 3. Roll up to MSA_GEN_ART — sum HOLD_QTY and FNL_Q from MSA_TOTAL
         # by gen_art group (sum of FNL_Q is the correct rollup, NOT
         # max(STK − PEND − HOLD) — see comment in apply_pend_alc_delta).
+        # When session_id is provided, only the gen_art groups whose
+        # variants appear in the session's history are recomputed.
         try:
-            r3 = conn.execute(text(f"""
-                UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
-                FROM ARS_MSA_GEN_ART G
-                JOIN (
-                    SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
-                           SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
-                           SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
-                    FROM ARS_MSA_TOTAL T
-                    GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
-                ) agg
-                  ON G.RDC = agg.RDC
-                 AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
-                 AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
-                 AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
-            """))
+            if session_id:
+                # Scoped: derive affected (RDC, MAJ_CAT, GEN_ART, CLR) keys
+                # from the session's articles via MSA_TOTAL → AH join.
+                r3 = conn.execute(text(f"""
+                    ;WITH ScopedGenKeys AS (
+                        SELECT DISTINCT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR
+                        FROM ARS_MSA_TOTAL T
+                        INNER JOIN [ARS_ALLOC_HISTORY] AH
+                            ON AH.[SESSION_ID] = :sid
+                           AND CAST(AH.[VAR_ART] AS NVARCHAR(30))
+                                = CAST(T.[{msa_total_art}] AS NVARCHAR(30))
+                    )
+                    UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
+                    FROM ARS_MSA_GEN_ART G
+                    INNER JOIN ScopedGenKeys SK
+                       ON G.RDC = SK.RDC
+                      AND ISNULL(G.MAJ_CAT, '')             = ISNULL(SK.MAJ_CAT, '')
+                      AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(SK.gen, '')
+                      AND ISNULL(G.CLR, '')                 = ISNULL(SK.CLR, '')
+                    JOIN (
+                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                               SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
+                               SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
+                        FROM ARS_MSA_TOTAL T
+                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                    ) agg
+                      ON G.RDC = agg.RDC
+                     AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+                     AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
+                     AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                """), sql_params)
+            else:
+                r3 = conn.execute(text(f"""
+                    UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
+                    FROM ARS_MSA_GEN_ART G
+                    JOIN (
+                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                               SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
+                               SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
+                        FROM ARS_MSA_TOTAL T
+                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                    ) agg
+                      ON G.RDC = agg.RDC
+                     AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+                     AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
+                     AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                """))
             result["msa_gen_art"] = int(r3.rowcount or 0)
         except Exception as e:
             logger.warning(f"[bootstrap_hold] MSA_GEN_ART skipped: {e}")

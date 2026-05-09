@@ -603,14 +603,14 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 approved_by_table["msa_adjusted"] = {"error": str(mp)}
 
             # Sync MSA HOLD_QTY/FNL_Q to current ARS_NL_TBL_HOLD_TRACKING.
-            # Hold tracking was already updated during listing generate
-            # (Part 8.6); this defensive call ensures MSA reflects it even
-            # if the listing-side hook was skipped or this is a re-approval.
-            # Idempotent — same call with no changes is a no-op.
+            # Pass session_id so the reseed is SCOPED to (RDC, ARTICLE) keys
+            # touched by this listing only — turns a 100K-row full-table
+            # update into a few-hundred-row scoped update. Massive win on
+            # approve latency.
             try:
-                hold_synced = bootstrap_msa_hold_sync(conn)
+                hold_synced = bootstrap_msa_hold_sync(conn, session_id=session_id)
                 logger.info(
-                    f"[hold] msa hold synced session={session_id}: "
+                    f"[hold] msa hold synced session={session_id} (scoped): "
                     f"total={hold_synced['msa_total']} "
                     f"var={hold_synced['msa_var_art']} gen={hold_synced['msa_gen_art']}"
                 )
