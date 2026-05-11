@@ -308,6 +308,7 @@ export const gridBuilderAPI = {
   reorder:     (sequence)   => api.put('/grid-builder/reorder', { sequence }),
   calcPreview: ()           => api.get('/grid-builder/calculation-preview'),
   buildCalcTables: ()       => api.post('/grid-builder/build-calc-tables', null, { timeout: 600000 }),
+  hierarchyGaps: (opts={})  => api.get('/grid-builder/hierarchy/gaps', { quiet: true, timeout: 30000, ...opts }),
 }
 
 // ============== Listing (Data Preparation) ==============

@@ -3,12 +3,12 @@
  */
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { listingAPI } from '@/services/api'
+import { listingAPI, gridBuilderAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
   List, RefreshCw, Loader2, Database, Play, Pause, ChevronLeft, ChevronRight,
   Eye, BarChart3, Search, Filter, Download, X, XCircle, Square, Cpu, Zap,
-  ChevronDown, ChevronUp, Activity, Clock, FileText, Maximize2,
+  ChevronDown, ChevronUp, Activity, Clock, FileText, Maximize2, AlertTriangle,
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 import { BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
@@ -622,6 +622,13 @@ export default function ListingPage() {
   const [activeSession, setActiveSession] = useState(null)
   const sessionPollRef = useRef(null)
 
+  // Hierarchy gap pre-flight check — surfaces MAJ_CATs in MSA that are
+  // missing from ARS_GRID_HIERARCHY (or have NULL grid columns). Listing
+  // joins against this table, so gaps cause those MAJ_CATs to drop out.
+  const [hierGaps, setHierGaps] = useState(null)
+  const [hierGapsDismissed, setHierGapsDismissed] = useState(false)
+  const [hierGapsExpanded, setHierGapsExpanded] = useState(false)
+
   // Park-then-promote: list of sessions awaiting Approve/Reject.
   const [parkedRuns, setParkedRuns] = useState([])
   const [parkedExpanded, setParkedExpanded] = useState(false)
@@ -703,6 +710,16 @@ export default function ListingPage() {
       const { data } = await listingAPI.summary({ quiet })
       setSummary(data.data)
     } catch {}
+  }, [])
+
+  const loadHierGaps = useCallback(async () => {
+    try {
+      const { data } = await gridBuilderAPI.hierarchyGaps()
+      setHierGaps(data?.data || null)
+    } catch {
+      // non-fatal — endpoint may not exist on older backends
+      setHierGaps(null)
+    }
   }, [])
 
   // Park-then-promote loaders + actions.
@@ -806,7 +823,7 @@ export default function ListingPage() {
     }
   }, [closeParkedDetail, loadParkedRuns])
 
-  useEffect(() => { loadConfig(); loadSummary(); loadParkedRuns() }, [])
+  useEffect(() => { loadConfig(); loadSummary(); loadParkedRuns(); loadHierGaps() }, [])
 
   // Auto-detect RDC(s) from selected stores via store_rdc_map
   const storeRdcMap = config?.store_rdc_map || {}
@@ -885,6 +902,12 @@ export default function ListingPage() {
   const handleGenerate = async () => {
     if (parkedRuns.length > 0) {
       toast.error('A parked session is awaiting review — approve or reject it from the Parked Runs section before generating.')
+      return
+    }
+    const missingCount = hierGaps?.missing?.length || 0
+    if (missingCount > 0 && !hierGapsDismissed) {
+      toast.error(`${missingCount} MAJ_CATs are missing from ARS_GRID_HIERARCHY and will be skipped. Review the banner above and click "Generate Anyway" to proceed.`)
+      setHierGapsExpanded(true)
       return
     }
     const controller = new AbortController()
@@ -1327,8 +1350,121 @@ export default function ListingPage() {
     .filter(r => (r.alloc_qty || 0) > 0 || (r.hold_qty || 0) > 0)
     .map(r => ({ hub: r.hub, alloc_qty: r.alloc_qty || 0, hold_qty: r.hold_qty || 0 }))
 
+  const hierMissing = hierGaps?.missing || []
+  const hierPartial = hierGaps?.partial || []
+  const hierHasGaps = hierMissing.length > 0 || hierPartial.length > 0
+
   return (
     <div style={{ color: C.text, fontFamily: 'inherit', display: 'flex', flexDirection: 'column', gap: 10, padding: '4px 2px' }}>
+
+      {/* ═══════════ ARS_GRID_HIERARCHY Pre-Flight Banner ═══════════ */}
+      {hierHasGaps && (
+        <div style={{
+          background: hierGapsDismissed ? '#fffbeb' : '#fef3c7',
+          border: `1px solid ${hierGapsDismissed ? '#fcd34d' : '#f59e0b'}`,
+          borderLeft: `4px solid #d97706`,
+          borderRadius: 8, padding: '10px 14px',
+          boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <AlertTriangle size={18} color="#b45309" style={{ flexShrink: 0 }}/>
+            <div style={{ flex: 1, fontSize: 12, color: '#78350f' }}>
+              <span style={{ fontWeight: 700, color: '#92400e' }}>
+                {hierMissing.length > 0 && `${hierMissing.length} MAJ_CAT${hierMissing.length === 1 ? '' : 's'} missing`}
+                {hierMissing.length > 0 && hierPartial.length > 0 && ' · '}
+                {hierPartial.length > 0 && `${hierPartial.length} partial`}
+                {' '}from ARS_GRID_HIERARCHY
+              </span>
+              <span style={{ marginLeft: 6, color: '#78350f' }}>
+                — these will be skipped during listing. Run the relevant grids in Grid Builder to populate them.
+              </span>
+              {hierGaps?.expected != null && (
+                <span style={{ marginLeft: 6, color: '#a16207', fontWeight: 600 }}>
+                  ({hierGaps.covered}/{hierGaps.expected} covered)
+                </span>
+              )}
+            </div>
+            <button onClick={() => setHierGapsExpanded(v => !v)}
+              style={{ height: 26, padding: '0 10px', fontSize: 11, fontWeight: 700,
+                background: '#fff', color: '#92400e', border: '1px solid #fcd34d',
+                borderRadius: 5, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+              {hierGapsExpanded ? <ChevronUp size={12}/> : <ChevronDown size={12}/>}
+              {hierGapsExpanded ? 'Hide' : 'Details'}
+            </button>
+            <button onClick={() => navigate('/data-prep/store-stock')}
+              style={{ height: 26, padding: '0 10px', fontSize: 11, fontWeight: 700,
+                background: '#d97706', color: '#fff', border: 'none',
+                borderRadius: 5, cursor: 'pointer' }}>
+              Grid Builder →
+            </button>
+            <button onClick={loadHierGaps}
+              title="Re-check after running grids"
+              style={{ height: 26, width: 26, background: '#fff', color: '#92400e',
+                border: '1px solid #fcd34d', borderRadius: 5, cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <RefreshCw size={12}/>
+            </button>
+            <button onClick={() => setHierGapsDismissed(true)}
+              title="Acknowledge and allow Generate anyway"
+              style={{ height: 26, padding: '0 10px', fontSize: 10, fontWeight: 700,
+                background: hierGapsDismissed ? '#fbbf24' : '#fff',
+                color: hierGapsDismissed ? '#fff' : '#92400e',
+                border: '1px solid #fcd34d', borderRadius: 5,
+                cursor: hierGapsDismissed ? 'default' : 'pointer' }}
+              disabled={hierGapsDismissed}>
+              {hierGapsDismissed ? '✓ Acknowledged' : 'Generate Anyway'}
+            </button>
+          </div>
+
+          {hierGapsExpanded && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px dashed #fcd34d',
+              display: 'grid', gridTemplateColumns: hierPartial.length > 0 ? '1fr 1fr' : '1fr', gap: 12 }}>
+              {hierMissing.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#92400e',
+                    textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 4 }}>
+                    Missing ({hierMissing.length})
+                  </div>
+                  <div style={{ maxHeight: 120, overflowY: 'auto', display: 'flex',
+                    flexWrap: 'wrap', gap: 4, padding: 4, background: '#fff',
+                    border: '1px solid #fde68a', borderRadius: 4 }}>
+                    {hierMissing.map(mc => (
+                      <span key={mc} style={{
+                        fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                        background: '#fef3c7', color: '#92400e',
+                        borderRadius: 3, fontFamily: 'ui-monospace, Menlo, Consolas, monospace',
+                      }}>{mc}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {hierPartial.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#92400e',
+                    textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 4 }}>
+                    Partial — NULL grid columns ({hierPartial.length})
+                  </div>
+                  <div style={{ maxHeight: 120, overflowY: 'auto',
+                    background: '#fff', border: '1px solid #fde68a', borderRadius: 4 }}>
+                    {hierPartial.map(p => (
+                      <div key={p.maj_cat} style={{
+                        display: 'flex', gap: 6, padding: '3px 6px', fontSize: 10,
+                        borderBottom: '1px solid #fef3c7' }}>
+                        <span style={{ fontWeight: 700, color: '#92400e',
+                          fontFamily: 'ui-monospace, Menlo, Consolas, monospace',
+                          minWidth: 80 }}>{p.maj_cat}</span>
+                        <span style={{ color: '#a16207' }}>
+                          {(p.null_cols || []).join(', ')}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ═══════════ Page Header + Primary Actions ═══════════ */}
       <div style={{
