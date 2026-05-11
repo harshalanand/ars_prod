@@ -1674,3 +1674,95 @@ def get_hierarchy_data(
         message=f"{len(data)} rows (page {page}, {total} total)",
         data={"columns": cols, "data": data, "total": total, "page": page, "page_size": page_size},
     )
+
+
+@router.get("/hierarchy/gaps", response_model=APIResponse)
+def get_hierarchy_gaps(current_user: User = Depends(get_current_user)):
+    """
+    Pre-flight check for Listing: report MAJ_CATs that exist in ARS_MSA_TOTAL
+    but are missing from ARS_GRID_HIERARCHY (or present with NULL grid columns).
+
+    Returns:
+      expected: # of distinct MAJ_CATs in ARS_MSA_TOTAL
+      covered:  # of MAJ_CATs that exist in ARS_GRID_HIERARCHY
+      missing:  list of MAJ_CATs in MSA but not in hierarchy
+      partial:  list of {maj_cat, null_cols[]} where hierarchy row has NULL grid cols
+    """
+    de = get_data_engine()
+    with de.connect() as conn:
+        hier_exists = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = :t"
+        ), {"t": GRID_HIER_TABLE}).scalar() > 0
+        msa_exists = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'ARS_MSA_TOTAL'"
+        )).scalar() > 0
+
+        if not msa_exists:
+            return APIResponse(success=True, message="ARS_MSA_TOTAL not found — skip check",
+                data={"expected": 0, "covered": 0, "missing": [], "partial": [],
+                      "hier_exists": hier_exists, "msa_exists": False})
+
+        expected = conn.execute(text(
+            "SELECT COUNT(DISTINCT MAJ_CAT) FROM ARS_MSA_TOTAL WHERE MAJ_CAT IS NOT NULL"
+        )).scalar() or 0
+
+        if not hier_exists:
+            missing_rows = conn.execute(text(
+                "SELECT DISTINCT MAJ_CAT FROM ARS_MSA_TOTAL "
+                "WHERE MAJ_CAT IS NOT NULL ORDER BY MAJ_CAT"
+            )).fetchall()
+            return APIResponse(success=True,
+                message=f"{GRID_HIER_TABLE} does not exist — all {expected} MAJ_CATs missing",
+                data={"expected": expected, "covered": 0,
+                      "missing": [r[0] for r in missing_rows], "partial": [],
+                      "hier_exists": False, "msa_exists": True})
+
+        covered = conn.execute(text(f"SELECT COUNT(*) FROM [{GRID_HIER_TABLE}]")).scalar() or 0
+
+        # Anti-join: MSA MAJ_CATs missing from hierarchy
+        missing_rows = conn.execute(text(f"""
+            SELECT DISTINCT m.MAJ_CAT
+            FROM ARS_MSA_TOTAL m
+            LEFT JOIN [{GRID_HIER_TABLE}] h ON h.MAJ_CAT = m.MAJ_CAT
+            WHERE m.MAJ_CAT IS NOT NULL AND h.MAJ_CAT IS NULL
+            ORDER BY m.MAJ_CAT
+        """)).fetchall()
+        missing = [r[0] for r in missing_rows]
+
+        # Partial-fill: MAJ_CATs in hierarchy where any grid column is NULL
+        grid_cols = [r[0] for r in conn.execute(text(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = :t AND UPPER(COLUMN_NAME) <> 'MAJ_CAT' "
+            "ORDER BY ORDINAL_POSITION"
+        ), {"t": GRID_HIER_TABLE}).fetchall()]
+
+        partial = []
+        if grid_cols:
+            null_expr = " OR ".join(f"[{c}] IS NULL" for c in grid_cols)
+            null_col_exprs = ", ".join(
+                f"CASE WHEN [{c}] IS NULL THEN '{c}' ELSE NULL END AS [_n_{c}]"
+                for c in grid_cols
+            )
+            partial_rows = conn.execute(text(f"""
+                SELECT MAJ_CAT, {null_col_exprs}
+                FROM [{GRID_HIER_TABLE}]
+                WHERE {null_expr}
+                ORDER BY MAJ_CAT
+            """)).fetchall()
+            for row in partial_rows:
+                maj = row[0]
+                nulls = [v for v in row[1:] if v]
+                partial.append({"maj_cat": maj, "null_cols": nulls})
+
+    return APIResponse(
+        success=True,
+        message=f"{len(missing)} missing, {len(partial)} partial of {expected} MSA MAJ_CATs",
+        data={
+            "expected": expected,
+            "covered": covered,
+            "missing": missing,
+            "partial": partial,
+            "hier_exists": True,
+            "msa_exists": True,
+        },
+    )

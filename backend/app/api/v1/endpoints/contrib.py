@@ -517,7 +517,9 @@ def _compute_kpis(df, avg_days, grouping_column):
     df['SALES_PSF_ACH%'] = np.where(df['SALE_PSF_MJ']==0, 0, df['SALES PSF']/df['SALE_PSF_MJ'])
     df['GM PSF'] = np.where(df['DISP_AREA']==0, 0, (df['GM_V']*V/df['DISP_AREA'])/avg_days)
     df['GM_PSF_MJ'] = np.where(da_sum==0, 0, (gv_sum*V/da_sum)/avg_days)
-    df['GM_PSF_ACH%'] = np.where(df['GM_PSF_MJ']==0, 0, df['GM PSF']/df['GM_PSF_MJ'])
+    gm_psf_clip = np.maximum(df['GM PSF'], 0)
+    gm_psf_mj_clip = np.maximum(df['GM_PSF_MJ'], 0)
+    df['GM_PSF_ACH%'] = np.where(gm_psf_mj_clip==0, 0, gm_psf_clip/gm_psf_mj_clip)
 
     # Contribution %
     pos_mask_stk = df['0001_STK_Q'] > 0
