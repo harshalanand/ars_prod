@@ -78,7 +78,14 @@
       "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' check_hold_sync.py 2>&1 | Select-Object -Last 30)",
       "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_hold_approve.py' 2>&1 | Select-Object -Last 80)",
       "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_undo_test_side_effect.py' 2>&1 | Select-Object -Last 15)",
-      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' check_hold_sync.py 2>&1 | Select-Object -Last 20)"
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' check_hold_sync.py 2>&1 | Select-Object -Last 20)",
+      "Bash(node --check e:/projects/ARS_V2/frontend/src/pages/SettingsPage.jsx)",
+      "Bash(node -e \"const fs=require\\('fs'\\);const s=fs.readFileSync\\('e:/projects/ARS_V2/frontend/src/pages/SettingsPage.jsx','utf8'\\);let d=0,maxd=0;for\\(const c of s\\){if\\(c==='{'\\)d++;if\\(c==='}'\\)d--;if\\(d<0\\){console.log\\('UNBALANCED'\\);break}maxd=Math.max\\(maxd,d\\)}console.log\\('final brace depth:',d,'max:',maxd\\)\")",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_check_schedule.py' 2>&1)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_inspect_stk_ttl.py' 2>&1 | Select-Object -Last 80)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_profile_approve.py' 2>&1 | Select-Object -Last 25)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_stk_ttl_and_scoped.py' 2>&1 | Select-Object -Last 40)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_stk_ttl_and_scoped.py' 2>&1 | Select-Object -Last 50)"
     ]
   }
 }

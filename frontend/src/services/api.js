@@ -491,6 +491,14 @@ export const maintenanceAPI = {
   dbSetLogMaxsize:   (db, maxMb)                => api.post(`/maintenance/db/${encodeURIComponent(db)}/set-log-maxsize`, null, { params: { max_mb: maxMb } }),
   diskSpace:         ()                         => api.get('/maintenance/disk'),
   reclaimAll:        ()                         => api.post('/maintenance/reclaim-all', null, { timeout: 900000 }),
+
+  // Transactional-data reset (Settings → Danger Zone)
+  resetPreview:      (includeMsaTracking=false) =>
+    api.get('/maintenance/reset/preview', { params: { include_msa_tracking: includeMsaTracking } }),
+  resetTransactionalData: (includeMsaTracking=false) =>
+    api.post('/maintenance/reset/transactional-data',
+      { confirm: 'RESET', include_msa_tracking: includeMsaTracking },
+      { timeout: 900000 }),
 }
 
 // ============== Reports ==============
