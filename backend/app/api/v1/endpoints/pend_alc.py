@@ -35,6 +35,7 @@ from app.security.dependencies import get_current_user
 from app.models.rbac import User
 from app.services.pend_alc_service import (
     adjust_msa_after_pend_insert,
+    apply_pend_alc_delta,
     apply_do_deductions,
     backfill_bdc_operations,
     delete_schedule,
@@ -1134,6 +1135,14 @@ class ManualRow(BaseModel):
 
 class ManualUploadRequest(BaseModel):
     rows: List[ManualRow]
+    # Multi-chunk upload coordination. The frontend generates ONE session_id
+    # for the whole upload and sends it with every chunk so all chunks land
+    # under the same SESSION_ID and roll up to a SINGLE operations_log entry
+    # — making the upload revertable as a single unit. All three fields are
+    # optional for backwards compatibility (legacy clients still work).
+    session_id:     Optional[str]  = None
+    is_first_chunk: bool           = True
+    is_last_chunk:  bool           = True
 
 
 @router.post("/manual-upload")
@@ -1143,10 +1152,17 @@ def pend_alc_manual_upload(
 ):
     """Insert manually-allocated rows (SOURCE=MANUAL) into ARS_PEND_ALC.
 
-    Immediately adjusts ARS_MSA_TOTAL/GEN_ART/VAR_ART for the affected
-    (RDC, ARTICLE_NUMBER) keys: PEND_QTY goes up, FNL_Q goes down. Same
-    treatment whether rows came from the manual entry table or from a bulk
+    Apply +1 delta to ARS_MSA_TOTAL/GEN_ART/VAR_ART and every active
+    ARS_GRID_MJ* table for the affected (RDC, ARTICLE_NUMBER) keys —
+    PEND_QTY goes up, FNL_Q goes down, GRID.PEND_ALC goes up. Same
+    treatment whether rows came from the manual entry table or a bulk
     CSV upload.
+
+    Multi-chunk uploads: the frontend slices large uploads into chunks and
+    sends each chunk with the same session_id. Chunk 1 (is_first_chunk=True)
+    creates the operations_log row; later chunks UPDATE the same row,
+    accumulating rows_affected and qty_total. Result: one log entry per
+    upload, one revert click to undo the whole thing.
     """
     if not body.rows:
         raise HTTPException(400, "No rows provided")
@@ -1156,14 +1172,50 @@ def pend_alc_manual_upload(
             {"rdc": r["rdc"], "article_number": r["article_number"]}
             for r in rows
         ]
+        from app.services.pend_alc_service import log_operation_upsert
         with _engine().connect() as conn:
-            res = write_manual_pend_alc(conn, rows)
-            msa_adjusted = adjust_msa_after_pend_insert(
-                conn, article_rdc_pairs=article_rdc_pairs,
-            )
-            # Log the manual upload for revert support
+            res = write_manual_pend_alc(conn, rows, session_id=body.session_id)
+
+            # ── Deferred delta: per-chunk MSA+grid sync was making each
+            # chunk take ~3-4 seconds, which on a 40-chunk upload meant 2+
+            # minutes of waiting and frequent mid-stream interruptions. We
+            # now skip the delta on chunks 1..N-1 (each chunk just runs
+            # fast_executemany INSERT, ~1 sec) and run ONE delta covering
+            # every row from this session_id when the last chunk arrives.
+            # Net effect: same final state, ~3× faster, lock contention drops
+            # because there's only one big UPDATE pass on MSA/grid.
+            msa_adjusted = None
+            if body.is_last_chunk:
+                from sqlalchemy import text as _text
+                all_rows = [
+                    {
+                        "rdc":            r[0],
+                        "st_cd":          r[1],
+                        "article_number": r[2],
+                        "maj_cat":        r[3],
+                        "gen_art_number": r[4],
+                        "clr":            r[5],
+                        "alloc_qty":      float(r[6] or 0),
+                        "do_qty":         float(r[7] or 0),
+                    }
+                    for r in conn.execute(_text(f"""
+                        SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                               ALLOC_QTY, ISNULL(DO_QTY, 0)
+                        FROM ARS_PEND_ALC
+                        WHERE SESSION_ID = :sid
+                    """), {"sid": res["session_id"]}).fetchall()
+                ]
+                if all_rows:
+                    msa_adjusted = apply_pend_alc_delta(conn, all_rows, sign=+1)
+                    logger.info(
+                        f"[pend_alc] deferred delta applied for session {res['session_id']}: "
+                        f"{len(all_rows)} total rows synced to MSA + grids"
+                    )
+
+            # Log per-chunk: chunk 1 INSERTs the ops_log row, chunks 2..N
+            # UPDATE it (accumulating rows_affected + qty_total).
             total_alloc = sum(float(r.get("alloc_qty") or 0) for r in rows)
-            log_operation(
+            log_operation_upsert(
                 conn,
                 op_type="MANUAL",
                 op_key=res["session_id"],
@@ -1172,15 +1224,17 @@ def pend_alc_manual_upload(
                     "inserted_ids":      res["inserted_ids"],
                     "article_rdc_pairs": article_rdc_pairs,
                 },
-                summary=f"Manual upload {res['session_id']}: "
-                        f"{res['inserted']} rows, {int(total_alloc)} units",
+                summary=f"Manual upload {res['session_id']}",
                 rows_affected=res["inserted"],
                 qty_total=total_alloc,
                 created_by=getattr(current_user, "username", None),
+                is_first=body.is_first_chunk,
             )
         logger.info(
             f"[pend_alc] manual-upload by {getattr(current_user,'username','?')}: "
-            f"{res['inserted']} rows inserted, session_id={res['session_id']}"
+            f"{res['inserted']} rows inserted, session_id={res['session_id']}, "
+            f"chunk(first={body.is_first_chunk}, last={body.is_last_chunk}), "
+            f"delta_applied={msa_adjusted is not None}"
         )
         return {
             "success":       True,

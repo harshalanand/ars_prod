@@ -688,18 +688,36 @@ async def list_all_database_tables(
                 SELECT table_name FROM table_settings WHERE visible_in_editor = 1
             """)).fetchall()
             visible_set = {row[0] for row in visible_tables_result}
-            
+
             # If no settings exist for a table, it's visible by default
             # So we only filter out tables explicitly marked as hidden
             hidden_result = db.execute(text("""
                 SELECT table_name FROM table_settings WHERE visible_in_editor = 0
             """)).fetchall()
             hidden_set = {row[0] for row in hidden_result}
-            
-            tables = [t for t in tables if t not in hidden_set]
+
+            # tables is a list of dicts ({"table_name": ..., "row_count": ...})
+            # so compare on the table_name field, not the dict itself.
+            tables = [t for t in tables if t.get("table_name") not in hidden_set]
         except Exception:
             pass  # If table_settings doesn't exist, return all tables
-    
+
+        # Also honour the Settings → Table Permissions toggles. A table whose
+        # row in table_permissions has can_view = 0 is hidden from the Data
+        # Editor dropdown. Filter on can_view (not can_edit) because can_view
+        # defaults to 1 in the UI — only tables the user explicitly unchecks
+        # "View" on get hidden. Tables with no row in table_permissions remain
+        # visible (consistent with the visible-by-default rule above).
+        try:
+            from sqlalchemy import text
+            hidden_perm_result = db.execute(text("""
+                SELECT table_name FROM table_permissions WHERE can_view = 0
+            """)).fetchall()
+            hidden_perm_set = {row[0] for row in hidden_perm_result}
+            tables = [t for t in tables if t.get("table_name") not in hidden_perm_set]
+        except Exception:
+            pass  # If table_permissions doesn't exist yet, skip this filter
+
     return APIResponse(data=tables)
 
 

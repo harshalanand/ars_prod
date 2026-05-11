@@ -203,6 +203,58 @@ def log_operation(
     return int(op_id)
 
 
+def log_operation_upsert(
+    conn, op_type: str, op_key: str, payload: Dict,
+    summary: str = "", rows_affected: int = 0, qty_total: float = 0,
+    created_by: Optional[str] = None, is_first: bool = True,
+) -> int:
+    """Multi-chunk-aware variant of log_operation.
+
+    - is_first=True  → INSERT a brand-new ops_log row (chunk 1 of an upload).
+    - is_first=False → UPDATE the existing row identified by (op_type, op_key),
+      accumulating rows_affected and qty_total. Used for chunks 2..N so the
+      whole upload appears as ONE entry in the ops log.
+
+    If is_first=False but no existing row is found (caller error or upstream
+    failure on chunk 1), falls through to a regular INSERT so we never lose
+    the audit trail.
+
+    Returns the OP_ID of the row (new or existing).
+    """
+    ensure_operations_table(conn)
+
+    if is_first:
+        return log_operation(conn, op_type, op_key, payload, summary,
+                             rows_affected, qty_total, created_by)
+
+    res = conn.execute(text(f"""
+        UPDATE {OPERATIONS_TABLE}
+           SET ROWS_AFFECTED = ISNULL(ROWS_AFFECTED, 0) + :n,
+               QTY_TOTAL     = ISNULL(QTY_TOTAL, 0)     + :q,
+               SUMMARY       = :s
+         OUTPUT INSERTED.OP_ID
+         WHERE OP_TYPE = :t AND OP_KEY = :k AND ISNULL(REVERTED_AT, '') = ''
+    """), {
+        "n": int(rows_affected or 0),
+        "q": float(qty_total or 0),
+        "s": (summary or "")[:500],
+        "t": op_type, "k": str(op_key)[:100],
+    })
+    rows = res.fetchall()
+    conn.commit()
+    if rows:
+        return int(rows[0][0])
+
+    # Fallback: existing row not found — recover by inserting a fresh row so
+    # we don't lose the audit trail for this chunk.
+    logger.warning(
+        f"[ops_log] upsert: no existing row for {op_type}/{op_key} on chunk N; "
+        f"falling back to INSERT"
+    )
+    return log_operation(conn, op_type, op_key, payload, summary,
+                         rows_affected, qty_total, created_by)
+
+
 def list_operations(
     conn, op_type: Optional[str] = None,
     include_reverted: bool = True, limit: int = 200,
@@ -603,25 +655,70 @@ def _revert_do(conn, payload: Dict) -> Dict:
 
 
 def _revert_manual(conn, payload: Dict) -> Dict:
-    """Delete inserted PEND_ALC rows + readjust MSA."""
+    """Delete every PEND_ALC row from the upload + apply symmetric -1 delta
+    to MSA/Grid.
+
+    Reverts by SESSION_ID (preferred) so multi-chunk uploads are undone in
+    full — even though the ops_log payload only carries chunk 1's
+    inserted_ids, the session_id covers every row from every chunk. Falls
+    back to inserted_ids for legacy single-chunk entries that pre-date the
+    session_id field.
+
+    The delta function is symmetric — same rows × sign=-1 produces byte-for-
+    byte the inverse of the +1 call that was made when the rows were
+    originally inserted.
+    """
+    session_id = payload.get("session_id")
     inserted_ids = payload.get("inserted_ids") or []
-    if not inserted_ids:
+
+    # Build the WHERE clause: prefer session_id (covers all chunks), fall
+    # back to inserted_ids for older log entries that didn't carry session_id.
+    if session_id:
+        where_sql = "SESSION_ID = :sid"
+        where_params = {"sid": session_id}
+    elif inserted_ids:
+        placeholders = ",".join(str(int(x)) for x in inserted_ids)
+        where_sql = f"ID IN ({placeholders})"
+        where_params = {}
+    else:
         return {"pend_alc_rows_deleted": 0}
-    placeholders = ",".join(str(int(x)) for x in inserted_ids)
+
+    # Read the rows BEFORE deleting so we can apply the -1 delta against
+    # the same grain (RDC, ST_CD, ARTICLE, MAJ_CAT, GEN_ART, CLR, qty).
+    rows_to_revert = [
+        {
+            "rdc":            r[0],
+            "st_cd":          r[1],
+            "article_number": r[2],
+            "maj_cat":        r[3],
+            "gen_art_number": r[4],
+            "clr":            r[5],
+            "alloc_qty":      float(r[6] or 0),
+            "do_qty":         float(r[7] or 0),
+        }
+        for r in conn.execute(text(f"""
+            SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                   ALLOC_QTY, ISNULL(DO_QTY, 0)
+            FROM {PEND_ALC_TABLE}
+            WHERE {where_sql}
+        """), where_params).fetchall()
+    ]
+
     res = conn.execute(text(
-        f"DELETE FROM {PEND_ALC_TABLE} WHERE ID IN ({placeholders})"
-    ))
+        f"DELETE FROM {PEND_ALC_TABLE} WHERE {where_sql}"
+    ), where_params)
     deleted = int(res.rowcount or 0)
 
-    # Re-adjust MSA for the affected (RDC, ARTICLE) keys so FNL_Q/PEND_QTY
-    # reflect the now-removed pending units.
-    pairs = payload.get("article_rdc_pairs") or []
-    if pairs:
+    if rows_to_revert:
         try:
-            adjust_msa_after_pend_insert(conn, article_rdc_pairs=pairs)
+            apply_pend_alc_delta(conn, rows_to_revert, sign=-1)
         except Exception as e:
-            logger.warning(f"[revert] MSA re-adjust skipped: {e}")
+            logger.warning(f"[revert] -1 delta skipped: {e}")
 
+    logger.info(
+        f"[revert] manual: deleted {deleted} rows "
+        f"(by {'session_id=' + session_id if session_id else 'inserted_ids'})"
+    )
     return {"pend_alc_rows_deleted": deleted}
 
 
@@ -1333,35 +1430,52 @@ def write_pend_alc(conn, session_id: str) -> int:
     return inserted
 
 
-def write_manual_pend_alc(conn, rows: List[Dict]) -> Dict:
+def write_manual_pend_alc(
+    conn,
+    rows: List[Dict],
+    session_id: Optional[str] = None,
+) -> Dict:
     """Insert manually-uploaded allocation rows into ARS_PEND_ALC.
+
+    Direct INSERT via fast_executemany — simple, fast, lock-light because
+    pyodbc's fast_executemany binds the row array as one parameterised batch
+    and the target lock is only held during the executemany call (~100-500 ms
+    for 10K rows). No staging table, no MERGE.
+
+    Args:
+      rows:        list of row dicts (rdc, article_number, alloc_qty, ...).
+      session_id:  if provided, all rows are tagged with this session_id
+                   (multi-chunk uploads share one session_id and roll up to
+                   one operations_log entry, which makes revert atomic).
+                   If omitted, a fresh MANUAL-YYYYMMDD-<6hex> id is generated.
 
     Returns: {
         "inserted":     int,
-        "session_id":   str,         # unique per upload
-        "inserted_ids": List[int],   # for revert
+        "session_id":   str,
+        "inserted_ids": List[int],   # ids inserted by THIS call
     }
-    The caller writes session_id + inserted_ids into the operations log so a
-    future revert can DELETE just the rows from this upload.
-
-    Each dict must have: rdc, article_number, alloc_qty.
-    Optional: st_cd, maj_cat, gen_art_number, clr, remarks.
-    SOURCE='MANUAL', ALLOC_MODE='MANUAL'.
-    SESSION_ID='MANUAL-YYYYMMDD-<6char-hex>' so each upload is uniquely
-    identifiable (multiple uploads same day used to collide).
     """
     ensure_pend_alc_table(conn)
     valid = [r for r in rows if float(r.get("alloc_qty", 0) or 0) > 0]
     if not valid:
-        return {"inserted": 0, "session_id": "", "inserted_ids": []}
+        return {"inserted": 0, "session_id": session_id or "", "inserted_ids": []}
 
-    import datetime
-    session_id = (
-        f"MANUAL-{datetime.date.today().strftime('%Y%m%d')}-"
-        f"{uuid.uuid4().hex[:6]}"
-    )
+    if not session_id:
+        import datetime
+        session_id = (
+            f"MANUAL-{datetime.date.today().strftime('%Y%m%d')}-"
+            f"{uuid.uuid4().hex[:6]}"
+        )
 
-    # Build the parameter tuples once, in a fixed column order.
+    # Snapshot the highest existing ID for this session BEFORE insert so the
+    # post-insert SELECT picks up only rows from this call (multi-chunk uploads
+    # reuse the same session_id, and we don't want chunk N to claim chunk N-1's
+    # ids).
+    prev_max_id = conn.execute(text(
+        f"SELECT ISNULL(MAX(ID), 0) FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid"
+    ), {"sid": session_id}).scalar() or 0
+
+    # Build parameter tuples in fixed column order.
     params = [
         (
             session_id,
@@ -1377,8 +1491,9 @@ def write_manual_pend_alc(conn, rows: List[Dict]) -> Dict:
         for r in valid
     ]
 
-    # Drop down to the raw pyodbc cursor so we can flip on fast_executemany.
-    # SQLAlchemy's executemany without it is slow (one round-trip per row).
+    # ── Direct INSERT via fast_executemany.  Drop down to the raw pyodbc
+    # cursor so we can flip on fast_executemany — SQLAlchemy executemany
+    # without it sends one round-trip per row, which is 100x slower.
     raw = conn.connection
     cursor = raw.cursor()
     try:
@@ -1394,28 +1509,34 @@ def write_manual_pend_alc(conn, rows: List[Dict]) -> Dict:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 'MANUAL', ?)"
         )
 
-        # Chunk to keep the parameter array manageable in memory and to avoid
-        # hitting any single-statement parameter cap. 5000 × 9 cols = 45K params.
-        CHUNK = 5000
+        # Internal chunk to keep the parameter array manageable in memory and
+        # to avoid hitting any single-statement parameter cap. With
+        # fast_executemany the lock on ARS_PEND_ALC is held only while one
+        # batch flushes — sub-second for 10K rows.
+        CHUNK = 10000
         inserted = 0
         for i in range(0, len(params), CHUNK):
             batch = params[i:i + CHUNK]
             cursor.executemany(sql, batch)
             inserted += len(batch)
             logger.info(
-                f"[pend_alc] manual upload: {inserted}/{len(params)} rows inserted"
+                f"[pend_alc] manual upload: {inserted}/{len(params)} rows inserted "
+                f"(session_id={session_id})"
             )
     finally:
         cursor.close()
 
     conn.commit()
 
-    # Read back the inserted IDs by session_id (unique per upload).
+    # Read back ONLY the IDs inserted by this call (ID > prev_max_id).
     inserted_ids = [
         int(r[0]) for r in conn.execute(text(f"""
-            SELECT ID FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid ORDER BY ID
-        """), {"sid": session_id}).fetchall()
+            SELECT ID FROM {PEND_ALC_TABLE}
+            WHERE SESSION_ID = :sid AND ID > :prev
+            ORDER BY ID
+        """), {"sid": session_id, "prev": int(prev_max_id)}).fetchall()
     ]
+    inserted = len(inserted_ids)
 
     logger.info(
         f"[pend_alc] manual upload complete: {inserted} rows inserted, "
@@ -1994,4 +2115,929 @@ def adjust_msa_after_pend_insert(
         logger.warning(f"[pend_alc] adjust_msa_after_pend_insert failed (non-fatal): {e}")
         result["error"] = str(e)
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PEND_ALC ↔ MSA/Grid synchronisation — symmetric incremental delta + bootstrap
+# ---------------------------------------------------------------------------
+#
+# Why this exists
+# ===============
+# Every INSERT into ARS_PEND_ALC must immediately reduce FNL_Q (and increase
+# PEND_QTY) on ARS_MSA_TOTAL/VAR_ART/GEN_ART, and increase PEND_ALC on each
+# ARS_GRID_* table. Conversely, every revert/delete must undo the same delta.
+# `apply_pend_alc_delta` does both — the same call with sign=+1 or sign=-1
+# produces symmetric, reversible state changes.
+#
+# Bootstrap functions seed the same columns from a full ARS_PEND_ALC scan; a
+# correctly-built bootstrap + every incremental delta = the same column values
+# you'd get by running bootstrap from scratch.
+#
+# Invariants (enforced by these functions):
+#   MSA.FNL_Q     = max(STK_QTY − PEND_QTY − HOLD_QTY, 0)
+#   MSA.PEND_QTY  = SUM(ARS_PEND_ALC.PEND_QTY where IS_CLOSED=0)  per (RDC, ARTICLE)
+#   GRID.PEND_ALC = SUM(ARS_PEND_ALC.PEND_QTY where IS_CLOSED=0)  per (WERKS, MAJ_CAT, ...)
+#   GRID.STK_TTL  = unchanged by pend_alc (physical stock)
+# ---------------------------------------------------------------------------
+
+
+def _probe_col(conn, table: str, *candidates: str) -> str:
+    """Return the first candidate column that exists on `table`. Falls back
+    to the first candidate so callers always get a usable name. Used because
+    article-column names vary across deployments (VAR_ART vs ARTICLE_NUMBER
+    vs ARTICLE — see CLAUDE.md note about prior renames)."""
+    for c in candidates:
+        found = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = :t AND COLUMN_NAME = :c"
+        ), {"t": table, "c": c}).scalar() or 0
+        if found:
+            return c
+    return candidates[0]
+
+
+# Attribute-rollup grids that aggregate PEND_ALC at (WERKS, MAJ_CAT) level.
+# Each such table has columns (WERKS, MAJ_CAT, <attribute>, ..., PEND_ALC, ...).
+# The set of grid tables changes whenever the grid builder runs (new attribute
+# grids can be added or old ones dropped) so the list is discovered at runtime
+# from INFORMATION_SCHEMA rather than hardcoded.
+#
+# Variant- and gen_art-grain grids (ARS_GRID_MJ_VAR_ART, ARS_GRID_MJ_GEN_ART)
+# are excluded here — they have additional join keys (article / gen_art / clr)
+# and are handled by their own dedicated UPDATE blocks.
+_EXCLUDED_FROM_ROLLUP = {"ARS_GRID_MJ_VAR_ART", "ARS_GRID_MJ_GEN_ART"}
+
+
+def _discover_grid_rollup_tables(conn) -> List[str]:
+    """Return every dbo.ARS_GRID_MJ* table that has the columns we update
+    (WERKS, MAJ_CAT, PEND_ALC) and isn't a variant/gen_art grain table.
+
+    Auto-adapts to whatever the grid builder created on this deployment —
+    if a new attribute grid is added (e.g. ARS_GRID_MJ_NEW_DIM) the delta
+    picks it up automatically. If an old grid is dropped, it's silently
+    excluded instead of raising 'table not found'.
+    """
+    rows = conn.execute(text("""
+        SELECT t.TABLE_NAME
+        FROM INFORMATION_SCHEMA.TABLES t
+        WHERE t.TABLE_TYPE = 'BASE TABLE'
+          AND t.TABLE_NAME LIKE 'ARS_GRID_MJ%'
+          AND EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c
+                      WHERE c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = 'WERKS')
+          AND EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c
+                      WHERE c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = 'MAJ_CAT')
+          AND EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c
+                      WHERE c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = 'PEND_ALC')
+        ORDER BY t.TABLE_NAME
+    """)).fetchall()
+    return [r[0] for r in rows if r[0] not in _EXCLUDED_FROM_ROLLUP]
+
+
+# Hierarchy columns held in ARS_PEND_ALC directly — for these, the rollup
+# can read straight from the delta / pend_alc table without a MSA join.
+_PEND_ALC_NATIVE = {"MAJ_CAT", "GEN_ART_NUMBER", "CLR"}
+
+# Columns we always exclude from "hierarchy" detection — they're either the
+# store/article axes or non-attribute metric columns.
+_NON_HIER_COLS = {
+    "WERKS", "RDC", "ST_CD",
+    "ARTICLE_NUMBER", "VAR_ART", "ARTICLE",
+    "PEND_ALC",
+    "ID", "CREATED_AT", "UPDATED_AT", "LAST_UPDATED",
+}
+
+
+def _discover_grid_hierarchy(conn, grid_table: str) -> List[str]:
+    """Discover the hierarchy columns of a rollup grid.
+
+    Hierarchy columns = columns that exist on BOTH the grid table AND
+    ARS_MSA_TOTAL (so we know we can resolve their values per article),
+    minus the store/article axes and known metric columns.
+
+    Examples:
+      ARS_GRID_MJ          → ['MAJ_CAT']
+      ARS_GRID_MJ_CLR      → ['MAJ_CAT', 'CLR']
+      ARS_GRID_MJ_FAB      → ['MAJ_CAT', 'FAB']
+      ARS_GRID_MJ_MACRO_MVGR → ['MAJ_CAT', 'MACRO_MVGR']
+    """
+    grid_cols = {r[0] for r in conn.execute(text(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = :t"
+    ), {"t": grid_table}).fetchall()}
+
+    msa_cols = {r[0] for r in conn.execute(text(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME = 'ARS_MSA_TOTAL'"
+    )).fetchall()}
+
+    return sorted((grid_cols & msa_cols) - _NON_HIER_COLS)
+
+
+def _build_rollup_delta_sql(
+    grid_table: str,
+    hier_cols: List[str],
+    delta_table: str,
+    msa_article_col: str,
+) -> str:
+    """Build an UPDATE statement that rolls up qty from a delta temp table
+    into a rollup grid, joined on the grid's full hierarchy.
+
+    Hierarchy columns present in ARS_PEND_ALC (MAJ_CAT, GEN_ART_NUMBER, CLR)
+    are read directly from the delta. Anything else (FAB, RNG_SEG,
+    MACRO_MVGR, MICRO_MVGR, VND_CD, M_VND_CD, ...) is resolved by joining
+    through ARS_MSA_TOTAL on ARTICLE_NUMBER. MAX(...) is used because each
+    article appears once per RDC in MSA_TOTAL but the attribute value is
+    constant across RDCs for the same article.
+    """
+    delta_native = {
+        "MAJ_CAT":         "t.maj_cat",
+        "GEN_ART_NUMBER":  "t.gen_art",
+        "CLR":             "t.clr",
+    }
+
+    select_parts = ["t.st_cd AS werks"]
+    group_parts  = ["t.st_cd"]
+    join_clauses = ["X.WERKS = d.werks"]
+    msa_lookup_cols: List[str] = []
+
+    for col in hier_cols:
+        bracketed = f"[{col}]"
+        if col in delta_native:
+            expr = delta_native[col]
+            select_parts.append(f"{expr} AS {bracketed}")
+            group_parts.append(expr)
+        else:
+            msa_lookup_cols.append(col)
+            select_parts.append(f"M.{bracketed} AS {bracketed}")
+            group_parts.append(f"M.{bracketed}")
+        join_clauses.append(
+            f"ISNULL(X.{bracketed}, '') = ISNULL(d.{bracketed}, '')"
+        )
+
+    select_parts.append("SUM(t.qty) AS qty")
+
+    msa_join_sql = ""
+    if msa_lookup_cols:
+        agg_csv = ", ".join(f"MAX([{c}]) AS [{c}]" for c in msa_lookup_cols)
+        msa_join_sql = f"""
+            LEFT JOIN (
+                SELECT [{msa_article_col}] AS art_key, {agg_csv}
+                FROM ARS_MSA_TOTAL
+                GROUP BY [{msa_article_col}]
+            ) M ON M.art_key = t.art
+        """
+
+    return f"""
+        UPDATE X SET
+            X.PEND_ALC = ISNULL(X.PEND_ALC, 0) + d.qty,
+            X.STK_TTL  = ISNULL(X.STK_TTL,  0) + d.qty
+        FROM [{grid_table}] X
+        JOIN (
+            SELECT {', '.join(select_parts)}
+            FROM {delta_table} t
+            {msa_join_sql}
+            GROUP BY {', '.join(group_parts)}
+        ) d
+          ON {' AND '.join(join_clauses)}
+    """
+
+
+def _build_rollup_bootstrap_sql(
+    grid_table: str,
+    hier_cols: List[str],
+    msa_article_col: str,
+) -> str:
+    """Build an UPDATE that reseeds a rollup grid's PEND_ALC column from a
+    fresh scan of ARS_PEND_ALC, joined through MSA for any attribute not
+    held directly in PEND_ALC. Idempotent — sets PEND_ALC, doesn't add."""
+    pend_native = {
+        "MAJ_CAT":         "P.MAJ_CAT",
+        "GEN_ART_NUMBER":  "P.GEN_ART_NUMBER",
+        "CLR":             "P.CLR",
+    }
+
+    select_parts = ["P.ST_CD AS werks"]
+    group_parts  = ["P.ST_CD"]
+    join_clauses = ["agg.werks = X.WERKS"]
+    msa_lookup_cols: List[str] = []
+
+    for col in hier_cols:
+        bracketed = f"[{col}]"
+        if col in pend_native:
+            expr = pend_native[col]
+            select_parts.append(f"{expr} AS {bracketed}")
+            group_parts.append(expr)
+        else:
+            msa_lookup_cols.append(col)
+            select_parts.append(f"M.{bracketed} AS {bracketed}")
+            group_parts.append(f"M.{bracketed}")
+        join_clauses.append(
+            f"ISNULL(X.{bracketed}, '') = ISNULL(agg.{bracketed}, '')"
+        )
+
+    select_parts.append("SUM(CAST(P.PEND_QTY AS FLOAT)) AS qty")
+
+    msa_join_sql = ""
+    if msa_lookup_cols:
+        agg_csv = ", ".join(f"MAX([{c}]) AS [{c}]" for c in msa_lookup_cols)
+        msa_join_sql = f"""
+            LEFT JOIN (
+                SELECT [{msa_article_col}] AS art_key, {agg_csv}
+                FROM ARS_MSA_TOTAL
+                GROUP BY [{msa_article_col}]
+            ) M ON M.art_key = P.ARTICLE_NUMBER
+        """
+
+    return f"""
+        UPDATE X SET X.PEND_ALC = ISNULL(agg.qty, 0)
+        FROM [{grid_table}] X
+        LEFT JOIN (
+            SELECT {', '.join(select_parts)}
+            FROM {PEND_ALC_TABLE} P
+            {msa_join_sql}
+            WHERE P.IS_CLOSED = 0
+            GROUP BY {', '.join(group_parts)}
+        ) agg
+          ON {' AND '.join(join_clauses)}
+    """
+
+
+def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
+    """Apply a +qty (insert) or -qty (revert) delta across MSA + Grid for each
+    ARS_PEND_ALC row. Symmetric: the same `rows` with sign=-1 exactly reverses
+    a prior sign=+1 call.
+
+    rows[i] keys: rdc, st_cd, article_number, maj_cat, gen_art_number, clr,
+                  alloc_qty, do_qty (default 0)
+    Effective qty per row = (alloc_qty - do_qty) * sign
+
+    Returns counts of rows updated per target table (best-effort — missing
+    tables are skipped silently and recorded as 0).
+    """
+    assert sign in (+1, -1), "sign must be +1 (insert) or -1 (revert)"
+    result: Dict = {
+        "msa_total":   0, "msa_var_art": 0, "msa_gen_art": 0,
+        "grid_var":    0, "grid_gen":    0, "grid_rollup": 0,
+        "error":       None,
+    }
+
+    # Build payload (skip zero-qty rows)
+    payload = []
+    for r in rows:
+        eff = (float(r.get("alloc_qty", 0) or 0)
+               - float(r.get("do_qty", 0) or 0)) * sign
+        if eff == 0:
+            continue
+        payload.append({
+            "r": str(r["rdc"]),
+            "s": str(r.get("st_cd") or ""),
+            "a": str(r["article_number"]),
+            "m": str(r.get("maj_cat") or ""),
+            "g": str(r.get("gen_art_number") or ""),
+            "c": str(r.get("clr") or ""),
+            "q": eff,
+        })
+    if not payload:
+        return result
+
+    tmp = f"#delta_{uuid.uuid4().hex[:8]}"
+    try:
+        conn.execute(text(f"""
+            CREATE TABLE {tmp} (
+                rdc      NVARCHAR(20),
+                st_cd    NVARCHAR(20),
+                art      NVARCHAR(30),
+                maj_cat  NVARCHAR(200),
+                gen_art  NVARCHAR(30),
+                clr      NVARCHAR(50),
+                qty      FLOAT
+            )
+        """))
+        conn.execute(
+            text(f"INSERT INTO {tmp} VALUES (:r, :s, :a, :m, :g, :c, :q)"),
+            payload,
+        )
+
+        # ── Probe deployment-specific column names. Article/gen_art column
+        # names vary across deployments (VAR_ART vs ARTICLE_NUMBER vs ARTICLE,
+        # and GEN_ART_NUMBER vs GEN_ART). The first existing candidate wins.
+        msa_total_art   = _probe_col(conn, "ARS_MSA_TOTAL",       "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_var_art_col = _probe_col(conn, "ARS_MSA_VAR_ART",     "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART",     "GEN_ART_NUMBER", "GEN_ART")
+        grid_var_art    = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        grid_var_gen    = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "GEN_ART_NUMBER", "GEN_ART")
+        grid_gen_gen    = _probe_col(conn, "ARS_GRID_MJ_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
+
+        # ── MSA: ARS_MSA_TOTAL — keyed on (RDC, <article>) ──────────────
+        # PEND_QTY is incremented by d.qty.
+        # FNL_Q is recomputed from the canonical formula
+        #     FNL_Q = max(STK_QTY − new_PEND_QTY − HOLD_QTY, 0)
+        # rather than incrementally subtracted, because the incremental
+        # approach drifted whenever FNL_Q hit 0 — clipping at 0 LOST the
+        # excess units, so subsequent reverts couldn't restore the true
+        # value. Recomputing from STK/PEND/HOLD makes the operation
+        # symmetric and self-healing.
+        try:
+            r1 = conn.execute(text(f"""
+                UPDATE T SET
+                    T.PEND_QTY = ISNULL(T.PEND_QTY, 0) + d.qty,
+                    T.FNL_Q    = CASE
+                        WHEN ISNULL(T.STK_QTY, 0)
+                             - (ISNULL(T.PEND_QTY, 0) + d.qty)
+                             - ISNULL(T.HOLD_QTY, 0) < 0 THEN 0
+                        ELSE ISNULL(T.STK_QTY, 0)
+                             - (ISNULL(T.PEND_QTY, 0) + d.qty)
+                             - ISNULL(T.HOLD_QTY, 0)
+                    END
+                FROM ARS_MSA_TOTAL T
+                JOIN (
+                    SELECT rdc, art, SUM(qty) AS qty
+                    FROM {tmp} GROUP BY rdc, art
+                ) d ON T.RDC = d.rdc AND T.[{msa_total_art}] = d.art
+            """))
+            result["msa_total"] = int(r1.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[delta] MSA_TOTAL skipped: {e}")
+
+        # ── MSA: ARS_MSA_VAR_ART — true rollup from MSA_TOTAL ───────────
+        # VAR_ART is variant-grain like TOTAL (1:1 by RDC + ARTICLE), so we
+        # just copy the now-correct PEND_QTY/FNL_Q from TOTAL for every
+        # article touched by this delta. Eliminates drift; matches what
+        # bootstrap_msa_pend_sync does.
+        try:
+            r2 = conn.execute(text(f"""
+                UPDATE V SET
+                    V.PEND_QTY = T.PEND_QTY,
+                    V.FNL_Q    = T.FNL_Q
+                FROM ARS_MSA_VAR_ART V
+                JOIN ARS_MSA_TOTAL T
+                  ON T.RDC = V.RDC
+                 AND T.[{msa_total_art}] = V.[{msa_var_art_col}]
+                JOIN (
+                    SELECT DISTINCT rdc, art FROM {tmp}
+                ) d
+                  ON d.rdc = T.RDC
+                 AND d.art = T.[{msa_total_art}]
+            """))
+            result["msa_var_art"] = int(r2.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[delta] MSA_VAR_ART skipped: {e}")
+
+        # ── MSA: ARS_MSA_GEN_ART — true rollup from MSA_TOTAL ────────────
+        # Gen_art grain coarser than TOTAL — many variants per gen_art row.
+        # We must SUM(FNL_Q) from MSA_TOTAL, not max(SUM(STK)−SUM(PEND)−SUM(HOLD), 0),
+        # because max() doesn't distribute over sums when one variant
+        # already clipped at 0. Scoped to (RDC, MAJ_CAT, GEN_ART, CLR)
+        # keys touched by this delta to avoid scanning all of MSA_TOTAL.
+        try:
+            r3 = conn.execute(text(f"""
+                UPDATE G SET
+                    G.PEND_QTY = agg.p,
+                    G.FNL_Q    = agg.f
+                FROM ARS_MSA_GEN_ART G
+                JOIN (
+                    SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                           SUM(CAST(T.PEND_QTY AS FLOAT)) AS p,
+                           SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
+                    FROM ARS_MSA_TOTAL T
+                    JOIN (
+                        SELECT DISTINCT rdc, maj_cat, gen_art, clr FROM {tmp}
+                    ) a
+                      ON T.RDC = a.rdc
+                     AND ISNULL(T.MAJ_CAT, '')             = ISNULL(a.maj_cat, '')
+                     AND ISNULL(T.[{msa_gen_genc}], '')    = ISNULL(a.gen_art, '')
+                     AND ISNULL(T.CLR, '')                 = ISNULL(a.clr, '')
+                    GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                ) agg
+                  ON G.RDC = agg.RDC
+                 AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+                 AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
+                 AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+            """))
+            result["msa_gen_art"] = int(r3.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[delta] MSA_GEN_ART skipped: {e}")
+
+        # ── Grid: ARS_GRID_MJ_VAR_ART — variant grain ───────────────────
+        # PEND_ALC is incremented by d.qty (the pending allocation that's
+        # been approved). STK_TTL is also incremented by the same qty so
+        # the planner-facing total reflects the incoming pending shipment
+        # — without this, STK_TTL would only track physical store stock
+        # and lag the pending pipeline until the next grid rebuild.
+        try:
+            r4 = conn.execute(text(f"""
+                UPDATE V SET
+                    V.PEND_ALC = ISNULL(V.PEND_ALC, 0) + d.qty,
+                    V.STK_TTL  = ISNULL(V.STK_TTL,  0) + d.qty
+                FROM ARS_GRID_MJ_VAR_ART V
+                JOIN (
+                    SELECT st_cd, maj_cat, gen_art, clr, art, SUM(qty) AS qty
+                    FROM {tmp}
+                    GROUP BY st_cd, maj_cat, gen_art, clr, art
+                ) d
+                  ON V.WERKS = d.st_cd
+                 AND ISNULL(V.MAJ_CAT, '')             = ISNULL(d.maj_cat, '')
+                 AND ISNULL(V.[{grid_var_gen}], '')    = ISNULL(d.gen_art, '')
+                 AND ISNULL(V.CLR, '')                 = ISNULL(d.clr, '')
+                 AND V.[{grid_var_art}]                = d.art
+            """))
+            result["grid_var"] = int(r4.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[delta] GRID_VAR_ART skipped: {e}")
+
+        # ── Grid: ARS_GRID_MJ_GEN_ART — gen_art grain ───────────────────
+        # Same dual update — PEND_ALC + STK_TTL track the pending shipment.
+        try:
+            r5 = conn.execute(text(f"""
+                UPDATE G SET
+                    G.PEND_ALC = ISNULL(G.PEND_ALC, 0) + d.qty,
+                    G.STK_TTL  = ISNULL(G.STK_TTL,  0) + d.qty
+                FROM ARS_GRID_MJ_GEN_ART G
+                JOIN (
+                    SELECT st_cd, maj_cat, gen_art, clr, SUM(qty) AS qty
+                    FROM {tmp}
+                    GROUP BY st_cd, maj_cat, gen_art, clr
+                ) d
+                  ON G.WERKS = d.st_cd
+                 AND ISNULL(G.MAJ_CAT, '')             = ISNULL(d.maj_cat, '')
+                 AND ISNULL(G.[{grid_gen_gen}], '')    = ISNULL(d.gen_art, '')
+                 AND ISNULL(G.CLR, '')                 = ISNULL(d.clr, '')
+            """))
+            result["grid_gen"] = int(r5.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[delta] GRID_GEN_ART skipped: {e}")
+
+        # ── Grid: attribute rollups — based on each grid's HIERARCHY ─────
+        # Each rollup grid has its own hierarchy (MAJ_CAT only / MAJ_CAT+CLR /
+        # MAJ_CAT+FAB / MAJ_CAT+RNG_SEG / etc.), discovered at runtime from
+        # INFORMATION_SCHEMA. Attributes not held directly on ARS_PEND_ALC
+        # (FAB, RNG_SEG, MACRO_MVGR, MICRO_MVGR, VND_CD, M_VND_CD) are
+        # resolved via a per-article lookup on ARS_MSA_TOTAL.
+        rollup_tables = _discover_grid_rollup_tables(conn)
+        rollup_total = 0
+        for tbl in rollup_tables:
+            try:
+                hier_cols = _discover_grid_hierarchy(conn, tbl)
+                if not hier_cols:
+                    logger.debug(f"[delta] {tbl}: no hierarchy columns found, skipping")
+                    continue
+                sql = _build_rollup_delta_sql(tbl, hier_cols, tmp, msa_total_art)
+                rr = conn.execute(text(sql))
+                rollup_total += int(rr.rowcount or 0)
+                logger.debug(
+                    f"[delta] {tbl}: hier={hier_cols} → {rr.rowcount or 0} rows"
+                )
+            except Exception as e:
+                logger.warning(f"[delta] rollup grid {tbl} skipped: {e}")
+        result["grid_rollup"] = rollup_total
+
+    except Exception as e:
+        logger.warning(f"[delta] apply_pend_alc_delta failed (non-fatal): {e}")
+        result["error"] = str(e)
+    finally:
+        try:
+            conn.execute(text(
+                f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
+            ))
+        except Exception:
+            pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+    logger.info(
+        f"[delta sign={sign}] msa_total={result['msa_total']} "
+        f"var={result['msa_var_art']} gen={result['msa_gen_art']} | "
+        f"grid_var={result['grid_var']} grid_gen={result['grid_gen']} "
+        f"rollups={result['grid_rollup']}"
+    )
+    return result
+
+
+def apply_pend_alc_delta_by_session(
+    conn, session_id: str, sign: int = +1
+) -> Dict:
+    """Convenience wrapper: read PEND_ALC rows by session_id, then apply the
+    delta. Used by approve_parked which only has the session_id, not the
+    original row dicts.
+    """
+    rows = [
+        {
+            "rdc":            r[0],
+            "st_cd":          r[1],
+            "article_number": r[2],
+            "maj_cat":        r[3],
+            "gen_art_number": r[4],
+            "clr":            r[5],
+            "alloc_qty":      float(r[6] or 0),
+            "do_qty":         float(r[7] or 0),
+        }
+        for r in conn.execute(text(f"""
+            SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                   ALLOC_QTY, ISNULL(DO_QTY, 0)
+            FROM {PEND_ALC_TABLE}
+            WHERE SESSION_ID = :sid
+        """), {"sid": session_id}).fetchall()
+    ]
+    return apply_pend_alc_delta(conn, rows, sign=sign)
+
+
+def bootstrap_msa_pend_sync(conn) -> Dict:
+    """Reseed PEND_QTY/FNL_Q in ARS_MSA_TOTAL/VAR_ART/GEN_ART from a fresh scan
+    of ARS_PEND_ALC (open rows only). Safe to run repeatedly — idempotent.
+
+    Call ONCE manually before deploying the delta function for the first time
+    (existing GEN_ART totals may be stale). After that, every full MSA build
+    should call this at the end of `store_results` so a freshly-rebuilt MSA
+    matches the open pend_alc ledger.
+    """
+    result: Dict = {"msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0, "error": None}
+    try:
+        msa_total_art   = _probe_col(conn, "ARS_MSA_TOTAL",   "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_var_art_col = _probe_col(conn, "ARS_MSA_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
+
+        # 1a. Seed PEND_QTY into ARS_MSA_TOTAL from open pend_alc rows
+        r1 = conn.execute(text(f"""
+            ;WITH P AS (
+                SELECT RDC, ARTICLE_NUMBER, SUM(PEND_QTY) AS qty
+                FROM {PEND_ALC_TABLE}
+                WHERE IS_CLOSED = 0
+                GROUP BY RDC, ARTICLE_NUMBER
+            )
+            UPDATE T
+               SET T.PEND_QTY = ISNULL(P.qty, 0),
+                   T.FNL_Q    = CASE
+                       WHEN ISNULL(T.STK_QTY, 0) - ISNULL(P.qty, 0)
+                            - ISNULL(T.HOLD_QTY, 0) < 0 THEN 0
+                       ELSE ISNULL(T.STK_QTY, 0) - ISNULL(P.qty, 0)
+                            - ISNULL(T.HOLD_QTY, 0)
+                   END
+            FROM ARS_MSA_TOTAL T
+            LEFT JOIN P ON P.RDC = T.RDC AND P.ARTICLE_NUMBER = T.[{msa_total_art}]
+        """))
+        result["msa_total"] = int(r1.rowcount or 0)
+
+        # 1b. Roll up TOTAL → VAR_ART
+        r2 = conn.execute(text(f"""
+            UPDATE V
+               SET V.PEND_QTY = agg.p, V.FNL_Q = agg.f
+            FROM ARS_MSA_VAR_ART V
+            JOIN (
+                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{msa_total_art}] AS art,
+                       SUM(CAST(PEND_QTY AS FLOAT)) AS p,
+                       SUM(CAST(FNL_Q    AS FLOAT)) AS f
+                FROM ARS_MSA_TOTAL
+                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{msa_total_art}]
+            ) agg
+              ON V.RDC = agg.RDC
+             AND ISNULL(V.MAJ_CAT, '')        = ISNULL(agg.MAJ_CAT, '')
+             AND ISNULL(V.GEN_ART_NUMBER, '') = ISNULL(agg.GEN_ART_NUMBER, '')
+             AND ISNULL(V.CLR, '')            = ISNULL(agg.CLR, '')
+             AND V.[{msa_var_art_col}]        = agg.art
+        """))
+        result["msa_var_art"] = int(r2.rowcount or 0)
+
+        # 1c. Roll up TOTAL → GEN_ART
+        r3 = conn.execute(text(f"""
+            UPDATE G
+               SET G.PEND_QTY = agg.p, G.FNL_Q = agg.f
+            FROM ARS_MSA_GEN_ART G
+            JOIN (
+                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                       SUM(CAST(PEND_QTY AS FLOAT)) AS p,
+                       SUM(CAST(FNL_Q    AS FLOAT)) AS f
+                FROM ARS_MSA_TOTAL
+                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
+            ) agg
+              ON G.RDC = agg.RDC
+             AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+             AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.GEN_ART_NUMBER, '')
+             AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+        """))
+        result["msa_gen_art"] = int(r3.rowcount or 0)
+
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[bootstrap_msa] failed (non-fatal): {e}")
+        result["error"] = str(e)
+        try: conn.rollback()
+        except Exception: pass
+
+    logger.info(
+        f"[bootstrap_msa] reseeded: total={result['msa_total']} "
+        f"var={result['msa_var_art']} gen={result['msa_gen_art']}"
+    )
+    return result
+
+
+def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
+    """Reseed HOLD_QTY in ARS_MSA_TOTAL/VAR_ART/GEN_ART from currently-open
+    ARS_NL_TBL_HOLD_TRACKING rows, then recompute FNL_Q from the canonical
+    formula max(STK_QTY − PEND_QTY − HOLD_QTY, 0).
+
+    Mirror of bootstrap_msa_pend_sync but for the HOLD axis. Idempotent.
+
+    Args:
+        session_id: Optional. If provided, scope the reseed to ONLY the
+            (RDC, ARTICLE) keys touched by this session in ARS_ALLOC_HISTORY
+            — turns a 100K-row full-table update into a few-hundred-row
+            scoped update. Major win on approve where the affected article
+            set is small.
+            Pass None to reseed every row (used by msa_result_storage,
+            full MSA builds, and the diagnostic script).
+
+    RDC resolution: prefers ARS_NL_TBL_HOLD_TRACKING.RDC if present (added
+    by listing.py Part 8.6 setup). Falls back to a Master_ALC_INPUT_ST_MASTER
+    join for older rows where RDC is still NULL.
+
+    Call from:
+      • approve_parked, after the PEND delta — keeps HOLD in step with the
+        same lifecycle event that updates PEND. PASS session_id for speed.
+      • msa_result_storage.store_results — defensive double-check after a
+        full MSA build. Pass None.
+    """
+    result: Dict = {
+        "msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0,
+        "scoped": session_id is not None, "error": None,
+    }
+    try:
+        msa_total_art   = _probe_col(conn, "ARS_MSA_TOTAL",
+                                     "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_var_art_col = _probe_col(conn, "ARS_MSA_VAR_ART",
+                                     "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART",
+                                     "GEN_ART_NUMBER", "GEN_ART")
+
+        # Build a scope-filter CTE that resolves the (RDC, ARTICLE) keys
+        # touched by this session — used to limit MSA_TOTAL row updates
+        # below. Empty / null when running unscoped.
+        scope_cte = ""
+        scope_join = ""
+        sql_params: Dict = {}
+        if session_id:
+            # Resolve affected (RDC, ARTICLE) keys via the alloc history for
+            # this session, joined through store master to map WERKS→RDC.
+            scope_cte = f"""
+                , ScopedKeys AS (
+                    SELECT DISTINCT
+                           SM.RDC AS rdc,
+                           CAST(A.[VAR_ART] AS NVARCHAR(30)) AS art
+                    FROM [ARS_ALLOC_HISTORY] A
+                    INNER JOIN [Master_ALC_INPUT_ST_MASTER] SM
+                        ON SM.[ST_CD] = A.[WERKS]
+                    WHERE A.[SESSION_ID] = :sid
+                      AND A.[OPT_TYPE] IN ('RL','TBC','TBL','NL')
+                )
+            """
+            scope_join = (
+                "INNER JOIN ScopedKeys SK "
+                "ON SK.rdc = T.RDC AND SK.art = T.[{}]".format(msa_total_art)
+            )
+            sql_params["sid"] = session_id
+
+        # Detect whether ARS_NL_TBL_HOLD_TRACKING already has the RDC column
+        has_rdc_col = (conn.execute(text("""
+            SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_NAME = 'ARS_NL_TBL_HOLD_TRACKING' AND COLUMN_NAME = 'RDC'
+        """)).scalar() or 0) > 0
+
+        if has_rdc_col:
+            hold_cte_inner = """
+                SELECT COALESCE(NULLIF(H.RDC, ''), SM.RDC) AS rdc,
+                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                       SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
+                FROM ARS_NL_TBL_HOLD_TRACKING H
+                LEFT JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
+                WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                  AND ISNULL(H.HOLD_REM, 0) > 0
+                GROUP BY COALESCE(NULLIF(H.RDC, ''), SM.RDC),
+                         CAST(H.VAR_ART AS NVARCHAR(30))
+            """
+        else:
+            hold_cte_inner = """
+                SELECT SM.RDC AS rdc,
+                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                       SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
+                FROM ARS_NL_TBL_HOLD_TRACKING H
+                INNER JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
+                WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                  AND ISNULL(H.HOLD_REM, 0) > 0
+                GROUP BY SM.RDC, CAST(H.VAR_ART AS NVARCHAR(30))
+            """
+
+        # 1. Reseed MSA_TOTAL.HOLD_QTY + recompute FNL_Q.  When session_id
+        # is provided, ScopedKeys filters MSA_TOTAL rows so only those
+        # touched by this session get re-written.
+        try:
+            r1 = conn.execute(text(f"""
+                ;WITH H AS ({hold_cte_inner})
+                {scope_cte}
+                UPDATE T SET
+                    T.HOLD_QTY = ISNULL(H.hold_qty, 0),
+                    T.FNL_Q = CASE
+                        WHEN ISNULL(T.STK_QTY, 0) - ISNULL(T.PEND_QTY, 0)
+                             - ISNULL(H.hold_qty, 0) < 0 THEN 0
+                        ELSE ISNULL(T.STK_QTY, 0) - ISNULL(T.PEND_QTY, 0)
+                             - ISNULL(H.hold_qty, 0)
+                    END
+                FROM ARS_MSA_TOTAL T
+                {scope_join}
+                LEFT JOIN H ON H.rdc = T.RDC AND H.art = T.[{msa_total_art}]
+            """), sql_params)
+            result["msa_total"] = int(r1.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[bootstrap_hold] MSA_TOTAL skipped: {e}")
+
+        # 2. Mirror to MSA_VAR_ART (variant grain — 1:1 with MSA_TOTAL).
+        # Same scope filter to avoid scanning the entire VAR_ART.
+        var_scope_join = ""
+        if session_id:
+            var_scope_join = (
+                "INNER JOIN [ARS_ALLOC_HISTORY] AH "
+                "ON AH.[SESSION_ID] = :sid "
+                "AND CAST(AH.[VAR_ART] AS NVARCHAR(30)) = "
+                f"CAST(V.[{msa_var_art_col}] AS NVARCHAR(30))"
+            )
+        try:
+            r2 = conn.execute(text(f"""
+                UPDATE V SET V.HOLD_QTY = T.HOLD_QTY, V.FNL_Q = T.FNL_Q
+                FROM ARS_MSA_VAR_ART V
+                JOIN ARS_MSA_TOTAL T
+                  ON T.RDC = V.RDC
+                 AND T.[{msa_total_art}] = V.[{msa_var_art_col}]
+                {var_scope_join}
+            """), sql_params)
+            result["msa_var_art"] = int(r2.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[bootstrap_hold] MSA_VAR_ART skipped: {e}")
+
+        # 3. Roll up to MSA_GEN_ART — sum HOLD_QTY and FNL_Q from MSA_TOTAL
+        # by gen_art group (sum of FNL_Q is the correct rollup, NOT
+        # max(STK − PEND − HOLD) — see comment in apply_pend_alc_delta).
+        # When session_id is provided, only the gen_art groups whose
+        # variants appear in the session's history are recomputed.
+        try:
+            if session_id:
+                # Scoped: derive affected (RDC, MAJ_CAT, GEN_ART, CLR) keys
+                # from the session's articles via MSA_TOTAL → AH join.
+                r3 = conn.execute(text(f"""
+                    ;WITH ScopedGenKeys AS (
+                        SELECT DISTINCT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR
+                        FROM ARS_MSA_TOTAL T
+                        INNER JOIN [ARS_ALLOC_HISTORY] AH
+                            ON AH.[SESSION_ID] = :sid
+                           AND CAST(AH.[VAR_ART] AS NVARCHAR(30))
+                                = CAST(T.[{msa_total_art}] AS NVARCHAR(30))
+                    )
+                    UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
+                    FROM ARS_MSA_GEN_ART G
+                    INNER JOIN ScopedGenKeys SK
+                       ON G.RDC = SK.RDC
+                      AND ISNULL(G.MAJ_CAT, '')             = ISNULL(SK.MAJ_CAT, '')
+                      AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(SK.gen, '')
+                      AND ISNULL(G.CLR, '')                 = ISNULL(SK.CLR, '')
+                    JOIN (
+                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                               SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
+                               SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
+                        FROM ARS_MSA_TOTAL T
+                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                    ) agg
+                      ON G.RDC = agg.RDC
+                     AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+                     AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
+                     AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                """), sql_params)
+            else:
+                r3 = conn.execute(text(f"""
+                    UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
+                    FROM ARS_MSA_GEN_ART G
+                    JOIN (
+                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                               SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
+                               SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
+                        FROM ARS_MSA_TOTAL T
+                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                    ) agg
+                      ON G.RDC = agg.RDC
+                     AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
+                     AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
+                     AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                """))
+            result["msa_gen_art"] = int(r3.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[bootstrap_hold] MSA_GEN_ART skipped: {e}")
+
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[bootstrap_hold] failed (non-fatal): {e}")
+        result["error"] = str(e)
+        try: conn.rollback()
+        except Exception: pass
+
+    logger.info(
+        f"[bootstrap_hold] reseeded: total={result['msa_total']} "
+        f"var={result['msa_var_art']} gen={result['msa_gen_art']}"
+    )
+    return result
+
+
+def bootstrap_grid_pend_sync(conn) -> Dict:
+    """Reseed PEND_ALC on the grid family from a fresh scan of ARS_PEND_ALC.
+    Skips silently if a grid table doesn't exist on this deployment. Safe to
+    run repeatedly — idempotent.
+
+    Call ONCE manually before deploying the delta function and each time the
+    grid is fully rebuilt. Note: the 8 attribute-rollup grids are seeded at
+    (WERKS, MAJ_CAT) precision (matches the incremental delta granularity).
+    """
+    result: Dict = {"grid_var": 0, "grid_gen": 0, "grid_rollup": 0, "error": None}
+    try:
+        grid_var_art = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+        grid_var_gen = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "GEN_ART_NUMBER", "GEN_ART")
+        grid_gen_gen = _probe_col(conn, "ARS_GRID_MJ_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
+
+        # 2a. ARS_GRID_MJ_VAR_ART — variant grain
+        try:
+            r1 = conn.execute(text(f"""
+                UPDATE V
+                   SET V.PEND_ALC = ISNULL(P.qty, 0)
+                FROM ARS_GRID_MJ_VAR_ART V
+                LEFT JOIN (
+                    SELECT ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER,
+                           SUM(CAST(PEND_QTY AS FLOAT)) AS qty
+                    FROM {PEND_ALC_TABLE} WHERE IS_CLOSED = 0
+                    GROUP BY ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER
+                ) P
+                  ON P.ST_CD = V.WERKS
+                 AND ISNULL(P.MAJ_CAT, '')             = ISNULL(V.MAJ_CAT, '')
+                 AND ISNULL(P.GEN_ART_NUMBER, '')      = ISNULL(V.[{grid_var_gen}], '')
+                 AND ISNULL(P.CLR, '')                 = ISNULL(V.CLR, '')
+                 AND P.ARTICLE_NUMBER                   = V.[{grid_var_art}]
+            """))
+            result["grid_var"] = int(r1.rowcount or 0)
+        except Exception as e:
+            logger.debug(f"[bootstrap_grid] GRID_VAR_ART skipped: {e}")
+
+        # 2b. ARS_GRID_MJ_GEN_ART — gen_art grain
+        try:
+            r2 = conn.execute(text(f"""
+                UPDATE G
+                   SET G.PEND_ALC = ISNULL(P.qty, 0)
+                FROM ARS_GRID_MJ_GEN_ART G
+                LEFT JOIN (
+                    SELECT ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                           SUM(CAST(PEND_QTY AS FLOAT)) AS qty
+                    FROM {PEND_ALC_TABLE} WHERE IS_CLOSED = 0
+                    GROUP BY ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR
+                ) P
+                  ON P.ST_CD = G.WERKS
+                 AND ISNULL(P.MAJ_CAT, '')             = ISNULL(G.MAJ_CAT, '')
+                 AND ISNULL(P.GEN_ART_NUMBER, '')      = ISNULL(G.[{grid_gen_gen}], '')
+                 AND ISNULL(P.CLR, '')                 = ISNULL(G.CLR, '')
+            """))
+            result["grid_gen"] = int(r2.rowcount or 0)
+        except Exception as e:
+            logger.debug(f"[bootstrap_grid] GRID_GEN_ART skipped: {e}")
+
+        # 2c. Attribute-rollup grids — reseed by each grid's full hierarchy.
+        # Hierarchy discovered at runtime from INFORMATION_SCHEMA so any new
+        # grid added by the grid builder is auto-included. Attributes not
+        # held in ARS_PEND_ALC are resolved via ARS_MSA_TOTAL.
+        msa_article_col = _probe_col(
+            conn, "ARS_MSA_TOTAL", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE",
+        )
+        rollup_tables = _discover_grid_rollup_tables(conn)
+        rollup_total = 0
+        for tbl in rollup_tables:
+            try:
+                hier_cols = _discover_grid_hierarchy(conn, tbl)
+                if not hier_cols:
+                    logger.debug(
+                        f"[bootstrap_grid] {tbl}: no hierarchy columns found, skipping"
+                    )
+                    continue
+                sql = _build_rollup_bootstrap_sql(tbl, hier_cols, msa_article_col)
+                rr = conn.execute(text(sql))
+                rollup_total += int(rr.rowcount or 0)
+                logger.debug(
+                    f"[bootstrap_grid] {tbl}: hier={hier_cols} → {rr.rowcount or 0} rows"
+                )
+            except Exception as e:
+                logger.warning(f"[bootstrap_grid] {tbl} skipped: {e}")
+        result["grid_rollup"] = rollup_total
+
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[bootstrap_grid] failed (non-fatal): {e}")
+        result["error"] = str(e)
+        try: conn.rollback()
+        except Exception: pass
+
+    logger.info(
+        f"[bootstrap_grid] reseeded: var={result['grid_var']} "
+        f"gen={result['grid_gen']} rollups={result['grid_rollup']}"
+    )
     return result

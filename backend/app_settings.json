@@ -1,10 +1,10 @@
 {
   "database": {
-    "server": "hopc560",
+    "server": "192.168.149.135",
     "system_database": "Claude",
     "data_database": "Rep_data",
     "username": "sa",
-    "password": "vrl@55555",
+    "password": "Vrl@12345",
     "driver": "ODBC Driver 18 for SQL Server",
     "trust_cert": "yes",
     "encrypt": "no",
@@ -34,5 +34,8 @@
     "show_row_numbers": true,
     "date_format": "YYYY-MM-DD",
     "number_format": "en-IN"
+  },
+  "allocation": {
+    "history_retention_days": 30
   }
 }

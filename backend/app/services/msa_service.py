@@ -561,11 +561,17 @@ class MSAService:
             # before the DO is issued.  IS_CLOSED=1 rows are excluded — those
             # units are already deducted in SAP via DO.
             msa_pivot["PEND_QTY"] = 0.0
-            msa_pivot["ARS_PEND"] = 0.0
+            # NOTE: do NOT pre-create ARS_PEND here. The merge below brings in
+            # an ARS_PEND column from _load_ars_pending(); a pre-existing
+            # column of the same name causes pandas to rename them to
+            # ARS_PEND_x / ARS_PEND_y, breaks the fillna access by name, and
+            # leaves duplicate columns on the pivot which downstream
+            # serialisation/storage steps mishandle.
             # pend_merged_cols tracks which columns were added by the PEND merge
             # so the column-classifier below (Step 9) can aggregate them, not use
             # them as hierarchy keys.
             pend_merged_cols: List[str] = []
+            ars_pend_loaded = False
             try:
                 ars_pend = self._load_ars_pending()
                 if not ars_pend.empty and "ARTICLE_NUMBER" in msa_pivot.columns:
@@ -593,6 +599,7 @@ class MSAService:
                     msa_pivot["ARS_PEND"] = msa_pivot["ARS_PEND"].fillna(0)
                     msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
                     msa_pivot["PEND_QTY"] = msa_pivot["ARS_PEND"]
+                    ars_pend_loaded = True
 
                     matched_pend = float(msa_pivot["ARS_PEND"].sum())
                     expected_pend = float(ars_pend["ARS_PEND"].sum())
@@ -612,6 +619,12 @@ class MSAService:
                     logger.info("ARS_PEND_ALC: no open pending rows — PEND_QTY = 0")
             except Exception as ars_err:
                 logger.warning(f"Could not load ARS pending: {ars_err}")
+
+            # Default ARS_PEND to 0 when the merge above didn't run (or failed)
+            # so downstream code that expects the column still works. Done
+            # AFTER the merge so we never collide with the merged column.
+            if not ars_pend_loaded and "ARS_PEND" not in msa_pivot.columns:
+                msa_pivot["ARS_PEND"] = 0.0
 
             # ============ STEP 6.5: DEDUCT OPEN HOLDS (NL/TBL reservations) ====
             # Held units physically sit at the RDC but are reserved for a

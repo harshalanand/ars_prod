@@ -18,3 +18,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     </BrowserRouter>
   </React.StrictMode>
 )
+
+// Fade out the boot preloader once React has mounted
+requestAnimationFrame(() => {
+  const preloader = document.getElementById('ars-preloader')
+  if (!preloader) return
+  preloader.classList.add('fade-out')
+  setTimeout(() => preloader.remove(), 350)
+})

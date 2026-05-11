@@ -160,9 +160,9 @@ export default function App() {
         <Route path="pend-alc/schedule-audit"  element={<ErrorBoundary><ScheduleAuditPage /></ErrorBoundary>} />
         <Route path="pend-alc/operations"      element={<ErrorBoundary><PendAlcOperationsPage /></ErrorBoundary>} />
         {/* Allocations */}
-        <Route path="allocations" element={<AllocationsPage />} />
-        <Route path="allocations/new" element={<NewAllocationPage />} />
-        <Route path="allocations/:id" element={<AllocationDetailPage />} />
+        <Route path="allocations" element={<ProtectedRoute permission="ALLOC_READ"><AllocationsPage /></ProtectedRoute>} />
+        <Route path="allocations/new" element={<ProtectedRoute permission="ALLOC_CREATE"><NewAllocationPage /></ProtectedRoute>} />
+        <Route path="allocations/:id" element={<ProtectedRoute permission="ALLOC_READ"><AllocationDetailPage /></ProtectedRoute>} />
         {/* Settings / Admin */}
         <Route path="settings" element={<ProtectedRoute permission="ADMIN_SETTINGS"><SettingsPage /></ProtectedRoute>} />
         <Route path="settings/tables" element={<ProtectedRoute permission="TABLE_CREATE"><TableManagementPage /></ProtectedRoute>} />

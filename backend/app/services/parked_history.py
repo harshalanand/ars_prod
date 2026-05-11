@@ -40,7 +40,12 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.database.session import get_data_engine
-from app.services.pend_alc_service import write_pend_alc, adjust_msa_after_pend_insert
+from app.services.pend_alc_service import (
+    write_pend_alc,
+    adjust_msa_after_pend_insert,
+    apply_pend_alc_delta_by_session,
+    bootstrap_msa_hold_sync,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -531,11 +536,62 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 logger.warning(f"[pend_alc] write failed for {session_id}: {pe}")
                 approved_by_table["pend_alc_rows"] = 0
 
-            # Immediately adjust ARS_MSA_TOTAL/GEN_ART/VAR_ART FNL_Q so the
-            # next alloc run sees the updated available stock without requiring
-            # a full MSA recalculation. Only runs after PEND_ALC INSERTs.
+            # Snapshot ARS_NL_TBL_HOLD_TRACKING BEFORE we modify it so any
+            # future "undo approve" tooling can restore the pre-approval
+            # state. Idempotent — second call for the same session is a no-op.
             try:
-                msa_adjusted = adjust_msa_after_pend_insert(conn, session_id=session_id)
+                _ensure_hold_snapshot_tables(conn)
+                already = conn.execute(text(
+                    f"SELECT COUNT(*) FROM [{_HOLD_SNAPSHOT_SESSIONS}] "
+                    f"WHERE SESSION_ID = :sid"
+                ), {"sid": session_id}).scalar() or 0
+                if already == 0:
+                    res = conn.execute(text(f"""
+                        INSERT INTO [{_HOLD_SNAPSHOT_TABLE}]
+                            (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                             VAR_ART, SZ, OPT_STATUS, LISTED_DATE,
+                             HOLD_QTY_INITIAL, HOLD_REM,
+                             LAST_UPDATED, IS_CLOSED, CLOSED_DATE)
+                        SELECT :sid, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                               VAR_ART, SZ, OPT_STATUS, LISTED_DATE,
+                               HOLD_QTY_INITIAL, HOLD_REM,
+                               LAST_UPDATED, IS_CLOSED, CLOSED_DATE
+                        FROM [ARS_NL_TBL_HOLD_TRACKING]
+                    """), {"sid": session_id})
+                    conn.execute(text(f"""
+                        INSERT INTO [{_HOLD_SNAPSHOT_SESSIONS}]
+                            (SESSION_ID, SNAPSHOTTED_AT, ROW_COUNT)
+                        VALUES (:sid, GETDATE(), :rc)
+                    """), {"sid": session_id, "rc": int(res.rowcount or 0)})
+                    conn.commit()
+            except Exception as _se:
+                logger.warning(f"[hold] pre-approve snapshot failed: {_se}")
+
+            # Apply the hold-tracking changes (Step A: decrement consumed
+            # by RL/TBC, Step B: MERGE new TBL holds). Reads from
+            # ARS_ALLOC_HISTORY for this session — symmetric with how
+            # write_pend_alc reads ALLOC_QTY from history. Used to live in
+            # listing.py Part 8.6 (during generate); moved here so HOLD
+            # commits at the same lifecycle event as PEND.
+            try:
+                hold_applied = _apply_hold_tracking_from_history(conn, session_id)
+                logger.info(
+                    f"[hold] tracking applied session={session_id}: "
+                    f"step_a={hold_applied['step_a_rows']} "
+                    f"step_b={hold_applied['step_b_rows']}"
+                )
+                approved_by_table["hold_tracking_applied"] = hold_applied
+            except Exception as he:
+                logger.warning(f"[hold] tracking apply failed (non-fatal): {he}")
+                approved_by_table["hold_tracking_applied"] = {"error": str(he)}
+
+            # Immediately adjust MSA + Grid so the next alloc run sees the
+            # updated available stock without requiring a full MSA / grid
+            # rebuild. Symmetric +1 delta — the revert path passes -1.
+            try:
+                msa_adjusted = apply_pend_alc_delta_by_session(
+                    conn, session_id, sign=+1,
+                )
                 logger.info(
                     f"[pend_alc] msa_adjusted session={session_id}: "
                     f"total={msa_adjusted['msa_total']} "
@@ -545,6 +601,23 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
             except Exception as mp:
                 logger.warning(f"[pend_alc] msa_adjusted failed (non-fatal): {mp}")
                 approved_by_table["msa_adjusted"] = {"error": str(mp)}
+
+            # Sync MSA HOLD_QTY/FNL_Q to current ARS_NL_TBL_HOLD_TRACKING.
+            # Pass session_id so the reseed is SCOPED to (RDC, ARTICLE) keys
+            # touched by this listing only — turns a 100K-row full-table
+            # update into a few-hundred-row scoped update. Massive win on
+            # approve latency.
+            try:
+                hold_synced = bootstrap_msa_hold_sync(conn, session_id=session_id)
+                logger.info(
+                    f"[hold] msa hold synced session={session_id} (scoped): "
+                    f"total={hold_synced['msa_total']} "
+                    f"var={hold_synced['msa_var_art']} gen={hold_synced['msa_gen_art']}"
+                )
+                approved_by_table["msa_hold_synced"] = hold_synced
+            except Exception as he:
+                logger.warning(f"[hold] msa hold sync failed (non-fatal): {he}")
+                approved_by_table["msa_hold_synced"] = {"error": str(he)}
 
         # Sum new + pre-existing for the headline number.
         # Skip non-int values (e.g. msa_patch dict, pend_alc_rows dict).
@@ -1009,6 +1082,7 @@ def _ensure_hold_snapshot_tables(conn) -> None:
         CREATE TABLE [{_HOLD_SNAPSHOT_TABLE}] (
             [SESSION_ID]       NVARCHAR(50)  NOT NULL,
             [WERKS]            NVARCHAR(50)  NOT NULL,
+            [RDC]              NVARCHAR(20)  NULL,
             [MAJ_CAT]          NVARCHAR(200) NULL,
             [GEN_ART_NUMBER]   BIGINT        NULL,
             [CLR]              NVARCHAR(200) NULL,
@@ -1024,6 +1098,16 @@ def _ensure_hold_snapshot_tables(conn) -> None:
             CONSTRAINT [PK_{_HOLD_SNAPSHOT_TABLE}]
                 PRIMARY KEY CLUSTERED ([SESSION_ID], [WERKS], [VAR_ART], [SZ])
         )
+    """))
+    # Idempotent ALTER for older deployments that already have the snapshot
+    # table without the RDC column.
+    conn.execute(text(f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.columns
+            WHERE object_id = OBJECT_ID('{_HOLD_SNAPSHOT_TABLE}')
+              AND name = 'RDC'
+        )
+        ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}] ADD [RDC] NVARCHAR(20) NULL
     """))
     conn.execute(text(f"""
         IF OBJECT_ID('{_HOLD_SNAPSHOT_SESSIONS}','U') IS NULL
@@ -1059,10 +1143,10 @@ def snapshot_hold_tracking(session_id: str) -> None:
             # Snapshot all current rows.
             res = conn.execute(text(f"""
                 INSERT INTO [{_HOLD_SNAPSHOT_TABLE}]
-                    (SESSION_ID, WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
+                    (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
                      OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL, HOLD_REM,
                      LAST_UPDATED, IS_CLOSED, CLOSED_DATE)
-                SELECT :sid, WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
+                SELECT :sid, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
                        OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL, HOLD_REM,
                        LAST_UPDATED, IS_CLOSED, CLOSED_DATE
                 FROM [ARS_NL_TBL_HOLD_TRACKING]
@@ -1080,6 +1164,123 @@ def snapshot_hold_tracking(session_id: str) -> None:
             )
     except Exception as e:
         logger.warning(f"[parked_history] hold tracking snapshot failed for {session_id}: {e}")
+
+
+def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
+    """Apply Step A + Step B hold-tracking changes for an approved listing.
+
+    Mirrors the SQL that used to live in listing.py Part 8.6 (during
+    generate), but moved here so the writes happen at APPROVE time —
+    symmetric with PEND_ALC, which is also written on approve. Reads from
+    ARS_ALLOC_HISTORY (post-promotion) filtered by SESSION_ID.
+
+    Step A: RL/TBC alloc rows consumed existing hold → decrement HOLD_REM.
+    Step B: TBL alloc rows created new hold → MERGE (insert / accumulate /
+            re-open) and stamp RDC from the store master.
+
+    Returns: {step_a_rows, step_b_rows, error}.
+    """
+    result: Dict[str, Any] = {"step_a_rows": 0, "step_b_rows": 0, "error": None}
+    try:
+        # STEP A — RL/TBC consumed warehouse hold
+        r_a = conn.execute(text("""
+            ;WITH RunHold AS (
+                SELECT A.[WERKS],
+                       TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
+                       A.[SZ],
+                       SUM(ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0)) AS from_hold_qty
+                FROM [ARS_ALLOC_HISTORY] A
+                WHERE A.[SESSION_ID] = :sid
+                  AND A.[OPT_TYPE] IN ('RL', 'TBC')
+                  AND ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0) > 0
+                GROUP BY A.[WERKS], TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
+            )
+            UPDATE T SET
+                T.[HOLD_REM] = CASE
+                    WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 0
+                    ELSE T.[HOLD_REM] - R.from_hold_qty
+                END,
+                T.[IS_CLOSED] = CASE
+                    WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 1
+                    ELSE 0
+                END,
+                T.[CLOSED_DATE] = CASE
+                    WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN GETDATE()
+                    ELSE NULL
+                END,
+                T.[LAST_UPDATED] = GETDATE()
+            FROM [ARS_NL_TBL_HOLD_TRACKING] T
+            INNER JOIN RunHold R
+                ON  T.[WERKS]   = R.[WERKS]
+                AND T.[VAR_ART] = R.[VAR_ART]
+                AND T.[SZ]      = R.[SZ]
+            WHERE T.[IS_CLOSED] = 0
+        """), {"sid": session_id})
+        result["step_a_rows"] = int(r_a.rowcount or 0)
+
+        # STEP B — TBL created new warehouse hold (with RDC populated from
+        # store master so MSA hold sync can join directly later).
+        r_b = conn.execute(text("""
+            MERGE [ARS_NL_TBL_HOLD_TRACKING] AS T
+            USING (
+                SELECT A.[WERKS], MAX(SM.[RDC]) AS RDC,
+                       A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
+                       TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
+                       A.[SZ],
+                       SUM(ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0)) AS hold_qty
+                FROM [ARS_ALLOC_HISTORY] A
+                LEFT JOIN [Master_ALC_INPUT_ST_MASTER] SM
+                    ON SM.[ST_CD] = A.[WERKS]
+                WHERE A.[SESSION_ID] = :sid
+                  AND A.[OPT_TYPE] = 'TBL'
+                  AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
+                GROUP BY A.[WERKS], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
+                         TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
+            ) AS R
+                ON T.[WERKS]   = R.[WERKS]
+               AND T.[VAR_ART] = R.[VAR_ART]
+               AND T.[SZ]      = R.[SZ]
+            WHEN MATCHED THEN
+                UPDATE SET
+                    T.[RDC] = ISNULL(T.[RDC], R.[RDC]),
+                    T.[HOLD_QTY_INITIAL] = CASE
+                        WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
+                        ELSE T.[HOLD_QTY_INITIAL] + R.hold_qty
+                    END,
+                    T.[HOLD_REM] = CASE
+                        WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
+                        ELSE T.[HOLD_REM] + R.hold_qty
+                    END,
+                    T.[IS_CLOSED]        = 0,
+                    T.[CLOSED_DATE]      = NULL,
+                    T.[LAST_UPDATED]     = GETDATE()
+            WHEN NOT MATCHED THEN
+                INSERT (
+                    [WERKS], [RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
+                    [VAR_ART], [SZ], [OPT_STATUS],
+                    [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM],
+                    [LAST_UPDATED], [IS_CLOSED]
+                )
+                VALUES (
+                    R.[WERKS], R.[RDC], R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
+                    R.[VAR_ART], R.[SZ], 'TBL',
+                    GETDATE(), R.hold_qty, R.hold_qty,
+                    GETDATE(), 0
+                );
+        """), {"sid": session_id})
+        result["step_b_rows"] = int(r_b.rowcount or 0)
+
+        conn.commit()
+        logger.info(
+            f"[hold] hold-tracking applied from history session={session_id}: "
+            f"step_a_rows={result['step_a_rows']} step_b_rows={result['step_b_rows']}"
+        )
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning(f"[hold] _apply_hold_tracking_from_history failed: {e}")
+        try: conn.rollback()
+        except Exception: pass
+    return result
 
 
 def _revert_hold_tracking(conn, session_id: str) -> Dict[str, Any]:
@@ -1114,6 +1315,7 @@ def _revert_hold_tracking(conn, session_id: str) -> Dict[str, Any]:
         # 2. Restore rows that existed before the run to their snapshot values.
         r_upd = conn.execute(text(f"""
             UPDATE T SET
+                T.[RDC]              = S.[RDC],
                 T.[MAJ_CAT]          = S.[MAJ_CAT],
                 T.[GEN_ART_NUMBER]   = S.[GEN_ART_NUMBER],
                 T.[CLR]              = S.[CLR],

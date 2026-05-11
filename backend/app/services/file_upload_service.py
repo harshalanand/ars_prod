@@ -8,6 +8,7 @@ import os
 import uuid
 import time
 import asyncio
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 from io import BytesIO
 
@@ -22,6 +23,33 @@ settings = get_settings()
 # Upload directory
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def cleanup_old_uploads() -> int:
+    """Delete files in UPLOAD_DIR whose mtime is before today's start.
+    Called at the start of every upload so the folder self-empties each new
+    day. Touches the filesystem only — does not query the upload_jobs table."""
+    if not os.path.isdir(UPLOAD_DIR):
+        return 0
+
+    today_start = datetime.combine(datetime.now().date(), datetime.min.time()).timestamp()
+
+    deleted = 0
+    for name in os.listdir(UPLOAD_DIR):
+        path = os.path.join(UPLOAD_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getmtime(path) >= today_start:
+                continue
+            os.remove(path)
+            deleted += 1
+        except Exception as e:
+            logger.warning(f"cleanup_old_uploads: could not delete {name}: {e}")
+
+    if deleted:
+        logger.info(f"cleanup_old_uploads: removed {deleted} stale file(s) from {UPLOAD_DIR}")
+    return deleted
 
 
 class FileUploadService:
@@ -81,6 +109,9 @@ class FileUploadService:
             )
 
         logger.info(f"[{batch_id}] Processing upload: {file_name} ({len(file_content)} bytes) → {table_name}")
+
+        # Sweep stale files from previous days before saving the new one
+        cleanup_old_uploads()
 
         # Save a copy for audit trail
         saved_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{file_name}")
@@ -266,6 +297,9 @@ class FileUploadService:
             )
 
         logger.info(f"[{batch_id}] Processing delete: {file_name} ({len(file_content)} bytes) → {table_name}")
+
+        # Sweep stale files from previous days before saving the new one
+        cleanup_old_uploads()
 
         # Save a copy for audit trail
         saved_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{file_name}")

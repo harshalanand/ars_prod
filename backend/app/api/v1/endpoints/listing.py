@@ -2197,22 +2197,23 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     t0 = _time_step("Part 8.5 (OPT_STATUS + TBL_LISTED_DATE)", t0)
 
     # ── Part 8.6 — NL/TBL hold-tracking table (persistent, WERKS × VAR_ART × SZ) ─
-    # Step A: RL/TBC rows consumed from warehouse hold → decrement HOLD_REM.
-    #         Uses FROM_HOLD_QTY written by the allocation engine.
-    # Step B: TBL rows created new warehouse hold → MERGE (re-open / accumulate / insert).
+    # NOTE: Hold-tracking WRITES (Step A decrement of consumed RL/TBC,
+    # Step B MERGE of new TBL holds) used to happen here during generate.
+    # They've been moved to parked_history.approve_parked so HOLD commits
+    # at the same lifecycle event as PEND_ALC — symmetric, and means a
+    # rejected listing leaves no trace in ARS_NL_TBL_HOLD_TRACKING.
     #
-    # Snapshot the current state BEFORE we modify it so that reject_parked()
-    # can restore ARS_NL_TBL_HOLD_TRACKING to its pre-run values.
-    try:
-        parked_history.snapshot_hold_tracking(session_id)
-    except Exception as _she:
-        logger.warning(f"[generate] hold tracking pre-snapshot failed: {_she}")
+    # What remains in this Part 8.6 block: the DDL guards (CREATE TABLE,
+    # ALTER ADD RDC, indexes, FROM_HOLD_QTY column on alloc table) plus a
+    # one-time RDC backfill from the store master. The actual data writes
+    # are deferred until approve.
     try:
         with de.connect() as ac:
             _run(ac, """
                 IF OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING','U') IS NULL
                 CREATE TABLE [ARS_NL_TBL_HOLD_TRACKING] (
                     [WERKS]           NVARCHAR(50)  NOT NULL,
+                    [RDC]             NVARCHAR(20)  NULL,
                     [MAJ_CAT]         NVARCHAR(200) NULL,
                     [GEN_ART_NUMBER]  BIGINT        NULL,
                     [CLR]             NVARCHAR(200) NULL,
@@ -2229,6 +2230,40 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         PRIMARY KEY CLUSTERED ([WERKS], [VAR_ART], [SZ])
                 )
             """)
+            # Add RDC column if the table predates this change (idempotent).
+            # Storing RDC directly avoids the WERKS→RDC join with the store
+            # master every time MSA needs to reseed HOLD_QTY.
+            try:
+                _run(ac, """
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
+                          AND name = 'RDC'
+                    )
+                    ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING] ADD [RDC] NVARCHAR(20) NULL
+                """)
+            except Exception:
+                pass
+
+            # Backfill RDC on any rows still NULL by joining the store master.
+            # Idempotent — only touches rows where RDC IS NULL.
+            try:
+                _run(ac, """
+                    IF EXISTS (SELECT 1 FROM sys.columns
+                               WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
+                                 AND name = 'RDC')
+                    AND OBJECT_ID('Master_ALC_INPUT_ST_MASTER','U') IS NOT NULL
+                    BEGIN
+                        UPDATE T SET T.[RDC] = S.[RDC]
+                        FROM [ARS_NL_TBL_HOLD_TRACKING] T
+                        INNER JOIN [Master_ALC_INPUT_ST_MASTER] S
+                            ON S.[ST_CD] = T.[WERKS]
+                        WHERE T.[RDC] IS NULL OR T.[RDC] = ''
+                    END
+                """)
+            except Exception:
+                pass
+
             try:
                 _run(ac, """
                     IF NOT EXISTS (SELECT 1 FROM sys.indexes
@@ -2254,90 +2289,14 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
-            # STEP A — RL/TBC consumed from warehouse hold → decrement HOLD_REM.
-            # FROM_HOLD_QTY is set by the allocation engine for RL/TBC rows only.
-            _run(ac, f"""
-                ;WITH RunHold AS (
-                    SELECT A.[WERKS],
-                           TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
-                           A.[SZ],
-                           SUM(ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0)) AS from_hold_qty
-                    FROM [{ALLOC_TABLE}] A
-                    WHERE A.[OPT_TYPE] IN ('RL', 'TBC')
-                      AND ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0) > 0
-                    GROUP BY A.[WERKS], TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
-                )
-                UPDATE T SET
-                    T.[HOLD_REM] = CASE
-                        WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 0
-                        ELSE T.[HOLD_REM] - R.from_hold_qty
-                    END,
-                    T.[IS_CLOSED] = CASE
-                        WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 1
-                        ELSE 0
-                    END,
-                    T.[CLOSED_DATE] = CASE
-                        WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN GETDATE()
-                        ELSE NULL
-                    END,
-                    T.[LAST_UPDATED] = GETDATE()
-                FROM [ARS_NL_TBL_HOLD_TRACKING] T
-                INNER JOIN RunHold R
-                    ON  T.[WERKS]   = R.[WERKS]
-                    AND T.[VAR_ART] = R.[VAR_ART]
-                    AND T.[SZ]      = R.[SZ]
-                WHERE T.[IS_CLOSED] = 0
-            """)
-
-            # STEP B — TBL rows created new warehouse hold → MERGE.
-            # Handles: re-open a closed row, accumulate onto an open row, insert new.
-            # Covers both IS_NEW=0 and IS_NEW=1 (identical TBL hold behaviour).
-            _run(ac, f"""
-                MERGE [ARS_NL_TBL_HOLD_TRACKING] AS T
-                USING (
-                    SELECT A.[WERKS], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
-                           TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
-                           A.[SZ],
-                           SUM(ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0)) AS hold_qty
-                    FROM [{ALLOC_TABLE}] A
-                    WHERE A.[OPT_TYPE] = 'TBL'
-                      AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
-                    GROUP BY A.[WERKS], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
-                             TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
-                ) AS R
-                    ON T.[WERKS]   = R.[WERKS]
-                   AND T.[VAR_ART] = R.[VAR_ART]
-                   AND T.[SZ]      = R.[SZ]
-                WHEN MATCHED THEN
-                    UPDATE SET
-                        T.[HOLD_QTY_INITIAL] = CASE
-                            WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
-                            ELSE T.[HOLD_QTY_INITIAL] + R.hold_qty
-                        END,
-                        T.[HOLD_REM] = CASE
-                            WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
-                            ELSE T.[HOLD_REM] + R.hold_qty
-                        END,
-                        T.[IS_CLOSED]        = 0,
-                        T.[CLOSED_DATE]      = NULL,
-                        T.[LAST_UPDATED]     = GETDATE()
-                WHEN NOT MATCHED THEN
-                    INSERT (
-                        [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
-                        [VAR_ART], [SZ], [OPT_STATUS],
-                        [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM],
-                        [LAST_UPDATED], [IS_CLOSED]
-                    )
-                    VALUES (
-                        R.[WERKS], R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
-                        R.[VAR_ART], R.[SZ], 'TBL',
-                        GETDATE(), R.hold_qty, R.hold_qty,
-                        GETDATE(), 0
-                    );
-            """)
+            # STEP A / STEP B / MSA HOLD sync — REMOVED from generate.
+            # All three are now executed during approve_parked so the HOLD
+            # axis commits at the same point as PEND_ALC (symmetric design,
+            # rejected listings leave no trace in hold tracking).
+            # See parked_history._apply_hold_tracking_from_history.
     except Exception as e:
-        logger.warning(f"NL/TBL hold tracking failed: {e}")
-    t0 = _time_step("Part 8.6 (NL/TBL hold tracking)", t0)
+        logger.warning(f"NL/TBL hold tracking schema setup failed: {e}")
+    t0 = _time_step("Part 8.6 (NL/TBL hold tracking schema)", t0)
 
     duration = round(time.time() - start, 1)
     logger.info(f"ARS_LISTING: {total} rows (grid={grid_count}, new={new_count}) in {duration}s")
