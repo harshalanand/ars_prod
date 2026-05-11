@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Settings, Database, Mail, Palette, Shield, Server, Check, AlertCircle, RefreshCw, Send, Save, HardDrive, Trash2, Download, Play, Users, Cpu, Clock, Table2, Eye, Upload, FileDown, Edit3 } from 'lucide-react'
-import { settingsAPI, tablesAPI } from '@/services/api'
+import { Settings, Database, Mail, Palette, Shield, Server, Check, AlertCircle, AlertTriangle, RefreshCw, Send, Save, HardDrive, Trash2, Download, Play, Users, Cpu, Clock, Table2, Eye, Upload, FileDown, Edit3 } from 'lucide-react'
+import { settingsAPI, tablesAPI, maintenanceAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 
 const tabs = [
@@ -11,6 +11,7 @@ const tabs = [
   { id: 'ui', label: 'UI Preferences', icon: Palette },
   { id: 'backup', label: 'Backup', icon: HardDrive },
   { id: 'system', label: 'System Info', icon: Server },
+  { id: 'danger', label: 'Danger Zone', icon: AlertTriangle },
 ]
 
 export default function SettingsPage() {
@@ -27,6 +28,14 @@ export default function SettingsPage() {
   const [creatingBackup, setCreatingBackup] = useState(false)
   const [backupsLoading, setBackupsLoading] = useState(false)
 
+  // Danger Zone — transactional reset
+  const [resetIncludeMsa, setResetIncludeMsa] = useState(false)
+  const [resetPreview, setResetPreview] = useState(null)
+  const [resetPreviewLoading, setResetPreviewLoading] = useState(false)
+  const [resetRunning, setResetRunning] = useState(false)
+  const [resetConfirmText, setResetConfirmText] = useState('')
+  const [resetReport, setResetReport] = useState(null)
+
   useEffect(() => {
     loadSettings()
     loadSystemInfo()
@@ -36,7 +45,46 @@ export default function SettingsPage() {
     if (activeTab === 'backup') {
       loadBackups()
     }
+    if (activeTab === 'danger') {
+      loadResetPreview(resetIncludeMsa)
+    }
   }, [activeTab])
+
+  const loadResetPreview = async (includeMsa = resetIncludeMsa) => {
+    setResetPreviewLoading(true)
+    try {
+      const { data } = await maintenanceAPI.resetPreview(includeMsa)
+      setResetPreview(data.report || null)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Preview failed')
+      setResetPreview(null)
+    } finally {
+      setResetPreviewLoading(false)
+    }
+  }
+
+  const runTransactionalReset = async () => {
+    if (resetConfirmText !== 'RESET') {
+      toast.error('Type RESET to confirm.')
+      return
+    }
+    setResetRunning(true)
+    setResetReport(null)
+    try {
+      const { data } = await maintenanceAPI.resetTransactionalData(resetIncludeMsa)
+      setResetReport(data.report || null)
+      const t = data.report?.totals
+      toast.success(
+        `Reset complete — cleared ${t?.cleared || 0} table(s), ${t?.rows_deleted?.toLocaleString?.() || 0} rows.`
+      )
+      setResetConfirmText('')
+      loadResetPreview(resetIncludeMsa)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Reset failed')
+    } finally {
+      setResetRunning(false)
+    }
+  }
 
   const loadSettings = async () => {
     setLoading(true)
@@ -884,6 +932,196 @@ export default function SettingsPage() {
                   <RefreshCw size={16} /> Refresh
                 </button>
               </div>
+            </div>
+          )}
+
+          {/* Danger Zone — Transactional Data Reset */}
+          {activeTab === 'danger' && (
+            <div className="card p-6 space-y-6 border-2 border-red-200">
+              <div>
+                <h3 className="font-semibold text-red-700 text-lg flex items-center gap-2">
+                  <AlertTriangle size={20} /> Danger Zone — Reset Transactional Data
+                </h3>
+                <p className="text-sm text-gray-600 mt-2">
+                  Wipes all transactional rows in BOTH databases — uploads, allocation runs,
+                  MSA results, parked / history snapshots, sessions, audit logs.{' '}
+                  <span className="font-medium text-gray-800">
+                    Master tables (RBAC, RLS, retail masters, settings, presets) are preserved.
+                  </span>{' '}
+                  Tables are auto-discovered every run by naming convention, so newly added
+                  transactional tables are picked up automatically.
+                </p>
+              </div>
+
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
+                <strong>How clear works:</strong> TRUNCATE is used where possible (no incoming
+                foreign keys), DELETE is the fallback. Identity columns are reseeded to 0.
+              </div>
+
+              {/* Options */}
+              <div className="space-y-3">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={resetIncludeMsa}
+                    onChange={e => {
+                      setResetIncludeMsa(e.target.checked)
+                      loadResetPreview(e.target.checked)
+                    }}
+                    className="w-4 h-4 mt-0.5 rounded text-red-600"
+                  />
+                  <span className="text-sm">
+                    <span className="font-medium text-gray-900">
+                      Also clear MSA tracking + user schedules
+                    </span>
+                    <span className="block text-gray-500">
+                      Includes <code>MSA_Calculation_Sequence</code>,{' '}
+                      <code>MSA_Column_Definitions</code>, and{' '}
+                      <code>ARS_PEND_ALC_SCHEDULE</code>.
+                    </span>
+                  </span>
+                </label>
+              </div>
+
+              {/* Preview */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-medium text-gray-800 flex items-center gap-2">
+                    <Eye size={16} /> Preview — what would be cleared
+                  </h4>
+                  <button
+                    onClick={() => loadResetPreview(resetIncludeMsa)}
+                    className="btn-secondary text-xs"
+                    disabled={resetPreviewLoading}
+                  >
+                    <RefreshCw size={14} className={resetPreviewLoading ? 'animate-spin' : ''} />
+                    Refresh
+                  </button>
+                </div>
+
+                {resetPreviewLoading && (
+                  <div className="text-sm text-gray-500 py-4 text-center">Loading preview…</div>
+                )}
+
+                {!resetPreviewLoading && resetPreview && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="p-3 bg-red-50 rounded-lg">
+                        <div className="text-xs text-red-700">Tables to clear</div>
+                        <div className="text-2xl font-bold text-red-700">
+                          {resetPreview.totals?.cleared || 0}
+                        </div>
+                      </div>
+                      <div className="p-3 bg-red-50 rounded-lg">
+                        <div className="text-xs text-red-700">Rows to delete</div>
+                        <div className="text-2xl font-bold text-red-700">
+                          {(resetPreview.totals?.rows_deleted || 0).toLocaleString()}
+                        </div>
+                      </div>
+                      <div className="p-3 bg-gray-50 rounded-lg">
+                        <div className="text-xs text-gray-600">Skipped (preserved)</div>
+                        <div className="text-2xl font-bold text-gray-700">
+                          {resetPreview.totals?.skipped || 0}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="max-h-72 overflow-y-auto border rounded-lg">
+                      <table className="w-full text-sm">
+                        <thead className="bg-gray-50 sticky top-0">
+                          <tr className="text-left text-xs text-gray-600 uppercase">
+                            <th className="px-3 py-2">DB</th>
+                            <th className="px-3 py-2">Table</th>
+                            <th className="px-3 py-2">Method</th>
+                            <th className="px-3 py-2 text-right">Rows</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(resetPreview.cleared || []).map((r, i) => (
+                            <tr key={i} className="border-t">
+                              <td className="px-3 py-1.5 text-gray-500">{r.db}</td>
+                              <td className="px-3 py-1.5 font-mono text-xs">{r.table}</td>
+                              <td className="px-3 py-1.5">
+                                <span className={`text-xs font-medium px-2 py-0.5 rounded ${
+                                  r.method?.includes('TRUNCATE') ? 'bg-orange-100 text-orange-800'
+                                  : 'bg-yellow-100 text-yellow-800'
+                                }`}>
+                                  {r.method?.replace('WOULD_', '')}
+                                </span>
+                              </td>
+                              <td className="px-3 py-1.5 text-right font-mono">
+                                {(r.rows_before || 0).toLocaleString()}
+                              </td>
+                            </tr>
+                          ))}
+                          {(resetPreview.cleared || []).length === 0 && (
+                            <tr>
+                              <td colSpan={4} className="px-3 py-6 text-center text-gray-500">
+                                Nothing to clear — already at zero state.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Confirm + Execute */}
+              <div className="border-t pt-4 space-y-3">
+                <label className="block text-sm">
+                  <span className="font-medium text-red-700">
+                    Type <code className="px-1.5 py-0.5 bg-red-100 rounded">RESET</code> to confirm:
+                  </span>
+                  <input
+                    type="text"
+                    value={resetConfirmText}
+                    onChange={e => setResetConfirmText(e.target.value)}
+                    placeholder="RESET"
+                    className="input mt-2 w-full max-w-xs font-mono"
+                    disabled={resetRunning}
+                  />
+                </label>
+
+                <button
+                  onClick={runTransactionalReset}
+                  disabled={
+                    resetRunning ||
+                    resetConfirmText !== 'RESET' ||
+                    !(resetPreview?.totals?.cleared)
+                  }
+                  className="px-5 py-2.5 rounded-lg bg-red-600 text-white font-medium
+                             hover:bg-red-700 disabled:bg-gray-300 disabled:cursor-not-allowed
+                             flex items-center gap-2"
+                >
+                  {resetRunning ? <RefreshCw size={16} className="animate-spin" /> : <Trash2 size={16} />}
+                  {resetRunning ? 'Resetting…' : 'Wipe Transactional Data'}
+                </button>
+              </div>
+
+              {/* Last run report */}
+              {resetReport && (
+                <div className="border-t pt-4">
+                  <h4 className="font-medium text-gray-800 mb-2 flex items-center gap-2">
+                    <Check size={16} className="text-green-600" /> Last reset
+                  </h4>
+                  <div className="text-sm space-y-1 text-gray-700">
+                    <div>Cleared: <strong>{resetReport.totals?.cleared}</strong> table(s)</div>
+                    <div>Rows deleted: <strong>{(resetReport.totals?.rows_deleted || 0).toLocaleString()}</strong></div>
+                    <div>Errors: <strong className={resetReport.totals?.errors ? 'text-red-700' : ''}>
+                      {resetReport.totals?.errors || 0}
+                    </strong></div>
+                  </div>
+                  {resetReport.errors?.length > 0 && (
+                    <div className="mt-2 p-3 bg-red-50 rounded text-xs text-red-800 space-y-1">
+                      {resetReport.errors.map((e, i) => (
+                        <div key={i}><strong>{e.table}:</strong> {e.error}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

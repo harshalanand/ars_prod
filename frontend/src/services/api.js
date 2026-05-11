@@ -491,6 +491,14 @@ export const maintenanceAPI = {
   dbSetLogMaxsize:   (db, maxMb)                => api.post(`/maintenance/db/${encodeURIComponent(db)}/set-log-maxsize`, null, { params: { max_mb: maxMb } }),
   diskSpace:         ()                         => api.get('/maintenance/disk'),
   reclaimAll:        ()                         => api.post('/maintenance/reclaim-all', null, { timeout: 900000 }),
+
+  // Transactional-data reset (Settings → Danger Zone)
+  resetPreview:      (includeMsaTracking=false) =>
+    api.get('/maintenance/reset/preview', { params: { include_msa_tracking: includeMsaTracking } }),
+  resetTransactionalData: (includeMsaTracking=false) =>
+    api.post('/maintenance/reset/transactional-data',
+      { confirm: 'RESET', include_msa_tracking: includeMsaTracking },
+      { timeout: 900000 }),
 }
 
 // ============== Reports ==============
@@ -533,7 +541,14 @@ export const pendAlcAPI = {
                                     { params, responseType: 'blob', timeout: 120000,
                                       paramsSerializer: { indexes: null } }),
   bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
-  manualUpload:(rows)           => api.post('/pend-alc/manual-upload', { rows }),
+  manualUpload:(payload)        => api.post('/pend-alc/manual-upload',
+    // Accept either a raw rows array (legacy callers) or the full request
+    // body { rows, session_id, is_first_chunk, is_last_chunk } (new callers).
+    Array.isArray(payload) ? { rows: payload } : payload,
+    // The last chunk runs the deferred MSA+grid delta which can take 30-60
+    // seconds on big uploads, so allow up to 5 minutes per request before we
+    // bail. Avoids indefinite hangs while still catching truly stuck calls.
+    { timeout: 5 * 60 * 1000, quiet: true }),
   reco:        (params = {})    => api.get('/pend-alc/reco', { params }),
   recoSummary: ()               => api.get('/pend-alc/reco-summary'),
 

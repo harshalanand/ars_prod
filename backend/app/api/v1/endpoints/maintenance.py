@@ -6,10 +6,12 @@ reclaim, trend history, and session diagnostics.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
+from pydantic import BaseModel
 
 from app.core.config import get_settings
 from app.security.dependencies import get_current_user
 from app.services.tempdb_cleanup_service import tempdb_cleaner
+from app.services.reset_service import reset_transactional_data
 from app.database.session import get_data_engine
 
 settings = get_settings()
@@ -950,3 +952,67 @@ def reclaim_all(_user=Depends(_require_superadmin)):
                 shrink_fairy.invalidate()
             except Exception:
                 pass
+
+
+# =============================================================================
+# Transactional-data reset (Settings → Danger Zone)
+# =============================================================================
+# Wipes every transactional table — uploads, allocation runs, MSA results,
+# parked / history snapshots, audit logs — and leaves masters, RBAC, RLS, and
+# config alone. Auto-discovers new tables by naming convention on every run.
+# =============================================================================
+
+class ResetRequest(BaseModel):
+    confirm: str                              # must equal "RESET"
+    include_msa_tracking: bool = False        # also clear MSA seq audit + schedules
+
+
+@router.get("/reset/preview", summary="Preview what a transactional reset would clear")
+def preview_transactional_reset(
+    include_msa_tracking: bool = Query(False),
+    _user=Depends(_require_superadmin),
+):
+    """Dry-run: returns the table list + row counts that WOULD be cleared.
+    Use this to populate a confirmation dialog in the Settings UI."""
+    try:
+        report = reset_transactional_data(
+            dry_run=True, include_msa_tracking=include_msa_tracking,
+        )
+        return {"success": True, "report": report.to_dict()}
+    except Exception as exc:
+        logger.error(f"reset preview failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/reset/transactional-data", summary="Wipe all transactional data")
+def execute_transactional_reset(
+    body: ResetRequest,
+    user=Depends(_require_superadmin),
+):
+    """
+    DESTRUCTIVE. Clears every transactional table in BOTH databases.
+    Master / RBAC / RLS / config tables are preserved.
+
+    Caller must POST `{"confirm": "RESET"}`. Optional
+    `include_msa_tracking=true` additionally clears the MSA sequence audit
+    and user-defined ARS_PEND_ALC_SCHEDULE rows.
+
+    TRUNCATE is used where possible (no incoming FKs); otherwise DELETE.
+    """
+    if body.confirm != "RESET":
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmation token must be the literal string 'RESET'.",
+        )
+    logger.warning(
+        f"TRANSACTIONAL RESET triggered by {getattr(user, 'username', '?')} "
+        f"(include_msa_tracking={body.include_msa_tracking})"
+    )
+    try:
+        report = reset_transactional_data(
+            dry_run=False, include_msa_tracking=body.include_msa_tracking,
+        )
+        return {"success": True, "report": report.to_dict()}
+    except Exception as exc:
+        logger.error(f"transactional reset failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
