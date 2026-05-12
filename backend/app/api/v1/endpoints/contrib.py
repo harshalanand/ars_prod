@@ -51,7 +51,7 @@ MAPPING_TABLE      = "Cont_mappings"
 ASSIGNMENT_TABLE   = "Cont_mapping_assignments"
 JOB_TABLE          = "Cont_jobs"
 NUMERIC_SQL_TYPES  = {'int','bigint','smallint','tinyint','numeric','decimal','float','real','money','smallmoney'}
-VALID_GROUPING     = ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB')
+VALID_GROUPING     = ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02')
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -263,7 +263,7 @@ def get_grouping_columns(current_user: User = Depends(get_current_user)):
             rows = c.execute(text("""
                 SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_NAME='VW_MASTER_PRODUCT' AND TABLE_SCHEMA='dbo'
-                AND COLUMN_NAME IN ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB')
+                AND COLUMN_NAME IN ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02')
                 ORDER BY ORDINAL_POSITION
             """)).fetchall()
         cols = [r[0] for r in rows] or ['MACRO_MVGR']

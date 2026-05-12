@@ -21,6 +21,8 @@ reproduces SQL ROW_NUMBER() tie-breaking on (OPT_PRIORITY_RANK, ST_RANK).
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +32,7 @@ import pandas as pd
 from loguru import logger
 from sqlalchemy import text
 
+from app.core.config import get_settings
 from app.database.session import get_data_engine
 from app.services import alloc_cancellation as ac
 from app.services import rule_engine_new as rne
@@ -82,11 +85,27 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     Pickleable contract: every argument and the return value must be
     picklable so the pool can ship them across the process boundary.
     DataFrames are picklable; the slices we pass are typically a few MB.
+
+    When `defer_writes=True` (15th tuple element), the worker skips the
+    write-back + mark_done step and instead returns the computed DataFrames
+    so the parent's dedicated writer thread can apply them serially.
+    Eliminates 8-way writer-writer deadlocks on ARS_ALLOC_WORKING /
+    ARS_LISTING_WORKING. See USE_WRITER_QUEUE flag.
     """
-    (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
-     pri_ct_check_rl, pri_ct_check_tbc,
-     rl_mbq_cap_pct, tbc_mbq_cap_pct,
-     size_threshold, min_size_count, opt_types) = args
+    # Backwards-compat unpack: defer_writes is optional (tuple may be 14 or 15
+    # long). Older callers pass 14 elements; the new writer-queue path passes
+    # 15 with defer_writes as the trailing flag.
+    if len(args) == 15:
+        (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
+         pri_ct_check_rl, pri_ct_check_tbc,
+         rl_mbq_cap_pct, tbc_mbq_cap_pct,
+         size_threshold, min_size_count, opt_types, defer_writes) = args
+    else:
+        (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
+         pri_ct_check_rl, pri_ct_check_tbc,
+         rl_mbq_cap_pct, tbc_mbq_cap_pct,
+         size_threshold, min_size_count, opt_types) = args
+        defer_writes = False
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
@@ -162,6 +181,26 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
         hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
         rows_mc = int(len(a_out))
 
+        # ── Writer-queue path: skip per-worker DB writes and hand results
+        # back to the parent's single-writer thread. The parent serialises
+        # all UPDATEs through one DB connection → zero writer-writer
+        # contention. mark_done is deferred to the writer too, so the row
+        # stays IN_PROGRESS in the queue until the bytes are actually in DB.
+        if defer_writes:
+            dur = time.time() - t_mc
+            return {
+                "mc":        mc,
+                "a_out":     a_out,
+                "w_out":     w_out,
+                "ship":      ship_mc,
+                "hold":      hold_mc,
+                "rows":      rows_mc,
+                "dur":       dur,
+                "wb_secs":   0.0,
+                "deferred":  True,
+                "deadlocks": DeadlockStats.snapshot(),
+            }
+
         # Live write-back for THIS MAJ_CAT — disjoint slices, safe to run
         # concurrently across processes (different rows in alloc/working).
         # Wrapped in retry_on_deadlock: even with ROWLOCK/UPDLOCK hints,
@@ -229,6 +268,107 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Writer thread — drains computed MAJ_CAT results and applies them serially.
+# Used only when USE_WRITER_QUEUE is True. One thread, one DB connection,
+# ONE writer in the whole pipeline → zero writer-writer deadlocks possible.
+# ---------------------------------------------------------------------------
+_WRITER_SENTINEL = object()  # singleton signal to shut down the writer
+
+
+def _writer_thread_fn(
+    result_queue: "queue.Queue",
+    alloc_table: str,
+    working_table: str,
+    grids: Dict,
+    batch_id: str,
+    stats: Dict,
+) -> None:
+    """Drain `result_queue`, write each MAJ_CAT's DataFrames sequentially,
+    then mark_done. On a write failure (rare with single-writer), call
+    mark_failed so the operator can retry just that MAJ_CAT.
+
+    `stats` is a shared dict the parent populates with running totals
+    (deadlocks, wb_total_secs) — written here, read by the parent at end."""
+    eng = get_data_engine()
+    while True:
+        item = result_queue.get()
+        try:
+            if item is _WRITER_SENTINEL:
+                return
+            mc       = item["mc"]
+            a_out    = item["a_out"]
+            w_out    = item["w_out"]
+            ship_mc  = item["ship"]
+            hold_mc  = item["hold"]
+            rows_mc  = item["rows"]
+            t_wb     = time.time()
+            wb_done  = False
+            try:
+                retry_on_deadlock(
+                    lambda: _write_back_alloc(eng, alloc_table, a_out),
+                    label=f"writer_alloc[{mc}]",
+                )
+                if not w_out.empty:
+                    retry_on_deadlock(
+                        lambda: _write_back_working(eng, working_table, w_out, grids),
+                        label=f"writer_working[{mc}]",
+                    )
+                wb_done = True
+                wb_secs = time.time() - t_wb
+                stats["wb_total_secs"] = stats.get("wb_total_secs", 0.0) + wb_secs
+
+                # Total per-MAJ_CAT duration = compute (in worker) + write-back.
+                total_dur = float(item.get("dur", 0.0)) + wb_secs
+                with eng.connect() as upd:
+                    mark_done(upd, batch_id, mc, ship_mc, hold_mc, rows_mc, total_dur)
+
+                # Aggregate deadlock telemetry the worker captured before
+                # handing off — keeps the end-of-run summary line accurate.
+                dl = item.get("deadlocks") or {}
+                stats["dl_caught"]    = stats.get("dl_caught", 0)    + int(dl.get("caught", 0))
+                stats["dl_succeeded"] = stats.get("dl_succeeded", 0) + int(dl.get("succeeded", 0))
+                stats["dl_exhausted"] = stats.get("dl_exhausted", 0) + int(dl.get("exhausted", 0))
+
+                # Live progress log — mirrors the inline path's log shape so
+                # operators can grep [C-pd-pool] regardless of mode.
+                try:
+                    with eng.connect() as conn:
+                        prog = get_progress(conn, batch_id)
+                    prog_str = f"{prog['done']}/{prog['total']} ({prog['pct']}%)"
+                except Exception:
+                    prog_str = "?"
+                logger.info(
+                    f"[C-pd-writer] {prog_str} — MAJ_CAT={mc} "
+                    f"ship={ship_mc:.0f} hold={hold_mc:.0f} "
+                    f"rows={rows_mc} in {total_dur:.1f}s (wb={wb_secs:.1f}s)"
+                )
+            except Exception as e:
+                err = str(e)[:2000]
+                wb_secs = time.time() - t_wb
+                if not wb_done:
+                    try:
+                        with eng.connect() as upd:
+                            mark_failed(upd, batch_id, mc, err, wb_secs)
+                    except Exception as me:
+                        logger.error(
+                            f"[C-pd-writer] mark_failed itself failed for "
+                            f"MAJ_CAT={mc}: {me}"
+                        )
+                    stats.setdefault("errors", []).append({"maj_cat": mc, "error": err})
+                    logger.error(
+                        f"[C-pd-writer] MAJ_CAT={mc} write-back FAILED "
+                        f"in {wb_secs:.1f}s: {err}"
+                    )
+                else:
+                    logger.warning(
+                        f"[C-pd-writer] MAJ_CAT={mc}: post-write exception "
+                        f"({err}); data already committed — NOT marking FAILED"
+                    )
+        finally:
+            result_queue.task_done()
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 def run_listing_and_allocation_pandas(
@@ -249,6 +389,7 @@ def run_listing_and_allocation_pandas(
     rl_mbq_cap_pct:  float = 0.0,
     tbc_mbq_cap_pct: float = 0.0,
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only
+    use_writer_queue: Optional[bool] = None, # per-run override; None = fall back to .env
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -371,6 +512,12 @@ def run_listing_and_allocation_pandas(
     dl_exhausted = 0
 
     _active_types = [ot for ot in OPT_TYPE_ORDER if not opt_types or ot in opt_types]
+    # Per-run override beats .env default. UI passes True/False; CLI/retry
+    # callers may omit it, in which case we fall back to settings.
+    if use_writer_queue is None:
+        use_writer_queue = bool(get_settings().USE_WRITER_QUEUE)
+    else:
+        use_writer_queue = bool(use_writer_queue)
     pool_args = [
         (
             mc,
@@ -387,11 +534,40 @@ def run_listing_and_allocation_pandas(
             float(size_threshold),
             int(min_size_count),
             list(_active_types),
+            # 15th element — defer_writes flag. When True the subprocess
+            # returns the computed DataFrames instead of writing them
+            # itself; the parent's writer thread (Pattern A) does all DB
+            # UPDATEs sequentially. Backwards-compatible: legacy 14-tuple
+            # callers still work (defer_writes defaults to False).
+            bool(use_writer_queue),
         )
         for mc in alloc_groups
     ]
 
     use_pool = (len(pool_args) >= PROCESS_POOL_MIN_MAJCATS and n_workers > 1)
+
+    # Writer-queue setup — only when both the flag is on AND we're using the
+    # process pool (single-MAJ_CAT inline runs don't have a contention
+    # problem and need no writer thread).
+    writer_thread = None
+    writer_queue: Optional["queue.Queue"] = None
+    writer_stats: Dict[str, Any] = {}
+    if use_pool and use_writer_queue:
+        logger.info(
+            f"[C-pd] USE_WRITER_QUEUE=ON → routing writes through "
+            f"dedicated single-writer thread (zero writer-writer contention)"
+        )
+        # maxsize bounds memory if workers outpace the writer. Each pickle
+        # is ~5 MB; cap depth at 2× worker count → ≤80 MB peak in worst case.
+        writer_queue = queue.Queue(maxsize=max(4, n_workers * 2))
+        writer_thread = threading.Thread(
+            target=_writer_thread_fn,
+            args=(writer_queue, alloc_table, working_table, grids,
+                  batch_id, writer_stats),
+            name=f"pd-writer-{batch_id}",
+            daemon=True,
+        )
+        writer_thread.start()
 
     if use_pool:
         logger.info(
@@ -427,6 +603,13 @@ def run_listing_and_allocation_pandas(
                         f"[C-pd-pool] MAJ_CAT={mc} FAILED in {r.get('dur', 0):.1f}s: "
                         f"{r['error']}"
                     )
+                elif r.get("deferred"):
+                    # Writer-queue path: hand the computed DataFrames to the
+                    # single writer thread. mark_done / progress logging /
+                    # error handling all happen there (see _writer_thread_fn).
+                    # Blocks briefly if the writer is behind — that's the
+                    # backpressure mechanism keeping queue depth bounded.
+                    writer_queue.put(r)
                 else:
                     wb_total_secs += float(r.get("wb_secs", 0.0))
                     # Cheap progress query — one row from the queue table.
@@ -442,6 +625,31 @@ def run_listing_and_allocation_pandas(
                         f"rows={r.get('rows', 0)} in {r.get('dur', 0):.1f}s "
                         f"(wb={r.get('wb_secs', 0):.1f}s)"
                     )
+
+        # All workers finished. If we were using the writer thread, signal
+        # it to drain remaining items and shut down, then merge its stats
+        # back into the run summary.
+        if writer_thread is not None and writer_queue is not None:
+            logger.info(
+                f"[C-pd] all workers done; waiting for writer thread to drain"
+            )
+            writer_queue.put(_WRITER_SENTINEL)
+            writer_thread.join(timeout=600)  # 10 min safety cap
+            if writer_thread.is_alive():
+                logger.error(
+                    f"[C-pd] writer thread did not finish in 10min — "
+                    f"backend should be restarted; some MAJ_CATs may remain "
+                    f"IN_PROGRESS in the queue"
+                )
+            else:
+                logger.info(f"[C-pd] writer thread drained cleanly")
+            # Merge writer stats back into the run aggregates
+            wb_total_secs += float(writer_stats.get("wb_total_secs", 0.0))
+            dl_caught     += int(writer_stats.get("dl_caught", 0))
+            dl_succeeded  += int(writer_stats.get("dl_succeeded", 0))
+            dl_exhausted  += int(writer_stats.get("dl_exhausted", 0))
+            for err in writer_stats.get("errors", []):
+                result["errors"].append(err)
     else:
         # Inline fallback: tiny inputs (or n_workers=1) skip subprocess overhead.
         logger.info(
@@ -1813,6 +2021,7 @@ def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
              AND T.GEN_ART_NUMBER = S.GEN_ART_NUMBER
              AND ISNULL(T.CLR,'')   = ISNULL(S.CLR,'')
              AND T.VAR_ART = S.VAR_ART AND T.SZ = S.SZ
+            OPTION (MAXDOP 1)
         """)
         cur.execute(f"DROP TABLE {tmp}")
         raw.commit()
@@ -1889,6 +2098,7 @@ def _write_back_working(engine, working_table: str, df: pd.DataFrame,
              AND T.MAJ_CAT = S.MAJ_CAT
              AND T.GEN_ART_NUMBER = S.GEN_ART_NUMBER
              AND ISNULL(T.CLR,'') = ISNULL(S.CLR,'')
+            OPTION (MAXDOP 1)
         """)
         cur.execute(f"DROP TABLE {tmp}")
         raw.commit()
