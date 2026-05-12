@@ -17,6 +17,10 @@ env/
 .env.local
 .env.production
 
+# Runtime settings (contains DB/SMTP credentials — never commit)
+app_settings.json
+backend/app_settings.json
+
 # IDE
 .vscode/
 .idea/

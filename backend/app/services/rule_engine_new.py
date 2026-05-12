@@ -329,48 +329,35 @@ def _stage_a_assign_tier(conn, working_table):
 
 def _stage_a_assign_rank(conn, working_table):
     """
-    Per-(store, opt_type) rank. Each store gets its own 1..N priority list
-    inside each opt_type bucket (RL, TBC, TBL). NOT a global rank — store
-    HB05's rank=1 is independent of HB07's rank=1; they tie at the pool
-    and the waterfall's WERKS tie-break decides who ships first.
+    Per-(store, opt_type, majcat) rank. Each (WERKS, OPT_TYPE, MAJ_CAT)
+    bucket gets its own 1..N priority list. NOT a global rank.
 
-    Within each (WERKS, OPT_TYPE) partition:
+    Within each (WERKS, OPT_TYPE, MAJ_CAT) partition:
         OPT_PRIORITY_TIER (1=focus-uncapped, 2=focus-capped, 3=regular) ASC,
-        SIZE_RATIO DESC,      (VAR_FNL_COUNT/VAR_COUNT — more complete size coverage first)
         SEC_CT% DESC,         (higher contribution % first)
         MAX_DAILY_SALE DESC,  (higher sales velocity first)
         OPT_REQ_WH DESC,      (more required first)
 
-    ST_RANK is NOT used here — it's a store-level rank, constant within a
-    single (WERKS, OPT_TYPE) partition, so it can't influence the order.
+    SIZE_RATIO is an eligibility gate (R07 in _stage_a_apply_rules), not a
+    ranking key — rows below threshold already have LISTED_FLAG=0 and are
+    filtered out of the CTE below.
+
+    No identity tie-breakers: rows tying on every sort column may swap
+    ranks across reruns. Acceptable per business rules.
     """
     _run(conn, f"""
-        ;WITH Base AS (
-            SELECT *,
-                CASE WHEN ISNULL([VAR_COUNT], 0) = 0 THEN 0
-                     ELSE CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT]
-                END AS SIZE_RATIO
-            FROM [{working_table}]
-            WHERE LISTED_FLAG = 1
-        ),
-        R AS (
+        ;WITH R AS (
             SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
                    ROW_NUMBER() OVER (
-                       PARTITION BY [WERKS], ISNULL([OPT_TYPE],'')
+                       PARTITION BY [WERKS], ISNULL([OPT_TYPE],''), [MAJ_CAT]
                        ORDER BY
                          ISNULL([OPT_PRIORITY_TIER], 3)            ASC,
-                         ISNULL([SIZE_RATIO], 0)                    DESC,
                          ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0)   DESC,
                          ISNULL([MAX_DAILY_SALE], 0)               DESC,
-                         ISNULL([OPT_REQ_WH], 0)                   DESC,
-                         -- Deterministic tie-breakers: identity columns so two
-                         -- OPTs that tie on all priority columns still get a
-                         -- reproducible rank across runs.
-                         [MAJ_CAT]                                  ASC,
-                         [GEN_ART_NUMBER]                           ASC,
-                         ISNULL([CLR], '')                          ASC
+                         ISNULL([OPT_REQ_WH], 0)                   DESC
                    ) AS rk
-            FROM Base
+            FROM [{working_table}]
+            WHERE LISTED_FLAG = 1
         )
         UPDATE W SET W.OPT_PRIORITY_RANK = R.rk
         FROM [{working_table}] W
@@ -394,9 +381,11 @@ def _rerank_for_next_opt_type(
     Step 1 — SKIP: any (WERKS, GEN_ART_NUMBER, CLR) where
         live_SIZE_RATIO < size_threshold AND live_VAR_FNL_COUNT < min_size_count
     is marked ALLOC_STATUS='SKIPPED', SKIP_REASON='R07_SIZE_RATIO_LIVE'.
+    This is the eligibility gate — SIZE_RATIO is validation only.
 
     Step 2 — RERANK: surviving rows get fresh OPT_PRIORITY_RANK using the
-    same ORDER BY as _stage_a_assign_rank but with live SIZE_RATIO.
+    same ORDER BY as _stage_a_assign_rank (tier → SEC_CT% → MAX_DAILY_SALE
+    → OPT_REQ_WH) partitioned by (WERKS, MAJ_CAT). No identity tie-breakers.
 
     Called once per OPT_TYPE boundary (after RL → before TBC,
     after TBC → before TBL). Only rows with ALLOC_STATUS IS NULL are affected.
@@ -444,48 +433,24 @@ def _rerank_for_next_opt_type(
           AND A.[ALLOC_STATUS] IS NULL
     """, params=params)
 
-    # Step 2: re-rank survivors using live SIZE_RATIO.
+    # Step 2: re-rank survivors. SIZE_RATIO already gated the row set in
+    # Step 1 above; ranking uses business keys only, mirroring
+    # _stage_a_assign_rank. Partition by (WERKS, MAJ_CAT) — OPT_TYPE is
+    # already pinned to :next_ot by the WHERE clause.
     _run(conn, f"""
-        ;WITH PoolState AS (
-            SELECT [GEN_ART_NUMBER], [CLR], [VAR_ART],
-                   COUNT(*) AS VAR_COUNT_LIVE,
-                   SUM(CASE WHEN ISNULL([FNL_Q_REM], 0) > 0 THEN 1 ELSE 0 END) AS VAR_FNL_LIVE
-            FROM [{alloc_table}]
-            WHERE [OPT_TYPE] = :next_ot
-            GROUP BY [GEN_ART_NUMBER], [CLR], [VAR_ART]
-        ),
-        Base AS (
-            SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
-                   A.[OPT_PRIORITY_TIER],
-                   CASE WHEN ISNULL(P.VAR_COUNT_LIVE, 0) = 0 THEN 0
-                        ELSE CAST(ISNULL(P.VAR_FNL_LIVE, 0) AS FLOAT) / P.VAR_COUNT_LIVE
-                   END AS SIZE_RATIO,
-                   A.[SEC_CT%], A.[MAX_DAILY_SALE], A.[OPT_REQ_WH]
-            FROM [{alloc_table}] A
-            LEFT JOIN PoolState P
-                ON A.GEN_ART_NUMBER = P.GEN_ART_NUMBER
-               AND ISNULL(A.CLR,'') = ISNULL(P.CLR,'')
-               AND A.VAR_ART = P.VAR_ART
-            WHERE A.[OPT_TYPE] = :next_ot
-              AND A.[ALLOC_STATUS] IS NULL
-        ),
-        R AS (
+        ;WITH R AS (
             SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
                    ROW_NUMBER() OVER (
-                       PARTITION BY [WERKS]
+                       PARTITION BY [WERKS], [MAJ_CAT]
                        ORDER BY
                          ISNULL([OPT_PRIORITY_TIER], 3)           ASC,
-                         ISNULL([SIZE_RATIO], 0)                   DESC,
                          ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0)  DESC,
                          ISNULL([MAX_DAILY_SALE], 0)              DESC,
-                         ISNULL([OPT_REQ_WH], 0)                  DESC,
-                         -- Deterministic tie-breakers — identity columns
-                         -- guarantee a reproducible rank across runs.
-                         [MAJ_CAT]                                ASC,
-                         [GEN_ART_NUMBER]                         ASC,
-                         ISNULL([CLR], '')                        ASC
+                         ISNULL([OPT_REQ_WH], 0)                  DESC
                    ) AS rk
-            FROM Base
+            FROM [{alloc_table}]
+            WHERE [OPT_TYPE] = :next_ot
+              AND [ALLOC_STATUS] IS NULL
         )
         UPDATE A SET A.[OPT_PRIORITY_RANK] = R.rk
         FROM [{alloc_table}] A

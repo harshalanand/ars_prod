@@ -610,6 +610,10 @@ export default function ListingPage() {
   // Stage C ~30 min instead of ~20 min, but near-zero deadlocks. Power
   // users on bigger SQL SKUs can still bump to 8 manually.
   const [parallelWorkers, setParallelWorkers] = useState(4)               // 2..8
+  // Writer-queue mode (Pattern A): routes all DB writes through ONE thread
+  // to eliminate the 4–8 worker deadlocks. null = use backend .env default;
+  // true/false = per-run override from this toggle.
+  const [useWriterQueue, setUseWriterQueue] = useState(true)
   const [allocBatchId, setAllocBatchId] = useState(null)
   const [allocProgress, setAllocProgress] = useState(null)
   const [allocFailed, setAllocFailed] = useState([])
@@ -938,6 +942,7 @@ export default function ListingPage() {
         tbc_mbq_cap_pct: parseFloat(tbcMbqCapPct) || 110,
         allocation_mode: allocationMode,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
+        use_writer_queue: useWriterQueue,
         ssn_values: selectedSsn,
         opt_types: ({ all: ['RL','TBC','TBL'], rl: ['RL'], rl_tbc: ['RL','TBC'] })[allocOtFilter] || ['RL','TBC','TBL'],
       }
@@ -1547,6 +1552,29 @@ export default function ListingPage() {
                       style={{ width: 48, height: 26, fontSize: 11,
                         border: `1px solid ${C.cardBorder}`, borderRadius: 6,
                         padding: '0 6px', textAlign: 'center' }}/>
+                    {/* Writer-queue toggle (Pattern A) — routes all DB writes
+                        through one thread to eliminate worker-worker deadlocks.
+                        Recommended ON for 4+ workers. */}
+                    <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
+                      textTransform: 'uppercase', letterSpacing: 0.4, marginLeft: 4 }}
+                      title="Routes all DB writes through a single thread to prevent the &quot;deadlocked on lock | generic waitable object&quot; failures. Recommended ON for 4+ workers. OFF reverts to the legacy direct-write path.">
+                      Writer-Q
+                    </span>
+                    <button type="button"
+                      onClick={() => setUseWriterQueue(v => !v)}
+                      title={useWriterQueue
+                        ? 'ON — single-writer mode (no deadlocks). Click to switch off.'
+                        : 'OFF — legacy mode (workers write directly, risk of deadlocks). Click to switch on.'}
+                      style={{ height: 26, padding: '0 10px', fontSize: 10, fontWeight: 700,
+                        borderRadius: 5, cursor: 'pointer',
+                        border: `1.5px solid ${useWriterQueue ? '#059669' : C.cardBorder}`,
+                        background: useWriterQueue ? '#d1fae5' : '#fff',
+                        color: useWriterQueue ? '#065f46' : C.textSub,
+                        display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ width: 6, height: 6, borderRadius: '50%',
+                        background: useWriterQueue ? '#059669' : '#cbd5e1' }}/>
+                      {useWriterQueue ? 'ON' : 'OFF'}
+                    </button>
                   </>
                 )}
               </div>
