@@ -139,6 +139,14 @@ class Settings(BaseSettings):
     GRID_INSERT_CHUNK_SIZE: int = 250000     # rows per INSERT batch within a grid
     GRID_LOG_FULL_RETRY_DELAY_SEC: int = 60  # wait before retrying after 9002
     GRID_LOG_FULL_RETRY_COUNT: int = 1       # one retry, then surface error
+
+    # Pandas listing engine — single-writer-queue pattern.
+    # When True, worker processes return computed DataFrames to the parent;
+    # ONE dedicated writer thread in the parent drains a queue and does all
+    # DB UPDATEs to ARS_ALLOC_WORKING / ARS_LISTING_WORKING. Eliminates
+    # writer-writer deadlocks (Pattern A from the listing concurrency review).
+    # Default OFF — flip to True via .env after RCSI is confirmed enabled.
+    USE_WRITER_QUEUE: bool = False
     USE_BLOB_STORAGE: bool = False           # True in production (Azure Blob)
     AZURE_STORAGE_CONNECTION_STRING: str = ""
     AZURE_STORAGE_CONTAINER: str = "ars-files"

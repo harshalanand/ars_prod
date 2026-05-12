@@ -110,6 +110,10 @@ class GenerateRequest(BaseModel):
     # Allocation mode. pandas = multi-process per MAJ_CAT (fast). sequential = single-thread fallback.
     allocation_mode:  str = "pandas"  # "sequential" | "pandas"
     parallel_workers: int = 8        # used only by pandas mode
+    # Per-run override for the single-writer-queue path. None → use .env default
+    # (settings.USE_WRITER_QUEUE). True/False → force on/off for this run only.
+    # Pandas mode only — sequential mode has no writers to coordinate.
+    use_writer_queue: Optional[bool] = None
     # Source tables:
     msa_table: str = "ARS_MSA_GEN_ART"
     grid_table: str = "ARS_GRID_MJ_GEN_ART"
@@ -2085,6 +2089,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 rl_mbq_cap_pct=req.rl_mbq_cap_pct,
                 tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
                 opt_types=req.opt_types or ["RL", "TBC", "TBL"],
+                use_writer_queue=req.use_writer_queue,
             )
         else:  # "sequential" — single-thread fallback
             from app.services.rule_engine_new import run_listing_and_allocation
