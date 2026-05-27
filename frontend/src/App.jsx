@@ -32,6 +32,7 @@ const JobsDashboardPage      = lazy(() => import('@/pages/JobsDashboardPage'))
 const BDCCreationPage        = lazy(() => import('@/pages/BDCCreationPage'))
 const StoreStockPage         = lazy(() => import('@/pages/StoreStockPage'))
 const GridBuilderPage        = lazy(() => import('@/pages/GridBuilderPage'))
+const MergeRulesPage         = lazy(() => import('@/pages/MergeRulesPage'))
 const LookupArtMasterPage    = lazy(() => import('@/pages/LookupArtMasterPage'))
 const ListingPage            = lazy(() => import('@/pages/ListingPage'))
 const ListingLogsPage        = lazy(() => import('@/pages/ListingLogsPage'))
@@ -44,6 +45,7 @@ const ScheduleAuditPage          = lazy(() => import('@/pages/ScheduleAuditPage'
 const PendAlcOperationsPage      = lazy(() => import('@/pages/PendAlcOperationsPage'))
 const ManualPendAlcPage          = lazy(() => import('@/pages/ManualPendAlcPage'))
 const HoldDashboardPage      = lazy(() => import('@/pages/HoldDashboardPage'))
+const ArsDashboardPage       = lazy(() => import('@/pages/ArsDashboardPage'))
 const ChecklistPage          = lazy(() => import('@/pages/ChecklistPage'))
 const TrendUploadPage        = lazy(() => import('@/pages/TrendUploadPage'))
 const TrendReviewPage        = lazy(() => import('@/pages/TrendReviewPage'))
@@ -114,6 +116,8 @@ export default function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route index element={<DashboardPage />} />
+        {/* ARS Dashboard — unified allocation analytics (Overview/Drill/Date/Hold/Pending/Gap) */}
+        <Route path="ars-dashboard" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><ArsDashboardPage /></ErrorBoundary></ProtectedRoute>} />
         {/* Data Management */}
         <Route path="tables" element={<ProtectedRoute permission="DATA_VIEW"><TablesPage /></ProtectedRoute>} />
         <Route path="tables/create" element={<ProtectedRoute permission="TABLE_CREATE"><CreateTablePage /></ProtectedRoute>} />
@@ -133,6 +137,7 @@ export default function App() {
         <Route path="data-validation/checklist" element={<ProtectedRoute permission="CHECKLIST_VIEW"><ChecklistPage /></ProtectedRoute>} />
         {/* Data Preparation - Grid Builder */}
         <Route path="data-prep/store-stock" element={<ProtectedRoute permission="GRID_VIEW"><GridBuilderPage /></ProtectedRoute>} />
+        <Route path="data-prep/merge-rules" element={<ProtectedRoute permission="GRID_VIEW"><MergeRulesPage /></ProtectedRoute>} />
         <Route path="data-prep/lookup-art-master" element={<ProtectedRoute permission="LOOKUP_VIEW"><LookupArtMasterPage /></ProtectedRoute>} />
         <Route path="data-prep/listing" element={<ErrorBoundary><ListingPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />

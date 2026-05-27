@@ -34,6 +34,7 @@ from app.api.v1.endpoints.settings import router as settings_router
 # Phase 6b: SLOC Validation / Data Validation
 from app.api.v1.endpoints.sloc_validation import router as store_stock_router
 from app.api.v1.endpoints.grid_builder import router as grid_builder_router
+from app.api.v1.endpoints.merge_rules import router as merge_rules_router
 
 # Phase 7: Lookup Art Master
 from app.api.v1.endpoints.lookup_art_master import router as lookup_art_master_router
@@ -58,6 +59,9 @@ from app.api.v1.endpoints.hold_dashboard import router as hold_dashboard_router
 
 # Pending Allocation — ARS_PEND_ALC lifecycle management
 from app.api.v1.endpoints.pend_alc import router as pend_alc_router
+
+# ARS Dashboard — unified analytics page (rev 2: Overview charts + Product Drill)
+from app.api.v1.endpoints.ars_dashboard import router as ars_dashboard_router
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -92,6 +96,7 @@ api_router.include_router(settings_router)
 # Phase 6b: Store Stock / Data Preparation
 api_router.include_router(store_stock_router)
 api_router.include_router(grid_builder_router)
+api_router.include_router(merge_rules_router)
 
 # Phase 7: Lookup Art Master
 api_router.include_router(lookup_art_master_router)
@@ -100,6 +105,7 @@ api_router.include_router(lookup_art_master_router)
 api_router.include_router(dashboard_router)
 api_router.include_router(hold_dashboard_router)
 api_router.include_router(pend_alc_router)
+api_router.include_router(ars_dashboard_router)
 
 # Data Checklist
 api_router.include_router(checklist_router)
