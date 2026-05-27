@@ -311,6 +311,18 @@ export const gridBuilderAPI = {
   hierarchyGaps: (opts={})  => api.get('/grid-builder/hierarchy/gaps', { quiet: true, timeout: 30000, ...opts }),
 }
 
+// ============== Merge Rules (ARS_MERGE_RULES — drives MERGE_<col> derivation) ==============
+export const mergeRulesAPI = {
+  list:         ()             => api.get('/merge-rules'),
+  sourceCols:   ()             => api.get('/merge-rules/source-cols'),
+  create:       (data)         => api.post('/merge-rules', data),
+  update:       (id, data)     => api.put(`/merge-rules/${id}`, data),
+  remove:       (id)           => api.delete(`/merge-rules/${id}`),
+  refresh:      (sourceCol)    => api.post(`/merge-rules/refresh/${encodeURIComponent(sourceCol)}`, null, { timeout: 300000 }),
+  bulk:         (rules, refresh_after=true) =>
+                                   api.post('/merge-rules/bulk', { rules, refresh_after }, { timeout: 600000 }),
+}
+
 // ============== Listing (Data Preparation) ==============
 // Polling calls (config, summary, activeJob, allocProgress) pass quiet:true
 // + a short timeout so transient backend pressure during a Generate run
@@ -350,6 +362,40 @@ export const listingAPI = {
   contribution:  (majCats) => api.get('/listing/contribution', {
     params: { maj_cats: (majCats || []).join(',') }, ..._POLL,
   }),
+  // Per-store drill-down from the MAJ_CAT modal. rdc is optional —
+  // omit to get all stores for the MAJ_CAT (TOTAL column drill-down).
+  storeByMajCat: (majCat, rdc) => api.get('/listing/store-by-majcat', {
+    params: rdc ? { maj_cat: majCat, rdc } : { maj_cat: majCat },
+  }),
+  // OPT-wise drill (per MAJ_CAT × RDC). Returns one row per (WERKS,
+  // GEN_ART_NUMBER, CLR) with OPT-grain columns (OPT_MBQ, OPT_REQ,
+  // MSA_FNL_Q_REM, ALLOC_REMARKS, OPT_PRIORITY_RANK, etc.). Optional
+  // `werks` further narrows to one store.
+  optSummary: (majCat, rdc, werks) => api.get('/listing/opt-summary', {
+    params: {
+      maj_cat: majCat,
+      ...(rdc   ? { rdc }   : {}),
+      ...(werks ? { werks } : {}),
+    },
+  }),
+  // VAR_ART × SZ drill (per OPT). Returns one row per (VAR_ART, SZ)
+  // from ARS_ALLOC_WORKING with per-size MBQ/REQ/SHIP/HOLD + audit trail.
+  varSummary: (majCat, werks, genArt, clr, rdc) =>
+    api.get('/listing/var-summary', {
+      params: {
+        maj_cat: majCat, werks, gen_art: genArt, clr: clr || '',
+        ...(rdc ? { rdc } : {}),
+      },
+    }),
+  // SLOC-wise inventory breakdown for the STORE_STOCK click — returns
+  // the dynamic SLOC column sums for the selected (MAJ_CAT, RDC).
+  slocBreakdown: (majCat, rdc, werks) => api.get('/listing/sloc-breakdown', {
+    params: {
+      maj_cat: majCat,
+      ...(rdc   ? { rdc }   : {}),
+      ...(werks ? { werks } : {}),
+    },
+  }),
   // Per-session log capture (Logs page).
   sessions:      (params)    => api.get('/listing/sessions', { params }),
   session:       (sid)       => api.get(`/listing/sessions/${sid}`),
@@ -371,6 +417,33 @@ export const listingAPI = {
                     api.post(`/listing/parked-runs/${sid}/reject`, { note: note || '' }),
   allocHistory:    (params) => api.get('/listing/alloc-history', { params }),
   listingHistory:  (params) => api.get('/listing/listing-history', { params }),
+}
+
+// ============== ARS Dashboard (unified analytics) ==============
+// All endpoints accept the standard scope filters as query params:
+//   date, sid, mc (csv), werks (csv), rdc (csv), from, to
+// The Product Drill tab reuses listingAPI.storeByMajCat / optSummary /
+// varSummary directly — no wrapper here.
+export const arsDashboardAPI = {
+  summary:        (params)   => api.get('/ars-dashboard/summary',          { params }),
+  breakdown:      (params)   => api.get('/ars-dashboard/breakdown',        { params }),
+  dates:          (params)   => api.get('/ars-dashboard/dates',            { params }),
+  sessionsByDate: (date)     => api.get('/ars-dashboard/sessions-by-date', { params: { date } }),
+  sessions:       (params)   => api.get('/ars-dashboard/sessions',         { params }),
+  sessionDetail:  (params)   => api.get('/ars-dashboard/session-detail',   { params }),
+  trend:          (params)   => api.get('/ars-dashboard/trend',            { params }),
+  trendSessions:  (params)   => api.get('/ars-dashboard/trend-sessions',   { params }),
+  pending:        (params)   => api.get('/ars-dashboard/pending',          { params }),
+  gap:            (params)   => api.get('/ars-dashboard/gap',              { params }),
+  exportGap:      (params)   => api.get('/ars-dashboard/gap/export',       { params, responseType: 'blob', timeout: 300000 }),
+  // Hierarchical drill — same endpoints power Date&Session deep drill and Product Drill tab
+  drillMajCats:   (params)   => api.get('/ars-dashboard/drill/maj-cats',   { params }),
+  drillStores:    (params)   => api.get('/ars-dashboard/drill/stores',     { params }),
+  drillGenArts:   (params)   => api.get('/ars-dashboard/drill/gen-arts',   { params }),
+  drillArticles:  (params)   => api.get('/ars-dashboard/drill/articles',   { params }),
+  configExtras:   ()         => api.get('/ars-dashboard/config-extras'),
+  holdByRdc:      (params)   => api.get('/ars-dashboard/hold-by-rdc',      { params }),
+  pivotMajCatRdc: (params)   => api.get('/ars-dashboard/pivot/maj-cat-rdc', { params }),
 }
 
 // ============== Lookup Art Master (Data Preparation) ==============

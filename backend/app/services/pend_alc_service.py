@@ -24,7 +24,7 @@ BDC_QTY  = cumulative qty included in BDC files sent to SAP (audit only, not use
 from __future__ import annotations
 
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 from sqlalchemy import text
@@ -579,6 +579,31 @@ def revert_operation(
          WHERE OP_ID = :id
     """), {"by": reverted_by, "note": (note or "")[:500], "id": op_id})
     conn.commit()
+
+    # Re-sync grid + MSA PEND_ALC/PEND_QTY from current ARS_PEND_ALC.
+    # This corrects any residual mismatch in grid rows whose +1 was applied
+    # by an older code revision (with a narrower hierarchy resolver) and
+    # whose -1 with the current resolver can't perfectly undo. The bootstrap
+    # rewrites PEND_ALC = SUM(open PA.PEND_QTY) per grain, which is the
+    # canonical state regardless of upload/revert history.
+    try:
+        bg = bootstrap_grid_pend_sync(conn)
+        result["grid_resync"] = bg
+        logger.info(
+            f"[revert] post-sync grids: var={bg.get('grid_var',0)} "
+            f"gen={bg.get('grid_gen',0)} rollups={bg.get('grid_rollup',0)}"
+        )
+    except Exception as e:
+        logger.warning(f"[revert] post-sync bootstrap_grid_pend_sync failed: {e}")
+        result["grid_resync_error"] = str(e)
+
+    try:
+        bm = bootstrap_msa_pend_sync(conn)
+        result["msa_resync"] = bm
+    except Exception as e:
+        logger.warning(f"[revert] post-sync bootstrap_msa_pend_sync failed: {e}")
+        result["msa_resync_error"] = str(e)
+
     return {"success": True, **result}
 
 
@@ -2166,7 +2191,14 @@ def _probe_col(conn, table: str, *candidates: str) -> str:
 # Variant- and gen_art-grain grids (ARS_GRID_MJ_VAR_ART, ARS_GRID_MJ_GEN_ART)
 # are excluded here — they have additional join keys (article / gen_art / clr)
 # and are handled by their own dedicated UPDATE blocks.
-_EXCLUDED_FROM_ROLLUP = {"ARS_GRID_MJ_VAR_ART", "ARS_GRID_MJ_GEN_ART"}
+# Grids excluded from the auto-discovered rollup loop. The article-grain
+# grids ARS_GRID_MJ_VAR_ART and ARS_GRID_MJ_GEN_ART now flow through the
+# same rollup builder (their article column is handled via delta_native),
+# making the path fully dynamic — any future grid the user creates with
+# columns from vw_master_product is auto-handled without code changes.
+_EXCLUDED_FROM_ROLLUP = {
+    "ARS_GRID_MJ_VND_CD",   # zombie grid (legacy, superseded by M_VND_CD)
+}
 
 
 def _discover_grid_rollup_tables(conn) -> List[str]:
@@ -2177,10 +2209,17 @@ def _discover_grid_rollup_tables(conn) -> List[str]:
     if a new attribute grid is added (e.g. ARS_GRID_MJ_NEW_DIM) the delta
     picks it up automatically. If an old grid is dropped, it's silently
     excluded instead of raising 'table not found'.
+
+    Grids whose registry row in ARS_GRID_BUILDER has status='Inactive' are
+    excluded — neither manual upload (+1 delta), revert (-1 delta), nor the
+    post-op bootstrap re-sync touches their PEND_ALC. Grids absent from the
+    registry are treated as active (back-compat with hand-created tables).
     """
     rows = conn.execute(text("""
         SELECT t.TABLE_NAME
         FROM INFORMATION_SCHEMA.TABLES t
+        LEFT JOIN ARS_GRID_BUILDER g
+               ON g.output_table = t.TABLE_NAME
         WHERE t.TABLE_TYPE = 'BASE TABLE'
           AND t.TABLE_NAME LIKE 'ARS_GRID_MJ%'
           AND EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c
@@ -2189,6 +2228,7 @@ def _discover_grid_rollup_tables(conn) -> List[str]:
                       WHERE c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = 'MAJ_CAT')
           AND EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c
                       WHERE c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = 'PEND_ALC')
+          AND (g.status IS NULL OR UPPER(g.status) <> 'INACTIVE')
         ORDER BY t.TABLE_NAME
     """)).fetchall()
     return [r[0] for r in rows if r[0] not in _EXCLUDED_FROM_ROLLUP]
@@ -2198,39 +2238,84 @@ def _discover_grid_rollup_tables(conn) -> List[str]:
 # can read straight from the delta / pend_alc table without a MSA join.
 _PEND_ALC_NATIVE = {"MAJ_CAT", "GEN_ART_NUMBER", "CLR"}
 
-# Columns we always exclude from "hierarchy" detection — they're either the
-# store/article axes or non-attribute metric columns.
+# Columns we always exclude from "hierarchy" detection.
+# Note: ARTICLE_NUMBER / VAR_ART / ARTICLE are included as valid hier cols
+# (they're the article axis used by VAR_ART-style grids) — resolved via the
+# delta payload's `t.art` field, not via master lookup.
 _NON_HIER_COLS = {
     "WERKS", "RDC", "ST_CD",
-    "ARTICLE_NUMBER", "VAR_ART", "ARTICLE",
     "PEND_ALC",
     "ID", "CREATED_AT", "UPDATED_AT", "LAST_UPDATED",
 }
+
+# Article-column aliases handled directly from the delta payload (t.art).
+# Any column matching one of these names in a grid's hierarchy is read
+# from the delta row instead of via a vw_master_product lookup.
+_ARTICLE_NATIVE_COLS = {"ARTICLE_NUMBER", "VAR_ART", "ARTICLE"}
 
 
 def _discover_grid_hierarchy(conn, grid_table: str) -> List[str]:
     """Discover the hierarchy columns of a rollup grid.
 
-    Hierarchy columns = columns that exist on BOTH the grid table AND
-    ARS_MSA_TOTAL (so we know we can resolve their values per article),
-    minus the store/article axes and known metric columns.
+    Hierarchy columns = columns that exist on the grid table AND can be
+    resolved per article via vw_master_product, minus the store/article
+    axes and metric columns.
+
+    Resolution sources:
+      • Direct match in vw_master_product (e.g., MAJ_CAT, FAB, MICRO_MVGR,
+        WEAVE_2, M_YARN_02, or any new master attribute added later)
+      • Derived MERGE_<col> whose parent (e.g., RNG_SEG for MERGE_RNG_SEG)
+        exists in vw_master_product — the CASE expression from
+        derived_masters is applied at delta time.
+
+    We use vw_master_product (NOT ARS_MSA_TOTAL) as the discovery source
+    because:
+      1. MSA only carries the allocation-eligible universe — pend-only
+         articles aren't in MSA, so MSA-side lookup would miss them.
+      2. The rollup delta SQL now JOINs vw_master_product as its master
+         source, so the discovered hier_cols must match what MP can
+         resolve. This keeps the path fully dynamic: any new attribute
+         column added to MP flows automatically.
 
     Examples:
-      ARS_GRID_MJ          → ['MAJ_CAT']
-      ARS_GRID_MJ_CLR      → ['MAJ_CAT', 'CLR']
-      ARS_GRID_MJ_FAB      → ['MAJ_CAT', 'FAB']
-      ARS_GRID_MJ_MACRO_MVGR → ['MAJ_CAT', 'MACRO_MVGR']
+      ARS_GRID_MJ                 → ['MAJ_CAT']
+      ARS_GRID_MJ_FAB             → ['FAB', 'MAJ_CAT']
+      ARS_GRID_MJ_WEAVE_2         → ['MAJ_CAT', 'WEAVE_2']
+      ARS_GRID_MJ_M_YARN_02       → ['M_YARN_02', 'MAJ_CAT']
+      ARS_GRID_MJ_MERGE_RNG_SEG   → ['MAJ_CAT', 'MERGE_RNG_SEG']
     """
     grid_cols = {r[0] for r in conn.execute(text(
         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = :t"
     ), {"t": grid_table}).fetchall()}
 
-    msa_cols = {r[0] for r in conn.execute(text(
+    mp_cols = {r[0] for r in conn.execute(text(
         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-        "WHERE TABLE_NAME = 'ARS_MSA_TOTAL'"
+        "WHERE TABLE_NAME = 'vw_master_product'"
     )).fetchall()}
 
-    return sorted((grid_cols & msa_cols) - _NON_HIER_COLS)
+    # Native master match (direct column in vw_master_product)
+    candidates = (grid_cols & mp_cols) - _NON_HIER_COLS
+
+    # MAJ_CAT is always a valid hier col even if absent from MP (it's part
+    # of every grid's grain and is carried natively by ARS_PEND_ALC).
+    if "MAJ_CAT" in grid_cols:
+        candidates.add("MAJ_CAT")
+
+    # Derived MERGE_<col>: include if the parent column lives in MP so we
+    # can compute the merged value via CASE at delta time.
+    try:
+        from app.services import derived_masters as _dm
+        for col in grid_cols - _NON_HIER_COLS:
+            if col in candidates:
+                continue
+            if _dm.is_merge_col(col):
+                parent = _dm.parent_col(col) or ""
+                if parent and parent in mp_cols:
+                    candidates.add(col)
+    except Exception as e:
+        logger.warning(f"derived_masters detection failed for {grid_table}: {e}")
+
+    return sorted(candidates)
 
 
 def _build_rollup_delta_sql(
@@ -2238,27 +2323,54 @@ def _build_rollup_delta_sql(
     hier_cols: List[str],
     delta_table: str,
     msa_article_col: str,
+    conn=None,
 ) -> str:
     """Build an UPDATE statement that rolls up qty from a delta temp table
     into a rollup grid, joined on the grid's full hierarchy.
 
     Hierarchy columns present in ARS_PEND_ALC (MAJ_CAT, GEN_ART_NUMBER, CLR)
-    are read directly from the delta. Anything else (FAB, RNG_SEG,
-    MACRO_MVGR, MICRO_MVGR, VND_CD, M_VND_CD, ...) is resolved by joining
-    through ARS_MSA_TOTAL on ARTICLE_NUMBER. MAX(...) is used because each
-    article appears once per RDC in MSA_TOTAL but the attribute value is
-    constant across RDCs for the same article.
+    are read directly from the delta. Master-lookup attrs (FAB, RNG_SEG,
+    MACRO_MVGR, MICRO_MVGR, VND_CD, M_VND_CD, ...) come from
+    vw_master_product joined on ARTICLE_NUMBER. Derived MERGE_<col> attrs
+    are computed via the CASE expression from derived_masters, applied to
+    the MP-joined parent column (e.g., MERGE_RNG_SEG = CASE MP.RNG_SEG ... END).
+
+    NOTE: master attributes are sourced from `vw_master_product` (not
+    ARS_MSA_TOTAL) because MSA only carries the allocation-eligible
+    universe — pend-only articles aren't in MSA, so a MSA-side lookup
+    would return NULL for those and the rollup UPDATE would silently miss
+    ~130K units of pend that landed via INSERT. Master has every article.
     """
     delta_native = {
         "MAJ_CAT":         "t.maj_cat",
         "GEN_ART_NUMBER":  "t.gen_art",
         "CLR":             "t.clr",
+        # Article axis (BIGINT) — VAR_ART-style grids include this in hier
+        "ARTICLE_NUMBER":  "t.art",
+        "VAR_ART":         "t.art",
+        "ARTICLE":         "t.art",
     }
+
+    # Resolve any derived MERGE_<col> in hier_cols to its parent + CASE expr
+    merge_resolved: Dict[str, Tuple[str, str]] = {}  # col -> (parent_col, case_expr_on_MP)
+    if conn is not None:
+        try:
+            from app.services import derived_masters as _dm
+            for col in hier_cols:
+                if _dm.is_merge_col(col):
+                    parent = _dm.parent_col(col)
+                    if not parent:
+                        continue
+                    expr = _dm.build_case_expr(conn, col, table_alias="MP")
+                    if expr:
+                        merge_resolved[col] = (parent, expr)
+        except Exception as e:
+            logger.warning(f"derived_masters resolution failed for {grid_table}: {e}")
 
     select_parts = ["t.st_cd AS werks"]
     group_parts  = ["t.st_cd"]
     join_clauses = ["X.WERKS = d.werks"]
-    msa_lookup_cols: List[str] = []
+    mp_lookup_cols: List[str] = []
 
     for col in hier_cols:
         bracketed = f"[{col}]"
@@ -2266,10 +2378,18 @@ def _build_rollup_delta_sql(
             expr = delta_native[col]
             select_parts.append(f"{expr} AS {bracketed}")
             group_parts.append(expr)
+        elif col in merge_resolved:
+            # Derived MERGE_<col>: ensure the PARENT col is on the MP join,
+            # then apply the CASE expression (already MP-rooted from derived_masters).
+            parent, case_expr = merge_resolved[col]
+            if parent not in mp_lookup_cols:
+                mp_lookup_cols.append(parent)
+            select_parts.append(f"{case_expr} AS {bracketed}")
+            group_parts.append(case_expr)
         else:
-            msa_lookup_cols.append(col)
-            select_parts.append(f"M.{bracketed} AS {bracketed}")
-            group_parts.append(f"M.{bracketed}")
+            mp_lookup_cols.append(col)
+            select_parts.append(f"MP.{bracketed} AS {bracketed}")
+            group_parts.append(f"MP.{bracketed}")
         join_clauses.append(
             f"ISNULL(X.{bracketed}, '') = ISNULL(d.{bracketed}, '')"
         )
@@ -2277,16 +2397,17 @@ def _build_rollup_delta_sql(
     select_parts.append("SUM(t.qty) AS qty")
 
     msa_join_sql = ""
-    if msa_lookup_cols:
-        agg_csv = ", ".join(f"MAX([{c}]) AS [{c}]" for c in msa_lookup_cols)
-        msa_join_sql = f"""
-            LEFT JOIN (
-                SELECT [{msa_article_col}] AS art_key, {agg_csv}
-                FROM ARS_MSA_TOTAL
-                GROUP BY [{msa_article_col}]
-            ) M ON M.art_key = t.art
-        """
+    if mp_lookup_cols:
+        # Source attributes from vw_master_product — same source as INSERT —
+        # so pend-only articles (not in MSA) still get their attrs resolved.
+        msa_join_sql = "LEFT JOIN dbo.vw_master_product MP ON MP.ARTICLE_NUMBER = t.art"
 
+    # STK_TTL = physical_stock + PEND_ALC (user-chosen contract). PEND_ALC has
+    # KPI='STK' in ARS_STORE_SLOC_SETTINGS, so pending units count toward total
+    # committed stock for allocation planning. The delta must keep both columns
+    # in step: PEND_ALC tracks just the pending portion, STK_TTL tracks the
+    # combined total. Without `STK_TTL += d.qty`, STK_TTL drifts behind pend
+    # activity between rebuilds.
     return f"""
         UPDATE X SET
             X.PEND_ALC = ISNULL(X.PEND_ALC, 0) + d.qty,
@@ -2302,24 +2423,152 @@ def _build_rollup_delta_sql(
     """
 
 
+def _build_rollup_insert_sql(
+    grid_table: str,
+    hier_cols: List[str],
+    delta_table: str,
+    conn=None,
+) -> str:
+    """Build INSERT-WHERE-NOT-EXISTS for one rollup grid.
+
+    For a pend-only article that doesn't yet have a row in this rollup
+    grid, this inserts a placeholder (WERKS, hier_cols..., STK_TTL=0,
+    PEND_ALC=0). The existing UPDATE built by `_build_rollup_delta_sql`
+    then lands the qty on that fresh row.
+
+    Hierarchy columns held on ARS_PEND_ALC directly (MAJ_CAT,
+    GEN_ART_NUMBER, CLR) come from the delta payload; master-lookup attrs
+    (FAB, RNG_SEG, MACRO_MVGR, MICRO_MVGR, M_VND_CD, VND_CD, ...) come
+    from `vw_master_product` on ARTICLE_NUMBER. Derived MERGE_<col> attrs
+    are computed via the CASE expression from derived_masters applied to
+    the MP-side parent column (e.g., MERGE_RNG_SEG = CASE MP.RNG_SEG ... END).
+    """
+    delta_native = {
+        "MAJ_CAT":        "d.maj_cat",
+        "GEN_ART_NUMBER": "d.gen_art",
+        "CLR":            "d.clr",
+        # Article axis (BIGINT) — VAR_ART-style grids include this in hier
+        "ARTICLE_NUMBER": "d.art",
+        "VAR_ART":        "d.art",
+        "ARTICLE":        "d.art",
+    }
+
+    # Resolve any derived MERGE_<col> in hier_cols → CASE on MP-side parent
+    merge_resolved: Dict[str, str] = {}  # col -> case_expr_on_MP
+    if conn is not None:
+        try:
+            from app.services import derived_masters as _dm
+            for col in hier_cols:
+                if _dm.is_merge_col(col):
+                    expr = _dm.build_case_expr(conn, col, table_alias="MP")
+                    if expr:
+                        merge_resolved[col] = expr
+        except Exception as e:
+            logger.warning(f"derived_masters resolution failed for insert {grid_table}: {e}")
+
+    insert_cols  = ["WERKS"] + [f"[{c}]" for c in hier_cols] + ["STK_TTL", "PEND_ALC"]
+    select_parts = ["d.st_cd"]
+    where_match  = ["g.WERKS = d.st_cd"]
+    needs_mp     = False
+
+    for col in hier_cols:
+        if col in delta_native:
+            expr = delta_native[col]
+            select_parts.append(f"{expr}")
+            where_match.append(
+                f"ISNULL(g.[{col}], '') = ISNULL({expr}, '')"
+            )
+        elif col in merge_resolved:
+            needs_mp = True
+            case_expr = merge_resolved[col]
+            select_parts.append(case_expr)
+            where_match.append(
+                f"ISNULL(g.[{col}], '') = ISNULL({case_expr}, '')"
+            )
+        else:
+            needs_mp = True
+            select_parts.append(f"MP.[{col}]")
+            where_match.append(
+                f"ISNULL(g.[{col}], '') = ISNULL(MP.[{col}], '')"
+            )
+
+    # INSERT seeds STK_TTL=0, PEND_ALC=0. The subsequent UPDATE built by
+    # _build_rollup_delta_sql bumps BOTH columns by +qty, producing the
+    # final state STK_TTL=qty, PEND_ALC=qty for newly-inserted rows
+    # (matches the user-chosen contract: STK_TTL = physical + PEND_ALC).
+    select_parts += ["0", "0"]  # STK_TTL, PEND_ALC
+
+    mp_join = ""
+    if needs_mp:
+        mp_join = (
+            "LEFT JOIN dbo.vw_master_product MP "
+            "ON MP.ARTICLE_NUMBER = d.art"
+        )
+
+    return f"""
+        INSERT INTO [{grid_table}] ({", ".join(insert_cols)})
+        SELECT DISTINCT {", ".join(select_parts)}
+        FROM (
+            SELECT DISTINCT st_cd, art, maj_cat, gen_art, clr
+            FROM {delta_table}
+        ) d
+        {mp_join}
+        WHERE NOT EXISTS (
+            SELECT 1 FROM [{grid_table}] g
+            WHERE {" AND ".join(where_match)}
+        )
+    """
+
+
 def _build_rollup_bootstrap_sql(
     grid_table: str,
     hier_cols: List[str],
     msa_article_col: str,
+    conn=None,
 ) -> str:
     """Build an UPDATE that reseeds a rollup grid's PEND_ALC column from a
-    fresh scan of ARS_PEND_ALC, joined through MSA for any attribute not
-    held directly in PEND_ALC. Idempotent — sets PEND_ALC, doesn't add."""
+    fresh scan of ARS_PEND_ALC. Idempotent — SETs PEND_ALC, doesn't add.
+
+    Resolution sources (same as `_build_rollup_delta_sql`):
+      • MAJ_CAT, GEN_ART_NUMBER, CLR → from ARS_PEND_ALC directly
+      • Other master attrs (FAB, RNG_SEG, WEAVE_2, M_YARN_02, ...) → from
+        vw_master_product joined on ARTICLE_NUMBER
+      • Derived MERGE_<col> → CASE expression on MP-side parent column
+
+    Uses vw_master_product (NOT ARS_MSA_TOTAL) because MSA only carries the
+    allocation-eligible universe — pend-only articles aren't in MSA, so
+    MSA-side lookup would silently miss them. Master has every article.
+    """
     pend_native = {
         "MAJ_CAT":         "P.MAJ_CAT",
         "GEN_ART_NUMBER":  "P.GEN_ART_NUMBER",
         "CLR":             "P.CLR",
+        # Article axis — VAR_ART-style grids include this in hier
+        "ARTICLE_NUMBER":  "P.ARTICLE_NUMBER",
+        "VAR_ART":         "P.ARTICLE_NUMBER",
+        "ARTICLE":         "P.ARTICLE_NUMBER",
     }
+
+    # Resolve derived MERGE_<col> to (parent_col, MP-side CASE expression).
+    merge_resolved: Dict[str, Tuple[str, str]] = {}
+    if conn is not None:
+        try:
+            from app.services import derived_masters as _dm
+            for col in hier_cols:
+                if _dm.is_merge_col(col):
+                    parent = _dm.parent_col(col)
+                    if not parent:
+                        continue
+                    expr = _dm.build_case_expr(conn, col, table_alias="MP")
+                    if expr:
+                        merge_resolved[col] = (parent, expr)
+        except Exception as e:
+            logger.warning(f"derived_masters resolution failed for bootstrap {grid_table}: {e}")
 
     select_parts = ["P.ST_CD AS werks"]
     group_parts  = ["P.ST_CD"]
     join_clauses = ["agg.werks = X.WERKS"]
-    msa_lookup_cols: List[str] = []
+    mp_lookup_cols: List[str] = []
 
     for col in hier_cols:
         bracketed = f"[{col}]"
@@ -2327,26 +2576,30 @@ def _build_rollup_bootstrap_sql(
             expr = pend_native[col]
             select_parts.append(f"{expr} AS {bracketed}")
             group_parts.append(expr)
+        elif col in merge_resolved:
+            parent, case_expr = merge_resolved[col]
+            if parent not in mp_lookup_cols:
+                mp_lookup_cols.append(parent)
+            select_parts.append(f"{case_expr} AS {bracketed}")
+            group_parts.append(case_expr)
         else:
-            msa_lookup_cols.append(col)
-            select_parts.append(f"M.{bracketed} AS {bracketed}")
-            group_parts.append(f"M.{bracketed}")
+            mp_lookup_cols.append(col)
+            select_parts.append(f"MP.{bracketed} AS {bracketed}")
+            group_parts.append(f"MP.{bracketed}")
         join_clauses.append(
             f"ISNULL(X.{bracketed}, '') = ISNULL(agg.{bracketed}, '')"
         )
 
     select_parts.append("SUM(CAST(P.PEND_QTY AS FLOAT)) AS qty")
 
-    msa_join_sql = ""
-    if msa_lookup_cols:
-        agg_csv = ", ".join(f"MAX([{c}]) AS [{c}]" for c in msa_lookup_cols)
-        msa_join_sql = f"""
-            LEFT JOIN (
-                SELECT [{msa_article_col}] AS art_key, {agg_csv}
-                FROM ARS_MSA_TOTAL
-                GROUP BY [{msa_article_col}]
-            ) M ON M.art_key = P.ARTICLE_NUMBER
-        """
+    mp_join_sql = ""
+    if mp_lookup_cols:
+        # vw_master_product is the canonical attribute source — has every
+        # article (pend-only too), unlike ARS_MSA_TOTAL.
+        mp_join_sql = (
+            "LEFT JOIN dbo.vw_master_product MP "
+            "ON MP.ARTICLE_NUMBER = P.ARTICLE_NUMBER"
+        )
 
     return f"""
         UPDATE X SET X.PEND_ALC = ISNULL(agg.qty, 0)
@@ -2354,7 +2607,7 @@ def _build_rollup_bootstrap_sql(
         LEFT JOIN (
             SELECT {', '.join(select_parts)}
             FROM {PEND_ALC_TABLE} P
-            {msa_join_sql}
+            {mp_join_sql}
             WHERE P.IS_CLOSED = 0
             GROUP BY {', '.join(group_parts)}
         ) agg
@@ -2437,6 +2690,13 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
         # excess units, so subsequent reverts couldn't restore the true
         # value. Recomputing from STK/PEND/HOLD makes the operation
         # symmetric and self-healing.
+        #
+        # MSA tables UPDATE-only by design (user requirement): only
+        # (RDC, article) keys that already exist in the MSA universe get
+        # adjusted. Pend-only articles (no matching MSA row) are deliberately
+        # not inserted here — MSA represents the allocation-eligible universe
+        # and must not be polluted with stockless rows. Grids, by contrast,
+        # do insert missing rows further below to keep stock displays current.
         try:
             r1 = conn.execute(text(f"""
                 UPDATE T SET
@@ -2464,6 +2724,7 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
         # just copy the now-correct PEND_QTY/FNL_Q from TOTAL for every
         # article touched by this delta. Eliminates drift; matches what
         # bootstrap_msa_pend_sync does.
+        # MSA_VAR_ART: UPDATE-only (same MSA rule).
         try:
             r2 = conn.execute(text(f"""
                 UPDATE V SET
@@ -2489,6 +2750,7 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
         # because max() doesn't distribute over sums when one variant
         # already clipped at 0. Scoped to (RDC, MAJ_CAT, GEN_ART, CLR)
         # keys touched by this delta to avoid scanning all of MSA_TOTAL.
+        # MSA_GEN_ART: UPDATE-only (same MSA rule).
         try:
             r3 = conn.execute(text(f"""
                 UPDATE G SET
@@ -2518,54 +2780,13 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
         except Exception as e:
             logger.warning(f"[delta] MSA_GEN_ART skipped: {e}")
 
-        # ── Grid: ARS_GRID_MJ_VAR_ART — variant grain ───────────────────
-        # PEND_ALC is incremented by d.qty (the pending allocation that's
-        # been approved). STK_TTL is also incremented by the same qty so
-        # the planner-facing total reflects the incoming pending shipment
-        # — without this, STK_TTL would only track physical store stock
-        # and lag the pending pipeline until the next grid rebuild.
-        try:
-            r4 = conn.execute(text(f"""
-                UPDATE V SET
-                    V.PEND_ALC = ISNULL(V.PEND_ALC, 0) + d.qty,
-                    V.STK_TTL  = ISNULL(V.STK_TTL,  0) + d.qty
-                FROM ARS_GRID_MJ_VAR_ART V
-                JOIN (
-                    SELECT st_cd, maj_cat, gen_art, clr, art, SUM(qty) AS qty
-                    FROM {tmp}
-                    GROUP BY st_cd, maj_cat, gen_art, clr, art
-                ) d
-                  ON V.WERKS = d.st_cd
-                 AND ISNULL(V.MAJ_CAT, '')             = ISNULL(d.maj_cat, '')
-                 AND ISNULL(V.[{grid_var_gen}], '')    = ISNULL(d.gen_art, '')
-                 AND ISNULL(V.CLR, '')                 = ISNULL(d.clr, '')
-                 AND V.[{grid_var_art}]                = d.art
-            """))
-            result["grid_var"] = int(r4.rowcount or 0)
-        except Exception as e:
-            logger.warning(f"[delta] GRID_VAR_ART skipped: {e}")
-
-        # ── Grid: ARS_GRID_MJ_GEN_ART — gen_art grain ───────────────────
-        # Same dual update — PEND_ALC + STK_TTL track the pending shipment.
-        try:
-            r5 = conn.execute(text(f"""
-                UPDATE G SET
-                    G.PEND_ALC = ISNULL(G.PEND_ALC, 0) + d.qty,
-                    G.STK_TTL  = ISNULL(G.STK_TTL,  0) + d.qty
-                FROM ARS_GRID_MJ_GEN_ART G
-                JOIN (
-                    SELECT st_cd, maj_cat, gen_art, clr, SUM(qty) AS qty
-                    FROM {tmp}
-                    GROUP BY st_cd, maj_cat, gen_art, clr
-                ) d
-                  ON G.WERKS = d.st_cd
-                 AND ISNULL(G.MAJ_CAT, '')             = ISNULL(d.maj_cat, '')
-                 AND ISNULL(G.[{grid_gen_gen}], '')    = ISNULL(d.gen_art, '')
-                 AND ISNULL(G.CLR, '')                 = ISNULL(d.clr, '')
-            """))
-            result["grid_gen"] = int(r5.rowcount or 0)
-        except Exception as e:
-            logger.warning(f"[delta] GRID_GEN_ART skipped: {e}")
+        # NOTE: ARS_GRID_MJ_VAR_ART and ARS_GRID_MJ_GEN_ART are now handled
+        # by the auto-discovered rollup loop below (no longer in
+        # _EXCLUDED_FROM_ROLLUP). Their hier_cols include ARTICLE_NUMBER /
+        # VAR_ART which is in delta_native (mapped to t.art) so the rollup
+        # builder handles them like any other grid. SZ and other extra hier
+        # cols are auto-resolved via vw_master_product.
+        # Result keys grid_var / grid_gen are reported from the rollup pass.
 
         # ── Grid: attribute rollups — based on each grid's HIERARCHY ─────
         # Each rollup grid has its own hierarchy (MAJ_CAT only / MAJ_CAT+CLR /
@@ -2581,11 +2802,28 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
                 if not hier_cols:
                     logger.debug(f"[delta] {tbl}: no hierarchy columns found, skipping")
                     continue
-                sql = _build_rollup_delta_sql(tbl, hier_cols, tmp, msa_total_art)
+                # On +1 deltas, INSERT placeholder rows for any (WERKS,
+                # hier_cols...) tuple missing from this rollup grid — the
+                # grouping attributes (FAB, M_VND_CD, MICRO_MVGR, ...) are
+                # resolved per-article from vw_master_product. Without this
+                # a pend-only article (no current stock) silently drops out
+                # of every rollup grid until the next full rebuild.
+                if sign > 0:
+                    conn.execute(text(
+                        _build_rollup_insert_sql(tbl, hier_cols, tmp, conn=conn)
+                    ))
+                sql = _build_rollup_delta_sql(tbl, hier_cols, tmp, msa_total_art, conn=conn)
                 rr = conn.execute(text(sql))
-                rollup_total += int(rr.rowcount or 0)
+                cnt = int(rr.rowcount or 0)
+                rollup_total += cnt
+                # Maintain back-compat result keys for the two article-grain grids
+                # that used to have their own dedicated blocks.
+                if tbl == "ARS_GRID_MJ_VAR_ART":
+                    result["grid_var"] = cnt
+                elif tbl == "ARS_GRID_MJ_GEN_ART":
+                    result["grid_gen"] = cnt
                 logger.debug(
-                    f"[delta] {tbl}: hier={hier_cols} → {rr.rowcount or 0} rows"
+                    f"[delta] {tbl}: hier={hier_cols} → {cnt} rows"
                 )
             except Exception as e:
                 logger.warning(f"[delta] rollup grid {tbl} skipped: {e}")
@@ -2658,7 +2896,12 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         msa_var_art_col = _probe_col(conn, "ARS_MSA_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
         msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
 
-        # 1a. Seed PEND_QTY into ARS_MSA_TOTAL from open pend_alc rows
+        # 1a. Seed PEND_QTY into ARS_MSA_TOTAL from open pend_alc rows.
+        # MSA tables are UPDATE-only by design (user requirement): only
+        # (RDC, article) keys already in the MSA universe get adjusted.
+        # Pend-only articles (no matching MSA row) are intentionally skipped
+        # — MSA represents the allocation-eligible universe and must not be
+        # polluted with stockless rows.
         r1 = conn.execute(text(f"""
             ;WITH P AS (
                 SELECT RDC, ARTICLE_NUMBER, SUM(PEND_QTY) AS qty
@@ -2679,7 +2922,7 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         """))
         result["msa_total"] = int(r1.rowcount or 0)
 
-        # 1b. Roll up TOTAL → VAR_ART
+        # 1b. Roll up TOTAL → VAR_ART (UPDATE-only — same MSA rule).
         r2 = conn.execute(text(f"""
             UPDATE V
                SET V.PEND_QTY = agg.p, V.FNL_Q = agg.f
@@ -2699,7 +2942,7 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         """))
         result["msa_var_art"] = int(r2.rowcount or 0)
 
-        # 1c. Roll up TOTAL → GEN_ART
+        # 1c. Roll up TOTAL → GEN_ART (UPDATE-only — same MSA rule).
         r3 = conn.execute(text(f"""
             UPDATE G
                SET G.PEND_QTY = agg.p, G.FNL_Q = agg.f
@@ -2955,57 +3198,10 @@ def bootstrap_grid_pend_sync(conn) -> Dict:
     """
     result: Dict = {"grid_var": 0, "grid_gen": 0, "grid_rollup": 0, "error": None}
     try:
-        grid_var_art = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
-        grid_var_gen = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "GEN_ART_NUMBER", "GEN_ART")
-        grid_gen_gen = _probe_col(conn, "ARS_GRID_MJ_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
-
-        # 2a. ARS_GRID_MJ_VAR_ART — variant grain
-        try:
-            r1 = conn.execute(text(f"""
-                UPDATE V
-                   SET V.PEND_ALC = ISNULL(P.qty, 0)
-                FROM ARS_GRID_MJ_VAR_ART V
-                LEFT JOIN (
-                    SELECT ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER,
-                           SUM(CAST(PEND_QTY AS FLOAT)) AS qty
-                    FROM {PEND_ALC_TABLE} WHERE IS_CLOSED = 0
-                    GROUP BY ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER
-                ) P
-                  ON P.ST_CD = V.WERKS
-                 AND ISNULL(P.MAJ_CAT, '')             = ISNULL(V.MAJ_CAT, '')
-                 AND ISNULL(P.GEN_ART_NUMBER, '')      = ISNULL(V.[{grid_var_gen}], '')
-                 AND ISNULL(P.CLR, '')                 = ISNULL(V.CLR, '')
-                 AND P.ARTICLE_NUMBER                   = V.[{grid_var_art}]
-            """))
-            result["grid_var"] = int(r1.rowcount or 0)
-        except Exception as e:
-            logger.debug(f"[bootstrap_grid] GRID_VAR_ART skipped: {e}")
-
-        # 2b. ARS_GRID_MJ_GEN_ART — gen_art grain
-        try:
-            r2 = conn.execute(text(f"""
-                UPDATE G
-                   SET G.PEND_ALC = ISNULL(P.qty, 0)
-                FROM ARS_GRID_MJ_GEN_ART G
-                LEFT JOIN (
-                    SELECT ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                           SUM(CAST(PEND_QTY AS FLOAT)) AS qty
-                    FROM {PEND_ALC_TABLE} WHERE IS_CLOSED = 0
-                    GROUP BY ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR
-                ) P
-                  ON P.ST_CD = G.WERKS
-                 AND ISNULL(P.MAJ_CAT, '')             = ISNULL(G.MAJ_CAT, '')
-                 AND ISNULL(P.GEN_ART_NUMBER, '')      = ISNULL(G.[{grid_gen_gen}], '')
-                 AND ISNULL(P.CLR, '')                 = ISNULL(G.CLR, '')
-            """))
-            result["grid_gen"] = int(r2.rowcount or 0)
-        except Exception as e:
-            logger.debug(f"[bootstrap_grid] GRID_GEN_ART skipped: {e}")
-
-        # 2c. Attribute-rollup grids — reseed by each grid's full hierarchy.
-        # Hierarchy discovered at runtime from INFORMATION_SCHEMA so any new
-        # grid added by the grid builder is auto-included. Attributes not
-        # held in ARS_PEND_ALC are resolved via ARS_MSA_TOTAL.
+        # ARS_GRID_MJ_VAR_ART and _GEN_ART are now handled by the same
+        # auto-discovered rollup loop below (their article column is in
+        # delta_native, SZ and other extras auto-resolved via MP). Fully
+        # dynamic — any future grid table flows through identically.
         msa_article_col = _probe_col(
             conn, "ARS_MSA_TOTAL", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE",
         )
@@ -3019,11 +3215,17 @@ def bootstrap_grid_pend_sync(conn) -> Dict:
                         f"[bootstrap_grid] {tbl}: no hierarchy columns found, skipping"
                     )
                     continue
-                sql = _build_rollup_bootstrap_sql(tbl, hier_cols, msa_article_col)
+                sql = _build_rollup_bootstrap_sql(tbl, hier_cols, msa_article_col, conn=conn)
                 rr = conn.execute(text(sql))
-                rollup_total += int(rr.rowcount or 0)
+                cnt = int(rr.rowcount or 0)
+                rollup_total += cnt
+                # Maintain back-compat result keys
+                if tbl == "ARS_GRID_MJ_VAR_ART":
+                    result["grid_var"] = cnt
+                elif tbl == "ARS_GRID_MJ_GEN_ART":
+                    result["grid_gen"] = cnt
                 logger.debug(
-                    f"[bootstrap_grid] {tbl}: hier={hier_cols} → {rr.rowcount or 0} rows"
+                    f"[bootstrap_grid] {tbl}: hier={hier_cols} → {cnt} rows"
                 )
             except Exception as e:
                 logger.warning(f"[bootstrap_grid] {tbl} skipped: {e}")

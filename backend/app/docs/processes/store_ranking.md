@@ -169,15 +169,24 @@ Location: `listing.py` around lines 1440–1494. The ranking is a single CTE:
 ),
 Ranked AS (
   SELECT *,
-         ROW_NUMBER() OVER (PARTITION BY MAJ_CAT ORDER BY MJ_REQ ASC)   AS REQ_RANK,
-         ROW_NUMBER() OVER (PARTITION BY MAJ_CAT ORDER BY FILL_RATE DESC) AS FILL_RANK
+         DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY MJ_REQ ASC)    AS REQ_RANK,
+         DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY FILL_RATE DESC) AS FILL_RANK
   FROM StoreAgg
 )
 SELECT *,
        ROUND(REQ_RANK * :rw + FILL_RANK * :fw, 2) AS W_SCORE,
-       ROW_NUMBER() OVER (PARTITION BY MAJ_CAT ORDER BY W_SCORE DESC) AS ST_RANK
+       ROW_NUMBER() OVER (
+         PARTITION BY MAJ_CAT
+         ORDER BY W_SCORE DESC, WERKS ASC      -- WERKS = stable tiebreaker
+       ) AS ST_RANK
 INTO ARS_STORE_RANKING
 FROM Ranked;
+
+-- REQ_RANK / FILL_RANK use DENSE_RANK so two stores with identical
+-- MJ_REQ (or identical FILL_RATE) share the same component rank.
+-- The final ST_RANK stays ROW_NUMBER so each store gets a unique
+-- waterfall position; WERKS ASC makes the order reproducible
+-- when W_SCOREs tie.
 ```
 
 Note the **`WHERE OPT_TYPE <> 'MIX'`** filter — MIX rows don't enter the rank, so clearance noise doesn't affect priorities.
