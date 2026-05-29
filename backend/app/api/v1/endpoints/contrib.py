@@ -616,11 +616,20 @@ def _process_single_preset(engine, preset_name, preset_cfg, majcats, grouping_co
 
     # Step 1: Data query (stock + product join)
     t = time.time()
+    # NOTE: do NOT ROUND() these averages in SQL — per-store, per-active-month
+    # values for GM_V/SALE_V are in lakhs and often < 0.005 (e.g. 0.0007 lakhs),
+    # which would round to 0.00 and then SUM across stores stays 0, hiding real
+    # contribution at the company level. Final 2-dp rounding happens once at
+    # the end of _compute_kpis().
     data_query = f"""
         SELECT ST_CD, MAJ_CAT, {grouping_column},
-               ROUND(AVG(OP_STK_Q), 2) AS OP_STK_Q, ROUND(AVG(OP_STK_V), 2) AS OP_STK_V,
-               ROUND(AVG(CL_STK_Q), 2) AS CL_STK_Q, ROUND(AVG(CL_STK_V), 2) AS CL_STK_V,
-               ROUND(AVG(SALE_Q), 2) AS SALE_Q, ROUND(AVG(SALE_V), 2) AS SALE_V, ROUND(AVG(GM_V), 2) AS GM_V
+               AVG(NULLIF(OP_STK_Q, 0)) AS OP_STK_Q,
+               AVG(NULLIF(OP_STK_V, 0)) AS OP_STK_V,
+               AVG(NULLIF(CL_STK_Q, 0)) AS CL_STK_Q,
+               AVG(NULLIF(CL_STK_V, 0)) AS CL_STK_V,
+               AVG(CASE WHEN SALE_Q <> 0 THEN SALE_Q END) AS SALE_Q,
+               AVG(CASE WHEN SALE_Q <> 0 THEN SALE_V END) AS SALE_V,
+               AVG(CASE WHEN SALE_Q <> 0 THEN GM_V   END) AS GM_V
         FROM (
             SELECT sal_stk.STOCK_DATE, sal_stk.WERKS AS ST_CD,
                    prod.MAJ_CAT, prod.{grouping_column},

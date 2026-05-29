@@ -63,12 +63,6 @@ export const authAPI = {
   changePassword: (data) => api.post('/auth/change-password', data),
 }
 
-// ============== Process Docs ==============
-export const processAPI = {
-  list: () => api.get('/process/list'),
-  get: (name) => api.get(`/process/get/${name}`),
-}
-
 // ============== Users ==============
 export const usersAPI = {
   list: (params) => api.get('/users', { params }),
@@ -179,19 +173,6 @@ export const uploadAPI = {
   queueStatus: () => api.get('/upload/queue/status'),
 }
 
-// ============== Allocations ==============
-export const allocAPI = {
-  run: (data) => api.post('/allocations/run', data),
-  list: (params) => api.get('/allocations', { params }),
-  details: (id, params) => api.get(`/allocations/${id}/details`, { params }),
-  summary: (id) => api.get(`/allocations/${id}/summary`),
-  overrides: (id, data) => api.post(`/allocations/${id}/overrides`, data),
-  approve: (id) => api.post(`/allocations/${id}/approve`),
-  execute: (id) => api.post(`/allocations/${id}/execute`),
-  cancel: (id) => api.post(`/allocations/${id}/cancel`),
-  grid: (id, storeCode, params) => api.get(`/allocations/${id}/grid/${storeCode}`, { params }),
-}
-
 // ============== MSA Analysis ==============
 export const msaAPI = {
   // Configuration & Discovery
@@ -294,37 +275,6 @@ export const settingsAPI = {
 
 
 
-// ============== BDC Creation ==============
-export const bdcAPI = {
-  upload: (formData) =>
-    api.post('/bdc/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 300000,
-    }),
-  save: (formData) =>
-    api.post('/bdc/save', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 300000,
-    }),
-  download: (formData) =>
-    api.post('/bdc/download', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      responseType: 'blob',
-      timeout: 300000,
-    }),
-  getSheets: (formData) =>
-    api.post('/bdc/sheets', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    }),
-  getSequences: () => api.get('/bdc/sequences'),
-  deleteSequence: (allocationNo) => api.delete(`/bdc/sequences/${allocationNo}`),
-  deliveryOrderUpload: (formData) =>
-    api.post('/bdc/delivery-order-upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 600000,
-    }),
-}
-
 // ============== Store Stock (Data Preparation) ==============
 // DB columns: kpi (NVARCHAR) and status ('Active' | 'Inactive')
 export const storeStockAPI = {
@@ -347,6 +297,18 @@ export const gridBuilderAPI = {
   calcPreview: ()           => api.get('/grid-builder/calculation-preview'),
   buildCalcTables: ()       => api.post('/grid-builder/build-calc-tables', null, { timeout: 600000 }),
   hierarchyGaps: (opts={})  => api.get('/grid-builder/hierarchy/gaps', { quiet: true, timeout: 30000, ...opts }),
+}
+
+// ============== Merge Rules (ARS_MERGE_RULES — drives MERGE_<col> derivation) ==============
+export const mergeRulesAPI = {
+  list:         ()             => api.get('/merge-rules'),
+  sourceCols:   ()             => api.get('/merge-rules/source-cols'),
+  create:       (data)         => api.post('/merge-rules', data),
+  update:       (id, data)     => api.put(`/merge-rules/${id}`, data),
+  remove:       (id)           => api.delete(`/merge-rules/${id}`),
+  refresh:      (sourceCol)    => api.post(`/merge-rules/refresh/${encodeURIComponent(sourceCol)}`, null, { timeout: 300000 }),
+  bulk:         (rules, refresh_after=true) =>
+                                   api.post('/merge-rules/bulk', { rules, refresh_after }, { timeout: 600000 }),
 }
 
 // ============== Listing (Data Preparation) ==============
@@ -388,6 +350,40 @@ export const listingAPI = {
   contribution:  (majCats) => api.get('/listing/contribution', {
     params: { maj_cats: (majCats || []).join(',') }, ..._POLL,
   }),
+  // Per-store drill-down from the MAJ_CAT modal. rdc is optional —
+  // omit to get all stores for the MAJ_CAT (TOTAL column drill-down).
+  storeByMajCat: (majCat, rdc) => api.get('/listing/store-by-majcat', {
+    params: rdc ? { maj_cat: majCat, rdc } : { maj_cat: majCat },
+  }),
+  // OPT-wise drill (per MAJ_CAT × RDC). Returns one row per (WERKS,
+  // GEN_ART_NUMBER, CLR) with OPT-grain columns (OPT_MBQ, OPT_REQ,
+  // MSA_FNL_Q_REM, ALLOC_REMARKS, OPT_PRIORITY_RANK, etc.). Optional
+  // `werks` further narrows to one store.
+  optSummary: (majCat, rdc, werks) => api.get('/listing/opt-summary', {
+    params: {
+      maj_cat: majCat,
+      ...(rdc   ? { rdc }   : {}),
+      ...(werks ? { werks } : {}),
+    },
+  }),
+  // VAR_ART × SZ drill (per OPT). Returns one row per (VAR_ART, SZ)
+  // from ARS_ALLOC_WORKING with per-size MBQ/REQ/SHIP/HOLD + audit trail.
+  varSummary: (majCat, werks, genArt, clr, rdc) =>
+    api.get('/listing/var-summary', {
+      params: {
+        maj_cat: majCat, werks, gen_art: genArt, clr: clr || '',
+        ...(rdc ? { rdc } : {}),
+      },
+    }),
+  // SLOC-wise inventory breakdown for the STORE_STOCK click — returns
+  // the dynamic SLOC column sums for the selected (MAJ_CAT, RDC).
+  slocBreakdown: (majCat, rdc, werks) => api.get('/listing/sloc-breakdown', {
+    params: {
+      maj_cat: majCat,
+      ...(rdc   ? { rdc }   : {}),
+      ...(werks ? { werks } : {}),
+    },
+  }),
   // Per-session log capture (Logs page).
   sessions:      (params)    => api.get('/listing/sessions', { params }),
   session:       (sid)       => api.get(`/listing/sessions/${sid}`),
@@ -409,6 +405,51 @@ export const listingAPI = {
                     api.post(`/listing/parked-runs/${sid}/reject`, { note: note || '' }),
   allocHistory:    (params) => api.get('/listing/alloc-history', { params }),
   listingHistory:  (params) => api.get('/listing/listing-history', { params }),
+}
+
+// ============== ARS Dashboard (unified analytics) ==============
+// All endpoints accept the standard scope filters as query params:
+//   date, sid, mc (csv), werks (csv), rdc (csv), from, to
+// The Product Drill tab reuses listingAPI.storeByMajCat / optSummary /
+// varSummary directly — no wrapper here.
+export const arsDashboardAPI = {
+  summary:        (params)   => api.get('/ars-dashboard/summary',          { params }),
+  breakdown:      (params)   => api.get('/ars-dashboard/breakdown',        { params }),
+  dates:          (params)   => api.get('/ars-dashboard/dates',            { params }),
+  sessionsByDate: (date)     => api.get('/ars-dashboard/sessions-by-date', { params: { date } }),
+  sessions:       (params)   => api.get('/ars-dashboard/sessions',         { params }),
+  sessionDetail:  (params)   => api.get('/ars-dashboard/session-detail',   { params }),
+  trend:          (params)   => api.get('/ars-dashboard/trend',            { params }),
+  trendSessions:  (params)   => api.get('/ars-dashboard/trend-sessions',   { params }),
+  pending:        (params)   => api.get('/ars-dashboard/pending',          { params }),
+  gap:            (params)   => api.get('/ars-dashboard/gap',              { params }),
+  exportGap:      (params)   => api.get('/ars-dashboard/gap/export',       { params, responseType: 'blob', timeout: 300000 }),
+  // Hierarchical drill — same endpoints power Date&Session deep drill and Product Drill tab
+  drillMajCats:   (params)   => api.get('/ars-dashboard/drill/maj-cats',   { params }),
+  drillStores:    (params)   => api.get('/ars-dashboard/drill/stores',     { params }),
+  drillGenArts:   (params)   => api.get('/ars-dashboard/drill/gen-arts',   { params }),
+  drillArticles:  (params)   => api.get('/ars-dashboard/drill/articles',   { params }),
+  drillLevel:     (params)   => api.get('/ars-dashboard/drill/level',      { params }),
+  sessionsLatest: (params)   => api.get('/ars-dashboard/sessions/latest',  { params }),
+  sessionsReviewList: (params) => api.get('/ars-dashboard/sessions/review-list', { params }),
+  sessionReview:  (params)   => api.get('/ars-dashboard/session-review',   { params }),
+  configExtras:   ()         => api.get('/ars-dashboard/config-extras'),
+  holdByRdc:      (params)   => api.get('/ars-dashboard/hold-by-rdc',      { params }),
+  pivotMajCatRdc: (params)   => api.get('/ars-dashboard/pivot/maj-cat-rdc', { params }),
+}
+
+// ============== GAP Report (multi-category algorithm review) ==============
+export const gapReportAPI = {
+  summary:        (params) => api.get('/gap-report/summary',          { params }),
+  excessStk:      (params) => api.get('/gap-report/excess-stk',       { params }),
+  listedNotAlloc: (params) => api.get('/gap-report/listed-not-alloc', { params }),
+  skipReason:     (params) => api.get('/gap-report/skip-reason',      { params }),
+  holdAnomaly:    (params) => api.get('/gap-report/hold-anomaly',     { params }),
+  mbqDeviation:   (params) => api.get('/gap-report/mbq-deviation',    { params }),
+  pendAging:      (params) => api.get('/gap-report/pend-aging',       { params }),
+  bdcDoReco:      (params) => api.get('/gap-report/bdc-do-reco',      { params }),
+  parkedDrift:    (params) => api.get('/gap-report/parked-drift',     { params }),
+  export:         (params) => api.get('/gap-report/export',           { params, responseType: 'blob', timeout: 300000 }),
 }
 
 // ============== Lookup Art Master (Data Preparation) ==============
@@ -582,7 +623,7 @@ export const pendAlcAPI = {
   doUpdate:    (rows)           => api.post('/pend-alc/do-update', { rows }),
   bdcPreview:  (params = {})    => api.get('/pend-alc/bdc-preview', { params }),
   bdcGenerate: (params = {})    => api.post('/pend-alc/bdc-generate', null,
-                                    { params, responseType: 'blob', timeout: 120000,
+                                    { params, responseType: 'blob', timeout: 300000,
                                       paramsSerializer: { indexes: null } }),
   bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
   manualUpload:(payload)        => api.post('/pend-alc/manual-upload',

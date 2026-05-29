@@ -76,6 +76,66 @@ _PROC_NAMES = (
 _FIRST_CALL_DONE = False
 
 
+def _stage_d_apply_pak_sz_rounding(conn, alloc_table: str) -> None:
+    """Final per-row rounding: SHIP_QTY must be a multiple of PAK_SZ.
+    Rows with req < 0.5*pak are zeroed; rows already zero are untouched.
+    Applies to all OPT_TYPEs uniformly — not a per-OPT cap."""
+    try:
+        run_sql(conn, f"ALTER TABLE [{alloc_table}] ADD [ALLOC_REMARKS] NVARCHAR(MAX) NULL")
+    except Exception:
+        pass  # idempotent — column may already exist
+    try:
+        run_sql(conn, f"""
+            ;WITH P AS (
+                SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
+                       ISNULL(SHIP_QTY, 0)                       AS old_ship,
+                       COALESCE(NULLIF(PAK_SZ, 0), 1)            AS pak,
+                       ISNULL(SZ_REQ_WH, 0)                      AS req
+                FROM [{alloc_table}]
+                WHERE ISNULL(SHIP_QTY, 0) > 0
+            ),
+            R AS (
+                SELECT P.*,
+                       CASE WHEN P.req < 0.5 * P.pak THEN 0
+                            ELSE CAST(ROUND(CAST(P.req AS FLOAT) / CAST(P.pak AS FLOAT), 0) AS INT) * P.pak
+                       END AS new_ship
+                FROM P
+            )
+            UPDATE A
+               SET A.SHIP_QTY      = R.new_ship,
+                   A.POOL_CONSUMED = CASE
+                       WHEN A.POOL_CONSUMED IS NULL THEN NULL
+                       ELSE CASE WHEN A.POOL_CONSUMED - (R.old_ship - R.new_ship) < 0
+                                 THEN 0
+                                 ELSE A.POOL_CONSUMED - (R.old_ship - R.new_ship) END
+                   END,
+                   A.ALLOC_STATUS  = CASE WHEN R.new_ship = 0 THEN 'SKIPPED' ELSE A.ALLOC_STATUS END,
+                   A.SKIP_REASON   = CASE WHEN R.new_ship = 0
+                                          THEN 'PAK_SZ_BELOW_HALF(pak=' + CAST(R.pak AS NVARCHAR(10)) + ')'
+                                          ELSE A.SKIP_REASON END,
+                   A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS,'') +
+                       CASE
+                           WHEN R.new_ship = 0
+                                THEN ' PAK_SZ_GATE(req=' + CAST(R.req AS NVARCHAR(20))
+                                     + ',pak=' + CAST(R.pak AS NVARCHAR(10)) + ');'
+                           WHEN R.new_ship <> R.old_ship
+                                THEN ' PAK_SZ_ROUND(from=' + CAST(R.old_ship AS NVARCHAR(20))
+                                     + ',to=' + CAST(R.new_ship AS NVARCHAR(20))
+                                     + ',pak=' + CAST(R.pak AS NVARCHAR(10)) + ');'
+                           ELSE ''
+                       END
+            FROM [{alloc_table}] A
+            INNER JOIN R
+              ON A.WERKS = R.WERKS AND A.MAJ_CAT = R.MAJ_CAT
+             AND A.GEN_ART_NUMBER = R.GEN_ART_NUMBER
+             AND ISNULL(A.CLR,'') = ISNULL(R.CLR,'')
+             AND A.VAR_ART = R.VAR_ART AND A.SZ = R.SZ
+        """)
+        logger.info("[D] PAK_SZ rounding applied")
+    except Exception as e:
+        logger.warning(f"[D] PAK_SZ rounding failed: {e}")
+
+
 def _split_on_go(sql: str) -> List[str]:
     """Split a T-SQL script on GO batch separators (case-insensitive,
     line-oriented). Identical to scripts/run_012_deploy_alloc_proc.py."""
@@ -411,6 +471,7 @@ def run_listing_and_allocation_sql_parallel(
 
     # ── Finalise on main thread (verbatim from sequential path) ──
     with engine.connect() as conn:
+        _stage_d_apply_pak_sz_rounding(conn, alloc_table)
         run_sql(conn, f"UPDATE [{alloc_table}] SET ALLOC_QTY = SHIP_QTY")
         run_sql(conn, f"""
             UPDATE [{alloc_table}] SET
@@ -426,11 +487,23 @@ def run_listing_and_allocation_sql_parallel(
                     WHEN SHIP_QTY > 0                 THEN 'PARTIAL'
                     ELSE 'SKIPPED' END,
                 SKIP_REASON = CASE
+                    -- Preserve any pre-stamped reason from the waterfall or
+                    -- post-waterfall gates (PAK_SZ_*, *_MJ_REQ_GATE_*, SEC_CAP_*,
+                    -- MBQ_CAP_*, MJ_REQ_CAP, R09_HEADROOM_TRIVIAL, R07_SIZE_RATIO_LIVE,
+                    -- SKIP_PRI_BROKEN, CROSS_SKIP_*, REVALIDATION_SKIP).  Without
+                    -- this broad guard the catch-all NO_POOL_MSA arm below stomps
+                    -- the real cause and the audit trail loses why the row was zeroed.
+                    -- Mirrors rule_engine_new.py:2547.
+                    WHEN ISNULL(SKIP_REASON,'') <> '' THEN SKIP_REASON
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
                          AND ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
                              - ISNULL(SZ_STK,0) <= 0
                          THEN 'ALREADY_STOCKED'
-                    WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_OR_DEMAND'
+                    -- Split NO_POOL_OR_DEMAND so users can tell demand-side
+                    -- (SZ_REQ<=0 → no demand) from supply-side (MSA pool empty).
+                    WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
+                         AND ISNULL(SZ_REQ, 0) <= 0 THEN 'NO_REQ'
+                    WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_MSA'
                     ELSE SKIP_REASON END
         """)
         rne._stage_d_reflect(conn, working_table, alloc_table)

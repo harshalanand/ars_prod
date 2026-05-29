@@ -15,9 +15,6 @@ from app.api.v1.endpoints.tables import router as tables_router
 from app.api.v1.endpoints.data_ops import router as data_ops_router
 from app.api.v1.endpoints.upload import router as upload_router
 
-# Phase 3: Allocation Engine
-from app.api.v1.endpoints.allocations import router as allocations_router
-
 # Phase 4: MSA Stock Calculation
 from app.api.v1.endpoints.msa_stock import router as msa_router
 from app.api.v1.endpoints.msa import router as msa_legacy_router
@@ -34,6 +31,7 @@ from app.api.v1.endpoints.settings import router as settings_router
 # Phase 6b: SLOC Validation / Data Validation
 from app.api.v1.endpoints.sloc_validation import router as store_stock_router
 from app.api.v1.endpoints.grid_builder import router as grid_builder_router
+from app.api.v1.endpoints.merge_rules import router as merge_rules_router
 
 # Phase 7: Lookup Art Master
 from app.api.v1.endpoints.lookup_art_master import router as lookup_art_master_router
@@ -59,6 +57,12 @@ from app.api.v1.endpoints.hold_dashboard import router as hold_dashboard_router
 # Pending Allocation — ARS_PEND_ALC lifecycle management
 from app.api.v1.endpoints.pend_alc import router as pend_alc_router
 
+# ARS Dashboard — unified analytics page (rev 2: Overview charts + Product Drill)
+from app.api.v1.endpoints.ars_dashboard import router as ars_dashboard_router
+
+# GAP Report — multi-category algorithm-driven review surface
+from app.api.v1.endpoints.gap_report import router as gap_report_router
+
 api_router = APIRouter(prefix="/api/v1")
 
 # Phase 1
@@ -72,9 +76,6 @@ api_router.include_router(audit_router)
 api_router.include_router(tables_router)
 api_router.include_router(data_ops_router)
 api_router.include_router(upload_router)
-
-# Phase 3
-api_router.include_router(allocations_router)
 
 # Phase 4: MSA Stock Calculation
 api_router.include_router(msa_router)
@@ -92,6 +93,7 @@ api_router.include_router(settings_router)
 # Phase 6b: Store Stock / Data Preparation
 api_router.include_router(store_stock_router)
 api_router.include_router(grid_builder_router)
+api_router.include_router(merge_rules_router)
 
 # Phase 7: Lookup Art Master
 api_router.include_router(lookup_art_master_router)
@@ -100,6 +102,8 @@ api_router.include_router(lookup_art_master_router)
 api_router.include_router(dashboard_router)
 api_router.include_router(hold_dashboard_router)
 api_router.include_router(pend_alc_router)
+api_router.include_router(ars_dashboard_router)
+api_router.include_router(gap_report_router)
 
 # Data Checklist
 api_router.include_router(checklist_router)
@@ -124,14 +128,6 @@ api_router.include_router(pipeline_router)
 # Allocation Engine v2 (score-based, replaces Excel 8-level waterfall)
 from app.api.v1.endpoints.allocation_engine import router as alloc_engine_router
 api_router.include_router(alloc_engine_router)
-
-# Process Docs (SOPs rendered on the Process page)
-from app.api.v1.endpoints.process_docs import router as process_docs_router
-api_router.include_router(process_docs_router)
-
-# Developer Guide — auto-introspecting docs for engineers
-from app.api.v1.endpoints.dev_guide import router as dev_guide_router
-api_router.include_router(dev_guide_router)
 
 # Project Tracker — hierarchical projects, status/priority/phase, dashboard
 from app.api.v1.endpoints.project_tracker import router as project_tracker_router
