@@ -30,6 +30,38 @@ from loguru import logger
 from sqlalchemy import text
 
 
+# Module-level latch flipped on by prewarm_pend_alc_tables(engine) at startup.
+# Once True, ensure_*_table() short-circuits — schema/DDL work no longer runs
+# inside user transactions, so /pend-alc/bdc-generate never takes a Sch-M
+# lock during the hot path (which is what was blocking other sessions during
+# "Generate BDC").
+_TABLES_PREWARMED = False
+
+
+def prewarm_pend_alc_tables(engine) -> None:
+    """Run every ensure_*_table once at startup on a dedicated connection, then
+    flip _TABLES_PREWARMED so per-request callers skip the DDL/INFORMATION_SCHEMA
+    round-trips entirely.
+
+    Call this from main.py's lifespan startup after enable_rcsi().
+    """
+    global _TABLES_PREWARMED
+    # Reset latch so the ensure_* calls below actually run (they early-return
+    # when _TABLES_PREWARMED is True).
+    was_warm = _TABLES_PREWARMED
+    _TABLES_PREWARMED = False
+    try:
+        with engine.connect() as conn:
+            ensure_pend_alc_table(conn)
+            ensure_bdc_history_table(conn)
+            ensure_operations_table(conn)
+        _TABLES_PREWARMED = True
+        logger.info("[pend_alc] tables prewarmed — hot-path DDL disabled")
+    except Exception as e:
+        _TABLES_PREWARMED = was_warm
+        logger.warning(f"[pend_alc] prewarm failed (will fall back to per-request ensure): {e}")
+
+
 PEND_ALC_TABLE = "ARS_PEND_ALC"
 
 _DDL = f"""
@@ -69,6 +101,13 @@ _INDEXES = [
      f"ON dbo.{PEND_ALC_TABLE} (ALLOC_MODE, IS_CLOSED)"),
     ("IX_ARS_PEND_ALC_source",
      f"ON dbo.{PEND_ALC_TABLE} (SOURCE, IS_CLOSED)"),
+    # Covering index for /pend-alc/bdc-generate aggregation + stamp_bdc_qty
+    # JOIN. The aggregation walks (RDC, ST_CD, ARTICLE) for IS_CLOSED=0 and
+    # only needs PEND_QTY, BDC_QTY, MAJ_CAT — so a covering index turns the
+    # full scan into a seek and removes the table-lock escalation risk.
+    ("IX_ARS_PEND_ALC_bdc_lookup",
+     f"ON dbo.{PEND_ALC_TABLE} (IS_CLOSED, RDC, ST_CD, ARTICLE_NUMBER) "
+     f"INCLUDE (PEND_QTY, BDC_QTY, MAJ_CAT, LAST_BDC_AT)"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -111,6 +150,8 @@ _BDC_HISTORY_INDEXES = [
 
 def ensure_bdc_history_table(conn) -> None:
     """Idempotent: create ARS_BDC_HISTORY if missing + ensure indexes."""
+    if _TABLES_PREWARMED:
+        return  # hot-path skip — startup already verified the schema
     conn.execute(text(_BDC_HISTORY_DDL))
     for idx_name, idx_def in _BDC_HISTORY_INDEXES:
         conn.execute(text(f"""
@@ -164,6 +205,8 @@ _OPERATIONS_INDEXES = [
 
 def ensure_operations_table(conn) -> None:
     """Idempotent: create ARS_PEND_ALC_OPERATIONS + indexes."""
+    if _TABLES_PREWARMED:
+        return  # hot-path skip — startup already verified the schema
     conn.execute(text(_OPERATIONS_DDL))
     for idx_name, idx_def in _OPERATIONS_INDEXES:
         conn.execute(text(f"""
@@ -412,7 +455,7 @@ def backfill_bdc_operations(conn, dry_run: bool = True) -> Dict:
 
         stamped_rows = [
             {"pend_alc_id": int(p[0]), "old_bdc_qty": 0,
-             "old_last_bdc_at": None, "new_bdc_qty": float(p[1] or 0)}
+             "old_last_bdc_at": None}
             for p in p_rows
         ]
 
@@ -1251,6 +1294,8 @@ _ENSURE_COLS = [
 def ensure_pend_alc_table(conn) -> None:
     """Idempotent: create ARS_PEND_ALC with full schema if missing, or add any
     missing columns to an existing table (handles old-schema upgrades)."""
+    if _TABLES_PREWARMED:
+        return  # hot-path skip — startup already verified the schema
     # 1. Create table if it doesn't exist at all
     conn.execute(text(_DDL))
 
@@ -1767,9 +1812,11 @@ def stamp_bdc_qty(
 ) -> List[Dict]:
     """Set BDC_QTY = current PEND_QTY and LAST_BDC_AT = now for open rows.
 
-    Returns a list of {pend_alc_id, old_bdc_qty, old_last_bdc_at, new_bdc_qty}
-    for every row touched — the caller persists this in the operations log
-    so the BDC stamp can be reverted later.
+    Returns a list of {pend_alc_id, old_bdc_qty, old_last_bdc_at} for every row
+    touched — the caller persists this in the operations log so the BDC stamp
+    can be reverted later. `new_bdc_qty` is not stored (it's recomputed at
+    revert time from the live PEND_QTY) — that alone cuts the JSON payload by
+    ~25 % when stamping hundreds of thousands of rows.
 
     article_rdc_pairs: list of dicts with rdc, article_number, optional st_cd.
         - If `st_cd` is provided, scoped to that exact destination store row.
@@ -1799,8 +1846,7 @@ def stamp_bdc_qty(
             UPDATE P
                SET P.BDC_QTY    = P.PEND_QTY,
                    P.LAST_BDC_AT = GETDATE()
-            OUTPUT INSERTED.ID, DELETED.BDC_QTY, DELETED.LAST_BDC_AT,
-                   INSERTED.BDC_QTY
+            OUTPUT INSERTED.ID, DELETED.BDC_QTY, DELETED.LAST_BDC_AT
             FROM {PEND_ALC_TABLE} P
             JOIN {tmp} u
               ON P.RDC = u.rdc
@@ -1819,8 +1865,7 @@ def stamp_bdc_qty(
             UPDATE {PEND_ALC_TABLE}
                SET BDC_QTY     = PEND_QTY,
                    LAST_BDC_AT  = GETDATE()
-            OUTPUT INSERTED.ID, DELETED.BDC_QTY, DELETED.LAST_BDC_AT,
-                   INSERTED.BDC_QTY
+            OUTPUT INSERTED.ID, DELETED.BDC_QTY, DELETED.LAST_BDC_AT
             WHERE IS_CLOSED = 0 AND PEND_QTY > 0
         """)).fetchall()
 
@@ -1830,7 +1875,6 @@ def stamp_bdc_qty(
             "pend_alc_id":     int(r[0]),
             "old_bdc_qty":     float(r[1] or 0),
             "old_last_bdc_at": r[2].isoformat() if r[2] else None,
-            "new_bdc_qty":     float(r[3] or 0),
         }
         for r in rows
     ]

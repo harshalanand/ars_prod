@@ -378,7 +378,7 @@ All rules are OR'd as exclusion criteria — an option is listed only if **every
 | **R05 — Positive Requirement** | Enforce minimum demand (`OPT_REQ_WH ≥ 1`). | Option | ON | `R05_REQ_POS` |
 | **R06 — Primary Inventory Ceiling** | Gate by primary-supplier ratio (`PRI_CT% ≥ 100`). TBL always enforced; RL/TBC enforcement is config-driven (else they use MBQ-cap instead). | Option | ON (TBL); config (RL/TBC) | `R06_PRI_100` |
 | **R07 — Size Coverage (TBL)** | Skip TBL when size coverage is sparse (`VAR_FNL_COUNT / VAR_COUNT < size_threshold` AND `VAR_FNL_COUNT < min_size_count`). | Option | ON | `R07_VAR_RATIO_TBL` |
-| **R09 — Headroom** | Prevent allocation when (store × MAJ_CAT) headroom is trivial: `headroom = cap_pct × MJ_MBQ − MJ_STK_TTL − ALLOC_QTY_RUNNING`; skip if `< 0.5 × ACS_D`. Re-evaluated after each OPT_TYPE waterfall pass. | (WERKS, MAJ_CAT) | ON | `R09_HEADROOM_TRIVIAL` |
+| **R09 — Headroom (TBL only)** | Prevent **TBL** allocation when (store × MAJ_CAT) headroom is trivial: `headroom = tbl_cap × MJ_MBQ − MJ_STK_TTL − ALLOC_QTY_RUNNING`; skip if `< 0.5 × ACS_D`. ACS_D NULL/0 falls back to `default_acs_d` (UI default = 18). RL/TBC are NOT gated by R09 — they rely on MBQ-cap + MJ_REQ-cap post-waterfall. Re-evaluated after each OPT_TYPE waterfall pass when TBL is still upcoming. | (WERKS, MAJ_CAT) | ON | `MJ_REQ < .5 OF ACS_D` |
 
 ### 8.4 Configurable Parameters
 

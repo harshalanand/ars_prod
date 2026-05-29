@@ -2005,17 +2005,43 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
 
     rows_sorted = sorted(rows, key=_key)
 
+    # Precompute the smallest TBL OPT_MBQ per (WERKS, MAJ_CAT) slice over
+    # TBL rows that actually have a positive waterfall outcome
+    # (opt_ship + opt_hold > 0). This anchors the first-shipment-floor
+    # escape below: if no TBL has shipped yet in a slice and the OPT
+    # under evaluation has the smallest TBL OPT_MBQ available, let it
+    # through even when budget < gate_threshold. Prevents a slice from
+    # silently zeroing every TBL when MJ_REQ is small relative to OPT_MBQ.
+    min_opt_mbq_by_slice: Dict[Tuple[str, str], float] = {}
+    for _r in rows:
+        if str(_r.OPT_TYPE or "").upper().strip() != "TBL":
+            continue
+        _ship = float(_r.opt_ship or 0.0)
+        _hold = float(_r.opt_hold or 0.0)
+        if _ship + _hold <= 0.0:
+            continue
+        _mbq = float(_r.opt_mbq or 0.0)
+        if _mbq <= 0.0:
+            continue
+        _slk = (str(_r.WERKS or ""), str(_r.MAJ_CAT or ""))
+        cur = min_opt_mbq_by_slice.get(_slk)
+        if cur is None or _mbq < cur:
+            min_opt_mbq_by_slice[_slk] = _mbq
+
     # 3) Iterate per (WERKS, MAJ_CAT) tracking req_rem. Record skip decisions.
     skip_records: List[Dict[str, Any]] = []
     current_key: Tuple[str, str] = ("", "")
     req_rem: float = 0.0
+    n_shipped_in_slice: int = 0  # resets per (WERKS, MAJ_CAT)
     n_skipped = 0
     n_shipped = 0
+    n_floor_escape = 0
     for r in rows_sorted:
         wm_key = (str(r.WERKS or ""), str(r.MAJ_CAT or ""))
         if wm_key != current_key:
             current_key = wm_key
             req_rem = float(r.mj_req or 0.0)
+            n_shipped_in_slice = 0
         ot = str(r.OPT_TYPE or "").upper().strip()
         cap_pct = cap_map.get(ot, 0.0)
         opt_ship = float(r.opt_ship or 0.0)
@@ -2032,6 +2058,7 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
         if ot != 'TBL':
             req_rem -= opt_ship
             n_shipped += 1
+            n_shipped_in_slice += 1
             continue
         if cap_pct <= 0.0:
             # TBL cap disabled → always skip
@@ -2055,7 +2082,34 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
             # SHIP this OPT in full. Waterfall rows stay untouched.
             req_rem -= opt_ship
             n_shipped += 1
+            n_shipped_in_slice += 1
         else:
+            # First-shipment-floor escape (TBL only): if NOTHING has shipped
+            # yet in this slice, there is still positive req_rem, and this OPT
+            # carries the smallest TBL OPT_MBQ available in the slice, allow
+            # it through. Without this, a slice with MJ_REQ=8 and three TBL
+            # OPTs at OPT_MBQ=17 each would zero every TBL (8 < 0.5*17=8.5)
+            # despite the waterfall having found stores willing to take them.
+            slice_min_mbq = min_opt_mbq_by_slice.get(wm_key)
+            if (
+                n_shipped_in_slice == 0
+                and req_rem > 0.0
+                and slice_min_mbq is not None
+                and abs(opt_mbq - slice_min_mbq) <= 1e-9
+            ):
+                req_rem -= opt_ship
+                n_shipped += 1
+                n_shipped_in_slice += 1
+                n_floor_escape += 1
+                logger.info(
+                    f"[C] TBL_MJ_REQ_GATE floor_escape: "
+                    f"WERKS={wm_key[0]} MAJ_CAT={wm_key[1]} "
+                    f"GEN_ART={r.GEN_ART_NUMBER} CLR={r.CLR_K} "
+                    f"req_rem={req_rem + opt_ship:.2f} opt_mbq={opt_mbq:.2f} "
+                    f"opt_ship={opt_ship:.2f} (smallest TBL OPT_MBQ in slice; "
+                    f"first shipment allowed)"
+                )
+                continue
             # SKIP this OPT. req_rem unchanged — a later, smaller-OPT_MBQ
             # OPT may still pass.
             skip_records.append({
@@ -2076,8 +2130,9 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
 
     if not skip_records:
         logger.info(
-            f"[C] OPT-grain MJ_REQ gate: {n_shipped} OPTs shipped, "
-            f"0 skipped (gate_factor={mbq_gate_factor})"
+            f"[C] OPT-grain MJ_REQ gate: {n_shipped} OPTs shipped "
+            f"(floor_escape={n_floor_escape}), 0 skipped "
+            f"(gate_factor={mbq_gate_factor})"
         )
         return
 
@@ -2116,6 +2171,38 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
                 ),
                 batch,
             )
+        # GATE_ZEROED audit: capture original SHIP/HOLD per OPT BEFORE the
+        # UPDATE below zeroes the size rows. We aggregate to OPT grain so
+        # the token reflects the OPT-level waterfall outcome (not a single
+        # size). Only rows where was_ship > 0 receive the token — rows that
+        # were already zero have nothing to record.
+        try:
+            try:
+                _run(conn, "DROP TABLE #OptGateAudit")
+            except Exception:
+                pass
+            _run(conn, f"""
+                SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER,
+                       ISNULL(A.CLR,'') AS CLR_K, A.OPT_TYPE,
+                       SUM(ISNULL(A.SHIP_QTY, 0)) AS was_ship,
+                       SUM(ISNULL(A.HOLD_QTY, 0)) AS was_hold,
+                       MAX(S.skip_reason)         AS skip_reason
+                INTO #OptGateAudit
+                FROM [{alloc_table}] A
+                INNER JOIN #OptSkip S
+                    ON  S.WERKS          = A.WERKS
+                    AND S.MAJ_CAT        = A.MAJ_CAT
+                    AND S.GEN_ART_NUMBER = A.GEN_ART_NUMBER
+                    AND S.CLR_K          = ISNULL(A.CLR, '')
+                    AND S.OPT_TYPE       = A.OPT_TYPE
+                WHERE S.skip_reason LIKE 'TBL_MJ_REQ_GATE_FAIL%'
+                GROUP BY A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER,
+                         ISNULL(A.CLR,''), A.OPT_TYPE
+                HAVING SUM(ISNULL(A.SHIP_QTY, 0)) > 0
+            """)
+        except Exception as _audit_e:
+            logger.warning(f"[C] GATE_ZEROED audit snapshot failed: {_audit_e}")
+
         _run(conn, f"""
             UPDATE A
                SET A.SHIP_QTY     = 0,
@@ -2139,10 +2226,61 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
                 AND S.OPT_TYPE       = A.OPT_TYPE
             WHERE (ISNULL(A.SHIP_QTY, 0) > 0 OR ISNULL(A.HOLD_QTY, 0) > 0)
         """)
+
+        # GATE_ZEROED token: stamp the pre-zero ship/hold + reason onto
+        # ALLOC_REMARKS for both the size-grain alloc rows and the matching
+        # OPT-grain working_table listing rows (LISTED_FLAG=1). This makes
+        # the loss visible during reconciliation — auditors can see what
+        # the waterfall produced before the gate erased it.
+        try:
+            _run(conn, f"""
+                UPDATE A
+                   SET A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS, '')
+                       + ' | GATE_ZEROED(was_ship='
+                       + CAST(G.was_ship AS NVARCHAR(20))
+                       + ', was_hold='
+                       + CAST(G.was_hold AS NVARCHAR(20))
+                       + ', reason='
+                       + ISNULL(G.skip_reason, '')
+                       + ')'
+                FROM [{alloc_table}] A
+                INNER JOIN #OptGateAudit G
+                    ON  G.WERKS          = A.WERKS
+                    AND G.MAJ_CAT        = A.MAJ_CAT
+                    AND G.GEN_ART_NUMBER = A.GEN_ART_NUMBER
+                    AND G.CLR_K          = ISNULL(A.CLR, '')
+                    AND G.OPT_TYPE       = A.OPT_TYPE
+            """)
+            _run(conn, f"""
+                UPDATE W
+                   SET W.ALLOC_REMARKS = ISNULL(W.ALLOC_REMARKS, '')
+                       + ' | GATE_ZEROED(was_ship='
+                       + CAST(G.was_ship AS NVARCHAR(20))
+                       + ', was_hold='
+                       + CAST(G.was_hold AS NVARCHAR(20))
+                       + ', reason='
+                       + ISNULL(G.skip_reason, '')
+                       + ')'
+                FROM [{working_table}] W
+                INNER JOIN #OptGateAudit G
+                    ON  G.WERKS          = W.WERKS
+                    AND G.MAJ_CAT        = W.MAJ_CAT
+                    AND G.GEN_ART_NUMBER = W.GEN_ART_NUMBER
+                    AND G.CLR_K          = ISNULL(W.CLR, '')
+                    AND G.OPT_TYPE       = W.OPT_TYPE
+                WHERE ISNULL(W.LISTED_FLAG, 0) = 1
+            """)
+        except Exception as _stamp_e:
+            logger.warning(f"[C] GATE_ZEROED stamp failed: {_stamp_e}")
+        try:
+            _run(conn, "DROP TABLE #OptGateAudit")
+        except Exception:
+            pass
         _run(conn, "DROP TABLE #OptSkip")
         logger.info(
-            f"[C] OPT-grain MJ_REQ gate: {n_shipped} OPTs shipped, "
-            f"{n_skipped} skipped (gate_factor={mbq_gate_factor}, "
+            f"[C] OPT-grain MJ_REQ gate: {n_shipped} OPTs shipped "
+            f"(floor_escape={n_floor_escape}), {n_skipped} skipped "
+            f"(gate_factor={mbq_gate_factor}, "
             f"caps RL={rl_cap_pct}% TBC={tbc_cap_pct}% TBL={tbl_cap_pct}%)"
         )
     except Exception as e:

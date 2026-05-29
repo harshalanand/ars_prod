@@ -403,6 +403,14 @@ def run_listing_and_allocation_python_parallel(
                     WHEN SHIP_QTY > 0                 THEN 'PARTIAL'
                     ELSE 'SKIPPED' END,
                 SKIP_REASON = CASE
+                    -- Preserve any pre-stamped reason from the waterfall or
+                    -- post-waterfall gates (PAK_SZ_*, *_MJ_REQ_GATE_*, SEC_CAP_*,
+                    -- MBQ_CAP_*, MJ_REQ_CAP, R09_HEADROOM_TRIVIAL, R07_SIZE_RATIO_LIVE,
+                    -- SKIP_PRI_BROKEN, CROSS_SKIP_*, REVALIDATION_SKIP).  Without
+                    -- this broad guard the catch-all NO_POOL_MSA arm below stomps
+                    -- the real cause and the audit trail loses why the row was zeroed.
+                    -- Mirrors rule_engine_new.py:2547.
+                    WHEN ISNULL(SKIP_REASON,'') <> '' THEN SKIP_REASON
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
                          AND ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
                              - ISNULL(SZ_STK,0) <= 0
