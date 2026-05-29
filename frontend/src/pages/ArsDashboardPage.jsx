@@ -16,7 +16,8 @@
  * Global filter bar (URL-synced):
  *   Date, Session, MAJ_CAT, Store, RDC, HUB, Status (OLD/UPC), DIV, SSN, Drill-path
  */
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { useSearchParams, Link } from 'react-router-dom'
 import {
   LayoutGrid, RefreshCw, Loader2, ChevronRight, ChevronLeft,
@@ -48,9 +49,9 @@ function StatusBadge({ status }) {
 
 const PIE_COLORS = ['#4f46e5', '#06b6d4', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#0891b2', '#a855f7']
 
-const EMPTY_SCOPE = { date:'', sid:'', mc:[], werks:[], rdc:[], hub:[], status:[], div:[], ssn:[] }
+export const EMPTY_SCOPE = { date:'', sid:'', mc:[], werks:[], rdc:[], hub:[], status:[], div:[], ssn:[] }
 
-function scopeParams(scope) {
+export function scopeParams(scope) {
   const out = {}
   if (scope.date)         out.date    = scope.date
   if (scope.sid)          out.sid     = scope.sid
@@ -64,8 +65,21 @@ function scopeParams(scope) {
   return out
 }
 
+// Drill-level dimension orders. The same names are used as `dim=…` query
+// params on the new /drill/level endpoint, and as keys on the DrillTab crumb.
+export const DRILL_LEVELS_MJST = ['SEG', 'DIV', 'SUB_DIV', 'MAJ_CAT', 'ST_CD', 'GEN_ART', 'ARTICLE']
+export const DRILL_LEVELS_STMJ = ['ST_CD', 'SEG', 'DIV', 'SUB_DIV', 'MAJ_CAT', 'GEN_ART', 'ARTICLE']
+export const DRILL_LABELS = {
+  SEG: 'Segment', DIV: 'Division', SUB_DIV: 'Sub-Division',
+  MAJ_CAT: 'MAJ_CAT', ST_CD: 'Store', GEN_ART: 'GEN_ART · CLR', ARTICLE: 'Article',
+}
+// Crumb key for each dim (stored on the DrillTab crumb object)
+export const DRILL_CRUMB_KEY = { SEG: 'seg', DIV: 'div', SUB_DIV: 'sub_div', MAJ_CAT: 'maj_cat', ST_CD: 'st_cd', GEN_ART: 'gen_art', ARTICLE: 'article' }
+// Scope-param key for each dim (sent to the backend as the parent filter)
+export const DRILL_SCOPE_KEY = { SEG: 'seg', DIV: 'div', SUB_DIV: 'sub_div', MAJ_CAT: 'mc', ST_CD: 'werks' }
+
 // Stringify scope into a stable dep value for React.useEffect
-function scopeKey(scope) {
+export function scopeKey(scope) {
   return JSON.stringify(scopeParams(scope))
 }
 
@@ -182,7 +196,8 @@ function DdMulti({ label, values, onChange, options }) {
 /* ─────────────────────────────────────────────────────────────────────────
    Filter bar
 ───────────────────────────────────────────────────────────────────────── */
-function FilterBar({ scope, setScope, config, sessionsForDate, drillPath, setDrillPath }) {
+function FilterBar({ scope, setScope, config, sessionsForDate, drillPath, setDrillPath,
+                     reportMode, setReportMode }) {
   const set = (k, v) => setScope({ ...scope, [k]: v })
   const hasAny = scope.date || scope.sid || scope.mc.length || scope.werks.length || scope.rdc.length
     || scope.hub.length || scope.status.length || scope.div.length || scope.ssn.length
@@ -197,8 +212,10 @@ function FilterBar({ scope, setScope, config, sessionsForDate, drillPath, setDri
           options={[{ value: '', label: 'Last 7 days' }, ...(config.dates || []).map(d => ({ value: d, label: d }))]} />
 
       <Dd label="Session" value={scope.sid} onChange={v => set('sid', v)}
-          disabled={!scope.date}
-          options={[{ value: '', label: scope.date ? 'All sessions' : 'Pick a date first' },
+          disabled={reportMode !== 'session' && !scope.date}
+          options={[{ value: '', label: reportMode === 'session'
+                                          ? (sessionsForDate.length ? 'All review sessions' : 'No archived sessions')
+                                          : (scope.date ? 'All sessions' : 'Pick a date first') },
                     ...sessionsForDate.map(s => ({ value: s.session_id, label: s.label }))]} />
 
       <DdMulti label="MAJ_CAT" values={scope.mc}     onChange={v => set('mc',     v)} options={config.maj_cats || []} />
@@ -220,7 +237,22 @@ function FilterBar({ scope, setScope, config, sessionsForDate, drillPath, setDri
         </button>
       )}
 
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-3">
+        {typeof setReportMode === 'function' && (
+          <>
+            <span className="text-[11px] text-gray-500">Report</span>
+            <div className="inline-flex border border-gray-200 rounded-md overflow-hidden">
+              <button onClick={() => setReportMode('pending')}
+                      className={`px-2.5 py-1 text-[11px] font-medium ${reportMode === 'pending' ? 'bg-amber-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>
+                Alloc + Pending
+              </button>
+              <button onClick={() => setReportMode('session')}
+                      className={`px-2.5 py-1 text-[11px] font-medium ${reportMode === 'session' ? 'bg-amber-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>
+                Session Review
+              </button>
+            </div>
+          </>
+        )}
         <span className="text-[11px] text-gray-500">Drill</span>
         <div className="inline-flex border border-gray-200 rounded-md overflow-hidden">
           <button onClick={() => setDrillPath('mjst')}
@@ -854,17 +886,476 @@ function PivotGrid({ data, filter, onRowClick }) {
   )
 }
 
-/* Flat drill table — for L2/L3/L4 (after a MAJ_CAT is picked) */
-function FlatDrillTable({ rows, columns, onRowClick, emptyText }) {
+/* ─────────────────────────────────────────────────────────────────────────
+   SessionReviewGrid — wide MAJ_CAT × RDC pivot for one SESSION_ID.
+   Mirrors the listing-page "MAJ_CATs that ran" report.
+   Sub-columns per RDC: MBQ | STOCK | STORE_STK | EXCESS_STK | REQ | ALLOC
+                        | REQ% | FILL% | REQ_REM | HOLD | MSA_REM | STK%
+   Every header is clickable to sort asc/desc.
+   Filter input above filters MAJ_CAT.
+───────────────────────────────────────────────────────────────────────── */
+const SR_SUBCOLS = [
+  { k: 'mbq',        l: 'MBQ',        pct: false, hint: 'MJ_MBQ deduped' },
+  { k: 'stock',      l: 'STOCK',      pct: false, hint: 'STK_TTL (option)' },
+  { k: 'store_stk',  l: 'STORE_STK',  pct: false, hint: 'MJ_STK_TTL deduped' },
+  { k: 'excess_stk', l: 'EXCESS_STK', pct: false },
+  { k: 'req',        l: 'REQ',        pct: false, hint: 'MJ_REQ deduped' },
+  { k: 'alloc',      l: 'ALLOC',      pct: false, strong: true },
+  { k: 'req_pct',    l: 'REQ%',       pct: true },
+  { k: 'fill_pct',   l: 'FILL%',      pct: true },
+  { k: 'req_rem',    l: 'REQ_REM',    pct: false, warn: true },
+  { k: 'hold',       l: 'HOLD',       pct: false },
+  { k: 'msa_rem',    l: 'MSA_REM',    pct: false },
+  { k: 'stk_pct',    l: 'STK%',       pct: true },
+]
+
+export function SessionReviewGrid({
+  data, filter, groupLabel = 'MAJ_CAT', onRowClick,
+  showRdc = true, onToggleRdc = null,
+}) {
+  const { rdcs: rawRdcs = [], items = [], totals = {}, source } = data || {}
+  // When showRdc is false, hide the per-RDC blocks entirely (only the TOTAL block remains).
+  const rdcs = showRdc ? rawRdcs : []
+  const [sortCol, setSortCol] = useState('totalAlloc')
+  const [sortDir, setSortDir] = useState('desc')
+  const toggleSort = (k) => {
+    if (sortCol === k) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortCol(k); setSortDir('desc') }
+  }
+
+  // Apply MAJ_CAT filter
+  const filteredItems = useMemo(() => {
+    if (!filter) return items
+    const q = filter.toLowerCase()
+    return items.filter(it => (it.maj_cat || '').toLowerCase().includes(q))
+  }, [items, filter])
+
+  // Build a sortable view
+  const rows = useMemo(() => {
+    const enriched = filteredItems.map(it => ({ ...it,
+      totalAlloc:   it.tot?.alloc ?? 0,
+      totalReq:     it.tot?.req ?? 0,
+      totalMbq:     it.tot?.mbq ?? 0,
+      totalStock:   it.tot?.stock ?? 0,
+      totalStoreStk:it.tot?.store_stk ?? 0,
+      totalExcess:  it.tot?.excess_stk ?? 0,
+      totalHold:    it.tot?.hold ?? 0,
+      totalReqRem:  it.tot?.req_rem ?? 0,
+      totalMsaRem:  it.tot?.msa_rem ?? 0,
+      totalReqPct:  it.tot?.req_pct ?? 0,
+      totalFillPct: it.tot?.fill_pct ?? 0,
+      totalStkPct:  it.tot?.stk_pct ?? 0,
+    }))
+    return [...enriched].sort((a, b) => {
+      const dir = sortDir === 'asc' ? 1 : -1
+      if (sortCol === 'maj_cat') return (a.maj_cat || '').localeCompare(b.maj_cat || '') * dir
+      // Per-RDC sub-column sort: "rdc::sub_k"
+      if (sortCol.includes('::')) {
+        const [rdc, k] = sortCol.split('::')
+        const av = a.by_rdc?.[rdc]?.[k] ?? 0
+        const bv = b.by_rdc?.[rdc]?.[k] ?? 0
+        return (Number(av) - Number(bv)) * dir
+      }
+      const av = a[sortCol] ?? 0, bv = b[sortCol] ?? 0
+      return (Number(av) - Number(bv)) * dir
+    })
+  }, [filteredItems, sortCol, sortDir])
+
+  const pctClass = (p) => p >= 80 ? 'text-emerald-700 font-semibold'
+                       : p >= 50 ? 'text-emerald-600'
+                       : p >= 25 ? 'text-amber-600'
+                       : p >  0  ? 'text-rose-600'
+                       :           'text-gray-300'
+
+  const fmtCell = (v, sc) => v == null ? <span className="text-gray-200">—</span>
+                                       : (sc.pct ? `${typeof v === 'number' ? v.toFixed(1) : v}%` : fmt(v))
+
+  const SortIndicator = ({ active, dir }) => (
+    <span className="text-[9px] text-gray-400 ml-0.5">
+      {active ? (dir === 'asc' ? '▲' : '▼') : '↕'}
+    </span>
+  )
+
+  const sourceLabel = {
+    history:  { txt: 'From HISTORY (approved)',            cls: 'bg-emerald-100 text-emerald-700' },
+    parked:   { txt: 'From PARKED (not yet approved)',     cls: 'bg-amber-100 text-amber-700'    },
+  }[source] || { txt: 'No PARKED/HISTORY snapshot — pick a different session', cls: 'bg-rose-100 text-rose-700' }
+
+  const onExport = () => {
+    const headerRdc = rdcs.flatMap(r => SR_SUBCOLS.map(s => `${r} ${s.l}`))
+    const headers = ['#','MAJ_CAT', ...headerRdc, ...SR_SUBCOLS.map(s => `TOTAL ${s.l}`)]
+    const lines = [headers.join(',')]
+    rows.forEach((row, i) => {
+      const cells = [i + 1, row.maj_cat]
+      rdcs.forEach(r => {
+        const c = row.by_rdc?.[r] || {}
+        SR_SUBCOLS.forEach(sc => cells.push(c[sc.k] ?? ''))
+      })
+      SR_SUBCOLS.forEach(sc => cells.push(row.tot?.[sc.k] ?? ''))
+      lines.push(cells.map(v => `"${v ?? ''}"`).join(','))
+    })
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `session_review_${data?.session_id || 'session'}.csv`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-3 flex-wrap text-[11px]">
+        <span className={`px-2 py-0.5 rounded ${sourceLabel.cls}`}>{sourceLabel.txt}</span>
+        <span className="text-gray-500">Session <b className="text-gray-900">{data?.session_id || '—'}</b></span>
+        <span className="text-gray-300">·</span>
+        <span className="text-gray-500">MBQ <b className="text-gray-900">{fmt(totals.mbq || 0)}</b></span>
+        <span className="text-gray-500">STOCK <b className="text-gray-900">{fmt(totals.stock || 0)}</b></span>
+        <span className="text-gray-500">REQ <b className="text-gray-900">{fmt(totals.req || 0)}</b></span>
+        <span className="text-gray-500">ALLOC <b className="text-indigo-700">{fmt(totals.alloc || 0)}</b></span>
+        <span className="text-gray-500">REQ% <b className={pctClass(totals.req_pct || 0)}>{(totals.req_pct || 0).toFixed(1)}%</b></span>
+        <span className="text-gray-500">FILL% <b className={pctClass(totals.fill_pct || 0)}>{(totals.fill_pct || 0).toFixed(1)}%</b></span>
+        <span className="text-gray-500">HOLD <b className="text-gray-900">{fmt(totals.hold || 0)}</b></span>
+        {onToggleRdc && (
+          <button onClick={onToggleRdc}
+                  className={`ml-auto text-[11px] px-2.5 py-1 rounded border flex items-center gap-1 ${
+                    showRdc ? 'bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100'
+                            : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}>
+            {showRdc ? 'Hide RDCs' : 'Show RDCs'}
+          </button>
+        )}
+        <button onClick={onExport}
+                className={`${onToggleRdc ? '' : 'ml-auto'} bg-emerald-600 text-white text-[11px] px-2.5 py-1 rounded hover:bg-emerald-700 flex items-center gap-1`}>
+          <Download size={11} /> Excel
+        </button>
+      </div>
+
+      <div className="border border-gray-200 rounded-lg bg-white overflow-auto" style={{ maxHeight: 'calc(100vh - 380px)' }}>
+        <table className="text-[11px] border-collapse" style={{ minWidth: '100%' }}>
+          <thead className="bg-gray-50 sticky top-0 z-20">
+            <tr>
+              <th rowSpan={2} className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider text-gray-500 sticky left-0 bg-gray-50 z-30 border-b border-r border-gray-200" style={{ minWidth: 36 }}>#</th>
+              <th rowSpan={2} onClick={() => toggleSort('maj_cat')}
+                  className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wider text-gray-500 sticky left-9 bg-gray-50 z-30 border-b border-r border-gray-200 cursor-pointer hover:text-gray-900"
+                  style={{ minWidth: 180 }}>
+                {groupLabel} <SortIndicator active={sortCol === 'maj_cat'} dir={sortDir} />
+              </th>
+              {rdcs.map(rdc => (
+                <th key={rdc} colSpan={SR_SUBCOLS.length}
+                    className="px-2 py-1.5 text-center text-[10px] uppercase tracking-wider text-indigo-700 bg-indigo-50 border-l border-r border-gray-200">
+                  {rdc}
+                </th>
+              ))}
+              <th colSpan={SR_SUBCOLS.length}
+                  className="px-2 py-1.5 text-center text-[10px] uppercase tracking-wider text-gray-800 bg-amber-50 border-l border-gray-200">
+                TOTAL
+              </th>
+            </tr>
+            <tr>
+              {rdcs.map(rdc => SR_SUBCOLS.map(sc => {
+                const key = `${rdc}::${sc.k}`
+                const active = sortCol === key
+                return (
+                  <th key={key} onClick={() => toggleSort(key)}
+                      className="px-1.5 py-1 text-right text-[9px] font-semibold text-gray-500 border-b border-gray-200 bg-gray-50 cursor-pointer hover:text-gray-900"
+                      title={sc.hint || ''}>
+                    {sc.l}<SortIndicator active={active} dir={sortDir} />
+                  </th>
+                )
+              }))}
+              {SR_SUBCOLS.map(sc => {
+                const totalKey = {
+                  mbq:'totalMbq', stock:'totalStock', store_stk:'totalStoreStk', excess_stk:'totalExcess',
+                  req:'totalReq', alloc:'totalAlloc', req_pct:'totalReqPct', fill_pct:'totalFillPct',
+                  req_rem:'totalReqRem', hold:'totalHold', msa_rem:'totalMsaRem', stk_pct:'totalStkPct',
+                }[sc.k]
+                const active = sortCol === totalKey
+                return (
+                  <th key={`tot.${sc.k}`} onClick={() => toggleSort(totalKey)}
+                      className="px-1.5 py-1 text-right text-[9px] font-semibold text-gray-700 border-b border-gray-200 bg-amber-50 cursor-pointer hover:text-gray-900">
+                    {sc.l}<SortIndicator active={active} dir={sortDir} />
+                  </th>
+                )
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr><td colSpan={2 + rdcs.length * SR_SUBCOLS.length + SR_SUBCOLS.length} className="text-center text-xs text-gray-400 py-6">no rows</td></tr>
+            )}
+            {rows.map((row, i) => (
+              <tr key={row.maj_cat}
+                  onClick={() => onRowClick && onRowClick(row)}
+                  className={`border-b border-gray-100 ${onRowClick ? 'hover:bg-indigo-50 cursor-pointer' : 'hover:bg-indigo-50'}`}>
+                <td className="px-2 py-1 text-gray-400 sticky left-0 bg-white border-r border-gray-200">{i + 1}</td>
+                <td className="px-2 py-1 font-medium text-indigo-700 sticky left-9 bg-white border-r border-gray-200 truncate" title={row.maj_cat}>{row.maj_cat}</td>
+                {rdcs.map(rdc => {
+                  const c = row.by_rdc?.[rdc] || {}
+                  return SR_SUBCOLS.map(sc => {
+                    const v = c[sc.k]
+                    const cls = sc.pct ? pctClass(v || 0) :
+                                sc.warn ? (Number(v) > 0 ? 'text-amber-700 font-semibold' : 'text-gray-400') :
+                                sc.strong ? 'text-gray-900 font-semibold' : 'text-gray-700'
+                    return (
+                      <td key={`${row.maj_cat}.${rdc}.${sc.k}`} className={`px-1.5 py-1 text-right font-mono ${cls}`}>
+                        {fmtCell(v, sc)}
+                      </td>
+                    )
+                  })
+                })}
+                {SR_SUBCOLS.map(sc => {
+                  const v = row.tot?.[sc.k]
+                  const cls = sc.pct ? pctClass(v || 0) :
+                              sc.warn ? (Number(v) > 0 ? 'text-amber-700 font-semibold' : 'text-gray-400') :
+                              'text-gray-900 font-semibold'
+                  return (
+                    <td key={`${row.maj_cat}.tot.${sc.k}`} className={`px-1.5 py-1 text-right font-mono bg-amber-50/30 ${cls}`}>
+                      {fmtCell(v, sc)}
+                    </td>
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot className="bg-gray-100 sticky bottom-0 z-10">
+              <tr>
+                <td colSpan={2} className="px-2 py-1.5 text-[10px] font-bold text-gray-600 sticky left-0 bg-gray-100 border-r border-gray-200">TOTAL ({fmt(rows.length)} MAJ_CATs)</td>
+                {rdcs.map(rdc => SR_SUBCOLS.map(sc => {
+                  // Sum across rows for this rdc/sub-col
+                  const v = rows.reduce((s, r) => s + (r.by_rdc?.[rdc]?.[sc.k] || 0), 0)
+                  return (
+                    <td key={`grand.${rdc}.${sc.k}`} className="px-1.5 py-1 text-right font-mono text-gray-700 bg-gray-100">
+                      {sc.pct ? '—' : fmt(Math.round(v))}
+                    </td>
+                  )
+                }))}
+                {SR_SUBCOLS.map(sc => (
+                  <td key={`grand.tot.${sc.k}`} className="px-1.5 py-1 text-right font-mono font-bold text-gray-900 bg-amber-100">
+                    {sc.pct ? `${(totals[sc.k] || 0).toFixed(1)}%` : fmt(totals[sc.k] || 0)}
+                  </td>
+                ))}
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   ColumnFilter — portal-rendered dropdown, anchored beneath its column header.
+   Renders into document.body so it isn't clipped by the table's overflow.
+   For "number" columns: min/max inputs.
+   For "text" columns:   contains text input + multi-select of distinct values.
+─────────────────────────────────────────────────────────────────────── */
+function ColumnFilter({ open, onClose, anchorEl, dataType, distinct, current, onChange }) {
+  const ref = useRef()
+  const [pos, setPos] = useState({ top: 0, left: 0 })
+
+  // Position below the anchor element, right-aligned, kept in viewport
+  useEffect(() => {
+    if (!open || !anchorEl) return
+    const recompute = () => {
+      const rect = anchorEl.getBoundingClientRect()
+      const popW = 240
+      const top  = rect.bottom + 4
+      let left   = rect.right - popW
+      if (left < 8) left = Math.max(8, rect.left)
+      if (left + popW > window.innerWidth - 8) left = window.innerWidth - popW - 8
+      setPos({ top, left })
+    }
+    recompute()
+    window.addEventListener('scroll', recompute, true)
+    window.addEventListener('resize', recompute)
+    return () => {
+      window.removeEventListener('scroll', recompute, true)
+      window.removeEventListener('resize', recompute)
+    }
+  }, [open, anchorEl])
+
+  useEffect(() => {
+    if (!open) return
+    const h = (e) => {
+      if (ref.current && !ref.current.contains(e.target) &&
+          anchorEl && !anchorEl.contains(e.target)) onClose()
+    }
+    document.addEventListener('mousedown', h)
+    return () => document.removeEventListener('mousedown', h)
+  }, [open, onClose, anchorEl])
+
+  if (!open) return null
+  const v = current || {}
+  const node = (
+    <div ref={ref}
+         style={{ position: 'fixed', top: pos.top, left: pos.left, width: 240, zIndex: 9999 }}
+         className="bg-white border border-gray-200 rounded-md shadow-xl p-2 text-left">
+      {dataType === 'number' ? (
+        <div className="space-y-1.5">
+          <div className="text-[10px] uppercase tracking-wider text-gray-500">Numeric filter</div>
+          <div className="flex items-center gap-1">
+            <input type="number" placeholder="min" value={v.min ?? ''}
+                   onChange={e => onChange({ ...v, min: e.target.value === '' ? undefined : Number(e.target.value) })}
+                   className="w-full text-xs border border-gray-200 rounded px-1.5 py-1" />
+            <input type="number" placeholder="max" value={v.max ?? ''}
+                   onChange={e => onChange({ ...v, max: e.target.value === '' ? undefined : Number(e.target.value) })}
+                   className="w-full text-xs border border-gray-200 rounded px-1.5 py-1" />
+          </div>
+          <button onClick={() => onChange({})}
+                  className="w-full text-[11px] text-rose-600 hover:text-rose-700 py-0.5">clear</button>
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          <div className="text-[10px] uppercase tracking-wider text-gray-500">Contains</div>
+          <input type="text" placeholder="search…" value={v.contains ?? ''}
+                 onChange={e => onChange({ ...v, contains: e.target.value || undefined })}
+                 className="w-full text-xs border border-gray-200 rounded px-1.5 py-1" autoFocus />
+          {distinct && distinct.length > 0 && distinct.length <= 50 && (
+            <div className="max-h-48 overflow-y-auto border-t border-gray-100 pt-1.5">
+              <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-0.5">Pick values</div>
+              {distinct.map(d => {
+                const sel = (v.in || []).includes(d)
+                return (
+                  <label key={d} className="flex items-center gap-1 px-1 py-0.5 text-xs hover:bg-gray-50 cursor-pointer rounded">
+                    <input type="checkbox" checked={sel} onChange={() => {
+                      const next = sel ? (v.in || []).filter(x => x !== d) : [ ...(v.in || []), d ]
+                      onChange({ ...v, in: next.length ? next : undefined })
+                    }} />
+                    <span className="truncate" title={String(d)}>{String(d)}</span>
+                  </label>
+                )
+              })}
+            </div>
+          )}
+          <button onClick={() => onChange({})}
+                  className="w-full text-[11px] text-rose-600 hover:text-rose-700 py-0.5">clear</button>
+        </div>
+      )}
+    </div>
+  )
+  return createPortal(node, document.body)
+}
+
+/* useSortableFilteredRows — hook that wraps a rows[] + columns[] with sort
+   state + per-column filter state. Returns the projected rows.
+   Column shape: { k, l, align?, fmt?, render?, warn?, type? }  (type defaults to text)
+─────────────────────────────────────────────────────────────────────── */
+function useSortableFilteredRows(rows, columns) {
+  const [sort,    setSort]    = useState({ key: null, dir: 'desc' })
+  const [filters, setFilters] = useState({})    // { col_key: {contains?, in?, min?, max?} }
+
+  const toggleSort = (key) => {
+    setSort(s => s.key !== key ? { key, dir: 'desc' } : { key, dir: s.dir === 'desc' ? 'asc' : 'desc' })
+  }
+  const setColFilter = (key, val) => setFilters(f => {
+    const next = { ...f }
+    if (!val || (val.contains == null && (val.in == null || val.in.length === 0) && val.min == null && val.max == null)) {
+      delete next[key]
+    } else next[key] = val
+    return next
+  })
+  const colType = (col) => col.type || (col.align === 'right' || col.fmt ? 'number' : 'text')
+  const valFor = (row, col) => {
+    if (col.sortValue) return col.sortValue(row)
+    return row[col.k]
+  }
+
+  const distinctByCol = useMemo(() => {
+    const out = {}
+    columns.forEach(c => {
+      if (colType(c) !== 'text') return
+      const set = new Set()
+      rows.forEach(r => {
+        const v = valFor(r, c)
+        if (v != null && v !== '') set.add(String(v))
+      })
+      out[c.k] = [...set].sort().slice(0, 200)
+    })
+    return out
+  }, [rows, columns])
+
+  const filtered = useMemo(() => {
+    if (!Object.keys(filters).length) return rows
+    return rows.filter(r => {
+      for (const c of columns) {
+        const f = filters[c.k]
+        if (!f) continue
+        const v = valFor(r, c)
+        if (colType(c) === 'number') {
+          const n = Number(v) || 0
+          if (f.min != null && n < f.min) return false
+          if (f.max != null && n > f.max) return false
+        } else {
+          if (f.contains && !String(v ?? '').toLowerCase().includes(String(f.contains).toLowerCase())) return false
+          if (f.in && f.in.length && !f.in.includes(String(v ?? ''))) return false
+        }
+      }
+      return true
+    })
+  }, [rows, columns, filters])
+
+  const sorted = useMemo(() => {
+    if (!sort.key) return filtered
+    const col = columns.find(c => c.k === sort.key)
+    if (!col) return filtered
+    const isNum = colType(col) === 'number'
+    const dir   = sort.dir === 'asc' ? 1 : -1
+    return [...filtered].sort((a, b) => {
+      const av = valFor(a, col)
+      const bv = valFor(b, col)
+      if (av == null && bv == null) return 0
+      if (av == null) return 1
+      if (bv == null) return -1
+      if (isNum) return (Number(av) - Number(bv)) * dir
+      return String(av).localeCompare(String(bv)) * dir
+    })
+  }, [filtered, sort, columns])
+
+  return { rows: sorted, sort, toggleSort, filters, setColFilter, distinctByCol }
+}
+
+/* Flat drill table — sortable + per-column filterable */
+export function FlatDrillTable({ rows, columns, onRowClick, emptyText }) {
+  const { rows: viewRows, sort, toggleSort, filters, setColFilter, distinctByCol } =
+    useSortableFilteredRows(rows, columns)
+  const [openFilterCol, setOpenFilterCol] = useState(null)
+  const [openAnchor,    setOpenAnchor]    = useState(null)
+  const openFilter = (k, el) => { setOpenFilterCol(k); setOpenAnchor(el) }
+  const closeFilter = () => { setOpenFilterCol(null); setOpenAnchor(null) }
+
   return (
     <div className="border border-gray-200 rounded-lg bg-white overflow-auto" style={{ maxHeight: 'calc(100vh - 380px)' }}>
       <table className="w-full text-sm">
-        <thead className="bg-gray-50 sticky top-0">
-          <tr>{columns.map(c => <th key={c.k} className={`px-3 py-2 text-[10px] uppercase tracking-wider text-gray-500 ${c.align === 'right' ? 'text-right' : 'text-left'}`}>{c.l}</th>)}</tr>
+        <thead className="bg-gray-50 sticky top-0 z-10">
+          <tr>{columns.map(c => {
+            const isActive = sort.key === c.k
+            const hasFilter = !!filters[c.k]
+            const dataType = c.type || (c.align === 'right' || c.fmt ? 'number' : 'text')
+            return (
+              <th key={c.k} className={`px-3 py-2 text-[10px] uppercase tracking-wider text-gray-500 ${c.align === 'right' ? 'text-right' : 'text-left'} relative select-none`}>
+                <div className={`inline-flex items-center gap-1 ${c.align === 'right' ? 'flex-row-reverse' : ''}`}>
+                  <button onClick={() => toggleSort(c.k)}
+                          className="inline-flex items-center gap-0.5 hover:text-gray-900">
+                    <span>{c.l}</span>
+                    <span className="text-[9px] text-gray-400">
+                      {isActive ? (sort.dir === 'asc' ? '▲' : '▼') : '↕'}
+                    </span>
+                  </button>
+                  <button onClick={(e) => {
+                            e.stopPropagation()
+                            if (openFilterCol === c.k) closeFilter()
+                            else openFilter(c.k, e.currentTarget)
+                          }}
+                          className={`text-[10px] ${hasFilter ? 'text-indigo-600' : 'text-gray-300 hover:text-gray-600'}`}
+                          title="Filter">⏷</button>
+                </div>
+              </th>
+            )
+          })}</tr>
         </thead>
         <tbody>
-          {rows.length === 0 && <tr><td colSpan={columns.length} className="text-center text-xs text-gray-400 py-6">{emptyText || 'no rows'}</td></tr>}
-          {rows.map((r, i) => (
+          {viewRows.length === 0 && <tr><td colSpan={columns.length} className="text-center text-xs text-gray-400 py-6">{emptyText || 'no rows'}</td></tr>}
+          {viewRows.map((r, i) => (
             <tr key={i} onClick={() => onRowClick && onRowClick(r)}
                 className={`border-t border-gray-100 ${onRowClick ? 'hover:bg-indigo-50 cursor-pointer' : ''}`}>
               {columns.map(c => {
@@ -880,79 +1371,145 @@ function FlatDrillTable({ rows, columns, onRowClick, emptyText }) {
           ))}
         </tbody>
       </table>
+      {/* Portal-rendered filter dropdown — anchored to the active header */}
+      {openFilterCol && (() => {
+        const c = columns.find(x => x.k === openFilterCol)
+        if (!c) return null
+        const dataType = c.type || (c.align === 'right' || c.fmt ? 'number' : 'text')
+        return (
+          <ColumnFilter open={true}
+                        onClose={closeFilter}
+                        anchorEl={openAnchor}
+                        dataType={dataType}
+                        distinct={distinctByCol[openFilterCol]}
+                        current={filters[openFilterCol]}
+                        onChange={(v) => setColFilter(openFilterCol, v)} />
+        )
+      })()}
     </div>
   )
 }
 
-function DrillTab({ scope, drillPath }) {
-  // State for the drill path
-  const [crumb, setCrumb] = useState({ maj_cat: '', st_cd: '', gen_art: '', clr: '' })
+function DrillTab({ scope, drillPath, reportMode }) {
+  // Dimension order for the current drill path
+  const levels = drillPath === 'stmj' ? DRILL_LEVELS_STMJ : DRILL_LEVELS_MJST
 
-  // Each level loads from its own endpoint
-  const [pivot,     setPivot]     = useState({ rdcs: [], items: [], totals: {} })
-  const [stores,    setStores]    = useState([])
-  const [genArts,   setGenArts]   = useState([])
-  const [articles,  setArticles]  = useState([])
-  const [filter,    setFilter]    = useState('')
-  const [busy,      setBusy]      = useState(false)
+  // crumb holds all parent values picked so far. Empty string = not set.
+  // st_nm is a display-only sidecar for the store crumb (not sent to the backend).
+  const [crumb, setCrumb] = useState({ seg:'', div:'', sub_div:'', maj_cat:'', st_cd:'', st_nm:'', gen_art:'', clr:'' })
+
+  // Current level index (0-based) is the first dim whose crumb value is empty
+  const levelIdx = useMemo(() => {
+    for (let i = 0; i < levels.length; i++) {
+      const k = DRILL_CRUMB_KEY[levels[i]]
+      if (!crumb[k]) return i
+    }
+    return levels.length - 1
+  }, [levels, crumb])
+  const currentDim = levels[levelIdx]
+
+  // Result holders per shape
+  const [flatRows,   setFlatRows]   = useState([])           // /drill/level rows
+  const [pivot,      setPivot]      = useState({ rdcs: [], items: [], totals: {} })
+  const [sessionRev, setSessionRev] = useState({ rdcs: [], items: [], totals: {}, source: null }) // rich session-review pivot
+  const [genArts,    setGenArts]    = useState([])
+  const [articles,   setArticles]   = useState([])
+  const [filter,     setFilter]     = useState('')
+  const [busy,       setBusy]       = useState(false)
+
+  // Build the scope params with crumb parents folded in (so the backend
+  // narrows to the selected SEG/DIV/SUB_DIV/MAJ_CAT/Store before grouping).
+  const crumbParams = useMemo(() => {
+    const p = { ...scopeParams(scope) }
+    // In Session Review mode the date range is irrelevant — sid is sufficient.
+    if (reportMode === 'session') { delete p.date; delete p.from; delete p.to }
+    // Each level above the current one becomes a single-value scope filter
+    for (let i = 0; i < levelIdx; i++) {
+      const dim = levels[i]
+      const v = crumb[DRILL_CRUMB_KEY[dim]]
+      if (!v) continue
+      const sk = DRILL_SCOPE_KEY[dim]
+      if (sk) p[sk] = v   // backend accepts csv; single value works
+    }
+    return p
+  }, [scope, reportMode, levels, levelIdx, crumb])
 
   const sk = scopeKey(scope)
-  const level = crumb.gen_art ? 4 : crumb.st_cd ? 3 : crumb.maj_cat ? 2 : 1
+  const crumbKey = JSON.stringify(crumb)
 
-  // Load when crumb or scope changes
+  // Load data for the current level
   useEffect(() => {
     let cancel = false
     setBusy(true)
-    let p
-    if (level === 1) {
-      p = arsDashboardAPI.pivotMajCatRdc(scopeParams(scope))
-       .then(r => { if (!cancel) setPivot(r?.data?.data || { rdcs: [], items: [], totals: {} }) })
-    } else if (level === 2) {
-      p = arsDashboardAPI.drillStores({ ...scopeParams(scope), mc: crumb.maj_cat })
-       .then(r => { if (!cancel) setStores(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []) })
-    } else if (level === 3) {
-      p = arsDashboardAPI.drillGenArts({ ...scopeParams(scope), mc: crumb.maj_cat, werks: crumb.st_cd })
-       .then(r => { if (!cancel) setGenArts(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []) })
+    let req
+    if (currentDim === 'MAJ_CAT' && reportMode === 'session' && scope.sid) {
+      // Rich session-review pivot — reads from history → parked → pend_alc
+      const mcCsv = crumb.maj_cat ? undefined : (scope.mc?.length ? scope.mc.join(',') : undefined)
+      req = arsDashboardAPI.sessionReview({ sid: scope.sid, mc: mcCsv })
+        .then(r => { if (!cancel) setSessionRev(r?.data?.data || { rdcs:[], items:[], totals:{}, source:null }) })
+    } else if (currentDim === 'MAJ_CAT') {
+      // Wide RDC pivot at the MAJ_CAT level (existing UI)
+      req = arsDashboardAPI.pivotMajCatRdc(crumbParams)
+        .then(r => { if (!cancel) setPivot(r?.data?.data || { rdcs:[], items:[], totals:{} }) })
+    } else if (currentDim === 'GEN_ART') {
+      req = arsDashboardAPI.drillGenArts(crumbParams)
+        .then(r => { if (!cancel) setGenArts(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []) })
+    } else if (currentDim === 'ARTICLE') {
+      req = arsDashboardAPI.drillArticles({ ...crumbParams, gen_art: crumb.gen_art, clr: crumb.clr })
+        .then(r => { if (!cancel) setArticles(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []) })
     } else {
-      p = arsDashboardAPI.drillArticles({ ...scopeParams(scope), mc: crumb.maj_cat, werks: crumb.st_cd, gen_art: crumb.gen_art, clr: crumb.clr })
-       .then(r => { if (!cancel) setArticles(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []) })
+      // SEG / DIV / SUB_DIV / ST_CD — flat rollup
+      req = arsDashboardAPI.drillLevel({ ...crumbParams, dim: currentDim })
+        .then(r => { if (!cancel) setFlatRows(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []) })
     }
-    p.catch(() => {}).finally(() => !cancel && setBusy(false))
+    req.catch(() => {}).finally(() => !cancel && setBusy(false))
     return () => { cancel = true }
-  }, [level, crumb.maj_cat, crumb.st_cd, crumb.gen_art, crumb.clr, sk])
+  }, [currentDim, crumbKey, sk, reportMode])
 
-  // Reset to L1 when scope or path changes
+  // Reset when drill path / scope / mode changes
   useEffect(() => {
-    setCrumb({ maj_cat: '', st_cd: '', gen_art: '', clr: '' })
+    setCrumb({ seg:'', div:'', sub_div:'', maj_cat:'', st_cd:'', gen_art:'', clr:'' })
     setFilter('')
-  }, [sk, drillPath])
+  }, [sk, drillPath, reportMode])
 
-  // Drill into a row
+  // Drill into a row at the current level
   const drillInto = (row) => {
-    if (level === 1) setCrumb({ ...crumb, maj_cat: row.maj_cat })
-    else if (level === 2) setCrumb({ ...crumb, st_cd: row.name })
-    else if (level === 3) setCrumb({ ...crumb, gen_art: String(row.gen_art_number), clr: row.clr || '' })
+    const next = { ...crumb }
+    if (currentDim === 'MAJ_CAT')      next.maj_cat = row.maj_cat || row.name
+    else if (currentDim === 'GEN_ART') { next.gen_art = String(row.gen_art_number); next.clr = row.clr || '' }
+    else if (currentDim === 'ARTICLE') return   // leaf
+    else if (currentDim === 'ST_CD') {
+      next.st_cd = row.name
+      next.st_nm = row.st_nm || ''
+    } else {
+      // SEG / DIV / SUB_DIV → name field is the dim value
+      next[DRILL_CRUMB_KEY[currentDim]] = row.name
+    }
+    setCrumb(next)
     setFilter('')
   }
 
-  // Climb breadcrumb
-  const goLevel = (lv) => {
-    const c = { ...crumb }
-    if (lv < 2) c.maj_cat = ''
-    if (lv < 3) c.st_cd = ''
-    if (lv < 4) { c.gen_art = ''; c.clr = '' }
-    setCrumb(c)
+  // Climb back to a given level index (clears every crumb at or beyond it)
+  const goLevel = (idx) => {
+    const next = { ...crumb }
+    for (let i = idx; i < levels.length; i++) {
+      const dim = levels[i]
+      if (dim === 'GEN_ART') { next.gen_art = ''; next.clr = '' }
+      else if (dim === 'ST_CD') { next.st_cd = ''; next.st_nm = '' }
+      else next[DRILL_CRUMB_KEY[dim]] = ''
+    }
+    setCrumb(next)
     setFilter('')
   }
 
-  // Excel export — only for L1 (the pivot grid)
-  const doExport = () => {
-    // Re-aggregate via the gap endpoint's export? Simplest: build CSV client-side from current pivot data
+  // Excel export for the MAJ_CAT × RDC pivot — kept as-is, but now exports
+  // the pivot regardless of which path the user took to reach it.
+  const doExportPivot = () => {
     const { rdcs, items } = pivot
     if (!items.length) return
     const headerRdc = rdcs.flatMap(r => [`${r} ALLOC`, `${r} DO`, `${r} PEND`, `${r} %PEND`, `${r} ST`])
-    const headers = ['#', 'MAJ_CAT', ...headerRdc,
-                     'TOT ALLOC', 'TOT DO', 'TOT PEND', 'TOT %PEND', 'TOT %FILL', 'TOT ST', 'TOT ART']
+    const headers = ['#','MAJ_CAT', ...headerRdc,
+                     'TOT ALLOC','TOT DO','TOT PEND','TOT %PEND','TOT %FILL','TOT ST','TOT ART']
     const lines = [headers.join(',')]
     items.forEach((row, i) => {
       const cells = [i + 1, row.maj_cat]
@@ -965,26 +1522,30 @@ function DrillTab({ scope, drillPath }) {
       lines.push(cells.map(v => `"${v ?? ''}"`).join(','))
     })
     const blob = new Blob([lines.join('\n')], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
     a.href = url; a.download = 'ars_dashboard_pivot.csv'; a.click()
     URL.revokeObjectURL(url)
   }
 
-  // Header KPI strip — totals from pivot (L1) or from current rows
+  // Header KPI strip — derive totals from whichever dataset is on screen
   const headerKpi = useMemo(() => {
-    if (level === 1) {
+    if (currentDim === 'MAJ_CAT' && reportMode === 'session' && scope.sid) {
+      const t = sessionRev.totals || {}
+      return { alloc: t.alloc || 0, do: t.do || 0, pend: t.pend || 0, rows: sessionRev.items?.length || 0 }
+    }
+    if (currentDim === 'MAJ_CAT') {
       const t = pivot.totals || {}
       return { alloc: t.alloc || 0, do: t.do_qty || 0, pend: t.pend || 0, rows: pivot.items?.length || 0 }
     }
-    const rows = level === 2 ? stores : level === 3 ? genArts : articles
+    const rows = currentDim === 'GEN_ART' ? genArts : currentDim === 'ARTICLE' ? articles : flatRows
     return {
       alloc: rows.reduce((s, r) => s + Number(r.alloc_qty || 0), 0),
       do:    rows.reduce((s, r) => s + Number(r.do_qty    || 0), 0),
       pend:  rows.reduce((s, r) => s + Number(r.pend_qty  || 0), 0),
       rows:  rows.length,
     }
-  }, [level, pivot, stores, genArts, articles])
+  }, [currentDim, reportMode, scope.sid, pivot, sessionRev, flatRows, genArts, articles])
 
   const Crumb = ({ label, onClick, active }) => (
     <button onClick={onClick} className={active ? 'text-gray-900 font-semibold cursor-default' : 'text-indigo-600 hover:underline cursor-pointer'}>
@@ -993,15 +1554,27 @@ function DrillTab({ scope, drillPath }) {
   )
 
   // Flat-table column configs
-  const storeCols = [
-    { k: 'name',      l: 'Store',    cls: 'text-indigo-700 font-medium' },
-    { k: 'hub',       l: 'HUB' },
-    { k: 'status',    l: 'St Status' },
-    { k: 'articles',  l: 'Articles', align: 'right', fmt: true },
+  const flatLevelCols = [
+    { k: 'name',      l: DRILL_LABELS[currentDim] || currentDim, cls: 'text-indigo-700 font-medium' },
     { k: 'alloc_qty', l: 'Alloc',    align: 'right', fmt: true },
     { k: 'do_qty',    l: 'DO',       align: 'right', fmt: true },
     { k: 'pend_qty',  l: 'Pending',  align: 'right', fmt: true, warn: true },
-    { k: 'rows_n',    l: 'Rows',     align: 'right', fmt: true },
+    { k: 'pend_pct',  l: '%Pend',    align: 'right', render: (r) => (r.pend_pct ?? 0) + '%' },
+    { k: 'fill_pct',  l: '%Fill',    align: 'right', render: (r) => (r.fill_pct ?? 0) + '%' },
+    { k: 'stores',    l: 'Stores',   align: 'right', fmt: true },
+    { k: 'articles',  l: 'Articles', align: 'right', fmt: true },
+  ]
+  const storeLevelCols = [
+    { k: 'st_nm',     l: 'Store',    cls: 'text-indigo-700 font-medium',
+      render: (r) => r.st_nm || r.name || '—' },
+    { k: 'name',      l: 'ST_CD',    cls: 'font-mono text-[11px] text-gray-500' },
+    { k: 'hub',       l: 'HUB' },
+    { k: 'status',    l: 'St Status' },
+    { k: 'alloc_qty', l: 'Alloc',    align: 'right', fmt: true },
+    { k: 'do_qty',    l: 'DO',       align: 'right', fmt: true },
+    { k: 'pend_qty',  l: 'Pending',  align: 'right', fmt: true, warn: true },
+    { k: 'pend_pct',  l: '%Pend',    align: 'right', render: (r) => (r.pend_pct ?? 0) + '%' },
+    { k: 'articles',  l: 'Articles', align: 'right', fmt: true },
   ]
   const genArtCols = [
     { k: 'name',      l: 'GEN_ART · CLR', cls: 'text-indigo-700 font-medium font-mono text-[11px]' },
@@ -1023,19 +1596,45 @@ function DrillTab({ scope, drillPath }) {
   ]
 
   const filterLower = filter.toLowerCase()
-  const filteredStores   = useMemo(() => filter ? stores  .filter(r => String(r.name)?.toLowerCase().includes(filterLower)) : stores,   [stores,   filter])
-  const filteredGenArts  = useMemo(() => filter ? genArts .filter(r => String(r.name)?.toLowerCase().includes(filterLower)) : genArts,  [genArts,  filter])
-  const filteredArticles = useMemo(() => filter ? articles.filter(r => String(r.article_number).toLowerCase().includes(filterLower)) : articles, [articles, filter])
+  const filteredFlat     = useMemo(() => filter ? flatRows.filter(r => String(r.name ?? '').toLowerCase().includes(filterLower)) : flatRows,  [flatRows, filter])
+  const filteredGenArts  = useMemo(() => filter ? genArts .filter(r => String(r.name ?? '').toLowerCase().includes(filterLower)) : genArts,   [genArts,  filter])
+  const filteredArticles = useMemo(() => filter ? articles.filter(r => String(r.article_number ?? '').toLowerCase().includes(filterLower)) : articles, [articles, filter])
+
+  const placeholder = `Filter ${(DRILL_LABELS[currentDim] || currentDim).toLowerCase()}…`
+  // The toolbar's Excel button only shows for the legacy Alloc+Pending pivot.
+  // SessionReviewGrid has its own embedded Excel export.
+  const showPivotExport = currentDim === 'MAJ_CAT' && !(reportMode === 'session' && scope.sid)
 
   return (
     <div className="space-y-3">
-      {/* KPI summary strip + breadcrumb */}
+      {/* Header strip: breadcrumb + KPIs + mode chip */}
       <div className="flex items-center flex-wrap gap-3 px-3 py-2 bg-white border border-gray-200 rounded-lg">
         <div className="flex items-center gap-1 text-xs flex-wrap">
-          <Crumb label={drillPath === 'mjst' ? 'MAJ_CAT' : 'Store'} onClick={() => goLevel(1)} active={level === 1} />
-          {crumb.maj_cat && <><ChevronRight size={11} className="text-gray-400" /><Crumb label={crumb.maj_cat} onClick={() => goLevel(2)} active={level === 2} /></>}
-          {crumb.st_cd && <><ChevronRight size={11} className="text-gray-400" /><Crumb label={crumb.st_cd} onClick={() => goLevel(3)} active={level === 3} /></>}
-          {crumb.gen_art && <><ChevronRight size={11} className="text-gray-400" /><Crumb label={`${crumb.gen_art}${crumb.clr ? ' · ' + crumb.clr : ''}`} onClick={() => goLevel(4)} active={level === 4} /></>}
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+            {reportMode === 'session' ? 'SESSION REVIEW' : 'ALLOC + PENDING'}
+          </span>
+          <span className="text-gray-300 mx-1">·</span>
+          {levels.map((dim, i) => {
+            if (i > levelIdx) return null
+            const key = DRILL_CRUMB_KEY[dim]
+            const val = crumb[key]
+            let label
+            if (i === levelIdx) {
+              label = DRILL_LABELS[dim] || dim
+            } else if (dim === 'GEN_ART') {
+              label = `${val}${crumb.clr ? ' · ' + crumb.clr : ''}`
+            } else if (dim === 'ST_CD') {
+              label = crumb.st_nm ? `${val} · ${crumb.st_nm}` : val
+            } else {
+              label = val
+            }
+            return (
+              <React.Fragment key={dim}>
+                {i > 0 && <ChevronRight size={11} className="text-gray-400" />}
+                <Crumb label={label} onClick={() => goLevel(i)} active={i === levelIdx} />
+              </React.Fragment>
+            )
+          })}
         </div>
         <div className="ml-auto flex items-center gap-4 text-[11px] text-gray-700">
           <span>Rows <b className="text-gray-900">{fmt(headerKpi.rows)}</b></span>
@@ -1050,24 +1649,42 @@ function DrillTab({ scope, drillPath }) {
         <div className="relative">
           <Search size={12} className="absolute left-2 top-2 text-gray-400" />
           <input value={filter} onChange={e => setFilter(e.target.value)}
-                 placeholder={level === 1 ? 'Filter MAJ_CAT…' : level === 2 ? 'Filter store…' : level === 3 ? 'Filter GEN_ART/CLR…' : 'Filter article…'}
+                 placeholder={placeholder}
                  className="text-xs border border-gray-200 rounded pl-7 pr-2 py-1.5 bg-white w-64" />
         </div>
-        <span className="text-[11px] text-gray-500">Level <b>{level}</b> · {['MAJ_CAT × RDC pivot','Stores','OPT (GEN_ART · CLR)','Article variants'][level-1]}</span>
+        <span className="text-[11px] text-gray-500">
+          Level <b>{levelIdx + 1}</b> · {DRILL_LABELS[currentDim] || currentDim}
+          {reportMode === 'session' && scope.sid && <> · Session <b className="text-amber-700">{scope.sid}</b></>}
+        </span>
         {busy && <Loader2 size={12} className="animate-spin text-indigo-500" />}
-        {level === 1 && (
-          <button onClick={doExport}
+        {showPivotExport && (
+          <button onClick={doExportPivot}
                   className="ml-auto bg-emerald-600 text-white text-xs px-3 py-1.5 rounded hover:bg-emerald-700 flex items-center gap-1">
             <Download size={12} /> Excel
           </button>
         )}
       </div>
 
-      {/* Grid / table */}
-      {level === 1 && <PivotGrid data={pivot} filter={filter} onRowClick={drillInto} />}
-      {level === 2 && <FlatDrillTable rows={filteredStores}   columns={storeCols}   onRowClick={drillInto} emptyText="no stores in scope" />}
-      {level === 3 && <FlatDrillTable rows={filteredGenArts}  columns={genArtCols}  onRowClick={drillInto} emptyText="no OPTs in scope" />}
-      {level === 4 && <FlatDrillTable rows={filteredArticles} columns={articleCols} onRowClick={null}       emptyText="no variants" />}
+      {/* Body — dispatch by dim */}
+      {currentDim === 'MAJ_CAT' && reportMode === 'session' && scope.sid && (
+        <SessionReviewGrid data={sessionRev} filter={filter} />
+      )}
+      {currentDim === 'MAJ_CAT' && !(reportMode === 'session' && scope.sid) && (
+        <PivotGrid data={pivot} filter={filter} onRowClick={drillInto} />
+      )}
+      {currentDim === 'ST_CD' && (
+        <FlatDrillTable rows={filteredFlat} columns={storeLevelCols} onRowClick={drillInto} emptyText="no stores in scope" />
+      )}
+      {(currentDim === 'SEG' || currentDim === 'DIV' || currentDim === 'SUB_DIV') && (
+        <FlatDrillTable rows={filteredFlat} columns={flatLevelCols} onRowClick={drillInto}
+                        emptyText={`no ${DRILL_LABELS[currentDim].toLowerCase()} in scope`} />
+      )}
+      {currentDim === 'GEN_ART' && (
+        <FlatDrillTable rows={filteredGenArts} columns={genArtCols} onRowClick={drillInto} emptyText="no OPTs in scope" />
+      )}
+      {currentDim === 'ARTICLE' && (
+        <FlatDrillTable rows={filteredArticles} columns={articleCols} onRowClick={null} emptyText="no variants" />
+      )}
     </div>
   )
 }
@@ -1595,8 +2212,9 @@ export default function ArsDashboardPage() {
     div:    (searchParams.get('div')    || '').split(',').filter(Boolean),
     ssn:    (searchParams.get('ssn')    || '').split(',').filter(Boolean),
   }))
-  const [tab,       setTab]       = useState(searchParams.get('tab')  || 'overview')
-  const [drillPath, setDrillPath] = useState(searchParams.get('path') || 'mjst')
+  const [tab,        setTab]        = useState(searchParams.get('tab')   || 'overview')
+  const [drillPath,  setDrillPath]  = useState(searchParams.get('path')  || 'mjst')
+  const [reportMode, setReportMode] = useState(searchParams.get('mode')  || 'pending')
 
   const [config,         setConfig]         = useState({ maj_cats: [], stores: [], rdcs: [], dates: [], hubs: [], statuses: [], divs: [], ssns: [] })
   const [sessionsForDate, setSessionsForDate] = useState([])
@@ -1615,14 +2233,48 @@ export default function ArsDashboardPage() {
     if (s.status.length) p.set('status', s.status.join(','))
     if (s.div.length)   p.set('div',   s.div.join(','))
     if (s.ssn.length)   p.set('ssn',   s.ssn.join(','))
-    p.set('tab', tab); p.set('path', drillPath)
+    p.set('tab', tab); p.set('path', drillPath); p.set('mode', reportMode)
     setSearchParams(p, { replace: true })
   }
   useEffect(() => {
     const p = new URLSearchParams(searchParams)
-    p.set('tab', tab); p.set('path', drillPath)
+    p.set('tab', tab); p.set('path', drillPath); p.set('mode', reportMode)
     setSearchParams(p, { replace: true })
-  }, [tab, drillPath])
+  }, [tab, drillPath, reportMode])
+
+  // Auto-pick latest session when entering Session Review mode without a sid.
+  // In session mode we only consider PARKED/HISTORY-eligible sessions — PEND_ALC
+  // sessions can't power the rich grid and would render zeros.
+  useEffect(() => {
+    if (reportMode !== 'session') return
+    if (scope.sid) return
+    const params = { source: 'review' }
+    if (scope.date) params.date = scope.date
+    arsDashboardAPI.sessionsLatest(params)
+      .then(r => {
+        const sid = r?.data?.data?.session_id
+        if (sid) setScopeState(s => ({ ...s, sid }))
+      })
+      .catch(() => {})
+  }, [reportMode, scope.date, scope.sid])
+
+  // When in Session Review mode, populate the Session dropdown from PARKED/HISTORY.
+  // When in Alloc + Pending mode, keep the existing PEND_ALC sessions-by-date.
+  const [reviewSessions, setReviewSessions] = useState([])
+  useEffect(() => {
+    if (reportMode !== 'session') { setReviewSessions([]); return }
+    arsDashboardAPI.sessionsReviewList(scope.date ? { date: scope.date } : {})
+      .then(r => setReviewSessions(Array.isArray(r?.data?.data?.items) ? r.data.data.items : []))
+      .catch(() => setReviewSessions([]))
+  }, [reportMode, scope.date])
+
+  // If the current sid was picked from the PEND_ALC list and isn't in
+  // the review archive, drop it so auto-pick can choose a valid session.
+  useEffect(() => {
+    if (reportMode !== 'session' || !scope.sid || reviewSessions.length === 0) return
+    const found = reviewSessions.some(s => s.session_id === scope.sid)
+    if (!found) setScopeState(s => ({ ...s, sid: '' }))
+  }, [reportMode, scope.sid, reviewSessions])
 
   // Initial config load
   useEffect(() => {
@@ -1682,8 +2334,10 @@ export default function ArsDashboardPage() {
       </div>
 
       <FilterBar scope={scope} setScope={setScope} config={config}
-                 sessionsForDate={sessionsForDate}
-                 drillPath={drillPath} setDrillPath={setDrillPath} />
+                 sessionsForDate={tab === 'drill' && reportMode === 'session' ? reviewSessions : sessionsForDate}
+                 drillPath={drillPath} setDrillPath={setDrillPath}
+                 reportMode={tab === 'drill' ? reportMode : null}
+                 setReportMode={tab === 'drill' ? setReportMode : null} />
 
       <KpiStrip summary={summary} onTabJump={setTab} />
 
@@ -1698,7 +2352,7 @@ export default function ArsDashboardPage() {
         </div>
         <div className="p-4">
           {tab === 'overview' && <OverviewTab    scope={scope} />}
-          {tab === 'drill'    && <DrillTab       scope={scope} drillPath={drillPath} />}
+          {tab === 'drill'    && <DrillTab       scope={scope} drillPath={drillPath} reportMode={reportMode} />}
           {tab === 'date'     && <DateSessionTab scope={scope} />}
           {tab === 'hold'     && <HoldTab />}
           {tab === 'pending'  && <PendingTab     scope={scope} />}

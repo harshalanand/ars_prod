@@ -131,13 +131,8 @@ class FileUploadService:
 
         logger.info(f"[{batch_id}] Processing upload: {file_name} ({len(file_content)} bytes) → {table_name}")
 
-        # Sweep stale files from previous days before saving the new one
+        # Sweep any stale files left behind by older flows.
         cleanup_old_uploads()
-
-        # Save a copy for audit trail
-        saved_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{file_name}")
-        with open(saved_path, "wb") as f:
-            f.write(file_content)
 
         # Read file into DataFrame — off the event loop (pandas/openpyxl is sync & slow)
         try:
@@ -262,7 +257,6 @@ class FileUploadService:
         result["file_name"] = file_name
         result["file_size_bytes"] = len(file_content)
         result["null_pk_rows_dropped"] = int(null_pk_count)
-        result["saved_file"] = saved_path
 
         # Derived-master hook: when a Master_CONT_<col> parent is uploaded,
         # rebuild Master_CONT_MERGE_<col> from it using ARS_MERGE_RULES.
@@ -331,13 +325,8 @@ class FileUploadService:
 
         logger.info(f"[{batch_id}] Processing delete: {file_name} ({len(file_content)} bytes) → {table_name}")
 
-        # Sweep stale files from previous days before saving the new one
+        # Sweep any stale files left behind by older flows.
         cleanup_old_uploads()
-
-        # Save a copy for audit trail
-        saved_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{file_name}")
-        with open(saved_path, "wb") as f:
-            f.write(file_content)
 
         # Read file into DataFrame — off the event loop
         try:
@@ -465,7 +454,6 @@ class FileUploadService:
             "file_name": file_name,
             "file_size_bytes": len(file_content),
             "null_pk_rows_dropped": int(null_pk_count),
-            "saved_file": saved_path,
             "total_duration_ms": duration_ms,
         }
 

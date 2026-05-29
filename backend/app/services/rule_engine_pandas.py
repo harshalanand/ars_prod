@@ -918,14 +918,14 @@ def run_listing_and_allocation_pandas(
                     WHEN SHIP_QTY + HOLD_QTY > 0      THEN 'PARTIAL'
                     ELSE 'SKIPPED' END,
                 SKIP_REASON = CASE
-                    -- Preserve specific reasons stamped by post-waterfall gates
-                    -- (_stage_d_apply_pak_sz_rounding, _stage_c_apply_opt_mj_req_gate,
-                    -- _apply_sec_grid_cap_pre_gate).  Without these guards the
-                    -- catch-all NO_POOL_MSA arm below stomps the real cause and
-                    -- the audit trail loses why the row was zeroed.
-                    WHEN ISNULL(SKIP_REASON,'') LIKE 'PAK_SZ_%'         THEN SKIP_REASON
-                    WHEN ISNULL(SKIP_REASON,'') LIKE '%_MJ_REQ_GATE_%'  THEN SKIP_REASON
-                    WHEN ISNULL(SKIP_REASON,'') LIKE 'SEC_CAP_%'        THEN SKIP_REASON
+                    -- Preserve any pre-stamped reason from the waterfall or
+                    -- post-waterfall gates (PAK_SZ_*, *_MJ_REQ_GATE_*, SEC_CAP_*,
+                    -- MBQ_CAP_*, MJ_REQ_CAP, R09_HEADROOM_TRIVIAL, R07_SIZE_RATIO_LIVE,
+                    -- SKIP_PRI_BROKEN, CROSS_SKIP_*, REVALIDATION_SKIP).  Without
+                    -- this broad guard the catch-all NO_POOL_MSA arm below stomps
+                    -- the real cause and the audit trail loses why the row was zeroed.
+                    -- Mirrors rule_engine_new.py:2547.
+                    WHEN ISNULL(SKIP_REASON,'') <> '' THEN SKIP_REASON
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
                          AND CASE WHEN OPT_TYPE='TBL'
                                   THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
@@ -2025,13 +2025,18 @@ def _revalidate_after_band(
 
     work_cols = set(working_df.columns)
 
-    # (1) Reduce MSA_FNL_Q_REM per OPT (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR)
+    # (1) Reduce MSA_FNL_Q_REM per OPT (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR).
+    # Note: OPT_KEYS already includes WERKS, so this groupby is naturally
+    # per-store. The `_ts` / `_hs` aliases below are per-store ship/hold
+    # sums for the OPT — renamed from terse `_t` / `_h` for clarity. The
+    # groupby keys and the dict produced here are unchanged from before;
+    # only the column names within `opt_take` are different.
     if 'MSA_FNL_Q_REM' in work_cols:
         opt_take = (
             band.groupby(OPT_KEYS, sort=False, observed=True, dropna=False)
-                .agg(_t=('ROUND_SHIP', 'sum'), _h=('ROUND_HOLD', 'sum'))
+                .agg(_ts=('ROUND_SHIP', 'sum'), _hs=('ROUND_HOLD', 'sum'))
         )
-        opt_take['_total'] = opt_take['_t'] + opt_take['_h']
+        opt_take['_total'] = opt_take['_ts'] + opt_take['_hs']
         opt_take_active = opt_take[opt_take['_total'] > 0]
         if not opt_take_active.empty:
             opt_dict = opt_take_active['_total'].to_dict()
@@ -2053,8 +2058,8 @@ def _revalidate_after_band(
             moved_w = decrement.to_numpy() > 0
             if moved_w.any():
                 idx_w = working_df.index[moved_w]
-                ship_map = opt_take_active['_t'].to_dict()
-                hold_map = opt_take_active['_h'].to_dict()
+                ship_map = opt_take_active['_ts'].to_dict()
+                hold_map = opt_take_active['_hs'].to_dict()
                 sh_w = keys.loc[idx_w].map(ship_map).fillna(0).astype('float64').to_numpy()
                 hl_w = keys.loc[idx_w].map(hold_map).fillna(0).astype('float64').to_numpy()
                 rk_w = (

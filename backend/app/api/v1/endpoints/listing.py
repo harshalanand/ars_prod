@@ -1729,7 +1729,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 mds_expr = new_mds
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
-                SET [MAX_DAILY_SALE] = ROUND({mds_expr}, 2)
+                SET [MAX_DAILY_SALE] = ROUND({mds_expr}, 3)
             """)
 
             logger.info(f"Part 4c: OPT_MBQ(ACS_D+ALC_D) + OPT_REQ + OPT_MBQ_WH(hold={hold}d) + OPT_REQ_WH + MAX_DAILY_SALE")

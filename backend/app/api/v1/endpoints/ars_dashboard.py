@@ -51,6 +51,28 @@ HOLD_TBL  = "ARS_NL_TBL_HOLD_TRACKING"
 ST_MASTER = "Master_ALC_INPUT_ST_MASTER"     # adds HUB + ST_STATUS via ST_CD join
 PROD_VIEW = "VW_MASTER_PRODUCT"              # adds DIV + SSN + SUB_DIV via ARTICLE_NUMBER/MATNR join
 
+# Session-review archives. Schema identical across all three:
+# WORKING (current run, no SESSION_ID) → PARKED (parked sessions) → HISTORY (approved sessions).
+LIST_HISTORY = "ARS_LISTING_WORKING_HISTORY"
+LIST_PARKED  = "ARS_LISTING_WORKING_PARKED"
+# Snapshot/input listing tables — EXCESS_STK source. The _WORKING_* equivalents
+# zero out EXCESS_STK during allocation, so we read it from these instead.
+LIST_SNAPSHOT_HISTORY = "ARS_LISTING_HISTORY"
+LIST_SNAPSHOT_PARKED  = "ARS_LISTING_PARKED"
+# MSA stock archives — RDC-grain (not store-grain) — sourced via GEN_ART rollups.
+# FNL_Q = max(STK_QTY − PEND_QTY − ARS_PEND, 0) — the net replenishable stock.
+MSA_HISTORY  = "ARS_MSA_GEN_ART_HISTORY"
+MSA_PARKED   = "ARS_MSA_GEN_ART_PARKED"
+# Variant-grain MSA archives — used only for stock context when alloc archive
+# is missing. The primary article-size source is now ARS_ALLOC_PARKED/HISTORY.
+MSA_VAR_HISTORY = "ARS_MSA_VAR_ART_HISTORY"
+MSA_VAR_PARKED  = "ARS_MSA_VAR_ART_PARKED"
+# Size-grain allocation archives. Keyed by SESSION_ID + (WERKS, MAJ_CAT, RDC,
+# GEN_ART_NUMBER, CLR, VAR_ART, SZ). Carry SZ_MBQ / SZ_STK / SZ_REQ / FNL_Q /
+# SHIP_QTY / HOLD_QTY / ALLOC_QTY / ALLOC_STATUS / ALLOC_REMARKS / etc.
+ALLOC_HISTORY = "ARS_ALLOC_HISTORY"
+ALLOC_PARKED  = "ARS_ALLOC_PARKED"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,7 +94,7 @@ def _parse_scope(request: Request) -> Dict:
     Scope keys:
         date, sid, mc, werks, rdc, from, to              (PEND_ALC native)
         hub, status                                      (joined from ST_MASTER)
-        div, ssn                                         (joined from VW_MASTER_PRODUCT)
+        seg, div, sub_div, ssn                           (joined from VW_MASTER_PRODUCT)
         gen_art, clr, article                            (drill keys, single-value)
     """
     qp = request.query_params
@@ -92,7 +114,9 @@ def _parse_scope(request: Request) -> Dict:
         # NEW dimensions (rev 3)
         "hub":     _csv("hub"),
         "status":  _csv("status"),     # OLD / UPC
+        "seg":     _csv("seg"),        # APP / GM
         "div":     _csv("div"),
+        "sub_div": _csv("sub_div"),
         "ssn":     _csv("ssn"),
         # Drill keys (single-value, used by /drill/* endpoints only)
         "gen_art": qp.get("gen_art") or None,
@@ -104,7 +128,8 @@ def _parse_scope(request: Request) -> Dict:
 def _needs_joins(scope: Dict) -> Tuple[bool, bool]:
     """Return (needs_st_master, needs_master_product) based on which scope keys are set."""
     needs_st   = bool(scope.get("hub")) or bool(scope.get("status"))
-    needs_prod = bool(scope.get("div")) or bool(scope.get("ssn"))
+    needs_prod = (bool(scope.get("seg")) or bool(scope.get("div"))
+                  or bool(scope.get("sub_div")) or bool(scope.get("ssn")))
     return needs_st, needs_prod
 
 
@@ -114,8 +139,9 @@ def _from_clause(needs_st: bool, needs_prod: bool) -> str:
     if needs_st:
         sql += f" LEFT JOIN {ST_MASTER} SM WITH (NOLOCK) ON SM.ST_CD = PA.ST_CD"
     if needs_prod:
-        # PEND_ALC.MATNR (bigint)  ↔  VW_MASTER_PRODUCT.ARTICLE_NUMBER (bigint)
-        sql += f" LEFT JOIN {PROD_VIEW} MP WITH (NOLOCK) ON MP.ARTICLE_NUMBER = PA.MATNR"
+        # PEND_ALC.ARTICLE_NUMBER (variant) ↔ VW_MASTER_PRODUCT.ARTICLE_NUMBER.
+        # (Legacy code joined on PA.MATNR, but that column is fully NULL in prod.)
+        sql += f" LEFT JOIN {PROD_VIEW} MP WITH (NOLOCK) ON MP.ARTICLE_NUMBER = PA.ARTICLE_NUMBER"
     return sql
 
 
@@ -164,10 +190,12 @@ def _where_pend(scope: Dict, params: Dict, alias: str = "PA") -> str:
 
     # NEW (rev 3) — joined dimensions
     for col, alias_join, key, vals in (
-        ("HUB",       "SM", "p_hub",    scope.get("hub")    or []),
-        ("ST_STATUS", "SM", "p_status", scope.get("status") or []),
-        ("DIV",       "MP", "p_div",    scope.get("div")    or []),
-        ("SSN",       "MP", "p_ssn",    scope.get("ssn")    or []),
+        ("HUB",       "SM", "p_hub",    scope.get("hub")     or []),
+        ("ST_STATUS", "SM", "p_status", scope.get("status")  or []),
+        ("SEG",       "MP", "p_seg",    scope.get("seg")     or []),
+        ("DIV",       "MP", "p_div",    scope.get("div")     or []),
+        ("SUB_DIV",   "MP", "p_sub_div", scope.get("sub_div") or []),
+        ("SSN",       "MP", "p_ssn",    scope.get("ssn")     or []),
     ):
         if vals:
             ph = []
@@ -785,7 +813,7 @@ def drill_stores(request: Request, current_user: User = Depends(get_current_user
         if not _table_exists(conn, PEND_ALC):
             return APIResponse(success=True, data={"items": []})
         items = _drill_level(conn, scope, "PA.ST_CD",
-                             extra_select="MIN(SM.HUB) AS hub, MIN(SM.ST_STATUS) AS status")
+                             extra_select="MIN(SM.ST_NM) AS st_nm, MIN(SM.HUB) AS hub, MIN(SM.ST_STATUS) AS status")
     return APIResponse(success=True, data={"items": items})
 
 
@@ -963,6 +991,845 @@ def pivot_maj_cat_rdc(
             "pend":     grand["pend"],
             "pend_pct": int(round(grand["pend"] / grand["alloc"] * 100)) if grand["alloc"] else 0,
             "fill_pct": int(round(grand["do_qty"] / grand["alloc"] * 100)) if grand["alloc"] else 0,
+        }
+    return APIResponse(success=True, data=out)
+
+
+# ---------------------------------------------------------------------------
+# GET /drill/level   — generic flat rollup at a chosen dimension
+#   ?dim=SEG|DIV|SUB_DIV|MAJ_CAT|ST_CD
+# Honours all standard scope filters (including new parent crumbs seg, div,
+# sub_div). Returns rows: { name, alloc_qty, do_qty, pend_qty, pend_pct,
+# fill_pct, stores, articles, rows_n }.
+# ---------------------------------------------------------------------------
+_DRILL_DIM_MAP = {
+    "SEG":     ("MP.SEG",     True),
+    "DIV":     ("MP.DIV",     True),
+    "SUB_DIV": ("MP.SUB_DIV", True),
+    "MAJ_CAT": ("PA.MAJ_CAT", False),
+    "ST_CD":   ("PA.ST_CD",   False),
+}
+
+
+@router.get("/drill/level", response_model=APIResponse)
+def drill_level(
+    request: Request,
+    dim: str = Query(..., description="One of SEG, DIV, SUB_DIV, MAJ_CAT, ST_CD"),
+    current_user: User = Depends(get_current_user),
+):
+    dim_up = (dim or "").strip().upper()
+    if dim_up not in _DRILL_DIM_MAP:
+        return APIResponse(success=False, data={"items": []},
+                           message=f"Unsupported dim '{dim}'. Use one of {list(_DRILL_DIM_MAP)}")
+    group_col, force_prod = _DRILL_DIM_MAP[dim_up]
+    extra_select = ""
+    # Stores benefit from HUB/status metadata (same shape as /drill/stores)
+    if dim_up == "ST_CD":
+        extra_select = "MIN(SM.ST_NM) AS st_nm, MIN(SM.HUB) AS hub, MIN(SM.ST_STATUS) AS status"
+
+    scope = _parse_scope(request)
+    engine = _engine()
+    with engine.connect() as conn:
+        if not _table_exists(conn, PEND_ALC):
+            return APIResponse(success=True, data={"items": []})
+        items = _drill_level(
+            conn, scope, group_col,
+            extra_select=extra_select,
+            force_st=(dim_up == "ST_CD"),
+            force_prod=force_prod,
+        )
+        # Derive %pend, %fill once on the server so the UI is dumb
+        for r in items:
+            a = int(r.get("alloc_qty") or 0)
+            r["pend_pct"] = int(round((r.get("pend_qty") or 0) / a * 100)) if a else 0
+            r["fill_pct"] = int(round((r.get("do_qty")   or 0) / a * 100)) if a else 0
+    return APIResponse(success=True, data={"items": items, "dim": dim_up})
+
+
+# ---------------------------------------------------------------------------
+# GET /sessions/latest    — pick the most recent SESSION_ID
+# Used by the Product Drill "Session Review" mode to auto-pick a session
+# when the user hasn't selected one explicitly.
+#
+# source=pend_alc (default) — most recent session that has shipped allocations.
+# source=review            — most recent session that has a PARKED/HISTORY
+#                             listing snapshot (so a rich Session Review report
+#                             is actually possible).
+# ---------------------------------------------------------------------------
+@router.get("/sessions/latest", response_model=APIResponse)
+def get_latest_session(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD; defaults to latest date with data"),
+    source: str = Query("pend_alc", description="pend_alc | review"),
+    current_user: User = Depends(get_current_user),
+):
+    engine = _engine()
+    with engine.connect() as conn:
+        if source == "review":
+            # Union HISTORY + PARKED, pick latest by APPROVED_AT/PARKED_AT.
+            parts = []
+            if _table_exists(conn, LIST_HISTORY):
+                parts.append(f"""
+                    SELECT SESSION_ID, MAX(APPROVED_AT) AS ts, 'history' AS src
+                    FROM {LIST_HISTORY} WITH (NOLOCK)
+                    GROUP BY SESSION_ID
+                """)
+            if _table_exists(conn, LIST_PARKED):
+                parts.append(f"""
+                    SELECT SESSION_ID, MAX(PARKED_AT) AS ts, 'parked' AS src
+                    FROM {LIST_PARKED} WITH (NOLOCK)
+                    GROUP BY SESSION_ID
+                """)
+            if not parts:
+                return APIResponse(success=True, data=None)
+            union_sql = " UNION ALL ".join(parts)
+            params: Dict = {}
+            date_filter = ""
+            if date:
+                params["p_date"] = date
+                date_filter = " WHERE CAST(ts AS DATE) = :p_date"
+            row = conn.execute(text(f"""
+                SELECT TOP 1 SESSION_ID, ts AS approved_at, src
+                FROM ({union_sql}) u {date_filter}
+                ORDER BY ts DESC
+            """), params).mappings().first()
+            if not row:
+                return APIResponse(success=True, data=None)
+            return APIResponse(success=True, data={
+                "session_id":  row["SESSION_ID"],
+                "approved_at": row["approved_at"].isoformat() if row["approved_at"] else None,
+                "source":      row["src"],
+                "date":        date,
+            })
+
+        # Default: PEND_ALC (the legacy behaviour)
+        if not _table_exists(conn, PEND_ALC):
+            return APIResponse(success=True, data=None)
+        params: Dict = {}
+        if date:
+            params["p_date"] = date
+            row = conn.execute(text(f"""
+                SELECT TOP 1 SESSION_ID, MAX(APPROVED_AT) AS approved_at
+                FROM {PEND_ALC} WITH (NOLOCK)
+                WHERE CAST(APPROVED_AT AS DATE) = :p_date
+                GROUP BY SESSION_ID
+                ORDER BY MAX(APPROVED_AT) DESC
+            """), params).mappings().first()
+        else:
+            row = conn.execute(text(f"""
+                SELECT TOP 1 SESSION_ID, MAX(APPROVED_AT) AS approved_at
+                FROM {PEND_ALC} WITH (NOLOCK)
+                GROUP BY SESSION_ID
+                ORDER BY MAX(APPROVED_AT) DESC
+            """)).mappings().first()
+        if not row:
+            return APIResponse(success=True, data=None)
+        return APIResponse(success=True, data={
+            "session_id":  row["SESSION_ID"],
+            "approved_at": row["approved_at"].isoformat() if row["approved_at"] else None,
+            "source":      "pend_alc",
+            "date":        date,
+        })
+
+
+# ---------------------------------------------------------------------------
+# GET /sessions/review-list   — every SESSION_ID that has a PARKED or HISTORY
+# listing snapshot, newest first. Drives the Session dropdown when the user
+# is in Session Review mode (PEND_ALC sessions are excluded — they cannot be
+# rendered with the rich grid).
+# ---------------------------------------------------------------------------
+@router.get("/sessions/review-list", response_model=APIResponse)
+def list_review_sessions(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD; exact match (overrides from/to)"),
+    from_: Optional[str] = Query(None, alias="from", description="YYYY-MM-DD lower bound"),
+    to:    Optional[str] = Query(None, description="YYYY-MM-DD upper bound (inclusive)"),
+    src:   Optional[str] = Query(None, description="parked | history | all (default all)"),
+    current_user: User = Depends(get_current_user),
+):
+    engine = _engine()
+    items: List[Dict] = []
+    src_filter = (src or "all").strip().lower()
+    with engine.connect() as conn:
+        parts = []
+        if src_filter in ("all", "history") and _table_exists(conn, LIST_HISTORY):
+            parts.append(f"""
+                SELECT SESSION_ID, MAX(APPROVED_AT) AS ts, 'history' AS src
+                FROM {LIST_HISTORY} WITH (NOLOCK)
+                GROUP BY SESSION_ID
+            """)
+        if src_filter in ("all", "parked") and _table_exists(conn, LIST_PARKED):
+            parts.append(f"""
+                SELECT SESSION_ID, MAX(PARKED_AT) AS ts, 'parked' AS src
+                FROM {LIST_PARKED} WITH (NOLOCK)
+                GROUP BY SESSION_ID
+            """)
+        if not parts:
+            return APIResponse(success=True, data={"items": []})
+
+        params: Dict = {}
+        where_parts: List[str] = []
+        if date:
+            params["p_date"] = date
+            where_parts.append("CAST(ts AS DATE) = :p_date")
+        else:
+            if from_:
+                params["p_from"] = from_
+                where_parts.append("CAST(ts AS DATE) >= :p_from")
+            if to:
+                params["p_to"] = to
+                where_parts.append("CAST(ts AS DATE) <= :p_to")
+        date_filter = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        rows = conn.execute(text(f"""
+            SELECT SESSION_ID, MAX(ts) AS ts, MAX(src) AS src
+            FROM ({' UNION ALL '.join(parts)}) u {date_filter}
+            GROUP BY SESSION_ID
+            ORDER BY MAX(ts) DESC
+        """), params).mappings().all()
+        items = [{
+            "session_id": r["SESSION_ID"],
+            "ts":         r["ts"].isoformat() if r["ts"] else None,
+            "src":        r["src"],
+            # Format a friendly label for the dropdown
+            "label":      f"{r['SESSION_ID']} · {r['src'].upper()}",
+        } for r in rows]
+    return APIResponse(success=True, data={"items": items})
+
+
+# ---------------------------------------------------------------------------
+# GET /session-review    — rich MAJ_CAT × RDC pivot for one SESSION_ID, with
+# MBQ/STOCK/STORE_STK/EXCESS_STK/REQ/ALLOC/HOLD/derived.
+#
+# Source cascade:
+#   1. ARS_LISTING_WORKING_HISTORY  (approved sessions)
+#   2. ARS_LISTING_WORKING_PARKED   (parked sessions)
+#   3. ARS_PEND_ALC                 (fallback — reduced columns only)
+#
+# Aggregation (matches listing.py /summary semantics):
+#   MJ_* (MBQ, STK_TTL, REQ) deduped per (WERKS, MAJ_CAT, RDC) with MAX,
+#     then SUM across WERKS to MAJ_CAT × RDC.
+#   ALLOC_QTY / HOLD_QTY / STK_TTL (option-grain stock) / EXCESS_STK SUM directly.
+# ---------------------------------------------------------------------------
+def _session_review_msa_stock(conn, table: str, sid: str, dim: str, crumb: Dict) -> Dict:
+    """RDC-grain MSA stock keyed by (dim_value, RDC).
+       Reads ARS_MSA_GEN_ART_PARKED/_HISTORY which carries SEG/DIV/SUB_DIV/MAJ_CAT/RDC
+       natively, so it can be grouped at any of the listing-dim levels without joins.
+       For dim=ST_CD: returns empty (RDC stock isn't store-specific).
+       For dim=GEN_ART: groups by GEN_ART · CLR.
+       For dim=ARTICLE: returns empty (article-level stock comes from MSA_VAR_*).
+    """
+    if not _table_exists(conn, table):
+        return {}
+    if dim in ("ST_CD", "ARTICLE"):
+        return {}
+
+    dim_expr_map = {
+        "SEG":     "ISNULL(SEG, '—')",
+        "DIV":     "ISNULL(DIV, '—')",
+        "SUB_DIV": "ISNULL(SUB_DIV, '—')",
+        "MAJ_CAT": "ISNULL(MAJ_CAT, '—')",
+        "GEN_ART": "CAST(GEN_ART_NUMBER AS NVARCHAR(50)) + ' · ' + ISNULL(CLR, '')",
+    }
+    dim_expr = dim_expr_map.get(dim, "ISNULL(MAJ_CAT, '—')")
+
+    params: Dict = {"sid": sid}
+    parts: List[str] = ["SESSION_ID = :sid"]
+    for col, key in (("MAJ_CAT", "mc"), ("SEG", "seg"), ("DIV", "div"), ("SUB_DIV", "sub_div")):
+        vals = crumb.get(key) or []
+        if vals:
+            ph = []
+            for i, v in enumerate(vals):
+                k = f"m{key}{i}"
+                params[k] = v
+                ph.append(f":{k}")
+            parts.append(f"{col} IN ({','.join(ph)})")
+    if crumb.get("gen_art"):
+        params["p_genart"] = crumb["gen_art"]
+        parts.append("GEN_ART_NUMBER = :p_genart")
+    if crumb.get("clr"):
+        params["p_clr"] = crumb["clr"]
+        parts.append("CLR = :p_clr")
+    where_sql = " WHERE " + " AND ".join(parts)
+
+    sql = f"""
+        SELECT {dim_expr} AS dim_val, RDC,
+               SUM(ISNULL(FNL_Q,    0)) AS stock_fnl,
+               SUM(ISNULL(STK_QTY,  0)) AS stock_raw
+        FROM {table} WITH (NOLOCK)
+        {where_sql}
+        GROUP BY {dim_expr}, RDC
+    """
+    rows = conn.execute(text(sql), params).mappings().all()
+    out = {}
+    for r in rows:
+        key = (str(r["dim_val"] or "—").strip(), str(r["RDC"] or "—").strip())
+        out[key] = {
+            "stock_fnl": int(r["stock_fnl"] or 0),
+            "stock_raw": int(r["stock_raw"] or 0),
+        }
+    return out
+
+
+# Per-dim aggregation configuration. Each entry tells us:
+#   sql_dim_expr  → expression used as the grouping value (alias 'dim_val')
+#   needs_mp_join → whether VW_MASTER_PRODUCT must be joined
+#   level_kind    → 'mj' = MAJ_CAT-grain MBQ/REQ apply
+#                   'store' = WERKS-grain; uses MJ_* deduped per (WERKS,MAJ,RDC) then summed
+#                   'opt' = GEN_ART_NUMBER · CLR grain; uses OPT_MBQ, STK_TTL, OPT_REQ
+#                   'article' = ARTICLE_NUMBER grain; sourced from MSA_VAR_*
+_SR_DIM_CONFIG = {
+    "SEG":     {"expr": "ISNULL(MP.SEG, '—')",     "needs_mp": True,  "kind": "mj"},
+    "DIV":     {"expr": "ISNULL(MP.DIV, '—')",     "needs_mp": True,  "kind": "mj"},
+    "SUB_DIV": {"expr": "ISNULL(MP.SUB_DIV, '—')", "needs_mp": True,  "kind": "mj"},
+    "MAJ_CAT": {"expr": "ISNULL(L.MAJ_CAT, '—')",  "needs_mp": False, "kind": "mj"},
+    "ST_CD":   {"expr": "ISNULL(L.WERKS, '—')",    "needs_mp": False, "kind": "store"},
+    "GEN_ART": {"expr": "CAST(L.GEN_ART_NUMBER AS NVARCHAR(50)) + ' · ' + ISNULL(L.CLR, '')", "needs_mp": False, "kind": "opt"},
+    "ARTICLE": {"expr": "VAR_ART",                 "needs_mp": False, "kind": "article"},
+    # Grid-dim review — every sec-cap grid (column with matching *_MBQ /
+    # *_STK_TTL / *_REQ rollups on the listing table). Same aggregation
+    # pattern as MAJ_CAT (OPT-grain SUM, no MJ_* dedup needed).
+    "FAB":           {"expr": "ISNULL(L.FAB, '—')",           "needs_mp": False, "kind": "grid"},
+    "MACRO_MVGR":    {"expr": "ISNULL(L.MACRO_MVGR, '—')",    "needs_mp": False, "kind": "grid"},
+    "MICRO_MVGR":    {"expr": "ISNULL(L.MICRO_MVGR, '—')",    "needs_mp": False, "kind": "grid"},
+    "RNG_SEG":       {"expr": "ISNULL(L.RNG_SEG, '—')",       "needs_mp": False, "kind": "grid"},
+    "MERGE_RNG_SEG": {"expr": "ISNULL(L.MERGE_RNG_SEG, '—')", "needs_mp": False, "kind": "grid"},
+    "M_VND_CD":      {"expr": "ISNULL(L.M_VND_CD, '—')",      "needs_mp": False, "kind": "grid"},
+    "M_YARN_02":     {"expr": "ISNULL(L.M_YARN_02, '—')",     "needs_mp": False, "kind": "grid"},
+    "WEAVE_2":       {"expr": "ISNULL(L.WEAVE_2, '—')",       "needs_mp": False, "kind": "grid"},
+    "CLR":           {"expr": "ISNULL(L.CLR, '—')",           "needs_mp": False, "kind": "grid"},
+}
+
+
+def _sr_crumb_where(crumb: Dict, params: Dict, listing_alias: str = "L", mp_alias: str = "MP"):
+    """Build WHERE-fragments for the session-review SQL based on crumb filters.
+    Returns (where_clause_str_without_WHERE, needs_mp_for_filters).
+    """
+    parts: List[str] = []
+    needs_mp = False
+    # Listing-native filters
+    for col, key in (("MAJ_CAT", "mc"), ("WERKS", "werks")):
+        vals = crumb.get(key) or []
+        if vals:
+            ph = []
+            for i, v in enumerate(vals):
+                k = f"{key}{i}"
+                params[k] = v
+                ph.append(f":{k}")
+            parts.append(f"{listing_alias}.{col} IN ({','.join(ph)})")
+    # Drill single-value filters
+    if crumb.get("gen_art"):
+        params["p_genart"] = crumb["gen_art"]
+        parts.append(f"{listing_alias}.GEN_ART_NUMBER = :p_genart")
+    if crumb.get("clr"):
+        params["p_clr"] = crumb["clr"]
+        parts.append(f"{listing_alias}.CLR = :p_clr")
+    # VW_MASTER_PRODUCT-joined filters
+    for col, key in (("SEG", "seg"), ("DIV", "div"), ("SUB_DIV", "sub_div")):
+        vals = crumb.get(key) or []
+        if vals:
+            ph = []
+            for i, v in enumerate(vals):
+                k = f"{key}{i}"
+                params[k] = v
+                ph.append(f":{k}")
+            parts.append(f"{mp_alias}.{col} IN ({','.join(ph)})")
+            needs_mp = True
+    return (" AND ".join(parts), needs_mp)
+
+
+def _session_review_from_listing(conn, table: str, sid: str, dim: str, crumb: Dict):
+    """Aggregate one of the listing archives at the requested dim × RDC grain.
+
+    EXCESS_STK is sourced from the snapshot listing table (ARS_LISTING_PARKED /
+    ARS_LISTING_HISTORY), NOT from the working table — the working table's
+    EXCESS_STK column is zeroed out during allocation. The snapshot CTE is
+    joined at OPT grain (WERKS, GEN_ART, CLR, RDC) so any crumb filter on L
+    (WERKS, MAJ_CAT, GEN_ART, CLR) naturally narrows the excess sum.
+
+    Returns rows with: dim_val, RDC, mbq_qty, store_stk, req_qty, alloc_qty,
+    hold_qty, excess_stk, st_nm/hub (store kind), opt_type/rank/seq/status/
+    remarks (opt kind).
+    """
+    cfg = _SR_DIM_CONFIG[dim]
+    dim_expr = cfg["expr"]
+    kind = cfg["kind"]
+    needs_mp = cfg["needs_mp"]
+
+    params: Dict = {"sid": sid}
+    crumb_where, crumb_needs_mp = _sr_crumb_where(crumb, params)
+    needs_mp = needs_mp or crumb_needs_mp
+
+    mp_join = ""
+    if needs_mp:
+        mp_join = f" LEFT JOIN {PROD_VIEW} MP WITH (NOLOCK) ON MP.GEN_ART_NUMBER = L.GEN_ART_NUMBER"
+
+    extra_where = f" AND {crumb_where}" if crumb_where else ""
+
+    # EXCESS_STK is sourced separately (see _session_review_snapshot_excess) because
+    # ARS_LISTING_PARKED and ARS_LISTING_WORKING_PARKED have disjoint GEN_ART sets —
+    # joining them would silently drop excess rows. Listing SQL emits 0 here; the
+    # orchestrator overwrites each cell's excess_stk after both fetches complete.
+    if kind == "mj":
+        # MJ_* are MAJ_CAT+WERKS aggregates → dedup per (WERKS, MAJ_CAT, RDC) with MAX,
+        # then SUM up to the requested dim × RDC. This works for SEG/DIV/SUB_DIV/MAJ_CAT.
+        sql = f"""
+        WITH src_mj AS (
+            SELECT {dim_expr} AS dim_val,
+                   L.WERKS, L.MAJ_CAT, L.RDC,
+                   MAX(ISNULL(L.MJ_MBQ, 0))     AS mj_mbq,
+                   MAX(ISNULL(L.MJ_STK_TTL, 0)) AS mj_stk_ttl,
+                   MAX(ISNULL(L.MJ_REQ, 0))     AS mj_req
+            FROM {table} L WITH (NOLOCK){mp_join}
+            WHERE L.SESSION_ID = :sid{extra_where}
+            GROUP BY {dim_expr}, L.WERKS, L.MAJ_CAT, L.RDC
+        ),
+        rolled AS (
+            SELECT dim_val, RDC,
+                   SUM(mj_mbq)     AS mbq_qty,
+                   SUM(mj_stk_ttl) AS store_stk,
+                   SUM(mj_req)     AS req_qty
+            FROM src_mj
+            GROUP BY dim_val, RDC
+        ),
+        opt AS (
+            SELECT {dim_expr} AS dim_val, L.RDC,
+                   SUM(ISNULL(L.ALLOC_QTY, 0))   AS alloc_qty,
+                   SUM(ISNULL(L.HOLD_QTY,  0))   AS hold_qty
+            FROM {table} L WITH (NOLOCK){mp_join}
+            WHERE L.SESSION_ID = :sid{extra_where}
+            GROUP BY {dim_expr}, L.RDC
+        )
+        SELECT r.dim_val, r.RDC,
+               r.mbq_qty, r.store_stk, r.req_qty,
+               ISNULL(o.alloc_qty,  0) AS alloc_qty,
+               ISNULL(o.hold_qty,   0) AS hold_qty,
+               0                      AS excess_stk   /* filled in by orchestrator from snapshot */
+        FROM rolled r LEFT JOIN opt o ON o.dim_val = r.dim_val AND o.RDC = r.RDC
+        """
+    elif kind == "store":
+        # Group by WERKS × RDC. MJ_* deduped per (WERKS, MAJ_CAT, RDC) then summed
+        # across MAJ_CATs within the WERKS. Join ST_MASTER for ST_NM/HUB display.
+        sql = f"""
+        WITH src_mj AS (
+            SELECT L.WERKS, L.MAJ_CAT, L.RDC,
+                   MAX(ISNULL(L.MJ_MBQ, 0))     AS mj_mbq,
+                   MAX(ISNULL(L.MJ_STK_TTL, 0)) AS mj_stk_ttl,
+                   MAX(ISNULL(L.MJ_REQ, 0))     AS mj_req
+            FROM {table} L WITH (NOLOCK){mp_join}
+            WHERE L.SESSION_ID = :sid{extra_where}
+            GROUP BY L.WERKS, L.MAJ_CAT, L.RDC
+        ),
+        rolled AS (
+            SELECT WERKS AS dim_val, RDC,
+                   SUM(mj_mbq)     AS mbq_qty,
+                   SUM(mj_stk_ttl) AS store_stk,
+                   SUM(mj_req)     AS req_qty
+            FROM src_mj
+            GROUP BY WERKS, RDC
+        ),
+        opt AS (
+            SELECT L.WERKS AS dim_val, L.RDC,
+                   SUM(ISNULL(L.ALLOC_QTY, 0))   AS alloc_qty,
+                   SUM(ISNULL(L.HOLD_QTY,  0))   AS hold_qty
+            FROM {table} L WITH (NOLOCK){mp_join}
+            WHERE L.SESSION_ID = :sid{extra_where}
+            GROUP BY L.WERKS, L.RDC
+        )
+        SELECT r.dim_val, r.RDC,
+               r.mbq_qty, r.store_stk, r.req_qty,
+               ISNULL(o.alloc_qty,  0) AS alloc_qty,
+               ISNULL(o.hold_qty,   0) AS hold_qty,
+               0                      AS excess_stk,  /* filled in by orchestrator */
+               SM.ST_NM AS st_nm,
+               SM.HUB   AS hub
+        FROM rolled r
+        LEFT JOIN opt o ON o.dim_val = r.dim_val AND o.RDC = r.RDC
+        LEFT JOIN {ST_MASTER} SM WITH (NOLOCK) ON SM.ST_CD = r.dim_val
+        """
+    elif kind == "opt":
+        # OPT-grain: GEN_ART · CLR × RDC. Use OPT_MBQ, STK_TTL (option stock), OPT_REQ.
+        # I_ROD: per-store rod allowance from listing → "planned" = SUM across
+        # stores in scope; "used" = SUM only for stores that actually got
+        # allocation (ALLOC_QTY > 0). ALLOC_WAVE lives on ARS_ALLOC_PARKED, so
+        # we join via a CTE.
+        snapshot_alloc = ALLOC_HISTORY if table == LIST_HISTORY else ALLOC_PARKED
+        sql = f"""
+        WITH wave_cte AS (
+            SELECT WERKS, MAJ_CAT, RDC, GEN_ART_NUMBER, ISNULL(CLR,'') AS CLR,
+                   MAX(ALLOC_WAVE) AS alloc_wave
+            FROM {snapshot_alloc} WITH (NOLOCK)
+            WHERE SESSION_ID = :sid AND ALLOC_WAVE IS NOT NULL AND ALLOC_WAVE <> ''
+            GROUP BY WERKS, MAJ_CAT, RDC, GEN_ART_NUMBER, ISNULL(CLR,'')
+        )
+        SELECT {dim_expr} AS dim_val, L.RDC,
+               SUM(ISNULL(L.OPT_MBQ,  0))       AS mbq_qty,
+               SUM(ISNULL(L.STK_TTL,  0))       AS store_stk,
+               SUM(ISNULL(L.OPT_REQ,  0))       AS req_qty,
+               SUM(ISNULL(L.ALLOC_QTY,0))       AS alloc_qty,
+               SUM(ISNULL(L.HOLD_QTY, 0))       AS hold_qty,
+               0                                AS excess_stk,  /* filled in by orchestrator */
+               MAX(L.GEN_ART_NUMBER)            AS gen_art_number,
+               MAX(L.CLR)                       AS clr,
+               MAX(L.OPT_TYPE)                  AS opt_type,
+               MIN(L.OPT_PRIORITY_RANK)         AS opt_priority_rank,
+               MIN(L.ALLOC_SEQ)                 AS alloc_seq,
+               MAX(L.ALLOC_STATUS)              AS alloc_status,
+               MAX(L.ALLOC_REMARKS)             AS alloc_remarks,
+               -- I_ROD planned vs used (rods at stores that actually got allocation)
+               SUM(ISNULL(L.I_ROD, 0))                                              AS i_rod_planned,
+               SUM(CASE WHEN ISNULL(L.ALLOC_QTY,0) > 0 THEN ISNULL(L.I_ROD,0) ELSE 0 END) AS i_rod_used,
+               MAX(w.alloc_wave)                AS alloc_wave
+        FROM {table} L WITH (NOLOCK){mp_join}
+        LEFT JOIN wave_cte w
+               ON w.WERKS = L.WERKS
+              AND w.MAJ_CAT = L.MAJ_CAT
+              AND w.GEN_ART_NUMBER = L.GEN_ART_NUMBER
+              AND w.CLR = ISNULL(L.CLR, '')
+              AND w.RDC = L.RDC
+        WHERE L.SESSION_ID = :sid{extra_where}
+        GROUP BY {dim_expr}, L.RDC
+        """
+    elif kind == "grid":
+        # Grid-dim review (FAB / MACRO_MVGR / MICRO_MVGR / RNG_SEG / M_VND_CD).
+        # Same OPT-grain SUMs as MAJ_CAT but grouped by the sec-cap grid column.
+        sql = f"""
+        SELECT {dim_expr} AS dim_val, L.RDC,
+               SUM(ISNULL(L.OPT_MBQ,   0))      AS mbq_qty,
+               SUM(ISNULL(L.STK_TTL,   0))      AS store_stk,
+               SUM(ISNULL(L.OPT_REQ,   0))      AS req_qty,
+               SUM(ISNULL(L.ALLOC_QTY, 0))      AS alloc_qty,
+               SUM(ISNULL(L.HOLD_QTY,  0))      AS hold_qty,
+               0                                AS excess_stk  /* filled in by orchestrator */
+        FROM {table} L WITH (NOLOCK){mp_join}
+        WHERE L.SESSION_ID = :sid{extra_where}
+        GROUP BY {dim_expr}, L.RDC
+        """
+    else:
+        # article level handled separately (different source table)
+        return []
+
+    return conn.execute(text(sql), params).mappings().all()
+
+
+def _session_review_snapshot_excess(conn, snapshot_tbl: str, sid: str,
+                                    dim: str, crumb: Dict) -> Dict:
+    """Aggregate EXCESS_STK from ARS_LISTING_PARKED / ARS_LISTING_HISTORY at the
+    requested dim × RDC grain, applying the same crumb filters as the listing
+    query. The snapshot table has *different* OPT rows than the working table
+    (snapshot rows include parked-out OPTs that don't make it to the working
+    pipeline), so we aggregate it independently and merge after-the-fact.
+
+    Returns: { (dim_val_str, rdc_str): excess_stk_int }
+    """
+    if not _table_exists(conn, snapshot_tbl) or dim == "ARTICLE":
+        return {}
+
+    cfg = _SR_DIM_CONFIG[dim]
+    # Use the same dim_expr as the listing query (it already references the
+    # listing-table alias 'L', which we re-use here for the snapshot).
+    dim_expr = cfg["expr"]
+    needs_mp = cfg["needs_mp"]
+
+    params: Dict = {"sid": sid}
+    crumb_where, crumb_needs_mp = _sr_crumb_where(crumb, params)
+    needs_mp = needs_mp or crumb_needs_mp
+
+    mp_join = ""
+    if needs_mp:
+        mp_join = f" LEFT JOIN {PROD_VIEW} MP WITH (NOLOCK) ON MP.GEN_ART_NUMBER = L.GEN_ART_NUMBER"
+
+    extra_where = f" AND {crumb_where}" if crumb_where else ""
+
+    sql = f"""
+    SELECT {dim_expr} AS dim_val, L.RDC,
+           SUM(ISNULL(L.EXCESS_STK, 0)) AS excess_stk
+    FROM {snapshot_tbl} L WITH (NOLOCK){mp_join}
+    WHERE L.SESSION_ID = :sid{extra_where}
+    GROUP BY {dim_expr}, L.RDC
+    """
+    rows = conn.execute(text(sql), params).mappings().all()
+    out = {}
+    for r in rows:
+        key = (str(r["dim_val"] or "—").strip(), str(r["RDC"] or "—").strip())
+        out[key] = int(r["excess_stk"] or 0)
+    return out
+
+
+def _session_review_from_alloc(conn, table: str, sid: str, crumb: Dict):
+    """Article-grain rollup at VAR_ART × SZ from ARS_ALLOC_PARKED/_HISTORY.
+    Returns one row per (VAR_ART, SZ) — the leaf of the drill, matching the
+    listing-page reference report. Carries SZ_MBQ/SZ_STK/SZ_REQ/FNL_Q/SHIP/
+    FROM_HOLD/HOLD/ALLOC/STATUS/REASON/BAND_TRACE.
+    """
+    params: Dict = {"sid": sid}
+    parts: List[str] = ["SESSION_ID = :sid"]
+    # Listing-native filters apply directly (same column names on ARS_ALLOC_*)
+    for col, key in (("MAJ_CAT", "mc"), ("WERKS", "werks"), ("RDC", "rdc")):
+        vals = crumb.get(key) or []
+        if vals:
+            ph = []
+            for i, v in enumerate(vals):
+                k = f"{key}{i}"
+                params[k] = v
+                ph.append(f":{k}")
+            parts.append(f"{col} IN ({','.join(ph)})")
+    if crumb.get("gen_art"):
+        params["p_genart"] = crumb["gen_art"]
+        parts.append("GEN_ART_NUMBER = :p_genart")
+    if crumb.get("clr"):
+        params["p_clr"] = crumb["clr"]
+        parts.append("CLR = :p_clr")
+    where_sql = " WHERE " + " AND ".join(parts)
+    # Aggregate per (VAR_ART, SZ, RDC). Across multiple WERKS (when no WERKS
+    # crumb is set), we sum the quantities. CONT / PAK_SZ are size-level
+    # attributes — MAX picks one (identical across WERKS for the same VAR_ART/SZ).
+    sql = f"""
+    SELECT VAR_ART                    AS dim_val,
+           SZ                         AS sz,
+           RDC,
+           MAX(ISNULL(CONT,    0))    AS cont,
+           MAX(ISNULL(PAK_SZ,  0))    AS pak_sz,
+           SUM(ISNULL(SZ_MBQ,  0))    AS sz_mbq,
+           SUM(ISNULL(SZ_STK,  0))    AS sz_stk,
+           SUM(ISNULL(SZ_REQ,  0))    AS sz_req,
+           SUM(ISNULL(FNL_Q,   0))    AS fnl_q,
+           SUM(ISNULL(SHIP_QTY,0))    AS ship_qty,
+           SUM(ISNULL(FROM_HOLD_QTY,0)) AS from_hold_qty,
+           SUM(ISNULL(HOLD_QTY,0))    AS hold_qty,
+           SUM(ISNULL(ALLOC_QTY,0))   AS alloc_qty,
+           MAX(ALLOC_STATUS)          AS alloc_status,
+           MAX(ALLOC_REMARKS)         AS alloc_remarks,
+           MAX(SKIP_REASON)           AS skip_reason
+    FROM {table} WITH (NOLOCK)
+    {where_sql}
+    GROUP BY VAR_ART, SZ, RDC
+    ORDER BY VAR_ART, SZ
+    """
+    return conn.execute(text(sql), params).mappings().all()
+
+
+def _parse_sr_crumb(request: Request) -> Dict:
+    """Pull crumb filters from the session-review query string. Each is csv."""
+    qp = request.query_params
+    def _csv(key):
+        raw = qp.get(key) or ""
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return {
+        "seg":     _csv("seg"),
+        "div":     _csv("div"),
+        "sub_div": _csv("sub_div"),
+        "mc":      _csv("mc"),
+        "werks":   _csv("werks"),
+        "rdc":     _csv("rdc"),
+        "gen_art": qp.get("gen_art") or None,
+        "clr":     qp.get("clr")     or None,
+    }
+
+
+@router.get("/session-review", response_model=APIResponse)
+def session_review(
+    request: Request,
+    sid: str = Query(..., description="SESSION_ID to review"),
+    dim: str = Query("MAJ_CAT", description="SEG|DIV|SUB_DIV|MAJ_CAT|ST_CD|GEN_ART|ARTICLE"),
+    current_user: User = Depends(get_current_user),
+):
+    dim_up = (dim or "MAJ_CAT").strip().upper()
+    if dim_up not in _SR_DIM_CONFIG:
+        return APIResponse(success=False, data={},
+                           message=f"Unsupported dim '{dim}'. Use one of {list(_SR_DIM_CONFIG)}")
+    crumb = _parse_sr_crumb(request)
+    engine = _engine()
+    out = {"source": None, "session_id": sid, "dim": dim_up,
+           "rdcs": [], "items": [], "totals": {}}
+
+    with engine.connect() as conn:
+        rows = []
+        msa_stock: Dict = {}
+        excess_map: Dict = {}     # NEW: snapshot-sourced EXCESS_STK keyed by (dim_val, RDC)
+        source = None
+
+        if dim_up == "ARTICLE":
+            # Size-grain (VAR_ART × SZ) from ARS_ALLOC_PARKED/HISTORY — leaf of the drill.
+            if _table_exists(conn, ALLOC_HISTORY):
+                rows = _session_review_from_alloc(conn, ALLOC_HISTORY, sid, crumb)
+                if rows: source = "history"
+            if not rows and _table_exists(conn, ALLOC_PARKED):
+                rows = _session_review_from_alloc(conn, ALLOC_PARKED, sid, crumb)
+                if rows: source = "parked"
+        else:
+            # SEG/DIV/SUB_DIV/MAJ_CAT/ST_CD/GEN_ART — listing archive (MBQ/REQ/ALLOC/HOLD)
+            # + MSA stock (FNL_Q) + snapshot listing (EXCESS_STK, sourced separately
+            # because snapshot and working tables have disjoint GEN_ART sets).
+            if _table_exists(conn, LIST_HISTORY):
+                rows = _session_review_from_listing(conn, LIST_HISTORY, sid, dim_up, crumb)
+                if rows:
+                    source = "history"
+                    msa_stock  = _session_review_msa_stock(conn, MSA_HISTORY, sid, dim_up, crumb)
+                    excess_map = _session_review_snapshot_excess(conn, LIST_SNAPSHOT_HISTORY, sid, dim_up, crumb)
+            if not rows and _table_exists(conn, LIST_PARKED):
+                rows = _session_review_from_listing(conn, LIST_PARKED, sid, dim_up, crumb)
+                if rows:
+                    source = "parked"
+                    msa_stock  = _session_review_msa_stock(conn, MSA_PARKED, sid, dim_up, crumb)
+                    excess_map = _session_review_snapshot_excess(conn, LIST_SNAPSHOT_PARKED, sid, dim_up, crumb)
+
+        if not rows:
+            return APIResponse(success=True, data=out,
+                               message=f"Session {sid} has no parked/history snapshot")
+
+        out["source"]    = source
+        out["msa_found"] = bool(msa_stock)
+
+        # ─── ARTICLE level returns a flat list of (VAR_ART, SZ) rows. The
+        # leaf view uses a dedicated columnset; no pivot/by_rdc bucketing. ───
+        if dim_up == "ARTICLE":
+            items = []
+            tot = {"sz_mbq": 0, "sz_stk": 0, "sz_req": 0, "fnl_q": 0,
+                   "ship": 0, "from_hold": 0, "hold": 0, "alloc": 0}
+            for r in rows:
+                var_art = str(r.get("dim_val") or "—").strip()
+                sz      = str(r.get("sz") or "—").strip()
+                rdc     = str(r.get("RDC") or "—").strip()
+                remarks = r.get("alloc_remarks") or ""
+                # Pull the "B[<TIER>.r<round>.rk<rank>]" prefix from remarks as band_trace.
+                import re as _re
+                m = _re.match(r"^(B\[[^\]]+\])", remarks)
+                band_trace = m.group(1) if m else ""
+                sz_mbq     = int(r.get("sz_mbq")    or 0)
+                sz_stk     = int(r.get("sz_stk")    or 0)
+                sz_req     = int(r.get("sz_req")    or 0)
+                fnl_q      = int(r.get("fnl_q")     or 0)
+                ship       = int(r.get("ship_qty")  or 0)
+                from_hold  = int(r.get("from_hold_qty") or 0)
+                hold       = int(r.get("hold_qty")  or 0)
+                alloc      = int(r.get("alloc_qty") or 0)
+                msa_rem    = max(0, fnl_q - alloc - hold)
+                items.append({
+                    "var_art":   var_art,
+                    "sz":        sz,
+                    "rdc":       rdc,
+                    "cont":      float(r.get("cont")   or 0),
+                    "pak_sz":    float(r.get("pak_sz") or 0),
+                    "sz_mbq":    sz_mbq,
+                    "sz_stk":    sz_stk,
+                    "sz_req":    sz_req,
+                    "fnl_q":     fnl_q,
+                    "msa_rem":   msa_rem,
+                    "ship":      ship,
+                    "from_hold": from_hold,
+                    "hold":      hold,
+                    "alloc":     alloc,
+                    "status":    r.get("alloc_status") or "",
+                    "reason":    r.get("skip_reason")  or "",
+                    "remarks":   remarks,
+                    "band_trace": band_trace,
+                })
+                tot["sz_mbq"]    += sz_mbq
+                tot["sz_stk"]    += sz_stk
+                tot["sz_req"]    += sz_req
+                tot["fnl_q"]     += fnl_q
+                tot["ship"]      += ship
+                tot["from_hold"] += from_hold
+                tot["hold"]      += hold
+                tot["alloc"]     += alloc
+            out["items"]  = items
+            out["totals"] = tot
+            out["rdcs"]   = []  # not pivoted by RDC at this level
+            return APIResponse(success=True, data=out)
+
+        # ─── All other dims (mj/store/opt/grid): bucket into rdcs[] + items[]. ───
+        # Each item is { key, by_rdc, tot }. The 'maj_cat' alias is preserved
+        # for frontend compatibility.
+        rdcs_set = set()
+        by_key: Dict[str, Dict] = {}
+        grand = {"mbq": 0, "stock": 0, "store_stk": 0, "excess_stk": 0,
+                 "req": 0, "alloc": 0, "hold": 0}
+
+        for r in rows:
+            key_val = str(r.get("dim_val") or "—").strip()
+            rdc = str(r["RDC"] or "—").strip()
+            rdcs_set.add(rdc)
+
+            # STOCK column source:
+            #   - SEG/DIV/SUB_DIV/MAJ_CAT/GEN_ART: from MSA aggregated at same dim grain
+            #   - ST_CD: STOCK = 0 (RDC stock isn't store-specific)
+            #   - ARTICLE: stock_avail is on the MSA_VAR row itself
+            stock_val = 0
+            if dim_up == "ARTICLE":
+                stock_val = int(r.get("stock_avail") or 0)
+            else:
+                msa = msa_stock.get((key_val, rdc), {})
+                stock_val = int(msa.get("stock_fnl") or 0)
+
+            # EXCESS_STK comes from the snapshot table (independent aggregation).
+            # Falls back to whatever the listing query emitted (0 in the new SQL)
+            # when there's no snapshot entry for this (dim, rdc).
+            excess_val = excess_map.get((key_val, rdc))
+            if excess_val is None:
+                excess_val = int(r.get("excess_stk") or 0)
+            cell = {
+                "mbq":        int(r.get("mbq_qty")    or 0),
+                "stock":      stock_val,
+                "store_stk":  int(r.get("store_stk")  or 0),
+                "excess_stk": int(excess_val),
+                "req":        int(r.get("req_qty")    or 0),
+                "alloc":      int(r.get("alloc_qty")  or 0),
+                "hold":       int(r.get("hold_qty")   or 0),
+            }
+            cell["req_rem"]  = max(0, cell["req"] - cell["alloc"])
+            cell["msa_rem"]  = max(0, cell["store_stk"] - cell["alloc"] - cell["hold"])
+            cell["req_pct"]  = round(cell["alloc"] / cell["req"] * 100, 1)  if cell["req"]   else 0.0
+            cell["fill_pct"] = round((cell["store_stk"] + cell["alloc"]) / cell["mbq"] * 100, 1) if cell["mbq"]   else 0.0
+            cell["stk_pct"]  = round(cell["alloc"] / cell["stock"] * 100, 1) if cell["stock"] else 0.0
+
+            row = by_key.setdefault(key_val, {
+                "key": key_val,
+                # Legacy alias for frontend (SessionReviewGrid was written
+                # against MAJ_CAT-grain output).
+                "maj_cat": key_val,
+                "by_rdc": {},
+                "tot": {"mbq": 0, "stock": 0, "store_stk": 0, "excess_stk": 0,
+                        "req": 0, "alloc": 0, "hold": 0},
+            })
+            # Sidecar metadata: store name/hub + gen_art for crumb building +
+            # OPT-level attributes (OPT_TYPE / rank / alloc_seq / status / remarks)
+            # used by the OPT-grain flat table.
+            if "st_nm" in r and r["st_nm"]:
+                row["st_nm"] = r["st_nm"]
+            if "hub" in r and r["hub"]:
+                row["hub"] = r["hub"]
+            if "gen_art_number" in r and r["gen_art_number"]:
+                row["gen_art_number"] = r["gen_art_number"]
+                row["clr"] = r.get("clr") or ""
+            # OPT attributes are per (GEN_ART, CLR, RDC) — store them on the
+            # by_rdc cell so the frontend can render them per-RDC row.
+            for opt_key in ("opt_type", "opt_priority_rank", "alloc_seq",
+                            "alloc_status", "alloc_remarks",
+                            "i_rod_planned", "i_rod_used", "alloc_wave"):
+                if opt_key in r and r[opt_key] is not None:
+                    cell[opt_key] = r[opt_key]
+            row["by_rdc"][rdc] = cell
+            for k in ("mbq", "stock", "store_stk", "excess_stk", "req", "alloc", "hold"):
+                row["tot"][k] += cell[k]
+                grand[k]      += cell[k]
+
+        # Derive row totals after sum
+        for row in by_key.values():
+            t = row["tot"]
+            t["req_rem"]  = max(0, t["req"] - t["alloc"])
+            t["msa_rem"]  = max(0, t["store_stk"] - t["alloc"] - t["hold"])
+            t["req_pct"]  = round(t["alloc"] / t["req"] * 100, 1)  if t["req"]   else 0.0
+            t["fill_pct"] = round((t["store_stk"] + t["alloc"]) / t["mbq"] * 100, 1) if t["mbq"]   else 0.0
+            t["stk_pct"]  = round(t["alloc"] / t["stock"] * 100, 1) if t["stock"] else 0.0
+
+        out["rdcs"]  = sorted(rdcs_set)
+        out["items"] = sorted(by_key.values(), key=lambda x: -x["tot"]["alloc"])
+        out["totals"] = {
+            **grand,
+            "req_rem":  max(0, grand["req"] - grand["alloc"]),
+            "msa_rem":  max(0, grand["store_stk"] - grand["alloc"] - grand["hold"]),
+            "req_pct":  round(grand["alloc"] / grand["req"] * 100, 1) if grand["req"]   else 0.0,
+            "fill_pct": round((grand["store_stk"] + grand["alloc"]) / grand["mbq"] * 100, 1) if grand["mbq"] else 0.0,
+            "stk_pct":  round(grand["alloc"] / grand["stock"] * 100, 1) if grand["stock"] else 0.0,
         }
     return APIResponse(success=True, data=out)
 

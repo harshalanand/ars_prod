@@ -3,20 +3,17 @@ import {
   LayoutDashboard, Table2, Upload, PackageCheck, Users, Shield, Eye, ScrollText,
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
-  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
-  HardDrive, Code2, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge
+  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
+  HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
+  AlertTriangle
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
 import { useState, useRef, useEffect } from 'react'
 
 const navItems = [
-  { label: 'Dashboard', path: '/', icon: LayoutDashboard, end: true },
   { label: 'ARS Dashboard', path: '/ars-dashboard', icon: LayoutGrid, permission: 'ALLOC_READ' },
-  { label: 'Allocations', path: '/allocations', icon: PackageCheck, permission: 'ALLOC_READ' },
-  { label: 'Process', path: '/process', icon: BookOpen },
-  // Developer Guide — superadmin only. Auto-introspecting, no SOP rot.
-  { label: 'Developer Guide', path: '/dev-guide', icon: Code2, superadminOnly: true },
+  { label: 'Alloc Review', path: '/alc-review', icon: History, permission: 'ALLOC_READ' },
 ]
 
 // Data Management submenu
@@ -32,11 +29,14 @@ const dataManagementItems = [
 // Data Preparation submenu
 const dataPreparationItems = [
   { label: 'MSA Stock Calculation', path: '/msa', icon: BarChart3, permission: 'MSA_VIEW' },
-  { label: 'BDC Creation', path: '/bdc', icon: FileText, permission: 'BDC_VIEW' },
   { label: 'Grid Builder', path: '/data-prep/store-stock', icon: LayoutGrid, permission: 'GRID_VIEW' },
   { label: 'Merge Rules', path: '/data-prep/merge-rules', icon: GitMerge, permission: 'GRID_VIEW' },
-  { label: 'Lookup Art Master', path: '/data-prep/lookup-art-master', icon: Search, permission: 'LOOKUP_VIEW' },
   { label: 'Listing', path: '/data-prep/listing', icon: List },
+]
+
+// Adhoc submenu
+const adhocItems = [
+  { label: 'Lookup Art Master', path: '/data-prep/lookup-art-master', icon: Search, permission: 'LOOKUP_VIEW' },
 ]
 
 // Contribution Percentage submenu
@@ -50,6 +50,7 @@ const contributionItems = [
 // Reports submenu
 const reportsItems = [
   { label: 'Hold Dashboard', path: '/reports/hold', icon: Lock },
+  { label: 'GAP Report',     path: '/reports/gap',  icon: AlertTriangle, permission: 'ALLOC_READ' },
 ]
 
 // Pending Allocation lifecycle submenu
@@ -253,10 +254,19 @@ export default function Sidebar({ collapsed, onToggle }) {
         />
 
         {/* Data Preparation submenu */}
-        <SubMenu 
-          title="Data Preparation" 
-          icon={Cpu} 
-          items={dataPreparationItems} 
+        <SubMenu
+          title="Listing & Alloc"
+          icon={Cpu}
+          items={dataPreparationItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+        />
+
+        {/* Adhoc submenu */}
+        <SubMenu
+          title="Adhoc"
+          icon={FolderOpen}
+          items={adhocItems}
           collapsed={collapsed}
           hasPermission={hasPermission}
         />
