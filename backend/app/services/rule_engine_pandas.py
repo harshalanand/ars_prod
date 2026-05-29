@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import os
 import queue
-import re
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -93,20 +92,20 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     Eliminates 8-way writer-writer deadlocks on ARS_ALLOC_WORKING /
     ARS_LISTING_WORKING. See USE_WRITER_QUEUE flag.
     """
-    if len(args) >= 15:
+    # Backwards-compat unpack: defer_writes is optional (tuple may be 14 or 15
+    # long). Older callers pass 14 elements; the new writer-queue path passes
+    # 15 with defer_writes as the trailing flag.
+    if len(args) == 15:
         (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
          pri_ct_check_rl, pri_ct_check_tbc,
          rl_mbq_cap_pct, tbc_mbq_cap_pct,
-         size_threshold, min_size_count, opt_types, defer_writes,
-         *_extras) = args
+         size_threshold, min_size_count, opt_types, defer_writes) = args
     else:
         (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
          pri_ct_check_rl, pri_ct_check_tbc,
          rl_mbq_cap_pct, tbc_mbq_cap_pct,
          size_threshold, min_size_count, opt_types) = args
         defer_writes = False
-        _extras = []
-    tbl_mbq_cap_pct = float(_extras[0]) if _extras else 0.0
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
@@ -173,7 +172,6 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
             pri_ct_check_tbc=pri_ct_check_tbc,
             rl_mbq_cap_pct=rl_mbq_cap_pct,
             tbc_mbq_cap_pct=tbc_mbq_cap_pct,
-            tbl_mbq_cap_pct=tbl_mbq_cap_pct,
             hold_dict=hold_dict if hold_dict else None,
             size_threshold=size_threshold,
             min_size_count=min_size_count,
@@ -248,17 +246,8 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
                 "deadlocks": DeadlockStats.snapshot()}
 
     except Exception as e:
-        import traceback as _tb
-        tb_str = _tb.format_exc()
-        # Bare keys (KeyError → just 'COLNAME') and similar one-word repr
-        # exceptions are useless without context. Keep the short form for
-        # the QUEUE_TABLE error column but log the full traceback so the
-        # operator can see file:line of the actual raise.
-        err = (f"{type(e).__name__}: {e}")[:2000]
+        err = str(e)[:2000]
         dur = time.time() - t_mc
-        logger.error(
-            f"[pandas] {mc}: worker FAILED ({err}) — full traceback:\n{tb_str}"
-        )
         if not _write_back_done:
             # True failure — waterfall or write-back exhausted retries.
             try:
@@ -379,73 +368,6 @@ def _writer_thread_fn(
             result_queue.task_done()
 
 
-def _stage_d_apply_pak_sz_rounding(conn, alloc_table: str) -> None:
-    """SQL safety-net for PAK_SZ rounding. Most rows are already pak-aligned
-    by `_apply_pak_sz_rounding_df` during MAJ_CAT write-back; this catches
-    anything that slipped through.
-
-    Half-up rule: SHIP_QTY rounds to the nearest whole pak. req >= 0.5*pak
-    rounds UP (e.g. 5/6 -> 6, 11/6 -> 12); below the half-pak threshold the
-    row is gated to 0 and marked SKIPPED. POOL_CONSUMED is adjusted by the
-    same delta so the FNL_Q_REM recompute downstream refunds (or charges)
-    the pool correctly."""
-    try:
-        run_sql(conn, f"ALTER TABLE [{alloc_table}] ADD [ALLOC_REMARKS] NVARCHAR(MAX) NULL")
-    except Exception:
-        pass  # idempotent — column may already exist
-    try:
-        run_sql(conn, f"""
-            ;WITH P AS (
-                SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
-                       ISNULL(SHIP_QTY, 0)                       AS old_ship,
-                       COALESCE(NULLIF(PAK_SZ, 0), 1)            AS pak,
-                       ISNULL(SHIP_QTY, 0)                       AS req
-                FROM [{alloc_table}]
-                WHERE ISNULL(SHIP_QTY, 0) > 0
-            ),
-            R AS (
-                SELECT P.*,
-                       CASE WHEN P.req < 0.5 * P.pak THEN 0
-                            ELSE CAST(FLOOR((CAST(P.req AS FLOAT) + 0.5 * CAST(P.pak AS FLOAT))
-                                            / CAST(P.pak AS FLOAT)) AS INT) * P.pak
-                       END AS new_ship
-                FROM P
-            )
-            UPDATE A
-               SET A.SHIP_QTY      = R.new_ship,
-                   A.POOL_CONSUMED = CASE
-                       WHEN A.POOL_CONSUMED IS NULL THEN NULL
-                       ELSE CASE WHEN A.POOL_CONSUMED - (R.old_ship - R.new_ship) < 0
-                                 THEN 0
-                                 ELSE A.POOL_CONSUMED - (R.old_ship - R.new_ship) END
-                   END,
-                   A.ALLOC_STATUS  = CASE WHEN R.new_ship = 0 THEN 'SKIPPED' ELSE A.ALLOC_STATUS END,
-                   A.SKIP_REASON   = CASE WHEN R.new_ship = 0
-                                          THEN 'PAK_SZ_BELOW_HALF(pak=' + CAST(R.pak AS NVARCHAR(10)) + ')'
-                                          ELSE A.SKIP_REASON END,
-                   A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS,'') +
-                       CASE
-                           WHEN R.new_ship = 0
-                                THEN ' PAK_SZ_GATE(req=' + CAST(R.req AS NVARCHAR(20))
-                                     + ',pak=' + CAST(R.pak AS NVARCHAR(10)) + ');'
-                           WHEN R.new_ship <> R.old_ship
-                                THEN ' PAK_SZ_ROUND(from=' + CAST(R.old_ship AS NVARCHAR(20))
-                                     + ',to=' + CAST(R.new_ship AS NVARCHAR(20))
-                                     + ',pak=' + CAST(R.pak AS NVARCHAR(10)) + ');'
-                           ELSE ''
-                       END
-            FROM [{alloc_table}] A
-            INNER JOIN R
-              ON A.WERKS = R.WERKS AND A.MAJ_CAT = R.MAJ_CAT
-             AND A.GEN_ART_NUMBER = R.GEN_ART_NUMBER
-             AND ISNULL(A.CLR,'') = ISNULL(R.CLR,'')
-             AND A.VAR_ART = R.VAR_ART AND A.SZ = R.SZ
-        """)
-        logger.info("[D] PAK_SZ rounding applied")
-    except Exception as e:
-        logger.warning(f"[D] PAK_SZ rounding failed: {e}")
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -466,21 +388,8 @@ def run_listing_and_allocation_pandas(
     pri_ct_check_tbc: bool = False,
     rl_mbq_cap_pct:  float = 0.0,
     tbc_mbq_cap_pct: float = 0.0,
-    tbl_mbq_cap_pct: float = 0.0,
-    # Per-OPT_TYPE downward MJ_REQ caps applied AFTER waterfall write-back,
-    # BEFORE PAK_SZ rounding. Each clamps SUM(SHIP_QTY) for that OPT_TYPE
-    # per (WERKS, MAJ_CAT) to cap_pct% × MJ_REQ. 100 = no over-ship vs
-    # MAJ_CAT req; 0 = cap disabled.
-    rl_mj_req_cap_pct:  float = 100.0,
-    tbc_mj_req_cap_pct: float = 100.0,
-    tbl_mj_req_cap_pct: float = 100.0,
-    # MJ_REQ growth headroom — applied upstream by /listing-build by scaling
-    # MJ_REQ on ARS_LISTING_WORKING.  Engine receives the already-scaled value
-    # and does not re-scale; this param is informational (audit log only).
-    mj_req_growth_pct:  float = 100.0,
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only
     use_writer_queue: Optional[bool] = None, # per-run override; None = fall back to .env
-    apply_sec_cap_in_normal: bool = True,    # 130% Secondary-grid cap in main pass
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -495,9 +404,8 @@ def run_listing_and_allocation_pandas(
     # Helps diagnose UI-toggle vs. server-state mismatches.
     logger.info(
         f"[engine] batch={batch_id} | "
-        f"RL: {'PRI>=100 strict (MJ-cap 100%)' if pri_ct_check_rl else f'MBQ-cap {rl_mbq_cap_pct}%'} | "
-        f"TBC: {'PRI>=100 strict (MJ-cap 100%)' if pri_ct_check_tbc else f'MBQ-cap {tbc_mbq_cap_pct}%'} | "
-        f"MJ_REQ growth={mj_req_growth_pct}%"
+        f"RL: {'PRI>=100 strict' if pri_ct_check_rl else f'MBQ-cap {rl_mbq_cap_pct}%'} | "
+        f"TBC: {'PRI>=100 strict' if pri_ct_check_tbc else f'MBQ-cap {tbc_mbq_cap_pct}%'}"
     )
 
     result: Dict = {
@@ -526,9 +434,6 @@ def run_listing_and_allocation_pandas(
                 tbl_trivial_factor,
                 pri_ct_check_rl=pri_ct_check_rl,
                 pri_ct_check_tbc=pri_ct_check_tbc,
-                rl_mbq_cap_pct=rl_mbq_cap_pct,
-                tbc_mbq_cap_pct=tbc_mbq_cap_pct,
-                tbl_mbq_cap_pct=tbl_mbq_cap_pct,
             )
             rne._stage_a_assign_tier(conn, working_table)
             rne._stage_a_assign_rank(conn, working_table)
@@ -554,13 +459,6 @@ def run_listing_and_allocation_pandas(
             rne._stage_b_fill_cont(conn, alloc_table, cont_table)
             rne._stage_b_fill_targets(conn, alloc_table, var_grid_table)
             rne._stage_b_indexes(conn, alloc_table)
-
-            # Ensure per-row reason-tracking columns exist (alloc_table was
-            # just re-created by Stage B). ALLOC_REMARKS is also written by
-            # the per-band audit trail in _run_band, so it must exist DB-side
-            # before the per-MAJ_CAT write-back fires — not just at finalise.
-            rne._ensure_phase_reason_cols(conn, alloc_table, working_table)
-            rne._ensure_alloc_remarks_col(conn, alloc_table)
 
             grids = rne._discover_primary_grids(conn)
             logger.info(f"[C-pd] primary grids = {list(grids.keys())}")
@@ -620,19 +518,6 @@ def run_listing_and_allocation_pandas(
         use_writer_queue = bool(get_settings().USE_WRITER_QUEUE)
     else:
         use_writer_queue = bool(use_writer_queue)
-
-    # use_pool decides whether we'll spin up a ProcessPoolExecutor. Below the
-    # min-MAJ_CATs threshold or with n_workers≤1 we fall back to inline
-    # execution. defer_writes must be tied to use_pool: the writer thread
-    # ONLY runs when use_pool=True (see writer_queue setup below). If
-    # defer_writes=True but use_pool=False, the worker returns DataFrames
-    # that nobody writes — the inline result loop drops them, alloc_rows
-    # ends up 0, and the MAJ_CAT queue row stays IN_PROGRESS (mark_done
-    # lives in the writer thread). Symptom: ship/hold logged per round but
-    # final totals all zero. Fix: only defer when we're actually pooling.
-    use_pool = (len(alloc_groups) >= PROCESS_POOL_MIN_MAJCATS and n_workers > 1)
-    defer_writes_flag = bool(use_writer_queue and use_pool)
-
     pool_args = [
         (
             mc,
@@ -653,13 +538,13 @@ def run_listing_and_allocation_pandas(
             # returns the computed DataFrames instead of writing them
             # itself; the parent's writer thread (Pattern A) does all DB
             # UPDATEs sequentially. Backwards-compatible: legacy 14-tuple
-            # callers still work (defer_writes defaults in the worker's
-            # unpack).
-            defer_writes_flag,
-            float(tbl_mbq_cap_pct),
+            # callers still work (defer_writes defaults to False).
+            bool(use_writer_queue),
         )
         for mc in alloc_groups
     ]
+
+    use_pool = (len(pool_args) >= PROCESS_POOL_MIN_MAJCATS and n_workers > 1)
 
     # Writer-queue setup — only when both the flag is on AND we're using the
     # process pool (single-MAJ_CAT inline runs don't have a contention
@@ -830,37 +715,12 @@ def run_listing_and_allocation_pandas(
 
     # ── Finalise + Stage D (SQL) ──
     with engine.connect() as conn:
-        # Ensure ALLOC_REMARKS column on alloc_table exists before any
-        # cap helper writes audit detail to it. Older alloc_tables didn't
-        # have this column; idempotent ALTER is safe to call here.
-        rne._ensure_alloc_remarks_col(conn, alloc_table)
-        # PAK_SZ rounding runs before the MJ_REQ gate. The gate uses OPT-grain
-        # SHIP/HOLD sums to validate each OPT, so individual sizes must be in
-        # their final pak-aligned form first.
-        _stage_d_apply_pak_sz_rounding(conn, alloc_table)
-        # OPT-grain MJ_REQ gate (full-OPT-or-skip). Per (WERKS, MAJ_CAT) the
-        # first OPT (in priority order RL→TBC→TBL, then OPT_PRIORITY_TIER/
-        # RANK/ST_RANK) whose `cap_pct × MJ_REQ ≥ 0.5 × OPT_MBQ` ships in
-        # full — SHIP and HOLD at every (VAR_ART, SZ) row stay as the
-        # waterfall produced them. Everything else in (WERKS, MAJ_CAT) gets
-        # SHIP=HOLD=0 with SKIP_REASON='{OPT}_MJ_REQ_GATE_FAIL' or
-        # '{OPT}_MJ_REQ_POST_WINNER'. Reuses the sequential engine's SQL
-        # helper since the operation is identical across engines.
-        rne._stage_c_apply_opt_mj_req_gate(
-            conn, alloc_table, working_table,
-            rl_cap_pct=rl_mj_req_cap_pct,
-            tbc_cap_pct=tbc_mj_req_cap_pct,
-            tbl_cap_pct=tbl_mj_req_cap_pct,
-        )
-        # Safety-net: a SKIPPED row with no ship has no business holding WH
-        # stock — zero its hold so the buffer is returned to FNL_Q_REM.  Rows
-        # that DID ship (SHIP_QTY>0) but were round-locked by the revalidate
-        # propagation are legitimate r=1 partial dispatches; their HOLD is
-        # the warehouse buffer paired with the ship and MUST be preserved.
+        # MJ_REQ cap: prevent SUM(SHIP_QTY across all OPTs) > MJ_REQ per store
+        rne._stage_c_apply_mj_req_cap(conn, alloc_table, working_table)
+        # Safety-net: skipped rows must never carry warehouse hold.
         run_sql(conn, f"""
             UPDATE [{alloc_table}] SET HOLD_QTY = 0, ROUND_HOLD = 0
             WHERE ISNULL(HOLD_QTY, 0) > 0
-              AND ISNULL(SHIP_QTY, 0) = 0
               AND ALLOC_STATUS = 'SKIPPED'
         """)
         # Rows with SHIP=0 AND HOLD=0 consumed pool during the waterfall but were
@@ -890,8 +750,6 @@ def run_listing_and_allocation_pandas(
                 AND A.[VAR_ART]        = B.[VAR_ART]
                 AND A.[SZ]             = B.[SZ]
         """)
-        # PAK_SZ rounding moved earlier (before MJ_REQ cap). ALLOC_QTY now
-        # reflects the post-cap, pak-aligned SHIP_QTY.
         run_sql(conn, f"UPDATE [{alloc_table}] SET ALLOC_QTY = SHIP_QTY")
         run_sql(conn, f"""
             UPDATE [{alloc_table}] SET
@@ -918,88 +776,15 @@ def run_listing_and_allocation_pandas(
                     WHEN SHIP_QTY + HOLD_QTY > 0      THEN 'PARTIAL'
                     ELSE 'SKIPPED' END,
                 SKIP_REASON = CASE
-                    -- Preserve any pre-stamped reason from the waterfall or
-                    -- post-waterfall gates (PAK_SZ_*, *_MJ_REQ_GATE_*, SEC_CAP_*,
-                    -- MBQ_CAP_*, MJ_REQ_CAP, R09_HEADROOM_TRIVIAL, R07_SIZE_RATIO_LIVE,
-                    -- SKIP_PRI_BROKEN, CROSS_SKIP_*, REVALIDATION_SKIP).  Without
-                    -- this broad guard the catch-all NO_POOL_MSA arm below stomps
-                    -- the real cause and the audit trail loses why the row was zeroed.
-                    -- Mirrors rule_engine_new.py:2547.
-                    WHEN ISNULL(SKIP_REASON,'') <> '' THEN SKIP_REASON
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
                          AND CASE WHEN OPT_TYPE='TBL'
                                   THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
                                   ELSE ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0) END
                              - ISNULL(SZ_STK,0) <= 0
                          THEN 'ALREADY_STOCKED'
-                    -- Split NO_POOL_OR_DEMAND so users can tell demand-side
-                    -- (SZ_REQ<=0 → no demand) from supply-side (MSA pool empty).
-                    WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                         AND ISNULL(SZ_REQ, 0) <= 0 THEN 'NO_REQ'
-                    WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_MSA'
+                    WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_OR_DEMAND'
                     ELSE SKIP_REASON END
         """)
-        # ── Secondary-grid cap (main pass, toggle-controlled) ─
-        # Pandas workers used in-memory pools; build a #nre_pool on the parent
-        # from the current FNL_Q_REM state so the sec-cap helper can return
-        # stock against the same authoritative table.
-        if apply_sec_cap_in_normal:
-            run_sql(conn, f"IF OBJECT_ID('tempdb..{rne.POOL_TABLE}') IS NOT NULL DROP TABLE {rne.POOL_TABLE}")
-            run_sql(conn, f"""
-                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
-                       MAX(ISNULL(FNL_Q,     0)) AS FNL_Q_ORIG,
-                       MAX(ISNULL(FNL_Q_REM, 0)) AS FNL_Q_REM
-                INTO {rne.POOL_TABLE}
-                FROM [{alloc_table}]
-                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ
-            """)
-            try:
-                run_sql(conn, f"""
-                    CREATE UNIQUE CLUSTERED INDEX IX_pool_key ON {rne.POOL_TABLE}
-                      (RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ)
-                """)
-            except Exception:
-                pass
-            logger.info(f"[C-pd] built {rne.POOL_TABLE} on parent for sec-cap "
-                        f"(post-pandas remaining stock)")
-
-            _all_grids_main = rne._discover_all_active_grids(conn)
-            rne._apply_sec_grid_cap_pre_gate(
-                conn, alloc_table, working_table, _all_grids_main,
-                opt_type=None,
-            )
-
-            # Drop the parent-side pool now — Stage D doesn't need it, and the
-            # parent connection persists across runs in some callers.
-            run_sql(conn, f"IF OBJECT_ID('tempdb..{rne.POOL_TABLE}') IS NOT NULL DROP TABLE {rne.POOL_TABLE}")
-
-        # Refund MJ_REQ_REM from final SHIP_QTY.
-        # The waterfall + _revalidate_after_band decremented MJ_REQ_REM using
-        # in-band ROUND_SHIP.  Post-waterfall stages (PAK_SZ rounding gate,
-        # OPT_MJ_REQ gate, SEC_CAP pre-gate) may have zeroed rows AFTER that
-        # decrement, leaving MJ_REQ_REM stale.  One authoritative recompute
-        # against the final SHIP_QTY restores the budget so it reflects what
-        # truly shipped — idempotent and gate-agnostic.
-        run_sql(conn, f"""
-            UPDATE W
-            SET W.[MJ_REQ_REM] = CASE
-                WHEN ISNULL(W.[MJ_REQ], 0) - ISNULL(S.shipped, 0) > 0
-                THEN ISNULL(W.[MJ_REQ], 0) - ISNULL(S.shipped, 0)
-                ELSE 0 END
-            FROM [{working_table}] W
-            LEFT JOIN (
-                SELECT WERKS, MAJ_CAT,
-                       SUM(ISNULL(SHIP_QTY, 0)) AS shipped
-                FROM [{alloc_table}]
-                GROUP BY WERKS, MAJ_CAT
-            ) S ON S.WERKS = W.WERKS AND S.MAJ_CAT = W.MAJ_CAT
-            WHERE ISNULL(W.[LISTED_FLAG], 0) = 1
-        """)
-
-        # Per-row reason classification before Stage D rolls up to the
-        # listing working table.
-        rne._classify_alloc_reason(conn, alloc_table)
-
         rne._stage_d_reflect(conn, working_table, alloc_table)
 
         totals = conn.execute(text(f"""
@@ -1097,14 +882,6 @@ def _load_tables(engine, alloc_table, working_table, grids, only_majcats):
     else:
         alloc_df['SKIP_REASON'] = alloc_df['SKIP_REASON'].fillna('').astype(str)
         alloc_df.loc[alloc_df['ALLOC_STATUS'] == 'PENDING', 'SKIP_REASON'] = ''
-    # ALLOC_REMARKS is appended to by the per-band audit-trail in _run_band.
-    # The DB column is added lazily by _ensure_alloc_remarks_col during finalise,
-    # so on a fresh ARS_ALLOC_WORKING it may not exist on the SELECT * read above.
-    # Materialise unconditionally here so the audit writes never KeyError.
-    if 'ALLOC_REMARKS' not in alloc_df.columns:
-        alloc_df['ALLOC_REMARKS'] = ''
-    else:
-        alloc_df['ALLOC_REMARKS'] = alloc_df['ALLOC_REMARKS'].fillna('').astype(str)
     # Zero out accumulators so each run starts clean.
     _non_inelig = alloc_df['ALLOC_STATUS'] != 'INELIGIBLE'
     for _c in ['POOL_CONSUMED', 'SHIP_QTY', 'HOLD_QTY', 'ROUND_SHIP', 'ROUND_HOLD',
@@ -1233,35 +1010,6 @@ def _build_mbq_budget(working_df: pd.DataFrame, cap_pct: float) -> Dict[str, flo
     return budget
 
 
-def _live_mbq_budget(working_df: pd.DataFrame, cap_pct: float) -> Dict[str, float]:
-    """Per-WERKS cap rebuilt from the LIVE MJ_REQ_REM at the moment of call.
-    Use this at the start of every band so the cap reflects everything that
-    has already shipped — across all OPT_TYPEs and rounds — without having
-    to re-derive from MJ_MBQ - MJ_STK_TTL - cum_ships.
-
-    Math:  budget = max(0, MJ_REQ_REM + ((cap_pct - 100) / 100) × MJ_MBQ)
-      • cap_pct = 100 (PRI strict) → budget = MJ_REQ_REM
-      • cap_pct = 130            → budget = MJ_REQ_REM + 30% × MJ_MBQ
-    Empty dict (cap disabled) when cap_pct ≤ 0 or required columns missing."""
-    if cap_pct <= 0:
-        return {}
-    needed = {'WERKS', 'MJ_REQ_REM', 'MJ_MBQ'}
-    if not needed.issubset(working_df.columns):
-        return {}
-    headroom = (cap_pct - 100.0) / 100.0
-    store_data = (
-        working_df[['WERKS', 'MJ_REQ_REM', 'MJ_MBQ']]
-        .sort_values(['WERKS', 'MJ_REQ_REM', 'MJ_MBQ'], kind='mergesort')
-        .drop_duplicates(subset=['WERKS'])
-    )
-    budget: Dict[str, float] = {}
-    for _, row in store_data.iterrows():
-        rem = float(row['MJ_REQ_REM'] or 0)
-        mbq = float(row['MJ_MBQ'] or 0)
-        budget[str(row['WERKS'])] = max(0.0, rem + headroom * mbq)
-    return budget
-
-
 def _snapshot_fnl_q_rem(
     alloc_df: pd.DataFrame,
     pool_dict: Dict[Tuple, float],
@@ -1297,7 +1045,6 @@ def _run_majcat_waterfall(
     pri_ct_check_tbc: bool = False,
     rl_mbq_cap_pct: float = 0.0,
     tbc_mbq_cap_pct: float = 0.0,
-    tbl_mbq_cap_pct: float = 0.0,
     hold_dict: Optional[Dict[Tuple, float]] = None,
     size_threshold: float = 0.6,
     min_size_count: int = 3,
@@ -1324,18 +1071,19 @@ def _run_majcat_waterfall(
     has_working = (working_df is not None) and (not working_df.empty)
     revalidate_enabled = bool(rne.ENABLE_PER_OPT_REVALIDATION) and has_working
 
-    # Per-OPT MJ-level cap PCT. PRI>=100 strict pins the cap to 100%; otherwise
-    # the UI-supplied % is used. TBL has no MJ-cap (removed 2026-05-16) — its
-    # only ceiling is per-size SZ_REQ, so cap_pct is forced to 0 below to skip
-    # the budget check entirely for TBL. The actual budget DICTS are rebuilt
-    # fresh at the start of every band from the live working_df['MJ_REQ_REM']
-    # (see _live_mbq_budget). MJ_REQ_REM is decremented after every band by
-    # _revalidate_after_band, so deriving the budget from it gives a single
-    # source of truth across opt_types + rounds — no stale static budget,
-    # no double-deduction of prior ships.
-    eff_rl_cap  = 100.0 if pri_ct_check_rl  else rl_mbq_cap_pct
-    eff_tbc_cap = 100.0 if pri_ct_check_tbc else tbc_mbq_cap_pct
-    eff_tbl_cap = tbl_mbq_cap_pct
+    # Build per-WERKS MBQ budget dicts for capped OPT_TYPEs.
+    # Cap is only active when the corresponding PRI gate is OFF (unchecked).
+    # Budget = max(0, cap_pct/100 × MJ_MBQ − MJ_STK_TTL) per WERKS.
+    _rl_budget: Dict[str, float] = (
+        _build_mbq_budget(working_df, rl_mbq_cap_pct)
+        if (not pri_ct_check_rl) and rl_mbq_cap_pct > 0 and has_working
+        else {}
+    )
+    _tbc_budget: Dict[str, float] = (
+        _build_mbq_budget(working_df, tbc_mbq_cap_pct)
+        if (not pri_ct_check_tbc) and tbc_mbq_cap_pct > 0 and has_working
+        else {}
+    )
 
     # Initial snapshot: all rows get the pre-waterfall pool value so that
     # SKIPPED rows (which never enter elig_mask) always show a meaningful
@@ -1351,11 +1099,7 @@ def _run_majcat_waterfall(
         if max_round == 0:
             continue
 
-        cap_pct_for_ot = (
-            eff_rl_cap  if ot == 'RL'
-            else eff_tbc_cap if ot == 'TBC'
-            else eff_tbl_cap
-        )
+        mbq_budget = _rl_budget if ot == 'RL' else (_tbc_budget if ot == 'TBC' else {})
 
         # Skip low-coverage OPTs and re-rank survivors using live SIZE_RATIO.
         # Only for TBC and TBL — RL uses the initial rank set at the start.
@@ -1387,14 +1131,6 @@ def _run_majcat_waterfall(
             # This lets users see exactly what pool was available and why skips
             # fired, rather than the post-waterfall depleted value.
             _snapshot_fnl_q_rem(alloc_df, pool_dict, mask=elig_mask)
-
-            # Rebuild the per-WERKS cap from the live MJ_REQ_REM at the start
-            # of every band — captures all ships from prior opt_types AND prior
-            # rounds of this opt_type in one read.
-            mbq_budget = (
-                _live_mbq_budget(working_df, cap_pct_for_ot)
-                if cap_pct_for_ot > 0 and has_working else {}
-            )
 
             # All stores compete in one vectorised band call.  Priority order
             # is enforced by the sort inside _run_band:
@@ -1650,24 +1386,6 @@ def _run_band(
         alloc_df.loc[h_idx, 'ALLOC_STATUS'] = np.where(
             new_pc_h >= target_h, 'ALLOCATED', 'PARTIAL'
         )
-        # Audit-trail (Option A): record this band's hold draw so the
-        # reviewer sees "where did this row's SHIP come from" without
-        # joining to a separate log. Compact format `B[ot.rN.rkN] hold=…;`
-        rk_h = (
-            alloc_df.loc[h_idx, 'OPT_PRIORITY_RANK']
-            .fillna(0).astype(int).astype(str).values
-        )
-        prev_h = (
-            alloc_df.loc[h_idx, 'ALLOC_REMARKS']
-            .fillna('').astype(str).values
-        )
-        trace_h = (
-            ' B[' + ot + '.r' + str(int(r)) + '.rk' + rk_h
-            + '] from_hold='
-            + np.round(h_take, 0).astype(int).astype(str)
-            + ';'
-        )
-        alloc_df.loc[h_idx, 'ALLOC_REMARKS'] = prev_h + trace_h
         # Decrement hold_dict in-memory so later rounds see reduced hold_rem.
         for (w, va, sz_val), amt in (
             hold_rows.groupby(['WERKS', 'VAR_ART', 'SZ'])['FROM_HOLD_QTY'].sum().items()
@@ -1734,14 +1452,20 @@ def _run_band(
     if sub.empty:
         return
 
-    # 5a) Per-WERKS MBQ cap — mbq_budget is rebuilt from live MJ_REQ_REM at the
-    # start of every band, so it already accounts for ships from prior opt_types
-    # and prior rounds. We just need the within-band cumulative deduction so
-    # multiple OPTs competing at the same WERKS don't all double-spend the same
-    # budget — highest priority eats first.
+    # 5a) Per-WERKS MBQ cap — only when mbq_budget is provided (PRI gate OFF).
+    # Budget = max(0, cap_pct/100 × MJ_MBQ − MJ_STK_TTL) computed once per
+    # waterfall run. Here we subtract whatever was already shipped for this
+    # OPT_TYPE in previous rounds, then cap within-batch take in priority order.
     if mbq_budget:
-        budg_ser = pd.Series(mbq_budget, dtype='float64').clip(lower=0.0)
-        sub['_budg_before'] = sub['WERKS'].map(budg_ser.to_dict()).fillna(0.0)
+        ot_shipped = (
+            alloc_df.loc[alloc_df['OPT_TYPE'] == ot, ['WERKS', 'SHIP_QTY']]
+            .groupby('WERKS', sort=False)['SHIP_QTY'].sum()
+        )
+        budg_ser = pd.Series(mbq_budget, dtype='float64')
+        shipped_ser = ot_shipped.reindex(budg_ser.index).fillna(0.0)
+        budget_before = (budg_ser - shipped_ser).clip(lower=0.0)
+
+        sub['_budg_before'] = sub['WERKS'].map(budget_before.to_dict()).fillna(0.0)
 
         # Sort by (WERKS, OPT_PRIORITY_RANK) so highest-priority rows eat
         # the per-WERKS budget first.
@@ -1812,39 +1536,6 @@ def _run_band(
     alloc_df.loc[idx, 'ALLOC_STATUS'] = np.where(
         new_ship >= target, 'ALLOCATED', 'PARTIAL'
     )
-
-    # Audit-trail (Option A): append per-band SHIP/HOLD/POOL line to
-    # ALLOC_REMARKS for every row that actually moved. Gives the reviewer
-    # the full lifecycle of an OPT (one entry per round it took stock)
-    # without joining to a separate log table.
-    moved = (round_ship + round_hold) > 0
-    if moved.any():
-        m_idx = idx[moved]
-        rk_m = (
-            alloc_df.loc[m_idx, 'OPT_PRIORITY_RANK']
-            .fillna(0).astype(int).astype(str).values
-        )
-        # Read pool-before from the trimmed `sub` (same row count as `idx`/`moved`).
-        # Earlier-captured `fnl` snapshot is pre-trim and would misalign here.
-        pool_before_m = sub.loc[m_idx, 'FNL_Q_REM'].to_numpy()
-        pool_after_m  = np.maximum(pool_before_m - pool_take[moved], 0.0)
-        prev_m = (
-            alloc_df.loc[m_idx, 'ALLOC_REMARKS']
-            .fillna('').astype(str).values
-        )
-        trace_m = (
-            ' B[' + ot + '.r' + str(int(r)) + '.rk' + rk_m
-            + '] sh='
-            + np.round(round_ship[moved], 0).astype(int).astype(str)
-            + ' hld='
-            + np.round(round_hold[moved], 0).astype(int).astype(str)
-            + ' pool='
-            + np.round(pool_before_m, 0).astype(int).astype(str)
-            + '->'
-            + np.round(pool_after_m, 0).astype(int).astype(str)
-            + ';'
-        )
-        alloc_df.loc[m_idx, 'ALLOC_REMARKS'] = prev_m + trace_m
 
     # 8) Decrement pool by pool_take only (FROM_HOLD_QTY does not consume RDC pool).
     # TBL PARTIAL rows have their cancelled hold returned to pool automatically
@@ -2025,64 +1716,24 @@ def _revalidate_after_band(
 
     work_cols = set(working_df.columns)
 
-    # (1) Reduce MSA_FNL_Q_REM per OPT (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR).
-    # Note: OPT_KEYS already includes WERKS, so this groupby is naturally
-    # per-store. The `_ts` / `_hs` aliases below are per-store ship/hold
-    # sums for the OPT — renamed from terse `_t` / `_h` for clarity. The
-    # groupby keys and the dict produced here are unchanged from before;
-    # only the column names within `opt_take` are different.
+    # (1) Reduce MSA_FNL_Q_REM per OPT (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR)
     if 'MSA_FNL_Q_REM' in work_cols:
         opt_take = (
             band.groupby(OPT_KEYS, sort=False, observed=True, dropna=False)
-                .agg(_ts=('ROUND_SHIP', 'sum'), _hs=('ROUND_HOLD', 'sum'))
+                .agg(_t=('ROUND_SHIP', 'sum'), _h=('ROUND_HOLD', 'sum'))
         )
-        opt_take['_total'] = opt_take['_ts'] + opt_take['_hs']
-        opt_take_active = opt_take[opt_take['_total'] > 0]
-        if not opt_take_active.empty:
-            opt_dict = opt_take_active['_total'].to_dict()
+        opt_take['_total'] = opt_take['_t'] + opt_take['_h']
+        opt_take = opt_take[opt_take['_total'] > 0]['_total']
+        if not opt_take.empty:
+            opt_dict = opt_take.to_dict()
             keys = pd.Series(
                 list(zip(*[working_df[c].to_numpy() for c in OPT_KEYS])),
                 index=working_df.index,
             )
             decrement = keys.map(opt_dict).fillna(0).astype('float64')
-            prev_msa = working_df['MSA_FNL_Q_REM'].fillna(0).to_numpy()
-            new_msa = prev_msa - decrement.to_numpy()
-            new_msa = np.maximum(new_msa, 0.0)
-            working_df['MSA_FNL_Q_REM'] = new_msa
-
-            # Audit-trail (Option A) at OPT grain: append the per-band
-            # ship/hold and MSA_REM before→after to working_df.ALLOC_REMARKS
-            # for every OPT that actually consumed pool. The reviewer can
-            # read the full lifecycle of an OPT directly on the listing
-            # working row (initial vs revised side-by-side via this trace).
-            moved_w = decrement.to_numpy() > 0
-            if moved_w.any():
-                idx_w = working_df.index[moved_w]
-                ship_map = opt_take_active['_ts'].to_dict()
-                hold_map = opt_take_active['_hs'].to_dict()
-                sh_w = keys.loc[idx_w].map(ship_map).fillna(0).astype('float64').to_numpy()
-                hl_w = keys.loc[idx_w].map(hold_map).fillna(0).astype('float64').to_numpy()
-                rk_w = (
-                    working_df.loc[idx_w, 'OPT_PRIORITY_RANK']
-                    .fillna(0).astype(int).astype(str).values
-                )
-                prev_w = (
-                    working_df.loc[idx_w, 'ALLOC_REMARKS']
-                    .fillna('').astype(str).values
-                )
-                trace_w = (
-                    ' B[' + ot + '.r' + str(int(r)) + '.rk' + rk_w
-                    + '] ship='
-                    + np.round(sh_w, 0).astype(int).astype(str)
-                    + ' hold='
-                    + np.round(hl_w, 0).astype(int).astype(str)
-                    + ' msa='
-                    + np.round(prev_msa[moved_w], 0).astype(int).astype(str)
-                    + '->'
-                    + np.round(new_msa[moved_w], 0).astype(int).astype(str)
-                    + ';'
-                )
-                working_df.loc[idx_w, 'ALLOC_REMARKS'] = prev_w + trace_w
+            new_msa = (working_df['MSA_FNL_Q_REM'].to_numpy()
+                       - decrement.to_numpy())
+            working_df['MSA_FNL_Q_REM'] = np.maximum(new_msa, 0.0)
 
     # (2) Reduce each primary grid's REQ_REM at its grain
     band_ship = alloc_df.loc[band_mask, [*OPT_KEYS, 'ROUND_SHIP']]
@@ -2189,11 +1840,6 @@ def _revalidate_after_band(
     )
     if pending_mask.any():
         msa_dead = (working_df['MSA_FNL_Q_REM'].fillna(0) <= 0)
-        mj_dead = (
-            (working_df['MJ_REQ_REM'].fillna(0) <= 0)
-            if 'MJ_REQ_REM' in work_cols else
-            pd.Series(False, index=working_df.index)
-        )
         pri_dead = (
             (working_df['PRI_CT_REM'].fillna(0) < 100)
             & (working_df['OPT_TYPE'].isin(enforced))
@@ -2207,21 +1853,8 @@ def _revalidate_after_band(
             working_df.loc[m_msa, 'ALLOC_REMARKS'] = (
                 working_df.loc[m_msa, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
             )
-        # MJ_EXHAUSTED — MAJ_CAT-level requirement satisfied in this round, so
-        # subsequent rounds for any OPT at the same (WERKS, MAJ_CAT) should not
-        # fire. Without this gate, round 2 would over-ship past MJ_REQ since the
-        # per-row need_ship (r×SZ_MBQ−SZ_STK) is computed independently of the
-        # MAJ_CAT-level cumulative ship.
-        m_mj = pending_mask & mj_dead & (~msa_dead)
-        if m_mj.any():
-            working_df.loc[m_mj, 'ALLOC_STATUS'] = 'SKIPPED'
-            mj_vals = working_df.loc[m_mj, 'MJ_REQ_REM'].fillna(0)
-            suffix = mj_vals.apply(lambda v: f' SKIP_MJ_EXHAUSTED(mj_rem={v:.1f});')
-            working_df.loc[m_mj, 'ALLOC_REMARKS'] = (
-                working_df.loc[m_mj, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
-            )
         # PRI_BROKEN — include PRI_CT_REM value
-        m_pri = pending_mask & pri_dead & (~msa_dead) & (~mj_dead)
+        m_pri = pending_mask & pri_dead & (~msa_dead)
         if m_pri.any():
             working_df.loc[m_pri, 'ALLOC_STATUS'] = 'SKIPPED'
             pri_vals = working_df.loc[m_pri, 'PRI_CT_REM'].fillna(0)
@@ -2272,11 +1905,6 @@ def _revalidate_after_band(
             )
         )
         # Only propagate to alloc rows that have a next band.
-        # PARTIAL rows MUST be re-marked SKIPPED here: working_df only enters
-        # newly_skipped via MJ_EXHAUSTED / PRI_BROKEN / STORE_BROKEN, all of
-        # which are hard stops for the OPT.  Leaving PARTIAL alloc rows alone
-        # lets _run_band re-admit them in round r+1 (its gate only excludes
-        # SKIPPED/INELIGIBLE), producing ship past MJ_REQ.
         next_alloc_mask = alloc_df['I_ROD'] >= r + 1
         if next_alloc_mask.any():
             sub = alloc_df.loc[next_alloc_mask]
@@ -2284,7 +1912,7 @@ def _revalidate_after_band(
             m_in_next = np.array([k in remarks_map for k in alloc_keys_next], dtype=bool)
             prop_idx = sub.index[
                 m_in_next
-                & (~sub['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED'])).to_numpy()
+                & (~sub['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED', 'PARTIAL'])).to_numpy()
             ]
             if len(prop_idx):
                 alloc_df.loc[prop_idx, 'ALLOC_STATUS'] = 'SKIPPED'
@@ -2306,112 +1934,14 @@ def _revalidate_after_band(
 _ALLOC_WRITE_COLS = [
     'WERKS', 'RDC', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'VAR_ART', 'SZ',
     'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'FROM_HOLD_QTY',
-    'ALLOC_STATUS', 'SKIP_REASON', 'ALLOC_REMARKS',
+    'ALLOC_STATUS', 'SKIP_REASON',
     'POOL_CONSUMED', 'ALLOC_WAVE', 'ALLOC_ROUND',
     'FNL_Q_REM',
 ]
 
 
-# Matches the band-trace tokens written by _run_band in
-# ALLOC_REMARKS, e.g. " B[TBL.r1.rk1] sh=5 hld=1 pool=382->376;".
-_BAND_TRACE_RE = re.compile(r'\s*B\[[^\]]+\]\s*sh=\d+\s+hld=\d+\s+pool=\d+->\d+;')
-
-
-def _apply_pak_sz_rounding_df(alloc_df: pd.DataFrame) -> pd.DataFrame:
-    """In-memory PAK_SZ rounding. Half-up: SHIP_QTY rounds to the nearest
-    whole pak (req >= 0.5*pak rounds UP, e.g. 5/6->6 and 11/6->12; below
-    the 0.5*pak threshold the row is gated to 0 and marked SKIPPED).
-
-    Side-effects:
-      - POOL_CONSUMED is adjusted by the SHIP delta so the downstream
-        FNL_Q_REM recompute refunds (or charges) the pool correctly.
-      - The trailing B[..] sh=N hld=M pool=A->B; band-trace token in
-        ALLOC_REMARKS is rewritten to match the post-PAK SHIP (or
-        dropped entirely when the row is gated to 0), then a
-        PAK_SZ_GATE/PAK_SZ_ROUND audit marker is appended."""
-    if 'PAK_SZ' not in alloc_df.columns:
-        return alloc_df
-    if 'SHIP_QTY' not in alloc_df.columns:
-        return alloc_df
-    nonzero = alloc_df['SHIP_QTY'].fillna(0) > 0
-    if not nonzero.any():
-        return alloc_df
-    pak_v = (
-        alloc_df.loc[nonzero, 'PAK_SZ']
-        .fillna(0).replace(0, 1).astype(float).values
-    )
-    old_v = alloc_df.loc[nonzero, 'SHIP_QTY'].fillna(0).astype(float).values
-    # Half-up rounding: floor((req + 0.5*pak) / pak) * pak — anything at
-    # or above the 0.5*pak threshold rounds UP to the next whole pak.
-    rounded = (np.floor((old_v + 0.5 * pak_v) / pak_v) * pak_v).astype(int)
-    gate = old_v < 0.5 * pak_v
-    new_v = np.where(gate, 0, rounded).astype(int)
-    idx = alloc_df.index[nonzero]
-    delta = old_v.astype(int) - new_v  # +ve = freed units, -ve = drew more
-    alloc_df.loc[idx, 'SHIP_QTY'] = new_v
-    # POOL_CONSUMED mirrors SHIP+HOLD draws; only SHIP changed here so
-    # subtract the delta. Clamp to zero in case prior accounting is off.
-    if 'POOL_CONSUMED' in alloc_df.columns:
-        prev_pc = (
-            alloc_df.loc[idx, 'POOL_CONSUMED']
-            .fillna(0).astype(float).values
-        )
-        alloc_df.loc[idx, 'POOL_CONSUMED'] = np.maximum(
-            prev_pc - delta.astype(float), 0.0
-        )
-    # Mark gated rows (req < 0.5*pak -> SHIP=0, status=SKIPPED)
-    gated_idx = idx[gate]
-    if len(gated_idx) > 0:
-        if 'ALLOC_STATUS' in alloc_df.columns:
-            alloc_df.loc[gated_idx, 'ALLOC_STATUS'] = 'SKIPPED'
-        if 'SKIP_REASON' in alloc_df.columns:
-            alloc_df.loc[gated_idx, 'SKIP_REASON'] = 'PAK_SZ_BELOW_HALF'
-    # Rewrite the trailing band-trace token + append PAK audit marker.
-    _rewrite_remarks_after_pak(
-        alloc_df, idx, old_v.astype(int), new_v.astype(int),
-        pak_v.astype(int), gate
-    )
-    return alloc_df
-
-
-def _rewrite_remarks_after_pak(alloc_df, idx, old_v, new_v, pak_v, gate):
-    """Update ALLOC_REMARKS to reflect the post-PAK SHIP. For the LAST
-    `B[..] sh=N hld=M pool=A->B;` token in the string:
-      - if SHIP became 0  -> drop the token entirely
-      - if SHIP changed   -> rewrite `sh=N` to the new value
-    Then append `PAK_SZ_GATE(...)` (zeroed rows) or `PAK_SZ_ROUND(...)`
-    (resized rows) — same format as the SQL safety-net stage."""
-    if 'ALLOC_REMARKS' not in alloc_df.columns:
-        return
-    prev = alloc_df.loc[idx, 'ALLOC_REMARKS'].fillna('').astype(str).values
-    out = prev.copy()
-    for i in range(len(idx)):
-        old_s = int(old_v[i])
-        new_s = int(new_v[i])
-        if old_s == new_s:
-            continue
-        s = out[i]
-        matches = list(_BAND_TRACE_RE.finditer(s))
-        if matches:
-            m = matches[-1]
-            if new_s == 0:
-                s = s[:m.start()] + s[m.end():]
-            else:
-                token = m.group(0)
-                token = re.sub(r'sh=\d+', f'sh={new_s}', token, count=1)
-                s = s[:m.start()] + token + s[m.end():]
-        marker = (
-            f' PAK_SZ_GATE(req={old_s},pak={int(pak_v[i])});'
-            if new_s == 0
-            else f' PAK_SZ_ROUND(from={old_s},to={new_s},pak={int(pak_v[i])});'
-        )
-        out[i] = s + marker
-    alloc_df.loc[idx, 'ALLOC_REMARKS'] = out
-
-
 def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
     """Bulk-MERGE the updated alloc rows back into alloc_table."""
-    _apply_pak_sz_rounding_df(df)
     cols = [c for c in _ALLOC_WRITE_COLS if c in df.columns]
     out = df[cols].copy()
     if 'ALLOC_QTY' not in out.columns and 'SHIP_QTY' in out.columns:
@@ -2462,10 +1992,6 @@ def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
             if c in {'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'FROM_HOLD_QTY',
                      'POOL_CONSUMED', 'ALLOC_ROUND', 'FNL_Q_REM'}:
                 col_defs.append(f"[{c}] FLOAT NULL")
-            elif c in {'ALLOC_REMARKS', 'SKIP_REASON'}:
-                # Band-trace accumulates across many rounds × ranks — must
-                # not be truncated. Mirrors the persisted column types.
-                col_defs.append(f"[{c}] NVARCHAR(MAX) NULL")
             else:
                 col_defs.append(f"[{c}] NVARCHAR(200) NULL")
         cur.execute(f"CREATE TABLE {tmp} ({', '.join(col_defs)})")

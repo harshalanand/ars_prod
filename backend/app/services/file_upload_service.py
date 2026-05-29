@@ -25,27 +25,6 @@ UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-def _refresh_derived_for_upload(table_name: str):
-    """Rebuild Master_CONT_MERGE_<col> if `table_name` is its parent.
-    Returns None when the upload is unrelated to a derived master."""
-    try:
-        from app.services import derived_masters as dm
-        from app.database.session import get_data_engine
-    except Exception as e:
-        logger.warning(f"derived_masters import failed: {e}")
-        return None
-
-    src = dm.source_col_from_parent_table(table_name)
-    if not src:
-        return None
-
-    engine = get_data_engine()
-    with engine.connect() as conn:
-        if src not in dm.list_active_source_cols(conn):
-            return None
-        return dm.refresh_for_parent_table(conn, table_name)
-
-
 def cleanup_old_uploads() -> int:
     """Delete files in UPLOAD_DIR whose mtime is before today's start.
     Called at the start of every upload so the folder self-empties each new
@@ -131,8 +110,13 @@ class FileUploadService:
 
         logger.info(f"[{batch_id}] Processing upload: {file_name} ({len(file_content)} bytes) → {table_name}")
 
-        # Sweep any stale files left behind by older flows.
+        # Sweep stale files from previous days before saving the new one
         cleanup_old_uploads()
+
+        # Save a copy for audit trail
+        saved_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{file_name}")
+        with open(saved_path, "wb") as f:
+            f.write(file_content)
 
         # Read file into DataFrame — off the event loop (pandas/openpyxl is sync & slow)
         try:
@@ -257,18 +241,7 @@ class FileUploadService:
         result["file_name"] = file_name
         result["file_size_bytes"] = len(file_content)
         result["null_pk_rows_dropped"] = int(null_pk_count)
-
-        # Derived-master hook: when a Master_CONT_<col> parent is uploaded,
-        # rebuild Master_CONT_MERGE_<col> from it using ARS_MERGE_RULES.
-        # No-op for any other table (or if no active rules exist for <col>).
-        try:
-            derived_info = await asyncio.to_thread(
-                _refresh_derived_for_upload, table_name
-            )
-            if derived_info:
-                result["derived_refresh"] = derived_info
-        except Exception as _e:
-            logger.warning(f"[{batch_id}] derived_masters refresh failed: {_e}")
+        result["saved_file"] = saved_path
 
         duration_ms = int((time.time() - start_time) * 1000)
         result["total_duration_ms"] = duration_ms
@@ -325,8 +298,13 @@ class FileUploadService:
 
         logger.info(f"[{batch_id}] Processing delete: {file_name} ({len(file_content)} bytes) → {table_name}")
 
-        # Sweep any stale files left behind by older flows.
+        # Sweep stale files from previous days before saving the new one
         cleanup_old_uploads()
+
+        # Save a copy for audit trail
+        saved_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{file_name}")
+        with open(saved_path, "wb") as f:
+            f.write(file_content)
 
         # Read file into DataFrame — off the event loop
         try:
@@ -454,6 +432,7 @@ class FileUploadService:
             "file_name": file_name,
             "file_size_bytes": len(file_content),
             "null_pk_rows_dropped": int(null_pk_count),
+            "saved_file": saved_path,
             "total_duration_ms": duration_ms,
         }
 

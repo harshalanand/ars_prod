@@ -139,7 +139,7 @@ const ColPicker = ({ available, selected, onChange }) => {
 }
 
 /* ── Create / Edit Modal ──────────────────────────────────────────────────── */
-const EMPTY_FORM = { grid_name:'', description:'', hierarchy_columns:[], kpi_filter:'', output_table:'', status:'Active', pivot_only:false, weightage:1.0, grid_group:'Primary', use_for_opt_sale:false, sec_cap_applicable:false, sec_cap_pct:null }
+const EMPTY_FORM = { grid_name:'', description:'', hierarchy_columns:[], kpi_filter:'', output_table:'', status:'Active', pivot_only:false, weightage:1.0, grid_group:'Primary', use_for_opt_sale:false }
 
 const GridModal = ({ open, onClose, onSave, availableCols, editing, allGrids = [] }) => {
   const [form, setForm] = useState(EMPTY_FORM)
@@ -156,9 +156,7 @@ const GridModal = ({ open, onClose, onSave, availableCols, editing, allGrids = [
       hierarchy_columns: editing.hierarchy_columns || [],
       weightage:  editing.weightage  ?? 1.0,         // null/undefined → 1.0
       grid_group: editing.grid_group || 'Primary',   // null/empty → 'Primary'
-      use_for_opt_sale:   !!editing.use_for_opt_sale,
-      sec_cap_applicable: !!editing.sec_cap_applicable,
-      sec_cap_pct:        editing.sec_cap_pct ?? null,
+      use_for_opt_sale: !!editing.use_for_opt_sale,
     })
     else setForm(EMPTY_FORM)
   }, [editing, open])
@@ -291,64 +289,6 @@ const GridModal = ({ open, onClose, onSave, availableCols, editing, allGrids = [
                   Formula: ((MBQ − DISP_Q) / DISP_Q × ACS_D) / ALC_D
                 </span>
               )}
-            </Field>
-            {/* Sec-cap participation — only meaningful for non-pivot Secondary grids. */}
-            <Field label="Apply Sec-Cap">
-              {(() => {
-                const secCapLocked = (form.grid_group !== 'Secondary') || !!form.pivot_only
-                return (
-                  <>
-                    <label style={{
-                      display:'flex', alignItems:'center', gap:6, fontSize:11,
-                      cursor: secCapLocked ? 'not-allowed' : 'pointer',
-                      opacity: secCapLocked ? 0.55 : 1,
-                    }}>
-                      <input type="checkbox"
-                        checked={!!form.sec_cap_applicable && !secCapLocked}
-                        disabled={secCapLocked}
-                        onChange={e => set('sec_cap_applicable', e.target.checked)}
-                        style={{ width:14, height:14, cursor: secCapLocked ? 'not-allowed' : 'pointer' }} />
-                      Cap this grid during allocation
-                    </label>
-                    {secCapLocked ? (
-                      <span style={{ fontSize:10, color:C.textMuted }}>
-                        🔒 Locked — only non-pivot Secondary grids can participate in sec-cap.
-                      </span>
-                    ) : (
-                      <span style={{ fontSize:10, color:C.textMuted }}>
-                        When ON, allocation enforces this grid's MBQ × cap%. Default cap = 130%.
-                      </span>
-                    )}
-                  </>
-                )
-              })()}
-            </Field>
-            <Field label="Sec-Cap %">
-              {(() => {
-                const secCapLocked = (form.grid_group !== 'Secondary') || !!form.pivot_only
-                const pctDisabled = secCapLocked || !form.sec_cap_applicable
-                return (
-                  <>
-                    <input type="number" step="1" min="0" max="500"
-                      value={form.sec_cap_pct ?? ''}
-                      disabled={pctDisabled}
-                      onChange={e => {
-                        const v = e.target.value
-                        set('sec_cap_pct', v === '' ? null : parseFloat(v))
-                      }}
-                      placeholder="blank → use global 130"
-                      style={{ width:'100%', padding:'6px 10px', borderRadius:6,
-                        border:`1px solid ${C.inputBd}`, fontSize:12,
-                        background: pctDisabled ? C.grayBg : C.inputBg,
-                        opacity: pctDisabled ? 0.6 : 1 }} />
-                    <span style={{ fontSize:10, color:C.textMuted }}>
-                      {pctDisabled
-                        ? 'Enable “Apply Sec-Cap” first.'
-                        : 'Per-grid override. Blank = use the global default (130%).'}
-                    </span>
-                  </>
-                )
-              })()}
             </Field>
           </div>
 
@@ -649,7 +589,7 @@ export default function GridBuilderPage() {
             <table style={{ width:'100%', borderCollapse:'collapse', fontSize:10, minWidth:700 }}>
               <thead>
                 <tr style={{ background:'#f1f5f9', borderBottom:`2px solid ${C.cardBorder}` }}>
-                  {['#','Grid Name','Output Table','Hierarchy','KPI','Group','Sec-Cap','Wt',
+                  {['#','Grid Name','Output Table','Hierarchy','KPI','Group','Wt',
                     'Last Run','Status','Rows','Time','Alerts','Actions'].map(h => (
                     <th key={h} style={{ padding:'5px 8px', textAlign:'left',
                       fontSize:9, fontWeight:700, color:C.textSub,
@@ -738,28 +678,6 @@ export default function GridBuilderPage() {
                           </span>
                         ) : (
                           <span style={{ fontSize:9, color:C.textMuted }}>—</span>
-                        )}
-                      </td>
-
-                      {/* Sec-Cap (applicable + per-grid %) */}
-                      <td style={{ padding:'4px 8px', textAlign:'center', whiteSpace:'nowrap' }}>
-                        {(g.grid_group !== 'Secondary' || g.pivot_only) ? (
-                          <span style={{ fontSize:9, color:C.textMuted }}>—</span>
-                        ) : g.sec_cap_applicable ? (
-                          <span style={{ fontSize:9, fontWeight:700,
-                            color:C.green, background:C.greenBg,
-                            border:`1px solid ${C.greenBd}`,
-                            padding:'1px 5px', borderRadius:3 }}
-                            title="Allocation will cap this grid">
-                            ON {g.sec_cap_pct != null ? `@${g.sec_cap_pct}%` : '@130%'}
-                          </span>
-                        ) : (
-                          <span style={{ fontSize:9, fontWeight:600,
-                            color:C.textSub, background:C.grayBg,
-                            border:`1px solid ${C.grayBd}`,
-                            padding:'1px 5px', borderRadius:3 }}>
-                            OFF
-                          </span>
                         )}
                       </td>
 

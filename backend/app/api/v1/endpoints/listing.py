@@ -80,15 +80,19 @@ class GenerateRequest(BaseModel):
     # Configurable variables (editable from UI):
     stock_threshold_pct: float = 0.6   # OPT_TYPE: RL when STK >= X% of ACS_D (default 60%)
     excess_multiplier: float = 2.0     # EXCESS: STK > X × OPT_MBQ is excess (default 2×)
-    hold_days: int = 0                 # OPT_MBQ_WH: extra days added to ALC_D for OPT_TYPE='TBL' only
+    hold_days: int = 0                 # OPT_MBQ_WH: extra days added to ALC_D for IS_NEW=1 only
     age_threshold: int = 15            # Articles with AGE < X use PER_OPT_SALE in OPT_MBQ
     req_weight: float = 0.4            # Store ranking: weight for requirement rank
     fill_weight: float = 0.6           # Store ranking: weight for fill rate rank
     # Allocation:
-    # Secondary-grid dispatch cap toggle.
-    # When True (default), main pass enforces cap = SEC_CAP_DEFAULT_PCT% (130)
-    # on every grid where grid_group='Secondary' in ARS_GRID_BUILDER.
-    apply_sec_cap_in_normal: bool = True
+    enable_fallback: bool = False      # Enable fallback allocation (demote grids one by one)
+    fallback_boost_mode: str = "full_mbq"  # "full_mbq" | "sales_only" | "str"
+    #   full_mbq:   OPT_MBQ × growth% (display + sales both boosted)
+    #   sales_only: ACS_D + (rate × growth%) × ALC_D (only velocity boosted)
+    #   str:        STR-based dynamic boost (tiered by days-of-cover)
+    static_growth_pct: float = 130.0      # growth % (130 = 1.3x multiplier)
+    # STR boost thresholds (configurable tiers: days_threshold → boost_pct)
+    str_tiers: str = "30:150,45:130,60:120,90:110"  # format: "days:pct,days:pct,..."
     default_acs_d: float = 18.0        # Default ACS_D when NULL/0 (used in OPT_TYPE fallback classification)
     min_size_count: int = 3            # Min sizes required for TBL listing (alternative to 60% ratio)
     # PRI_CT% >= 100 gate (R06 + revalidation SKIP_PRI_BROKEN). TBL always enforces.
@@ -98,23 +102,11 @@ class GenerateRequest(BaseModel):
     # flip behavior to strict-gate.
     pri_ct_check_rl: bool = False
     pri_ct_check_tbc: bool = False
-    # Per-OPT_TYPE MJ_REQ downward cap. SUM(SHIP_QTY) for each OPT_TYPE per
-    # (WERKS, MAJ_CAT) is clamped to cap_pct% × MJ_REQ. 100 = hard ceiling at
-    # MAJ_CAT requirement; 0 = cap disabled. Defaults 100/100/100 ensure no
-    # over-allocation vs MJ_REQ out of the box. Independent of MBQ caps above —
-    # MBQ caps trim against MJ_MBQ, these trim against MJ_REQ (= MJ_MBQ − MJ_STK_TTL).
-    rl_mj_req_cap_pct:  float = 100.0
-    tbc_mj_req_cap_pct: float = 100.0
-    tbl_mj_req_cap_pct: float = 100.0
-    # MJ_MBQ growth headroom (Allocation Gate).  100 = strict (waterfall stops
-    # at the MAJ_CAT target, current default).  >100 scales MJ_MBQ to a
-    # SIBLING column MJ_MBQ_REV — the original MJ_MBQ is preserved untouched —
-    # and MJ_REQ_REV is re-derived as MAX(0, MJ_MBQ_REV − MJ_STK_TTL).  When
-    # >100, MJ_REQ is then promoted to MJ_REQ_REV so every downstream engine
-    # consumer (revalidate, OPT_MJ_REQ gate, store-broken pre-band, post-
-    # waterfall MJ_REQ_REM recompute) reads the scaled ceiling with no math
-    # change.  Original MJ_REQ value is kept in MJ_REQ_ORIG for audit.
-    mj_req_growth_pct: float = 100.0
+    # MBQ cap (only active when the corresponding pri_ct_check is False).
+    # Prevents over-allocation by capping total SHIP_QTY per (WERKS, OPT_TYPE) at
+    # cap_pct% of MJ_MBQ. e.g. 110 → store can receive at most 110% of its MAJ_CAT target.
+    rl_mbq_cap_pct:  float = 110.0
+    tbc_mbq_cap_pct: float = 110.0
     # Allocation mode. pandas = multi-process per MAJ_CAT (fast). sequential = single-thread fallback.
     allocation_mode:  str = "pandas"  # "sequential" | "pandas"
     parallel_workers: int = 8        # used only by pandas mode
@@ -128,11 +120,6 @@ class GenerateRequest(BaseModel):
     st_master_table: str = "Master_ALC_INPUT_ST_MASTER"
     ssn_values: List[str] = []  # restrict run to MAJ_CATs whose articles belong to selected seasons
     opt_types: List[str] = ["RL", "TBC", "TBL"]  # which OPT_TYPEs the waterfall runs (subset to skip types)
-    # Parking mode. False (default) = single-parked: a new run is blocked
-    # while a parked session is awaiting approve/reject. True = multi-parked:
-    # the pending-parked guard is bypassed so several parked snapshots can
-    # coexist and be reviewed independently from the Parked Runs page.
-    allow_multi_parked: bool = False
 
 
 # ── Helpers — delegating to shared db_helpers ───────────────────────────────
@@ -295,16 +282,16 @@ _SETTING_DEFAULTS = {
     "run_mode": "listing",
     "req_weight": "0.4",
     "fill_weight": "0.6",
-    "apply_sec_cap_in_normal": "true",
+    "enable_fallback": "false",
+    "fallback_boost_mode": "full_mbq",
+    "static_growth_pct": "130.0",
+    "str_tiers": "30:150,45:130,60:120,90:110",
     "default_acs_d": "18",
     "min_size_count": "3",
     "pri_ct_check_rl": "false",
     "pri_ct_check_tbc": "false",
-    "rl_mj_req_cap_pct": "100.0",
-    "tbc_mj_req_cap_pct": "100.0",
-    "tbl_mj_req_cap_pct": "100.0",
-    "mj_req_growth_pct": "100.0",
-    "allow_multi_parked": "false",
+    "rl_mbq_cap_pct": "110.0",
+    "tbc_mbq_cap_pct": "110.0",
 }
 _SETTING_PREFIX = "listing."
 
@@ -389,14 +376,11 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     # awaiting approve/reject. Running a new listing would overwrite
     # ARS_ALLOC_WORKING and ARS_LISTING_WORKING, making the parked
     # snapshot unrecoverable.
-    # allow_multi_parked=True opts out of this guard so users can stack
-    # several parked snapshots for side-by-side review.
-    if not getattr(req, "allow_multi_parked", False) and parked_history.has_pending_parked():
+    if parked_history.has_pending_parked():
         raise HTTPException(
             409,
             "A parked session is awaiting review. Please approve or reject it "
-            "from the Parked Runs page before generating a new one, or enable "
-            "'Allow multiple parked' to stack snapshots."
+            "from the Parked Runs page before generating a new one."
         )
 
     session_id = make_session_id()
@@ -561,16 +545,16 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "run_mode": req.run_mode,
                 "req_weight": str(req.req_weight),
                 "fill_weight": str(req.fill_weight),
-                "apply_sec_cap_in_normal": str(req.apply_sec_cap_in_normal).lower(),
+                "enable_fallback": str(req.enable_fallback).lower(),
+                "fallback_boost_mode": req.fallback_boost_mode,
+                "static_growth_pct": str(req.static_growth_pct),
+                "str_tiers": str(req.str_tiers),
                 "default_acs_d": str(req.default_acs_d),
                 "min_size_count": str(req.min_size_count),
                 "pri_ct_check_rl": str(req.pri_ct_check_rl).lower(),
                 "pri_ct_check_tbc": str(req.pri_ct_check_tbc).lower(),
-                "rl_mj_req_cap_pct": str(req.rl_mj_req_cap_pct),
-                "tbc_mj_req_cap_pct": str(req.tbc_mj_req_cap_pct),
-                "tbl_mj_req_cap_pct": str(req.tbl_mj_req_cap_pct),
-                "mj_req_growth_pct": str(req.mj_req_growth_pct),
-                "allow_multi_parked": str(req.allow_multi_parked).lower(),
+                "rl_mbq_cap_pct": str(req.rl_mbq_cap_pct),
+                "tbc_mbq_cap_pct": str(req.tbc_mbq_cap_pct),
             })
     except Exception as e:
         logger.error(f"[generate] failed to persist listing settings: {e}")
@@ -778,12 +762,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         # All SLOC + sale columns are carried (SELECT + INSERT)
         stk_sel = ", ".join(f"ISNULL(G.[{c}], 0) AS [{c}]" for c in stock_cols)
         stk_sel_str = f", {stk_sel}" if stk_sel else ""
-        # STK_TTL = sum of STOCK columns only (excludes sale columns like L-7 DAYS SALE-Q).
-        # Negative totals (SLOC adjustments) are clamped to 0 — treated as "no stock",
-        # never as a negative requirement offset that would inflate OPT_REQ/SZ_REQ.
-        _stk_raw = " + ".join(f"ISNULL(G.[{c}], 0)" for c in stk_sum_cols) if stk_sum_cols else "0"
-        stk_ttl  = f"CASE WHEN ({_stk_raw}) < 0 THEN 0 ELSE ({_stk_raw}) END"
-        str_ttl  = " + ".join(f"ISNULL(G.[{c}], 0)" for c in sale_cols) if sale_cols else "0"
+        # STK_TTL = sum of STOCK columns only (excludes sale columns like L-7 DAYS SALE-Q)
+        stk_ttl = " + ".join(f"ISNULL(G.[{c}], 0)" for c in stk_sum_cols) if stk_sum_cols else "0"
+        str_ttl = " + ".join(f"ISNULL(G.[{c}], 0)" for c in sale_cols) if sale_cols else "0"
         stk_ins = ", ".join(f"[{c}]" for c in stock_cols)
         stk_ins_str = f", {stk_ins}" if stk_ins else ""
         stk_zeros = ", ".join("0" for _ in stock_cols)
@@ -869,13 +850,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 _run(conn, f"CREATE NONCLUSTERED INDEX IX_{LISTING_TABLE}_GENART ON [{LISTING_TABLE}]([GEN_ART_NUMBER]) INCLUDE ([WERKS], [MAJ_CAT], [CLR])")
             except Exception:
                 pass
-            # Covers 4-col equi-joins in Part 3.5a Step 2 (ARS_CALC_ST_ART),
-            # 3.5b (MASTER_GEN_ART_SALE), 3.5c (MASTER_GEN_ART_AGE), 3.54 (NL_TBL_HOLD).
-            # Without this, those UPDATEs fall back to hash joins over millions of rows.
-            try:
-                _run(conn, f"CREATE NONCLUSTERED INDEX IX_{LISTING_TABLE}_OPTKEY ON [{LISTING_TABLE}]([WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR])")
-            except Exception:
-                pass
             t0 = _time_step("Part 2.5 (Indexes before Part 4)", t0)
         else:
             logger.info(f"Part 2.5: skipped indexes (listing has only {total} rows, < 5000 threshold)")
@@ -951,17 +925,12 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         # Article-level values override MAJ_CAT-level where ARS_CALC_ST_ART has data.
         if _table_exists(conn, "ARS_CALC_ST_ART"):
             art_cols = _get_columns(conn, "ARS_CALC_ST_ART")
-            # Per-column CASE in SET avoids the OR-heavy WHERE that blocked index seeks
-            # on the 4-col (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR) join at 6M+ rows.
             art_upd = []
+            art_where = []
             for col in enrich_cols_art:
                 if col in art_cols:
-                    art_upd.append(
-                        f"L.[{col}] = CASE "
-                        f"WHEN A.[{col}] IS NOT NULL "
-                        f"AND LTRIM(RTRIM(CAST(A.[{col}] AS NVARCHAR(50)))) NOT IN ('', '0') "
-                        f"THEN TRY_CAST(A.[{col}] AS FLOAT) ELSE L.[{col}] END"
-                    )
+                    art_upd.append(f"L.[{col}] = TRY_CAST(A.[{col}] AS FLOAT)")
+                    art_where.append(f"(A.[{col}] IS NOT NULL AND LTRIM(RTRIM(CAST(A.[{col}] AS NVARCHAR(50)))) NOT IN ('', '0'))")
             if art_upd:
                 # Build join — ARS_CALC_ST_ART has ST_CD, MAJ_CAT, GEN_ART_NUMBER [, CLR]
                 art_join = "L.[WERKS] = A.[ST_CD] AND L.[MAJ_CAT] = A.[MAJ_CAT]"
@@ -969,20 +938,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     art_join += " AND L.[GEN_ART_NUMBER] = A.[GEN_ART_NUMBER]"
                 if "CLR" in art_cols:
                     art_join += " AND L.[CLR] = A.[CLR]"
+                # Only override where ART has non-null/non-zero values
+                where_clause = f" WHERE ({' OR '.join(art_where)})" if art_where else ""
                 _run(conn, f"""
                     UPDATE L SET {', '.join(art_upd)}
                     FROM [{LISTING_TABLE}] L
                     INNER JOIN [ARS_CALC_ST_ART] A WITH (NOLOCK) ON {art_join}
+                    {where_clause}
                 """)
                 logger.info(f"Part 3.5a: {[c for c in enrich_cols_art if c in art_cols]} cascaded from ARS_CALC_ST_ART")
-
-        # Part 3.5a override: CLR 'A' / 'A_MIX' → I_ROD = 2 (display-density floor)
-        _run(conn, f"""
-            UPDATE [{LISTING_TABLE}]
-            SET [I_ROD] = 2
-            WHERE UPPER(LTRIM(RTRIM([CLR]))) IN ('A', 'A_MIX')
-        """)
-        logger.info("Part 3.5a: I_ROD=2 forced for CLR in ('A','A_MIX')")
         t0 = _time_step("Part 3.5a (LISTING/I_ROD/CLR/FOCUS)", t0)
 
         # Part 3.5b: Populate AUTO_GEN_ART_SALE from MASTER_GEN_ART_SALE.SAL_PD
@@ -1006,7 +970,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 """)
                 logger.info("Part 3.5b: AUTO_GEN_ART_SALE from MASTER_GEN_ART_SALE.SAL_PD")
             else:
-                logger.warning("Part 3.5b: MASTER_GEN_ART_SALE.SAL_PD not yet computed — run Contribution calc pipeline")
                 logger.warning("Part 3.5b: MASTER_GEN_ART_SALE.SAL_PD not yet computed — run Contribution calc pipeline")
 
         # Part 3.5c: Populate AGE (option age in days) from MASTER_GEN_ART_AGE
@@ -1033,62 +996,51 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             logger.warning("Part 3.5c: MASTER_GEN_ART_AGE table not found — AGE will remain NULL")
         t0 = _time_step("Part 3.5 (ACS_D/ALC_D/AUTO_GEN_ART_SALE/AGE)", t0)
 
-        # ── PART 3.54: Populate RL_HOLD_QTY from ARS_NL_TBL_HOLD_TRACKING ────────
-        # ARS_NL_TBL_HOLD_TRACKING records the warehouse hold reserved when an
-        # option was first listed as TBL. Grain is (WERKS, VAR_ART, SZ); we roll
-        # up open HOLD_REM to the listing's option grain
-        # (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR) and write it as RL_HOLD_QTY.
-        #
-        # RL_HOLD_QTY is distinct from HOLD_QTY (the current-run allocation hold
-        # written by Stage C). Must be populated BEFORE Part 3.6 OPT_TYPE
-        # classification — the RL/TBC/TBL rules treat RL_HOLD_QTY > 0 as
-        # equivalent to having warehouse supply for the option.
-        #
-        # Filter: IS_CLOSED = 0 only. Closed holds are assumed to already be
-        # reflected in the latest STK_TTL upload; counting them again would
-        # double-count physical inventory.
+        # ── PART 3.54: Populate RL_HOLD_QTY from ARS_NL (before MSA_FNL_Q) ────────
+        # ARS_NL holds stock already allocated in a prior run but still in transit.
+        # Stored as RL_HOLD_QTY (separate from HOLD_QTY which is the current-run
+        # allocation hold written by Stage C).  Must be populated BEFORE Part 3.6
+        # OPT_TYPE classification — RL rule includes RL_HOLD_QTY > 0 as an
+        # alternative to STK_TTL >= threshold × ACS_D.
         try:
             _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [RL_HOLD_QTY] FLOAT NULL DEFAULT 0")
         except Exception:
             pass  # column may already exist
-        if _table_exists(conn, "ARS_NL_TBL_HOLD_TRACKING"):
-            try:
-                _run(conn, f"""
-                    UPDATE L
-                    SET    L.[RL_HOLD_QTY] = H.[HOLD_REM_OPT]
-                    FROM   [{LISTING_TABLE}] L
-                    INNER JOIN (
-                        SELECT  [WERKS],
-                                [MAJ_CAT],
-                                [GEN_ART_NUMBER],
-                                ISNULL([CLR],'') AS [CLR],
-                                SUM([HOLD_REM])  AS [HOLD_REM_OPT]
-                        FROM    [ARS_NL_TBL_HOLD_TRACKING]
-                        WHERE   ISNULL([IS_CLOSED], 0) = 0
-                          AND   ISNULL([HOLD_REM],  0) > 0
-                        GROUP BY [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], ISNULL([CLR],'')
-                    ) H
-                      ON  L.[WERKS]                              = H.[WERKS]
-                      AND L.[MAJ_CAT]                            = H.[MAJ_CAT]
-                      AND TRY_CAST(L.[GEN_ART_NUMBER] AS BIGINT) = H.[GEN_ART_NUMBER]
-                      AND ISNULL(L.[CLR],'')                     = H.[CLR]
-                    WHERE  H.[HOLD_REM_OPT] > 0
-                """)
-                hq_cnt = conn.execute(text(
-                    f"SELECT COUNT(*) FROM [{LISTING_TABLE}] WHERE ISNULL([RL_HOLD_QTY],0) > 0"
-                )).scalar() or 0
-                hq_sum = conn.execute(text(
-                    f"SELECT ISNULL(SUM([RL_HOLD_QTY]),0) FROM [{LISTING_TABLE}]"
-                )).scalar() or 0
-                logger.info(
-                    f"Part 3.54: RL_HOLD_QTY from ARS_NL_TBL_HOLD_TRACKING — "
-                    f"{hq_cnt} rows populated, total qty {float(hq_sum):.0f}"
-                )
-            except Exception as e:
-                logger.warning(f"Part 3.54: RL_HOLD_QTY from ARS_NL_TBL_HOLD_TRACKING failed: {str(e)[:150]}")
+        if _table_exists(conn, "ARS_NL"):
+            nl_cols = _get_columns(conn, "ARS_NL")
+            nl_hq_col = next((c for c in ["HOLD_QTY", "HOLD_Q", "HLD_QTY"] if c in nl_cols), None)
+            nl_werks   = next((c for c in ["WERKS", "ST_CD"] if c in nl_cols), None)
+            nl_art     = next((c for c in ["GEN_ART_NUMBER", "GEN_ART", "ARTICLE_NUMBER"] if c in nl_cols), None)
+            nl_clr     = "CLR" if "CLR" in nl_cols else None
+            nl_maj     = "MAJ_CAT" if "MAJ_CAT" in nl_cols else None
+            if nl_hq_col and nl_werks and nl_art:
+                join_parts = [
+                    f"L.[WERKS] = N.[{nl_werks}]",
+                    f"TRY_CAST(L.[GEN_ART_NUMBER] AS BIGINT) = TRY_CAST(TRY_CAST(N.[{nl_art}] AS FLOAT) AS BIGINT)",
+                ]
+                if nl_maj:
+                    join_parts.append(f"L.[MAJ_CAT] = N.[{nl_maj}]")
+                if nl_clr:
+                    join_parts.append(f"ISNULL(L.[CLR],'') = ISNULL(N.[{nl_clr}],'')")
+                try:
+                    _run(conn, f"""
+                        UPDATE L SET L.[RL_HOLD_QTY] = ISNULL(TRY_CAST(N.[{nl_hq_col}] AS FLOAT), 0)
+                        FROM [{LISTING_TABLE}] L
+                        INNER JOIN [ARS_NL] N WITH (NOLOCK)
+                            ON {' AND '.join(join_parts)}
+                        WHERE ISNULL(TRY_CAST(N.[{nl_hq_col}] AS FLOAT), 0) > 0
+                    """)
+                    hq_cnt = conn.execute(text(
+                        f"SELECT COUNT(*) FROM [{LISTING_TABLE}] WHERE ISNULL([RL_HOLD_QTY],0) > 0"
+                    )).scalar() or 0
+                    logger.info(f"Part 3.54: RL_HOLD_QTY from ARS_NL populated for {hq_cnt} rows")
+                except Exception as e:
+                    logger.warning(f"Part 3.54: RL_HOLD_QTY from ARS_NL failed: {str(e)[:150]}")
+            else:
+                logger.info("Part 3.54: ARS_NL missing expected columns — RL_HOLD_QTY stays 0")
         else:
-            logger.info("Part 3.54: ARS_NL_TBL_HOLD_TRACKING not found — RL_HOLD_QTY stays 0")
-        t0 = _time_step("Part 3.54 (RL_HOLD_QTY from ARS_NL_TBL_HOLD_TRACKING)", t0)
+            logger.info("Part 3.54: ARS_NL not found — RL_HOLD_QTY stays 0")
+        t0 = _time_step("Part 3.54 (RL_HOLD_QTY from ARS_NL)", t0)
 
         # ── PART 3.55: Populate MSA_FNL_Q early (needed by Part 3.6 for TBL/TBC tagging)
         # Part 5c re-populates the same value later — idempotent.
@@ -1184,9 +1136,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         #
         #   MIX (a): low stock + no MSA + no RL_HOLD_QTY (nothing to send)
         #   MIX (b): poor color fill (VAR ratio < threshold)
-        #   RL:  (adequate stock OR RL_HOLD_QTY > 0) AND MSA_FNL_Q > 0
-        #        — RL requires fresh MSA supply to top up against; an open TBL
-        #          hold alone is no longer enough to land in RL.
+        #   RL:  adequate stock (STK >= threshold × ACS_D)
+        #        OR RL_HOLD_QTY > 0 (stock already dispatched from a prior run)
         #   TBC: low stock, MSA or NL hold available
         #   TBL: zero stock, MSA or NL hold available
         threshold = req.stock_threshold_pct
@@ -1205,10 +1156,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                      AND (CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT] < {threshold}
                           {f'OR ISNULL([VAR_FNL_COUNT], 0) < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else ''})
                         THEN 'MIX'
-                    -- RL: (adequate stock OR prior-run NL hold) AND fresh MSA supply available
-                    WHEN (ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                          OR ISNULL([RL_HOLD_QTY], 0) > 0)
-                     AND ISNULL([MSA_FNL_Q], 0) > 0
+                    -- RL: adequate stock OR prior-run NL hold already dispatched
+                    WHEN ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
+                      OR ISNULL([RL_HOLD_QTY], 0) > 0
                         THEN 'RL'
                     -- TBC: low stock but MSA or NL hold available
                     WHEN ISNULL([STK_TTL], 0) > 0
@@ -1655,22 +1605,18 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
             # Use "new article" rate (includes PER_OPT_SALE) when:
             #   AGE < threshold  OR  AGE is NULL/blank/0 (unknown = treat as new)
-            # Effective AGE = 0 (treat as new) when STK_TTL<=0 AND L-7 sale<=0
-            # (no stock + no recent sale → fresh / about-to-dispatch OPT).
+            # IS_NEW=1 rows always get AGE=0 (new MSA options are always "new",
+            # even if master data carries a stale AGE value).
+            # Only use default_rate (excludes PER_OPT_SALE) when AGE >= threshold.
             if has_age:
-                eff_age = (
-                    "CASE "
-                    f"WHEN ISNULL([STK_TTL], 0) <= 0 AND ISNULL(TRY_CAST([{sale_col}] AS FLOAT), 0) <= 0 THEN 0 "
-                    "ELSE ISNULL([AGE], 0) "
-                    "END"
-                )
+                # Effective AGE: IS_NEW=1 → 0, else → ISNULL(AGE, 0)
+                eff_age = "CASE WHEN ISNULL([IS_NEW], 0) = 1 THEN 0 ELSE ISNULL([AGE], 0) END"
                 rate_expr = (
                     f"CASE WHEN ({eff_age}) < {int(req.age_threshold)} "
                     f"THEN {new_rate} ELSE {default_rate} END"
                 )
             else:
                 rate_expr = new_rate
-                eff_age = None  # used by MAX_DAILY_SALE branching below
 
             # OPT_MBQ = ACS_D + rate × ALC_D
             _run(conn, f"""
@@ -1693,15 +1639,13 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [{col}] FLOAT NULL")
                 except Exception:
                     pass
-            # HOLD_DAYS applies ONLY to OPT_TYPE='TBL' (zero-stock + MSA available —
-            # the dispatch warrants a one-shot warehouse buffer alongside the display
-            # set, regardless of whether the article is new or an existing one that
-            # depleted to zero).  For RL/TBC/MIX rows, OPT_MBQ_WH = OPT_MBQ (no hold).
+            # HOLD_DAYS applies ONLY to IS_NEW=1 (new options without store stock).
+            # For existing options (IS_NEW=0), OPT_MBQ_WH = OPT_MBQ (same as without hold).
             hold = int(req.hold_days or 0)
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
                 SET [OPT_MBQ_WH] = ROUND(ISNULL([ACS_D], 0) + ({rate_expr})
-                    * (ISNULL([ALC_D], 0) + CASE WHEN ISNULL([OPT_TYPE], '') = 'TBL' THEN {hold} ELSE 0 END), 0)
+                    * (ISNULL([ALC_D], 0) + CASE WHEN ISNULL([IS_NEW], 0) = 1 THEN {hold} ELSE 0 END), 0)
             """)
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
@@ -1710,51 +1654,34 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     THEN ROUND(ISNULL([OPT_MBQ_WH], 0) - ISNULL([STK_TTL], 0), 0)
                     ELSE 0 END
             """)
-            # MAX_DAILY_SALE — same eff_age branching as the OPT_MBQ rate:
-            #   eff_age < threshold → MAX(PER_OPT_SALE, L-7/7, AUTO_GEN_ART_SALE)
-            #   else                → MAX(L-7/7, AUTO_GEN_ART_SALE)
+            # MAX_DAILY_SALE = MAX(L-7/7, AUTO_GEN_ART_SALE)
             try:
                 _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [MAX_DAILY_SALE] FLOAT NULL")
             except Exception:
                 pass
             auto_expr = "ISNULL([AUTO_GEN_ART_SALE], 0)" if has_auto else "0"
-            new_mds     = _sql_max(per_opt, l7_daily, auto_expr) if has_auto else _sql_max(per_opt, l7_daily)
-            default_mds = _sql_max(l7_daily, auto_expr)          if has_auto else l7_daily
-            if has_age and eff_age is not None:
-                mds_expr = (
-                    f"CASE WHEN ({eff_age}) < {int(req.age_threshold)} "
-                    f"THEN {new_mds} ELSE {default_mds} END"
-                )
-            else:
-                mds_expr = new_mds
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
-                SET [MAX_DAILY_SALE] = ROUND({mds_expr}, 3)
+                SET [MAX_DAILY_SALE] = ROUND((SELECT MAX(v) FROM (VALUES
+                    ({l7_daily}), ({auto_expr})) T(v)), 2)
             """)
 
             logger.info(f"Part 4c: OPT_MBQ(ACS_D+ALC_D) + OPT_REQ + OPT_MBQ_WH(hold={hold}d) + OPT_REQ_WH + MAX_DAILY_SALE")
 
         t0 = _time_step("Part 4c (OPT_MBQ + OPT_REQ + OPT_MBQ_WH + MAX_DAILY_SALE)", t0)
 
-        # ── Part 4d: ART_EXCESS = MAX(0, STK_TTL - eff_mult × OPT_MBQ), skip MIX ──
-        # eff_mult = MAX(I_ROD, excess_multiplier). An OPT already configured with N
-        # replen rounds carries N × OPT_MBQ of planned stock — only stock above that
-        # threshold is true "excess" available for redistribution.
+        # ── Part 4d: ART_EXCESS = MAX(0, STK_TTL - 2*OPT_MBQ), skip MIX ──
+        # This is the article-level excess used to deduct from each grid's stock.
         try:
             _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [ART_EXCESS] FLOAT NULL")
         except Exception:
             pass
-        eff_mult = (
-            f"CASE WHEN ISNULL(TRY_CAST([I_ROD] AS FLOAT), 0) > {req.excess_multiplier} "
-            f"THEN TRY_CAST([I_ROD] AS FLOAT) "
-            f"ELSE {req.excess_multiplier} END"
-        )
         _run(conn, f"""
             UPDATE [{LISTING_TABLE}]
             SET [ART_EXCESS] = CASE
                 WHEN ISNULL([OPT_TYPE],'') = 'MIX' THEN 0
-                WHEN ISNULL([STK_TTL],0) - ({eff_mult}) * ISNULL([OPT_MBQ],0) > 0
-                THEN ROUND(ISNULL([STK_TTL],0) - ({eff_mult}) * ISNULL([OPT_MBQ],0), 0)
+                WHEN ISNULL([STK_TTL],0) - {req.excess_multiplier} * ISNULL([OPT_MBQ],0) > 0
+                THEN ROUND(ISNULL([STK_TTL],0) - {req.excess_multiplier} * ISNULL([OPT_MBQ],0), 0)
                 ELSE 0 END
         """)
         # Also set overall EXCESS_STK (same formula, visible in output)
@@ -1767,12 +1694,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
         t0 = _time_step("Part 4d (ART_EXCESS + EXCESS_STK)", t0)
 
-        # ── Part 4e: Per-grid stock deduction + REQ calc ────────────────
-        # For each grid:
-        #   1. Aggregate ART_EXCESS by that grid's hierarchy keys.
-        #   2. Deduct from {prefix}_STK_TTL (clamped to 0).
-        #   3. REQ = MAX(0, {prefix}_MBQ - deducted_{prefix}_STK_TTL).
-        # Part 4 rewrites STK_TTL fresh on every rebuild, so deduction is idempotent.
+        # ── Part 4e: Per-grid REQ with aggregated excess deduction ──────
+        # For each grid: aggregate ART_EXCESS by that grid's hierarchy,
+        # then: REQ = MAX(0, MBQ - (STK_TTL - aggregated_excess))
+        # No per-grid EXCESS column stored — calculated internally.
         listing_cols = _get_columns(conn, LISTING_TABLE)
         req_log = []
         for gname in mapped_grids:
@@ -1803,58 +1728,33 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 continue
 
-            # Build GROUP BY keys from hierarchy. WERKS+MAJ_CAT are always present
-            # in the CTE base — strip them here to avoid duplicate column errors
-            # (e.g. MJ grid's hierarchy IS just [WERKS, MAJ_CAT]).
-            group_cols = [
-                h.upper() for h in ghier
-                if h.upper() in {c.upper() for c in listing_cols}
-                and h.upper() not in {"WERKS", "MAJ_CAT"}
-            ]
+            # Build GROUP BY keys from hierarchy (exclude WERKS-only grouping)
+            group_cols = [h.upper() for h in ghier if h.upper() in {c.upper() for c in listing_cols}]
+            if not group_cols:
+                continue
 
-            # Extra (non-WERKS/MAJ_CAT) grouping keys, if any
-            extra_sel  = (", " + ", ".join(f"[{c}]" for c in group_cols)) if group_cols else ""
-            extra_join = (" AND " + " AND ".join(f"L.[{c}] = E.[{c}]" for c in group_cols)) if group_cols else ""
+            group_by = ", ".join(f"[{c}]" for c in group_cols)
+            join_cond = " AND ".join(f"L.[{c}] = E.[{c}]" for c in group_cols)
 
-            # Reusable deducted-stock expression — used by both SET clauses; SQL Server
-            # evaluates SET right-hand sides against the row's pre-UPDATE values, so
-            # repeating the CASE is required to make REQ see the deducted stock.
-            deducted_stk = (
-                f"CASE WHEN ISNULL(L.[{stk_col}], 0) - ISNULL(E.exc, 0) > 0 "
-                f"THEN ROUND(ISNULL(L.[{stk_col}], 0) - ISNULL(E.exc, 0), 0) "
-                f"ELSE 0 END"
-            )
             try:
                 _run(conn, f"""
-                    ;WITH ExcessByGrid AS (
-                        SELECT [WERKS], [MAJ_CAT]{extra_sel},
-                               SUM(ISNULL([ART_EXCESS], 0)) AS exc
-                        FROM [{LISTING_TABLE}]
-                        WHERE [WERKS] IS NOT NULL
-                        GROUP BY [WERKS], [MAJ_CAT]{extra_sel}
-                    )
-                    UPDATE L SET
-                        L.[{stk_col}] = {deducted_stk},
-                        L.[{req_col}] = CASE
-                            WHEN ISNULL(L.[{mbq_col}], 0) - ({deducted_stk}) > 0
-                            THEN ROUND(ISNULL(L.[{mbq_col}], 0) - ({deducted_stk}), 0)
-                            ELSE 0
-                        END
-                    FROM [{LISTING_TABLE}] L
-                    LEFT JOIN ExcessByGrid E
-                      ON L.[WERKS] = E.[WERKS]
-                     AND L.[MAJ_CAT] = E.[MAJ_CAT]{extra_join}
+                    UPDATE [{LISTING_TABLE}] SET [{req_col}] =
+                        CASE WHEN ISNULL([{mbq_col}],0) - ISNULL([{stk_col}],0) > 0
+                             THEN ROUND(ISNULL([{mbq_col}],0) - ISNULL([{stk_col}],0), 0)
+                             ELSE 0 END
                 """)
-                grp_label = ",".join(["WERKS", "MAJ_CAT"] + group_cols)
-                req_log.append(f"{req_col}(by {grp_label})")
+                req_log.append(f"{req_col}(by {','.join(group_cols)})")
             except Exception as e:
                 logger.warning(f"Part 4e: {req_col} failed: {str(e)[:150]}")
 
         if req_log:
             logger.info(f"Part 4e: REQ with excess deduction: {req_log}")
 
-        # ART_EXCESS retained on listing for audit/UI — drives the deduction above
-        # and remains queryable via the public EXCESS_STK alias.
+        # Drop internal ART_EXCESS column (was only needed for aggregation)
+        try:
+            _run(conn, f"ALTER TABLE [{LISTING_TABLE}] DROP COLUMN [ART_EXCESS]")
+        except Exception:
+            pass
 
         logger.info(f"Part 4 complete: {len(mapped_grids)} grids: {', '.join(mapped_grids)}")
         t0 = _time_step("Part 4e (Per-grid REQ with excess deduction)", t0)
@@ -1895,15 +1795,14 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 ),
                 Ranked AS (
                     SELECT *,
-                        DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY MJ_REQ ASC)    AS REQ_RANK,
-                        DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY FILL_RATE DESC) AS FILL_RANK
+                        ROW_NUMBER() OVER (PARTITION BY MAJ_CAT ORDER BY MJ_REQ ASC)   AS REQ_RANK,
+                        ROW_NUMBER() OVER (PARTITION BY MAJ_CAT ORDER BY FILL_RATE DESC) AS FILL_RANK
                     FROM StoreAgg
                 )
                 SELECT *,
                     ROUND(REQ_RANK * {rw} + FILL_RANK * {fw}, 2) AS W_SCORE,
                     ROW_NUMBER() OVER (PARTITION BY MAJ_CAT
-                        ORDER BY ROUND(REQ_RANK * {rw} + FILL_RANK * {fw}, 2) DESC,
-                                 WERKS ASC) AS ST_RANK
+                        ORDER BY ROUND(REQ_RANK * {rw} + FILL_RANK * {fw}, 2) DESC) AS ST_RANK
                 INTO [{RANK_TABLE}]
                 FROM Ranked
             """)
@@ -1942,7 +1841,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         with de.connect() as wc:
             all_cols = _get_columns(wc, LISTING_TABLE)
             all_upper = {c.upper(): c for c in all_cols}
-            selected = list(all_cols)
+            keep = _FINAL_KEEP_COLS
+            selected = [c for c in all_cols if c.upper() in keep or any(c.upper().endswith(s) for s in _FINAL_KEEP_SUFFIX)]
             if selected:
                 col_list = ", ".join(f"[{c}]" for c in selected)
                 _run(wc, f"IF OBJECT_ID('{FINAL_TABLE}','U') IS NOT NULL DROP TABLE [{FINAL_TABLE}]")
@@ -1970,10 +1870,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 # Only listed OPTs (LISTING = 1)
                 if "LISTING" in all_upper:
                     where.append("ISNULL(TRY_CAST([LISTING] AS INT), 1) = 1")
-                # MAJ_CAT display capacity must be positive — if the store has
-                # no display slots for this MAJ_CAT, the OPT can't be allocated.
-                if "MJ_DISP_Q" in all_upper:
-                    where.append("ISNULL(TRY_CAST([MJ_DISP_Q] AS FLOAT), 0) > 0")
                 where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
                 _run(wc, f"""
@@ -1983,63 +1879,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     {where_sql}
                 """)
                 working_rows = wc.execute(text(f"SELECT COUNT(*) FROM [{FINAL_TABLE}]")).scalar()
-                logger.info(f"{FINAL_TABLE}: {working_rows} rows (MSA_FNL_Q>0 OR HOLD_QTY>0, OPT_REQ_WH>=1, MJ_DISP_Q>0)")
-
-                # ── Allocation Gate: MJ_MBQ growth headroom ───────────────
-                # Lift the per-(WERKS, MAJ_CAT) target by scaling MJ_MBQ into
-                # a sibling MJ_MBQ_REV column (MJ_MBQ itself is NEVER mutated
-                # — kept as the immutable source-of-truth target).  MJ_REQ_REV
-                # is then re-derived from the scaled MBQ as the unfilled-
-                # portion of the new target.  When growth>100, MJ_REQ is
-                # promoted to MJ_REQ_REV so every downstream engine consumer
-                # (revalidate, OPT_MJ_REQ gate, store-broken pre-band, post-
-                # waterfall recompute) sees the new ceiling with zero code
-                # changes.  MJ_MBQ / MJ_REQ_ORIG remain visible for UI/audit.
-                growth_pct = float(req.mj_req_growth_pct or 100.0)
-                # Always create the revised-target columns so the UI sees them
-                # consistently — at growth=100 they equal MJ_MBQ / MJ_REQ.
-                for _rev_col in ("MJ_MBQ_REV", "MJ_REQ_REV", "MJ_REQ_ORIG"):
-                    try:
-                        _run(wc, f"ALTER TABLE [{FINAL_TABLE}] ADD [{_rev_col}] FLOAT NULL")
-                    except Exception:
-                        pass  # idempotent — column may already exist
-                # Snapshot pre-scaling MJ_REQ exactly once (first run wins).
-                _run(wc, f"""
-                    UPDATE [{FINAL_TABLE}]
-                    SET [MJ_REQ_ORIG] = [MJ_REQ]
-                    WHERE [MJ_REQ_ORIG] IS NULL
-                """)
-                # MJ_MBQ_REV = MJ_MBQ × growth_pct/100 (MJ_MBQ untouched).
-                _run(wc, f"""
-                    UPDATE [{FINAL_TABLE}]
-                    SET [MJ_MBQ_REV] = ROUND(ISNULL([MJ_MBQ], 0) * {growth_pct} / 100.0, 0)
-                """)
-                # MJ_REQ_REV = MAX(0, MJ_MBQ_REV − MJ_STK_TTL).  At growth=100
-                # this equals the original MJ_REQ; above 100 it's the scaled
-                # ceiling the engine should respect.
-                _run(wc, f"""
-                    UPDATE [{FINAL_TABLE}]
-                    SET [MJ_REQ_REV] = CASE
-                        WHEN ISNULL([MJ_MBQ_REV], 0) - ISNULL([MJ_STK_TTL], 0) > 0
-                        THEN ROUND(ISNULL([MJ_MBQ_REV], 0) - ISNULL([MJ_STK_TTL], 0), 0)
-                        ELSE 0 END
-                """)
-                if growth_pct != 100.0:
-                    # Promote MJ_REQ_REV → MJ_REQ so the engine reads the
-                    # scaled ceiling.  MJ_REQ_ORIG retains the original.
-                    _run(wc, f"""
-                        UPDATE [{FINAL_TABLE}] SET [MJ_REQ] = [MJ_REQ_REV]
-                    """)
-                    logger.info(
-                        f"{FINAL_TABLE}: MJ_MBQ × {growth_pct}% → MJ_MBQ_REV; "
-                        f"MJ_REQ_REV recomputed from scaled MBQ; "
-                        f"MJ_REQ promoted to MJ_REQ_REV (MJ_REQ_ORIG preserved)"
-                    )
-                else:
-                    logger.info(
-                        f"{FINAL_TABLE}: growth=100% — MJ_MBQ_REV/MJ_REQ_REV "
-                        f"populated for audit; MJ_REQ unchanged"
-                    )
+                logger.info(f"{FINAL_TABLE}: {working_rows} rows (MSA_FNL_Q>0 OR HOLD_QTY>0, OPT_REQ_WH>=1)")
 
                 # ── Add ARS_GRID_HIERARCHY columns to working table ────────
                 # For each hierarchy column (RNG_SEG, MACRO_MVGR, etc.):
@@ -2231,7 +2071,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     alloc_failed_count = 0
     mode = (req.allocation_mode or "pandas").lower()
     n_workers = max(2, min(8, int(req.parallel_workers or 4)))
-    _growth = req.mj_req_growth_pct
     try:
         if mode == "pandas":
             from app.services.rule_engine_pandas import (
@@ -2247,18 +2086,12 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
                 pri_ct_check_tbc=req.pri_ct_check_tbc,
-                rl_mbq_cap_pct=_growth,
-                tbc_mbq_cap_pct=_growth,
-                tbl_mbq_cap_pct=_growth,
-                rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
-                tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
-                tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,
-                mj_req_growth_pct=_growth,
+                rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+                tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
                 opt_types=req.opt_types or ["RL", "TBC", "TBL"],
                 use_writer_queue=req.use_writer_queue,
-                apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
             )
-        else:  # "sequential" — single-thread reference path
+        else:  # "sequential" — single-thread fallback
             from app.services.rule_engine_new import run_listing_and_allocation
             with de.connect() as ac:
                 alloc_result = run_listing_and_allocation(
@@ -2270,28 +2103,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     min_size_count=req.min_size_count,
                     pri_ct_check_rl=req.pri_ct_check_rl,
                     pri_ct_check_tbc=req.pri_ct_check_tbc,
-                    rl_mbq_cap_pct=_growth,
-                    tbc_mbq_cap_pct=_growth,
-                    tbl_mbq_cap_pct=_growth,
-                    rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
-                    tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
-                    tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,
-                    mj_req_growth_pct=_growth,
+                    rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+                    tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
                     opt_types=req.opt_types or ["RL", "TBC", "TBL"],
-                    apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
                 )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")
         alloc_failed_count = alloc_result.get("failed", 0) or 0
-        # Engine returned but reported per-MAJ_CAT failures → surface as FAILED
-        # so the parked-runs UI doesn't show a green SUCCESS for a broken run.
-        if alloc_failed_count > 0:
-            summary["error"] = (
-                f"rule engine ({mode}): {alloc_failed_count} MAJ_CAT(s) failed"
-            )
     except Exception as e:
-        logger.exception(f"Rule engine ({mode}) failed: {e}")
-        summary["error"] = f"rule engine ({mode}) raised: {e}"
+        logger.warning(f"Rule engine ({mode}) failed: {e}")
     t0 = _time_step(
         f"Part 8 ({mode}, workers={n_workers} → {alloc_rows} alloc rows, "
         f"failed={alloc_failed_count}, batch={alloc_batch_id})",
@@ -2344,21 +2164,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         thr = float(req.stock_threshold_pct or 0.6)
         default_acs = float(req.default_acs_d or 18.0)
         with de.connect() as ac:
-            # Guard: ALLOC_QTY only exists on FINAL_TABLE after the rule engine's
-            # Stage A runs (_stage_a_add_columns). If the engine failed in Part 8
-            # (e.g. kwarg mismatch, schema drift), the column is missing and this
-            # UPDATE would fail with a confusing "Invalid column name 'ALLOC_QTY'"
-            # SQL error. Surface the upstream failure clearly instead.
-            alloc_qty_exists = ac.execute(text(
-                "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
-                "WHERE TABLE_NAME = :t AND COLUMN_NAME = 'ALLOC_QTY'"
-            ), {"t": FINAL_TABLE}).fetchone()
-            if not alloc_qty_exists:
-                logger.warning(
-                    f"Part 8.5 skipped: ALLOC_QTY column missing on {FINAL_TABLE} "
-                    f"(rule engine likely failed in Part 8 — check warnings above)"
-                )
-                raise RuntimeError("ALLOC_QTY missing — engine failure upstream")
             for coldef in ("[OPT_STATUS] NVARCHAR(10) NULL",
                             "[TBL_LISTED_DATE] DATETIME NULL"):
                 try:
@@ -3584,120 +3389,34 @@ def _compute_listing_summary(conn):
 
     summary["by_maj_cat"] = by_maj_cat
 
-    # by_maj_cat_rdc: (MAJ_CAT × RDC) breakdown — stock available, alloc, hold,
-    # and MJ_REQ. Used by the MAJ_CAT modal to pivot one row per MAJ_CAT with
-    # per-RDC columns. Residual FNL_Q (stock − alloc − hold) is computed on the
-    # frontend so the modal stays in sync if any of the three move.
+    # by_maj_cat_rdc: (MAJ_CAT × RDC) breakdown — stock available and alloc qty.
+    # Used by the MAJ_CAT modal to pivot one row per MAJ_CAT with per-RDC columns.
     if _table_exists(conn, WORKING_TABLE):
         wk_cols = _get_columns(conn, WORKING_TABLE)
         if "ALLOC_QTY" in wk_cols and "MAJ_CAT" in wk_cols and "RDC" in wk_cols and "FNL_Q" in wk_cols:
             try:
-                hold_sel = ("ROUND(ISNULL(SUM(TRY_CAST(A.[HOLD_QTY] AS FLOAT)), 0), 0)"
-                            if "HOLD_QTY" in wk_cols else "0")
-                # MJ_REQ / MJ_MBQ / MJ_STK_TTL all live at WERKS×MAJ_CAT grain
-                # in ARS_LISTING_WORKING. Dedup per (WERKS, MAJ_CAT, RDC) with
-                # MAX, then SUM across WERKS to land at MAJ_CAT × RDC.
-                lw_exists = _table_exists(conn, "ARS_LISTING_WORKING")
-                lw_cols   = _get_columns(conn, "ARS_LISTING_WORKING") if lw_exists else []
-                lw_keys_ok = (lw_exists and "WERKS" in lw_cols
-                              and "RDC" in lw_cols and "MAJ_CAT" in lw_cols)
-                has_req = lw_keys_ok and "MJ_REQ" in lw_cols
-                has_mbq = lw_keys_ok and "MJ_MBQ" in lw_cols
-                has_stk = lw_keys_ok and "MJ_STK_TTL" in lw_cols
-                src_cte = ""
-                src_join = ""
-                req_sel = "0"
-                mbq_sel = "0"
-                stk_sel = "0"
-                if lw_keys_ok and (has_req or has_mbq or has_stk):
-                    req_inner = ("MAX(ISNULL(TRY_CAST([MJ_REQ] AS FLOAT), 0))"
-                                 if has_req else "0")
-                    mbq_inner = ("MAX(ISNULL(TRY_CAST([MJ_MBQ] AS FLOAT), 0))"
-                                 if has_mbq else "0")
-                    stk_inner = ("MAX(ISNULL(TRY_CAST([MJ_STK_TTL] AS FLOAT), 0))"
-                                 if has_stk else "0")
-                    src_cte = f""",
-                    SrcByMR AS (
-                        SELECT [MAJ_CAT], [RDC],
-                               SUM(req_w) AS req_qty,
-                               SUM(mbq_w) AS mbq_qty,
-                               SUM(stk_w) AS stk_qty
-                        FROM (
-                            SELECT [WERKS], [MAJ_CAT], [RDC],
-                                   {req_inner} AS req_w,
-                                   {mbq_inner} AS mbq_w,
-                                   {stk_inner} AS stk_w
-                            FROM [ARS_LISTING_WORKING] WITH (NOLOCK)
-                            WHERE [MAJ_CAT] IS NOT NULL AND [RDC] IS NOT NULL
-                            GROUP BY [WERKS], [MAJ_CAT], [RDC]
-                        ) S
-                        GROUP BY [MAJ_CAT], [RDC]
-                    )"""
-                    src_join = ("LEFT JOIN SrcByMR R "
-                                "ON R.[MAJ_CAT] = A.[MAJ_CAT] AND R.[RDC] = A.[RDC]")
-                    if has_req:
-                        req_sel = "ROUND(ISNULL(MAX(R.req_qty), 0), 0)"
-                    if has_mbq:
-                        mbq_sel = "ROUND(ISNULL(MAX(R.mbq_qty), 0), 0)"
-                    if has_stk:
-                        stk_sel = "ROUND(ISNULL(MAX(R.stk_qty), 0), 0)"
-
-                # EXCESS_STK lives at option grain on ARS_LISTING (Part 4d
-                # populates: max(0, STK_TTL − excess_multiplier × OPT_MBQ),
-                # MIX rows skipped). Aggregate to MAJ_CAT × RDC here.
-                lst_exists = _table_exists(conn, LISTING_TABLE)
-                lst_cols   = _get_columns(conn, LISTING_TABLE) if lst_exists else []
-                has_excess = (lst_exists and "EXCESS_STK" in lst_cols
-                              and "MAJ_CAT" in lst_cols and "RDC" in lst_cols)
-                excess_cte = ""
-                excess_join = ""
-                excess_sel = "0"
-                if has_excess:
-                    excess_cte = f""",
-                    ExcessByMR AS (
-                        SELECT [MAJ_CAT], [RDC],
-                               SUM(ISNULL(TRY_CAST([EXCESS_STK] AS FLOAT), 0)) AS excess_stk
-                        FROM [{LISTING_TABLE}] WITH (NOLOCK)
-                        WHERE [MAJ_CAT] IS NOT NULL AND [RDC] IS NOT NULL
-                        GROUP BY [MAJ_CAT], [RDC]
-                    )"""
-                    excess_join = ("LEFT JOIN ExcessByMR EX "
-                                   "ON EX.[MAJ_CAT] = A.[MAJ_CAT] AND EX.[RDC] = A.[RDC]")
-                    excess_sel = "ROUND(ISNULL(MAX(EX.excess_stk), 0), 0)"
-
                 mr_rows = conn.execute(text(f"""
                     ;WITH PoolPerSize AS (
                         SELECT [MAJ_CAT], [RDC], [GEN_ART_NUMBER], [CLR], [VAR_ART], [SZ],
                                MAX(TRY_CAST([FNL_Q] AS FLOAT)) AS pool_sz
                         FROM [{WORKING_TABLE}] WITH (NOLOCK)
                         GROUP BY [MAJ_CAT],[RDC],[GEN_ART_NUMBER],[CLR],[VAR_ART],[SZ]
-                    ){src_cte}{excess_cte}
+                    )
                     SELECT A.[MAJ_CAT], A.[RDC],
                            ROUND(ISNULL(SUM(TRY_CAST(A.[ALLOC_QTY] AS FLOAT)), 0), 0) AS aq,
-                           ROUND(ISNULL(MAX(P.stock_avail), 0), 0) AS stock_avail,
-                           {hold_sel} AS hq,
-                           {req_sel} AS req_qty,
-                           {mbq_sel} AS mbq_qty,
-                           {stk_sel} AS store_stk,
-                           {excess_sel} AS excess_stk
+                           ROUND(ISNULL(P.stock_avail, 0), 0) AS stock_avail
                     FROM [{WORKING_TABLE}] A WITH (NOLOCK)
                     LEFT JOIN (
                         SELECT [MAJ_CAT], [RDC], SUM(pool_sz) AS stock_avail
                         FROM PoolPerSize
                         GROUP BY [MAJ_CAT], [RDC]
                     ) P ON P.[MAJ_CAT] = A.[MAJ_CAT] AND P.[RDC] = A.[RDC]
-                    {src_join}
-                    {excess_join}
                     WHERE A.[MAJ_CAT] IS NOT NULL AND A.[RDC] IS NOT NULL
-                    GROUP BY A.[MAJ_CAT], A.[RDC]
+                    GROUP BY A.[MAJ_CAT], A.[RDC], P.stock_avail
                     ORDER BY A.[MAJ_CAT], A.[RDC]
                 """)).fetchall()
                 summary["by_maj_cat_rdc"] = [
-                    {"maj_cat": r[0], "rdc": r[1],
-                     "alloc_qty":   int(r[2] or 0), "stock_avail": int(r[3] or 0),
-                     "hold_qty":    int(r[4] or 0), "req_qty":     int(r[5] or 0),
-                     "mbq_qty":     int(r[6] or 0), "store_stk":   int(r[7] or 0),
-                     "excess_stk":  int(r[8] or 0)}
+                    {"maj_cat": r[0], "rdc": r[1], "alloc_qty": int(r[2] or 0), "stock_avail": int(r[3] or 0)}
                     for r in mr_rows if r[0] and r[1]
                 ]
             except Exception:
@@ -3952,421 +3671,6 @@ def _compute_listing_summary(conn):
                 summary["by_hub"] = []
 
     return {"success": True, "data": summary}
-
-
-@router.get("/store-by-majcat")
-def store_by_majcat(
-    maj_cat: str,
-    rdc: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Per-store breakdown for ONE MAJ_CAT (optionally filtered to one RDC).
-    Powers the click-to-drill from the MAJ_CAT modal in the listing UI.
-
-    Returns one row per WERKS with: store_stk, mbq, req, alloc, hold,
-    fnl_q (residual at the store grain), req_pct (= alloc/req), and
-    fill_pct (= (store_stk + alloc) / mbq) — same columns the parent
-    modal shows, but at the store grain.
-    """
-    if not (maj_cat or "").strip():
-        return {"success": True, "data": [], "maj_cat": maj_cat, "rdc": rdc}
-    A_TBL = "ARS_ALLOC_WORKING"
-    L_TBL = "ARS_LISTING_WORKING"
-    de = get_data_engine()
-    with de.connect() as conn:
-        conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
-        if not _table_exists(conn, A_TBL):
-            return {"success": True, "data": [], "maj_cat": maj_cat, "rdc": rdc}
-        ac = _get_columns(conn, A_TBL)
-        if not all(k in ac for k in ("WERKS", "MAJ_CAT", "RDC", "ALLOC_QTY")):
-            return {"success": True, "data": [], "maj_cat": maj_cat, "rdc": rdc}
-        lw_exists = _table_exists(conn, L_TBL)
-        lc = _get_columns(conn, L_TBL) if lw_exists else []
-        lw_ok = lw_exists and all(k in lc for k in ("WERKS", "MAJ_CAT", "RDC"))
-        has_req = lw_ok and "MJ_REQ" in lc
-        has_mbq = lw_ok and "MJ_MBQ" in lc
-        has_stk = lw_ok and "MJ_STK_TTL" in lc
-        hold_sel = ("ROUND(ISNULL(SUM(TRY_CAST(A.[HOLD_QTY] AS FLOAT)),0),0)"
-                    if "HOLD_QTY" in ac else "0")
-        # Source per (WERKS, MAJ_CAT, RDC) — MAX dedups OPT rows that share
-        # the same MAJ_CAT-level value.
-        src_cte = ""
-        src_join = ""
-        req_sel = "0"
-        mbq_sel = "0"
-        stk_sel = "0"
-        params: Dict[str, Any] = {"mc": maj_cat}
-        rdc_filter_lw = ""
-        if rdc:
-            params["rdc"] = rdc
-            rdc_filter_lw = "AND [RDC] = :rdc"
-        if lw_ok and (has_req or has_mbq or has_stk):
-            req_inner = ("MAX(ISNULL(TRY_CAST([MJ_REQ] AS FLOAT),0))"
-                         if has_req else "0")
-            mbq_inner = ("MAX(ISNULL(TRY_CAST([MJ_MBQ] AS FLOAT),0))"
-                         if has_mbq else "0")
-            stk_inner = ("MAX(ISNULL(TRY_CAST([MJ_STK_TTL] AS FLOAT),0))"
-                         if has_stk else "0")
-            src_cte = f""";WITH Src AS (
-                SELECT [WERKS],
-                       {req_inner} AS req_q,
-                       {mbq_inner} AS mbq_q,
-                       {stk_inner} AS stk_q
-                FROM [{L_TBL}] WITH (NOLOCK)
-                WHERE [MAJ_CAT] = :mc {rdc_filter_lw}
-                GROUP BY [WERKS]
-            )"""
-            src_join = "LEFT JOIN Src R ON R.[WERKS] = A.[WERKS]"
-            if has_req:
-                req_sel = "ROUND(ISNULL(MAX(R.req_q),0),0)"
-            if has_mbq:
-                mbq_sel = "ROUND(ISNULL(MAX(R.mbq_q),0),0)"
-            if has_stk:
-                stk_sel = "ROUND(ISNULL(MAX(R.stk_q),0),0)"
-        rdc_filter_a = "AND A.[RDC] = :rdc" if rdc else ""
-        sql = f"""
-            {src_cte}
-            SELECT A.[WERKS],
-                   ROUND(ISNULL(SUM(TRY_CAST(A.[ALLOC_QTY] AS FLOAT)),0),0) AS aq,
-                   {hold_sel} AS hq,
-                   {req_sel} AS req_q,
-                   {mbq_sel} AS mbq_q,
-                   {stk_sel} AS stk_q
-            FROM [{A_TBL}] A WITH (NOLOCK)
-            {src_join}
-            WHERE A.[MAJ_CAT] = :mc {rdc_filter_a}
-            GROUP BY A.[WERKS]
-            ORDER BY aq DESC
-        """
-        rows = conn.execute(text(sql), params).fetchall()
-        data = []
-        for r in rows:
-            werks = r[0]
-            if not werks:
-                continue
-            alloc = int(r[1] or 0)
-            hold  = int(r[2] or 0)
-            req   = int(r[3] or 0)
-            mbq   = int(r[4] or 0)
-            stk   = int(r[5] or 0)
-            data.append({
-                "werks": werks,
-                "alloc_qty": alloc,
-                "hold_qty":  hold,
-                "req_qty":   req,
-                "mbq_qty":   mbq,
-                "store_stk": stk,
-            })
-        return {"success": True, "data": data,
-                "maj_cat": maj_cat, "rdc": rdc}
-
-
-@router.get("/opt-summary")
-def opt_summary(
-    maj_cat: str,
-    rdc: Optional[str] = None,
-    werks: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-):
-    """Per-OPT drill for a MAJ_CAT (optionally filtered by RDC and/or WERKS).
-
-    Returns one row per (WERKS, GEN_ART_NUMBER, CLR) with the OPT-grain
-    columns (OPT_MBQ, OPT_REQ, STK_TTL, EXCESS_STK, ALLOC_QTY, HOLD_QTY,
-    MSA_FNL_Q_REM, OPT_TYPE, OPT_STATUS, ALLOC_STATUS, ALLOC_REMARKS,
-    OPT_PRIORITY_RANK, ST_RANK). Sourced from ARS_LISTING_WORKING (OPT
-    grain) joined with aggregated ARS_ALLOC_WORKING (size grain rolled
-    to OPT).
-    """
-    if not (maj_cat or "").strip():
-        return {"success": True, "data": [], "maj_cat": maj_cat, "rdc": rdc, "werks": werks}
-    L_TBL = "ARS_LISTING_WORKING"
-    A_TBL = "ARS_ALLOC_WORKING"
-    de = get_data_engine()
-    with de.connect() as conn:
-        conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
-        if not _table_exists(conn, L_TBL):
-            return {"success": True, "data": [], "maj_cat": maj_cat, "rdc": rdc, "werks": werks}
-        lc = _get_columns(conn, L_TBL)
-        if not all(k in lc for k in ("WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR")):
-            return {"success": True, "data": [], "maj_cat": maj_cat, "rdc": rdc, "werks": werks}
-        # Optional columns — selected only when present.
-        opt_cols = {
-            "RDC", "GEN_ART_DESC", "OPT_TYPE", "OPT_STATUS", "FINAL_OPT_TYPE",
-            "IS_NEW", "I_ROD", "ACS_D", "ALC_D", "MAX_DAILY_SALE",
-            "STK_TTL", "EXCESS_STK", "MSA_FNL_Q", "MSA_FNL_Q_REM",
-            "OPT_MBQ", "OPT_REQ", "OPT_REQ_WH",
-            "MJ_REQ", "MJ_MBQ", "MJ_STK_TTL", "MJ_REQ_REM",
-            "PRI_CT%", "PRI_CT_REM", "SEC_CT%",
-            "ALLOC_QTY", "HOLD_QTY", "ALLOC_STATUS", "ALLOC_REMARKS",
-            "ST_RANK", "OPT_PRIORITY_RANK", "OPT_PRIORITY_TIER",
-            "LISTED_FLAG", "LISTED_REASON",
-        }
-        present = [c for c in opt_cols if c in lc]
-        sel_list = ", ".join(f"L.[{c}]" for c in present)
-
-        params: Dict[str, Any] = {"mc": maj_cat}
-        rdc_filter = ""
-        if rdc:
-            params["rdc"] = rdc
-            rdc_filter = " AND L.[RDC] = :rdc"
-        werks_filter = ""
-        if werks:
-            params["werks"] = werks
-            werks_filter = " AND L.[WERKS] = :werks"
-
-        # Pull alloc-side totals at OPT grain from ARS_ALLOC_WORKING so the
-        # numbers match the size-grain source of truth (Stage D rollup can lag
-        # if anything in the pipeline interrupted).
-        alloc_join_sel = "0 AS alloc_qty_a, 0 AS hold_qty_a"
-        alloc_join_cte = ""
-        alloc_join_clause = ""
-        if _table_exists(conn, A_TBL):
-            ac = _get_columns(conn, A_TBL)
-            if all(k in ac for k in ("WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "ALLOC_QTY")):
-                hold_sel = ("ROUND(ISNULL(SUM(TRY_CAST([HOLD_QTY] AS FLOAT)),0),0)"
-                            if "HOLD_QTY" in ac else "0")
-                alloc_join_cte = f""", AggAlloc AS (
-                    SELECT [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], ISNULL([CLR],'') AS CLR,
-                           ROUND(ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)),0),0) AS aq,
-                           {hold_sel} AS hq
-                    FROM [{A_TBL}] WITH (NOLOCK)
-                    WHERE [MAJ_CAT] = :mc {('AND [RDC] = :rdc' if rdc else '')}
-                    GROUP BY [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], ISNULL([CLR],'')
-                )"""
-                alloc_join_sel = "ISNULL(AA.aq, 0) AS alloc_qty_a, ISNULL(AA.hq, 0) AS hold_qty_a"
-                alloc_join_clause = ("LEFT JOIN AggAlloc AA "
-                                     "ON AA.[WERKS] = L.[WERKS] "
-                                     "AND AA.[MAJ_CAT] = L.[MAJ_CAT] "
-                                     "AND AA.[GEN_ART_NUMBER] = L.[GEN_ART_NUMBER] "
-                                     "AND AA.[CLR] = ISNULL(L.[CLR],'')")
-
-        sql = f"""
-            ;WITH Listed AS (
-                SELECT L.[WERKS], L.[MAJ_CAT], L.[GEN_ART_NUMBER], L.[CLR]
-                FROM [{L_TBL}] L WITH (NOLOCK)
-                WHERE L.[MAJ_CAT] = :mc {rdc_filter}{werks_filter}
-            ){alloc_join_cte}
-            SELECT L.[WERKS], L.[MAJ_CAT], L.[GEN_ART_NUMBER], L.[CLR],
-                   {sel_list},
-                   {alloc_join_sel}
-            FROM [{L_TBL}] L WITH (NOLOCK)
-            {alloc_join_clause}
-            WHERE L.[MAJ_CAT] = :mc {rdc_filter}{werks_filter}
-            ORDER BY ISNULL(L.[OPT_PRIORITY_RANK], 999999) ASC,
-                     L.[WERKS], L.[GEN_ART_NUMBER], L.[CLR]
-        """
-        rows = conn.execute(text(sql), params).fetchall()
-        # Column index map: 4 keys + present cols + 2 alloc-join cols
-        keys = ["WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
-        all_cols = keys + present + ["alloc_qty_a", "hold_qty_a"]
-        data = []
-        for r in rows:
-            rec: Dict[str, Any] = {}
-            for i, c in enumerate(all_cols):
-                v = r[i]
-                rec[c] = v if not isinstance(v, bytes) else v.decode("utf-8", "ignore")
-            # Convert BIGINT to int safely
-            if rec.get("GEN_ART_NUMBER") is not None:
-                try: rec["GEN_ART_NUMBER"] = int(rec["GEN_ART_NUMBER"])
-                except Exception: pass
-            # Prefer alloc-side totals when available; falls back to working
-            # table values when alloc table isn't present.
-            if rec.get("alloc_qty_a") is not None and "ALLOC_QTY" in rec:
-                rec["ALLOC_QTY"] = rec["alloc_qty_a"]
-            if rec.get("hold_qty_a") is not None and "HOLD_QTY" in rec:
-                rec["HOLD_QTY"] = rec["hold_qty_a"]
-            rec.pop("alloc_qty_a", None)
-            rec.pop("hold_qty_a", None)
-            data.append(rec)
-        return {"success": True, "data": data, "columns": keys + present,
-                "maj_cat": maj_cat, "rdc": rdc, "werks": werks}
-
-
-@router.get("/var-summary")
-def var_summary(
-    maj_cat: str,
-    werks: str,
-    gen_art: int,
-    clr: str = "",
-    rdc: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-):
-    """Per-VAR_ART × SZ drill for ONE OPT (WERKS, MAJ_CAT, GEN_ART, CLR).
-
-    Returns one row per (VAR_ART, SZ) from ARS_ALLOC_WORKING with:
-    VAR_DESC, MRP, SZ_MBQ, SZ_STK, SZ_REQ, ALLOC_QTY, HOLD_QTY, FNL_Q,
-    FNL_Q_REM, ALLOC_STATUS, SKIP_REASON, ALLOC_WAVE, ALLOC_ROUND,
-    ALLOC_REMARKS, FROM_HOLD_QTY.
-    """
-    A_TBL = "ARS_ALLOC_WORKING"
-    de = get_data_engine()
-    with de.connect() as conn:
-        conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
-        if not _table_exists(conn, A_TBL):
-            return {"success": True, "data": [], "maj_cat": maj_cat,
-                    "werks": werks, "gen_art": gen_art, "clr": clr, "rdc": rdc}
-        ac = _get_columns(conn, A_TBL)
-        if not all(k in ac for k in ("WERKS", "MAJ_CAT", "GEN_ART_NUMBER",
-                                       "VAR_ART", "SZ")):
-            return {"success": True, "data": [], "maj_cat": maj_cat,
-                    "werks": werks, "gen_art": gen_art, "clr": clr, "rdc": rdc}
-        # Optional columns
-        var_cols = {
-            "RDC", "VAR_DESC", "MRP", "PAK_SZ", "OPT_TYPE",
-            "OPT_PRIORITY_RANK", "ST_RANK", "IS_NEW", "I_ROD",
-            "CONT", "SZ_MBQ", "SZ_MBQ_WH", "SZ_STK", "SZ_REQ", "SZ_REQ_WH",
-            "FNL_Q", "FNL_Q_REM",
-            "POOL_CONSUMED", "SHIP_QTY", "HOLD_QTY", "ALLOC_QTY",
-            "FROM_HOLD_QTY",
-            "ALLOC_STATUS", "SKIP_REASON", "ALLOC_REMARKS",
-            "ALLOC_WAVE", "ALLOC_ROUND",
-        }
-        present = [c for c in var_cols if c in ac]
-        sel_list = ", ".join(f"[{c}]" for c in present)
-
-        params: Dict[str, Any] = {"mc": maj_cat, "werks": werks,
-                                    "ga": int(gen_art), "clr": clr or ""}
-        rdc_filter = ""
-        if rdc:
-            params["rdc"] = rdc
-            rdc_filter = " AND [RDC] = :rdc"
-        sql = f"""
-            SELECT [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
-                   [VAR_ART], [SZ], {sel_list}
-            FROM [{A_TBL}] WITH (NOLOCK)
-            WHERE [MAJ_CAT] = :mc
-              AND [WERKS] = :werks
-              AND TRY_CAST([GEN_ART_NUMBER] AS BIGINT) = :ga
-              AND ISNULL([CLR],'') = :clr
-              {rdc_filter}
-            ORDER BY [VAR_ART], [SZ]
-        """
-        rows = conn.execute(text(sql), params).fetchall()
-        keys = ["WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
-        all_cols = keys + present
-        data = []
-        for r in rows:
-            rec: Dict[str, Any] = {}
-            for i, c in enumerate(all_cols):
-                v = r[i]
-                rec[c] = v if not isinstance(v, bytes) else v.decode("utf-8", "ignore")
-            if rec.get("GEN_ART_NUMBER") is not None:
-                try: rec["GEN_ART_NUMBER"] = int(rec["GEN_ART_NUMBER"])
-                except Exception: pass
-            if rec.get("VAR_ART") is not None:
-                try: rec["VAR_ART"] = int(rec["VAR_ART"])
-                except Exception: pass
-            data.append(rec)
-        return {"success": True, "data": data, "columns": keys + present,
-                "maj_cat": maj_cat, "werks": werks, "gen_art": gen_art,
-                "clr": clr, "rdc": rdc}
-
-
-@router.get("/sloc-breakdown")
-def sloc_breakdown(
-    maj_cat: str,
-    rdc: Optional[str] = None,
-    werks: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-):
-    """SLOC-wise inventory breakdown for STORE_STOCK drill.
-
-    The SLOC columns on ARS_LISTING are dynamic (discovered from the
-    grid table at generate time). Returns the SUM of each SLOC column
-    for the selected (MAJ_CAT [, RDC] [, WERKS]) — one entry per SLOC.
-    Plus STK_TTL grand-total for sanity.
-    """
-    if not (maj_cat or "").strip():
-        return {"success": True, "data": [], "maj_cat": maj_cat,
-                "rdc": rdc, "werks": werks}
-    de = get_data_engine()
-    with de.connect() as conn:
-        conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
-        if not _table_exists(conn, LISTING_TABLE):
-            return {"success": True, "data": [], "maj_cat": maj_cat,
-                    "rdc": rdc, "werks": werks}
-        cols = _get_columns(conn, LISTING_TABLE)
-        # Identity / known calc columns — everything else that's numeric is
-        # treated as a SLOC. This mirrors how Part 1 builds the table:
-        # SLOC cols = grid stock cols not in the skip set.
-        non_sloc = {
-            "WERKS", "RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "GEN_ART_DESC",
-            "STK_TTL", "STR", "IS_NEW", "OPT_TYPE", "ACS_D", "ALC_D",
-            "AUTO_GEN_ART_SALE", "AGE", "LISTING", "I_ROD",
-            "CLR_MIN", "CLR_MAX", "FOCUS_W_CAP", "FOCUS_WO_CAP",
-            "RL_HOLD_QTY", "MSA_FNL_Q", "VAR_COUNT", "VAR_FNL_COUNT",
-            "PER_OPT_SALE", "OPT_MBQ", "OPT_REQ",
-            "OPT_MBQ_WH", "OPT_REQ_WH", "EXCESS_STK",
-            "ST_RANK", "MAX_DAILY_SALE",
-            "FINAL_OPT_TYPE", "ALLOC_BATCH_ID", "ALLOC_TYPE",
-            "OPT_TYPE_REASON", "FOCUS_FLAG", "CLR_CAP_MODE", "STR_BOOST_PCT",
-            "MJ_MBQ", "MJ_STK_TTL", "MJ_REQ",
-            "M_VND_CD", "RNG_SEG", "MACRO_MVGR", "MICRO_MVGR", "FAB",
-        }
-        # SLOC candidates: numeric (FLOAT-typed) columns not in the non_sloc set,
-        # not ending in _REQ / _MBQ / _CONT / _STK_TTL / _STR / _OPT_CNT
-        # / _DISP_Q / _WEIGHTAGE / _PER_OPT_SALE / _GRID_GROUP / _GROUP / _REM
-        # (all of which are grid-prefix calc columns, not SLOC stock).
-        bad_suffixes = ("_REQ", "_MBQ", "_CONT", "_STK_TTL", "_STR",
-                        "_OPT_CNT", "_DISP_Q", "_WEIGHTAGE", "_PER_OPT_SALE",
-                        "_GRID_GROUP", "_GROUP", "_REM", "_REASON")
-        # We need data-type info to skip non-numeric — re-query INFORMATION_SCHEMA.
-        type_rows = conn.execute(text(
-            "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE TABLE_NAME = :t"
-        ), {"t": LISTING_TABLE}).fetchall()
-        type_map = {r[0]: (r[1] or "").lower() for r in type_rows}
-        numeric_types = {"float", "real", "int", "bigint", "smallint",
-                         "tinyint", "decimal", "numeric", "money", "smallmoney"}
-        sloc_cols = []
-        for c in cols:
-            if c in non_sloc:
-                continue
-            if type_map.get(c, "") not in numeric_types:
-                continue
-            if any(c.upper().endswith(s) for s in bad_suffixes):
-                continue
-            if c.upper().startswith("H_") or c.upper().startswith("GH_"):
-                continue
-            sloc_cols.append(c)
-
-        params: Dict[str, Any] = {"mc": maj_cat}
-        where_parts = ["[MAJ_CAT] = :mc"]
-        if rdc:
-            params["rdc"] = rdc
-            where_parts.append("[RDC] = :rdc")
-        if werks:
-            params["werks"] = werks
-            where_parts.append("[WERKS] = :werks")
-        where_sql = " AND ".join(where_parts)
-
-        # Single roundtrip — sum every SLOC + STK_TTL together.
-        agg_exprs = [f"ISNULL(SUM(TRY_CAST([{c}] AS FLOAT)), 0) AS [{c}]"
-                     for c in sloc_cols]
-        agg_exprs.append("ISNULL(SUM(TRY_CAST([STK_TTL] AS FLOAT)), 0) AS [STK_TTL]")
-        sql = f"""
-            SELECT {', '.join(agg_exprs)}, COUNT(*) AS row_count
-            FROM [{LISTING_TABLE}] WITH (NOLOCK)
-            WHERE {where_sql}
-        """
-        row = conn.execute(text(sql), params).fetchone()
-        if row is None:
-            return {"success": True, "data": [], "stk_ttl": 0, "row_count": 0,
-                    "maj_cat": maj_cat, "rdc": rdc, "werks": werks}
-
-        data = []
-        for i, c in enumerate(sloc_cols):
-            qty = float(row[i] or 0)
-            if qty > 0:
-                data.append({"sloc": c, "qty": int(round(qty))})
-        # Sort descending by qty
-        data.sort(key=lambda x: x["qty"], reverse=True)
-        stk_ttl  = int(round(float(row[len(sloc_cols)] or 0)))
-        row_cnt  = int(row[len(sloc_cols) + 1] or 0)
-        return {"success": True, "data": data, "stk_ttl": stk_ttl,
-                "row_count": row_cnt, "sloc_count": len(sloc_cols),
-                "maj_cat": maj_cat, "rdc": rdc, "werks": werks}
 
 
 @router.get("/contribution")

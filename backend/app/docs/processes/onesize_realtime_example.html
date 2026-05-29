@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OneSize — Real-Time Worked Example</title>
+<style>
+  @page { size: A4; margin: 1.5cm; }
+  body { font: 11pt/1.45 -apple-system, "Segoe UI", Arial, sans-serif; color: #0f172a; max-width: 920px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 22pt; border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-top: 24px; }
+  h2 { font-size: 16pt; margin-top: 32px; color: #4f46e5; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
+  h3 { font-size: 13pt; margin-top: 24px; color: #1e293b; }
+  h4 { font-size: 11.5pt; margin-top: 16px; color: #475569; }
+  code { background: #f1f5f9; padding: 1px 5px; border-radius: 3px; font-size: 10pt; font-family: "Consolas", "Monaco", monospace; color: #1e293b; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 12px 16px; border-radius: 6px; overflow-x: auto; font-size: 9.5pt; line-height: 1.5; }
+  pre code { background: transparent; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 10pt; page-break-inside: avoid; }
+  th { background: #4f46e5; color: white; text-align: left; padding: 6px 10px; }
+  td { border: 1px solid #e2e8f0; padding: 5px 10px; }
+  tr:nth-child(even) { background: #f8fafc; }
+  .stage { border-left: 4px solid #4f46e5; background: #eef2ff; padding: 10px 14px; margin: 14px 0; border-radius: 0 4px 4px 0; page-break-inside: avoid; }
+  .stage h3 { margin-top: 0; color: #3730a3; }
+  .formula { background: #fefce8; border: 1px solid #facc15; padding: 10px 14px; border-radius: 4px; margin: 10px 0; font-family: "Consolas", monospace; font-size: 10pt; }
+  .result-box { background: #ecfdf5; border: 2px solid #10b981; padding: 10px 14px; border-radius: 4px; margin: 10px 0; font-weight: 600; }
+  .meta { color: #64748b; font-size: 10pt; margin-bottom: 24px; }
+  .badge { display: inline-block; background: #6366f1; color: white; padding: 2px 8px; border-radius: 10px; font-size: 9pt; margin: 0 4px; }
+  .input-badge { background: #06b6d4; }
+  .output-badge { background: #10b981; }
+  .table-badge { background: #f59e0b; }
+  .arrow { font-size: 14pt; color: #4f46e5; }
+  @media print { body { padding: 0; } .stage, table { break-inside: avoid; } h2 { page-break-after: avoid; } }
+</style>
+</head>
+<body>
+
+<h1>OneSize — Real-Time Worked Example</h1>
+<p class="meta">A single-row walkthrough from raw MSA data → final allocation, with every input source, formula, and intermediate value shown.</p>
+
+<h2>The Scenario</h2>
+<p>We're tracking <strong>one specific row</strong> through the full pipeline: a black polo shirt (GEN_ART 12345 / CLR BLK), size M, at store <strong>TR05</strong> in RDC <strong>DH24</strong>.</p>
+
+<table>
+  <tr><th>Identifier</th><th>Value</th></tr>
+  <tr><td>Store</td><td><code>ST_CD = TR05</code> (HAVERI) — assigned to RDC <code>DH24</code></td></tr>
+  <tr><td>Category</td><td><code>MAJCAT = M_TEES_HS</code> (Men's T-Shirts Half-Sleeve)</td></tr>
+  <tr><td>Article</td><td><code>GEN_ART = 12345</code></td></tr>
+  <tr><td>Colour</td><td><code>CLR = BLK</code></td></tr>
+  <tr><td>Size</td><td><code>SZ = M</code></td></tr>
+  <tr><td>Season</td><td><code>SSN = A</code> (All-season)</td></tr>
+  <tr><td>User inputs</td><td>count_threshold = <strong>2</strong>, qty_threshold = <strong>50</strong>, RDC = <strong>DH24</strong>, SSN = <strong>A,OC,S</strong></td></tr>
+</table>
+
+<h2>Pipeline at a Glance</h2>
+<pre><code>ARS_MSA_TOTAL  ──filter──►  applicable  ──group──►  count + fnl_q_sum  ──filter──►  passing rows
+                                                                                            │
+                       ┌────────────────────────────────────────────────────────────────────┘
+                       ▼
+              Master_ALC_INPUT_ST_MASTER  ──cross-join on RDC──►  per-store rows
+                       │
+                       ▼  Enrich: cont, DISP_Q, SAL_PD, ALC_D, ACS_D, STK_TTL,
+                       │            L7, AUTO_GEN_ART_SALE, PER_OPT_SALE, AGE
+                       ▼
+                Compute: MBQ_SZ, REQ, MAX_DAILY_SALE, SALE_VAR_ART, MBQ_VAR, VAR_REQ
+                       │
+                       ▼
+              MSA_REMAIN (pool) + ST_RANK  ──sequential allocate──►  ALLOC
+</code></pre>
+
+<h2>Stage 1–2 — Source data</h2>
+<div class="stage">
+  <h3>Stage 1: <code>latest_sequence</code> + Stage 2: <code>load_msa</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>ARS_MSA_TOTAL</code></p>
+  <p>Pulls all rows for the latest <code>sequence_id</code> filtered by SSN ∈ {A, OC, S}.</p>
+
+  <p><strong>Our row at this stage:</strong></p>
+  <table>
+    <tr><th>Field</th><th>Value</th><th>Source column</th></tr>
+    <tr><td>ST_CD</td><td>TR05</td><td>ARS_MSA_TOTAL.ST_CD</td></tr>
+    <tr><td>RDC</td><td>DH24</td><td>ARS_MSA_TOTAL.RDC</td></tr>
+    <tr><td>MAJCAT</td><td>M_TEES_HS</td><td>ARS_MSA_TOTAL.MAJCAT</td></tr>
+    <tr><td>GEN_ART</td><td>12345</td><td>ARS_MSA_TOTAL.GEN_ART</td></tr>
+    <tr><td>CLR</td><td>BLK</td><td>ARS_MSA_TOTAL.CLR</td></tr>
+    <tr><td>SZ</td><td>M</td><td>ARS_MSA_TOTAL.SZ</td></tr>
+    <tr><td>FNL_Q</td><td>4</td><td>ARS_MSA_TOTAL.FNL_Q (= STK_QTY − PEND − HOLD)</td></tr>
+    <tr><td>SSN</td><td>A</td><td>ARS_MSA_TOTAL.SSN</td></tr>
+  </table>
+</div>
+
+<h2>Stage 3 — MAJCAT applicability check</h2>
+<div class="stage">
+  <h3><code>applicable_majcats</code> + <code>filter_to_applicable</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>MASTER_SZ_APPLICABLE</code></p>
+  <p>Lookup: <code>WHERE UPPER(APPLICABLE) = 'Y'</code></p>
+  <p>Suppose <code>M_TEES_HS</code> is in the applicable list → <strong>row survives</strong>.</p>
+</div>
+
+<h2>Stages 4–5c — Combination grouping &amp; filters</h2>
+<div class="stage">
+  <h3><code>group_and_count</code></h3>
+  <div class="formula">count = COUNT(rows) per (MAJCAT, GEN_ART, CLR), broadcast per row</div>
+  <p>Suppose Polo BLK has only 2 sizes (M and L) → <code>count = 2</code></p>
+</div>
+<div class="stage">
+  <h3><code>group_fnl_q_sum</code></h3>
+  <div class="formula">fnl_q_sum = SUM(FNL_Q) per (MAJCAT, GEN_ART, CLR), broadcast per row</div>
+  <p>Polo BLK: M has FNL_Q=4, L has FNL_Q=6 → <code>fnl_q_sum = 10</code></p>
+</div>
+<div class="stage">
+  <h3><code>filter_count</code> + <code>filter_fnl_q_sum</code> + <code>filter_placeholder</code></h3>
+  <ul>
+    <li><code>count = 2 ≤ 2</code> ✓ (user threshold)</li>
+    <li><code>fnl_q_sum = 10 ≤ 50</code> ✓ (user threshold)</li>
+    <li><code>CLR = 'BLK' ≠ 'A'</code> ✓, <code>SZ = 'M' ≠ 'A'</code> ✓</li>
+  </ul>
+  <p class="result-box">Row survives → tagged <code>status = '1sz'</code></p>
+</div>
+
+<h2>Stage 6 — Load stores</h2>
+<div class="stage">
+  <h3><code>load_stores</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>Master_ALC_INPUT_ST_MASTER</code></p>
+  <div class="formula">days = SUM(SL_CVR) + SUM(INT_DAYS) + SUM(PRD_DAYS) per store</div>
+  <p>For TR05: SL_CVR=2, INT_DAYS=3, PRD_DAYS=4 → <code>days = 9</code></p>
+  <table>
+    <tr><th>ST_CD</th><th>ST_NM</th><th>RDC</th><th>SL_CVR</th><th>INT_DAYS</th><th>PRD_DAYS</th><th>days</th></tr>
+    <tr><td>TR05</td><td>HAVERI</td><td>DH24</td><td>2</td><td>3</td><td>4</td><td><strong>9</strong></td></tr>
+  </table>
+</div>
+
+<h2>Stages 7a–7b — RDC filter &amp; cross-join</h2>
+<div class="stage">
+  <h3><code>apply_rdc_filter</code> + <code>cross_join</code></h3>
+  <p>User picked <code>RDC = DH24</code>. Both MSA and stores reduced to DH24 only.</p>
+  <p>INNER JOIN on RDC. Our Polo BLK row in RDC DH24 joins with TR05 (also DH24).</p>
+  <p class="result-box">After cross-join: one row with ST_CD=TR05, ST_NM=HAVERI, RDC=DH24, days=9, MAJCAT=M_TEES_HS, GEN_ART=12345, CLR=BLK, SZ=M, count=2, fnl_q_sum=10</p>
+</div>
+
+<h2>Stage 8 — Lookup <code>cont</code> (size contribution %)</h2>
+<div class="stage">
+  <h3><code>enrich_cont</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>Master_CONT_SZ</code></p>
+  <p>Join keys: <code>(ST_CD, MAJ_CAT, SZ)</code></p>
+  <p>Lookup row: <code>(TR05, M_TEES_HS, M) → CONT = 0.5</code></p>
+  <p>(Size M accounts for 50% of category sales at this store.)</p>
+  <p class="result-box">cont = 0.5</p>
+</div>
+
+<h2>Stage 9 — DISP_Q + SAL_PD + ALC_D from <code>ARS_CALC_ST_MAJ_CAT</code></h2>
+<div class="stage">
+  <h3><code>enrich_calc_maj_cat</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>ARS_CALC_ST_MAJ_CAT</code></p>
+  <p>Join keys: <code>(ST_CD, MAJ_CAT)</code> — maj_cat grain</p>
+  <p>Lookup row: <code>(TR05, M_TEES_HS)</code></p>
+  <table>
+    <tr><th>Column</th><th>Value</th><th>Meaning</th></tr>
+    <tr><td>DISP_Q</td><td>14</td><td>Dispatch quantity</td></tr>
+    <tr><td>SAL_PD</td><td>0.6</td><td>Sales per day (maj_cat-grain baseline)</td></tr>
+    <tr><td>ALC_D</td><td>14</td><td>Allocation cover days</td></tr>
+  </table>
+</div>
+
+<h2>Stage 9a — Overwrite SAL_PD with option-grain</h2>
+<div class="stage">
+  <h3><code>enrich_sal_pd_option_grain</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>MASTER_GEN_ART_SALE</code></p>
+  <p>Join keys: <code>(ST_CD, MAJ_CAT, GEN_ART_NUMBER, CLR)</code> — option grain</p>
+  <p>Lookup: <code>(TR05, M_TEES_HS, 12345, BLK) → SAL_PD = 0.8</code></p>
+  <p>(Polo BLK specifically sells 0.8/day at TR05 — slightly higher than category baseline 0.6.)</p>
+  <p class="result-box">SAL_PD overwritten: 0.6 → <strong>0.8</strong></p>
+</div>
+
+<h2>Stage 9b — ACS_D from <code>ARS_GRID_MJ</code></h2>
+<div class="stage">
+  <h3><code>enrich_grid_mj_base</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>ARS_GRID_MJ</code></p>
+  <p>Join keys: <code>(WERKS=ST_CD, MAJ_CAT)</code></p>
+  <p>Lookup: <code>(TR05, M_TEES_HS) → ACS_D = 16</code> (fixture buffer days)</p>
+  <p class="result-box">ACS_D = 16</p>
+</div>
+
+<h2>Stage 9c — Compute <code>var_art_disp</code></h2>
+<div class="stage">
+  <h3><code>compute_var_art_disp</code></h3>
+  <div class="formula">var_art_disp = ACS_D × cont = 16 × 0.5 = <strong>8</strong></div>
+</div>
+
+<h2>Stage 10 — Compute <code>MBQ_SZ</code></h2>
+<div class="stage">
+  <h3><code>compute_mbq_sz</code></h3>
+  <div class="formula">MBQ_SZ = (DISP_Q + SAL_PD × days) × cont<br>
+       = (14 + 0.8 × 9) × 0.5<br>
+       = (14 + 7.2) × 0.5<br>
+       = 21.2 × 0.5<br>
+       = <strong>10.6 → 11 (rounded)</strong></div>
+</div>
+
+<h2>Stage 11 — STK_TTL from <code>ARS_GRID_MJ_VAR_ART</code></h2>
+<div class="stage">
+  <h3><code>enrich_grid_mj</code></h3>
+  <p><span class="badge table-badge">TABLE</span> <code>ARS_GRID_MJ_VAR_ART</code></p>
+  <p>Join keys: <code>(WERKS=ST_CD, MAJ_CAT, SZ)</code> — size grain</p>
+  <p>SUM aggregated across variants of size M.</p>
+  <p>Lookup: <code>(TR05, M_TEES_HS, M) → STK_TTL = 3</code></p>
+</div>
+
+<h2>Stage 12 — Compute <code>REQ</code></h2>
+<div class="stage">
+  <h3><code>compute_req</code></h3>
+  <div class="formula">REQ = ROUND(MAX(MBQ_SZ − STK_TTL, 0), 0)<br>
+       = MAX(11 − 3, 0)<br>
+       = <strong>8</strong></div>
+</div>
+
+<h2>Stage 13 — Compute <code>MAX_DAILY_SALE</code> (age-aware)</h2>
+<div class="stage">
+  <h3><code>enrich_listing</code> — 5 sub-steps</h3>
+
+  <h4>Step a: AUTO_GEN_ART_SALE = SAL_PD</h4>
+  <p>Just an alias: <code>AUTO_GEN_ART_SALE = 0.8</code></p>
+
+  <h4>Step b: Load L-7-day sale from <code>ARS_GRID_MJ_GEN_ART</code></h4>
+  <p>Column <code>L-7 DAYS SALE-Q = 5.6</code> for this option</p>
+  <div class="formula">L7_DAILY = 5.6 / 7 = <strong>0.8</strong></div>
+
+  <h4>Step c: Compute PER_OPT_SALE from opt-sale grid</h4>
+  <p>Active grid <code>MJ_STKD</code> has STKD_MBQ=30, STKD_DISP_Q=10 for this option.</p>
+  <div class="formula">PER_OPT_SALE = ((30 − 10) / 10 × 16) / 14<br>
+       = (2.0 × 16) / 14<br>
+       = 32 / 14<br>
+       = <strong>2.29</strong></div>
+
+  <h4>Step d: Load AGE from <code>MASTER_GEN_ART_AGE</code></h4>
+  <p>Lookup: <code>(TR05, M_TEES_HS, 12345, BLK) → AGE = 5 days</code> (a new article)</p>
+
+  <h4>Step e: Compute MAX_DAILY_SALE with AGE switch</h4>
+  <p>AGE = 5 → <code>AGE < 15</code> → use 3-input MAX</p>
+  <div class="formula">MAX_DAILY_SALE = MAX(L7_DAILY, AUTO_GEN_ART_SALE, PER_OPT_SALE)<br>
+       = MAX(0.8, 0.8, 2.29)<br>
+       = <strong>2.29</strong> &nbsp; (PER_OPT_SALE wins)</div>
+
+  <p>If AGE were ≥ 15 (old article), we'd exclude PER_OPT_SALE:</p>
+  <div class="formula">[hypothetical OLD] MAX_DAILY_SALE = MAX(0.8, 0.8) = <strong>0.8</strong></div>
+</div>
+
+<h2>Stage 14 — Compute <code>SALE_VAR_ART</code></h2>
+<div class="stage">
+  <h3><code>compute_sale_var_art</code></h3>
+  <div class="formula">SALE_VAR_ART = MAX_DAILY_SALE × cont<br>
+       = 2.29 × 0.5<br>
+       = <strong>1.145</strong></div>
+</div>
+
+<h2>Stage 15 — Compute <code>MBQ_VAR</code></h2>
+<div class="stage">
+  <h3><code>compute_mbq_var</code></h3>
+  <div class="formula">MBQ_VAR = (MAX_DAILY_SALE × days) + ACS_D<br>
+       = (2.29 × 9) + 16<br>
+       = 20.61 + 16<br>
+       = 36.61<br>
+       = <strong>37 (rounded)</strong></div>
+</div>
+
+<h2>Stage 16 — Compute <code>VAR_REQ</code></h2>
+<div class="stage">
+  <h3><code>compute_var_req</code></h3>
+  <div class="formula">VAR_REQ = ROUND(MAX(MBQ_VAR − STK_TTL, 0), 0)<br>
+       = MAX(37 − 3, 0)<br>
+       = <strong>34</strong></div>
+</div>
+
+<h2>Stage 17 — Load MSA_REMAIN pool + ST_RANK</h2>
+<div class="stage">
+  <h3><code>enrich_msa_remain_and_rank</code></h3>
+
+  <h4>Part A — MSA_REMAIN (warehouse pool for this size in this RDC)</h4>
+  <p><span class="badge table-badge">TABLE</span> <code>ARS_MSA_TOTAL</code> re-aggregated</p>
+  <div class="formula">MSA_REMAIN = SUM(FNL_Q) across all SLOCs<br>
+       per (RDC, MAJ_CAT, GEN_ART, CLR, SZ)</div>
+  <p>For (DH24, M_TEES_HS, 12345, BLK, M) → <strong>MSA_REMAIN = 12 units</strong> in the warehouse</p>
+
+  <h4>Part B — ST_RANK</h4>
+  <p><span class="badge table-badge">TABLE</span> <code>ARS_STORE_RANKING</code></p>
+  <p>Join: <code>(ST_CD, MAJ_CAT)</code> → Lookup: <code>(TR05, M_TEES_HS) → ST_RANK = 3</code></p>
+  <p>(TR05 is the 3rd-priority store for this category.)</p>
+</div>
+
+<h2>Stage 18 — Allocate (strict)</h2>
+<div class="stage">
+  <h3><code>compute_allocation</code></h3>
+  <p>Pool: <code>(DH24, M_TEES_HS, 12345, BLK, M)</code> has 4 stores, all ranked.</p>
+  <table>
+    <tr><th>POOL_POS</th><th>ST_CD</th><th>ST_RANK</th><th>REQ</th><th>VAR_REQ</th><th>Available pool</th><th>ALLOC</th><th>DEMAND_SRC</th></tr>
+    <tr><td>1</td><td>TR01</td><td>1</td><td>10</td><td>30</td><td>12</td><td><strong>10</strong> (MIN(10,30,12))</td><td>BOTH</td></tr>
+    <tr><td>2</td><td>TR02</td><td>2</td><td>0</td><td>15</td><td>2</td><td>0</td><td>NO_REQ</td></tr>
+    <tr style="background:#fef3c7"><td><strong>3</strong></td><td><strong>TR05</strong></td><td><strong>3</strong></td><td><strong>8</strong></td><td><strong>34</strong></td><td><strong>2</strong></td><td><strong>2</strong> (MIN(8,34,2))</td><td><strong>BOTH</strong></td></tr>
+    <tr><td>4</td><td>TR07</td><td>NaN</td><td>5</td><td>10</td><td>0</td><td>0</td><td>POOL_EMPTY</td></tr>
+  </table>
+  <p>Our TR05 row gets allocated <strong>2 units</strong> (capped by what's left after TR01 took 10).</p>
+  <p class="result-box">ALLOC = 2 &nbsp; • &nbsp; REMAIN_AFTER = 0 &nbsp; • &nbsp; DEMAND_SRC = BOTH &nbsp; • &nbsp; POOL_POS = 3</p>
+</div>
+
+<h2>Final Row in the Result CSV</h2>
+<table>
+  <tr><th>Column</th><th>Value</th><th>Where it came from</th></tr>
+  <tr><td>ST_CD</td><td>TR05</td><td>Master_ALC_INPUT_ST_MASTER</td></tr>
+  <tr><td>ST_NM</td><td>HAVERI</td><td>Master_ALC_INPUT_ST_MASTER</td></tr>
+  <tr><td>RDC</td><td>DH24</td><td>Master_ALC_INPUT_ST_MASTER</td></tr>
+  <tr><td>ST_RANK</td><td>3</td><td>ARS_STORE_RANKING</td></tr>
+  <tr><td>days</td><td>9</td><td>SL_CVR + INT_DAYS + PRD_DAYS</td></tr>
+  <tr><td>MAJCAT</td><td>M_TEES_HS</td><td>ARS_MSA_TOTAL</td></tr>
+  <tr><td>GEN_ART</td><td>12345</td><td>ARS_MSA_TOTAL</td></tr>
+  <tr><td>CLR</td><td>BLK</td><td>ARS_MSA_TOTAL</td></tr>
+  <tr><td>SZ</td><td>M</td><td>ARS_MSA_TOTAL</td></tr>
+  <tr><td>count</td><td>2</td><td>Derived: rows per (MAJCAT, GEN_ART, CLR)</td></tr>
+  <tr><td>fnl_q_sum</td><td>10</td><td>Derived: SUM(FNL_Q) per combo</td></tr>
+  <tr><td>cont</td><td>0.5</td><td>Master_CONT_SZ</td></tr>
+  <tr><td>DISP_Q</td><td>14</td><td>ARS_CALC_ST_MAJ_CAT</td></tr>
+  <tr><td>SAL_PD</td><td>0.8</td><td>MASTER_GEN_ART_SALE (overwrites maj_cat 0.6)</td></tr>
+  <tr><td>ALC_D</td><td>14</td><td>ARS_CALC_ST_MAJ_CAT</td></tr>
+  <tr><td>MBQ_SZ</td><td>11</td><td>(DISP_Q + SAL_PD × days) × cont</td></tr>
+  <tr><td>ACS_D</td><td>16</td><td>ARS_GRID_MJ</td></tr>
+  <tr><td>var_art_disp</td><td>8</td><td>ACS_D × cont</td></tr>
+  <tr><td>OPT_GRID_MBQ</td><td>30</td><td>ARS_GRID_MJ_STKD</td></tr>
+  <tr><td>OPT_GRID_DISP_Q</td><td>10</td><td>ARS_GRID_MJ_STKD</td></tr>
+  <tr><td>PER_OPT_SALE</td><td>2.29</td><td>((MBQ − DISP_Q)/DISP_Q × ACS_D) / ALC_D</td></tr>
+  <tr><td>L7_DAILY</td><td>0.8</td><td>ARS_GRID_MJ_GEN_ART (L-7 ÷ 7)</td></tr>
+  <tr><td>AUTO_GEN_ART_SALE</td><td>0.8</td><td>alias for SAL_PD</td></tr>
+  <tr><td>AGE</td><td>5</td><td>MASTER_GEN_ART_AGE</td></tr>
+  <tr><td>MAX_DAILY_SALE</td><td>2.29</td><td>AGE&lt;15 → MAX(L7, AUTO, PER_OPT)</td></tr>
+  <tr><td>SALE_VAR_ART</td><td>1.145</td><td>MAX_DAILY_SALE × cont</td></tr>
+  <tr><td>MBQ_VAR</td><td>37</td><td>(MAX_DAILY_SALE × days) + ACS_D</td></tr>
+  <tr><td>STK_TTL</td><td>3</td><td>ARS_GRID_MJ_VAR_ART</td></tr>
+  <tr><td>REQ</td><td>8</td><td>MAX(MBQ_SZ − STK_TTL, 0)</td></tr>
+  <tr><td>VAR_REQ</td><td>34</td><td>MAX(MBQ_VAR − STK_TTL, 0)</td></tr>
+  <tr><td>MSA_REMAIN</td><td>12</td><td>SUM(FNL_Q) per pool</td></tr>
+  <tr><td>POOL_POS</td><td>3</td><td>Position in pool after rank sort</td></tr>
+  <tr style="background:#dcfce7"><td><strong>ALLOC</strong></td><td><strong>2</strong></td><td>MIN(VAR_REQ, REQ, remaining)</td></tr>
+  <tr><td>REMAIN_AFTER</td><td>0</td><td>Pool drained after this row</td></tr>
+  <tr><td>DEMAND_SRC</td><td>BOTH</td><td>Both REQ and VAR_REQ were positive</td></tr>
+  <tr><td>status</td><td>1sz</td><td>Tag for OneSize-qualifying row</td></tr>
+</table>
+
+<h2>Reading the Result</h2>
+<p>One row produced one shipment decision: <strong>ship 2 units of Polo BLK size M to store TR05</strong>.</p>
+<ul>
+  <li>The system thought TR05 needs 34 units variant-wise (VAR_REQ) and 8 units size-wise (REQ).</li>
+  <li>It would have shipped MIN(34, 8) = 8 — but the warehouse only had 2 left after higher-ranked stores took theirs.</li>
+  <li>So TR05 got 2 — the most it could.</li>
+  <li>Subsequent (lower-ranked) stores in this pool will get 0 (POOL_EMPTY).</li>
+</ul>
+
+<h2>Tables Referenced (Summary)</h2>
+<table>
+  <tr><th>Table</th><th>What we read</th><th>Used in stage</th></tr>
+  <tr><td>ARS_MSA_TOTAL</td><td>Source data + pool aggregation (FNL_Q)</td><td>2, 17</td></tr>
+  <tr><td>MASTER_SZ_APPLICABLE</td><td>MAJCAT eligibility flag</td><td>3</td></tr>
+  <tr><td>Master_ALC_INPUT_ST_MASTER</td><td>Stores + RDC + days</td><td>6</td></tr>
+  <tr><td>Master_CONT_SZ</td><td>Size contribution %</td><td>8</td></tr>
+  <tr><td>ARS_CALC_ST_MAJ_CAT</td><td>DISP_Q, SAL_PD, ALC_D</td><td>9</td></tr>
+  <tr><td>MASTER_GEN_ART_SALE</td><td>Option-grain SAL_PD</td><td>9a</td></tr>
+  <tr><td>ARS_GRID_MJ</td><td>ACS_D</td><td>9b</td></tr>
+  <tr><td>ARS_GRID_MJ_VAR_ART</td><td>STK_TTL</td><td>11</td></tr>
+  <tr><td>ARS_GRID_MJ_GEN_ART</td><td>L-7-day sale</td><td>13</td></tr>
+  <tr><td>ARS_GRID_BUILDER + ARS_GRID_&lt;active&gt;</td><td>Opt-grid MBQ + DISP_Q</td><td>13</td></tr>
+  <tr><td>MASTER_GEN_ART_AGE</td><td>Article age</td><td>13</td></tr>
+  <tr><td>ARS_STORE_RANKING</td><td>Per-MAJCAT store rank</td><td>17</td></tr>
+</table>
+
+<h2>To Print as PDF</h2>
+<p style="font-size:11pt; color:#475569; background:#f1f5f9; padding:12px; border-radius:4px;">
+1. Open this HTML in any browser (double-click the file)<br>
+2. Press <code>Ctrl+P</code> (or <code>Cmd+P</code>)<br>
+3. Choose "Save as PDF" as the destination<br>
+4. The print CSS in the page header formats it for A4 with page breaks
+</p>
+
+<p style="text-align:center; color:#94a3b8; margin-top:32px; font-size:9pt;">ARS — OneSize Module — Real-time Worked Example</p>
+</body>
+</html>

@@ -57,18 +57,19 @@ def run_multilevel_allocation(
     var_grid_table: str = "ARS_GRID_MJ_VAR_ART",
     cont_table: str = "Master_CONT_SZ",
     threshold: float = 0.6,
+    enable_fallback: bool = False,
+    fallback_boost_mode: str = "static",
+    static_growth_pct: float = 130.0,
+    str_tiers: str = "30:150,45:130,60:120,90:110",
     min_size_count: int = 3,
 ) -> Dict:
     """
     Run multi-level allocation with live eligibility checks and status tracking.
-    Returns dict with: alloc_rows, phases, skipped_opts, duration_sec.
-
-    NOTE: legacy reference allocator — not used by the live pipeline. Fallback
-    support was stripped 2026-05-16; see fallback_archived.md.
+    Returns dict with: alloc_rows, phases, skipped_opts, fallback_levels, duration_sec
     """
     t0 = time.time()
     result = {"alloc_rows": 0, "phases": [], "skipped_opts": 0,
-              "ineligible_opts": 0}
+              "fallback_levels": 0, "ineligible_opts": 0}
 
     if not _exists(conn, final_table) or not _exists(conn, msa_var_table):
         logger.info(f"Skipped allocation: missing {final_table} or {msa_var_table}")
@@ -105,6 +106,16 @@ def run_multilevel_allocation(
     # ── Step 6: Primary allocation (RL → TBC → TBL, I_ROD rounds) ────
     primary_result = _run_primary(conn, alloc_table, final_table, threshold, min_size_count=min_size_count)
     result["phases"].append({"pass": "PRIMARY", **primary_result})
+
+    # ── Step 7: Fallback (optional) ───────────────────────────────────
+    if enable_fallback:
+        fb_result = _run_fallback(conn, final_table, alloc_table, threshold,
+                                  boost_mode=fallback_boost_mode,
+                                  static_pct=static_growth_pct,
+                                  str_tiers=str_tiers,
+                                  min_size_count=min_size_count)
+        result["phases"].append({"pass": "FALLBACK", **fb_result})
+        result["fallback_levels"] = fb_result.get("levels", 0)
 
     # ── Step 8: Reflect to working table + final status ───────────────
     _reflect_to_working(conn, final_table, alloc_table)
@@ -178,17 +189,6 @@ def _create_alloc_working(conn, final_table, alloc_table, msa_var_table) -> int:
         WHERE W.[ALLOC_FLAG] = 1
           AND TRY_CAST(V.[FNL_Q] AS FLOAT) > 0
     """)
-    # Sanitize PAK_SZ once at source: NULL / 0 / negative → 1 (one-carton).
-    # Bad data from the master variant table used to silently zero rows in the
-    # PAK_SZ gate (req < 0.5*0 is always false, but COALESCE(NULLIF(...),1)
-    # only protected the gate expression — the column itself stayed NULL and
-    # downstream UI / reports saw junk).  Fixing the column once makes every
-    # downstream consumer see consistent data.
-    _run(conn, f"""
-        UPDATE [{alloc_table}]
-        SET [PAK_SZ] = 1
-        WHERE [PAK_SZ] IS NULL OR [PAK_SZ] <= 0
-    """)
     return conn.execute(text(f"SELECT COUNT(*) FROM [{alloc_table}]")).scalar() or 0
 
 
@@ -207,13 +207,8 @@ def _enrich_variant_stock(conn, alloc_table, var_grid_table):
         gcols = {c.upper() for c in _get_cols(conn, var_grid_table)}
         var_col = next((c for c in ("VAR_ART", "ARTICLE_NUMBER", "GEN_ART") if c in gcols), None)
         if "STK_TTL" in gcols and "WERKS" in gcols and "MAJ_CAT" in gcols and var_col:
-            # Clamp negative variant stock to 0 so SZ_REQ math doesn't treat a
-            # negative balance as extra demand.
             _run(conn, f"""
-                UPDATE A SET A.[STK_TTL] = CASE
-                    WHEN TRY_CAST(G.[STK_TTL] AS FLOAT) < 0 THEN 0
-                    ELSE TRY_CAST(G.[STK_TTL] AS FLOAT)
-                END
+                UPDATE A SET A.[STK_TTL] = TRY_CAST(G.[STK_TTL] AS FLOAT)
                 FROM [{alloc_table}] A
                 INNER JOIN [{var_grid_table}] G WITH (NOLOCK)
                     ON G.[WERKS] = A.[WERKS] AND G.[MAJ_CAT] = A.[MAJ_CAT]
@@ -306,43 +301,22 @@ def _calc_sz_mbq_req(conn, alloc_table, new_only: bool = False):
     SZ_REQ is kept for ALLOC/HOLD split at commit time.
     When new_only=True, only update rows that have never been allocated
     (protects already-allocated rows during fallback from SZ_REQ reset).
-
-    Floor-to-1 rule: when CONT>0 and OPT_MBQ>0 (or OPT_MBQ_WH>0) but
-    ROUND(OPT_MBQ × CONT, 0) underflows to 0, force SZ_MBQ (resp.
-    SZ_MBQ_WH) to 1 so a non-zero contribution share always ships at
-    least one piece. Genuinely-zero MBQ rows stay at 0.
     """
     where_extra = ""
     if new_only:
         where_extra = "WHERE ISNULL([ALLOC_QTY], 0) = 0 AND ISNULL([ALLOC_ROUND], 0) = 0"
     _run(conn, f"""
         UPDATE [{alloc_table}]
-        SET [SZ_MBQ] = CASE
-                WHEN ISNULL([CONT], 0) > 0
-                     AND ISNULL([OPT_MBQ], 0) > 0
-                     AND ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0) = 0
-                    THEN 1
-                ELSE ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0)
-            END,
-            [SZ_MBQ_WH] = CASE
-                WHEN ISNULL([CONT], 0) > 0
-                     AND ISNULL([OPT_MBQ_WH], 0) > 0
-                     AND ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0) = 0
-                    THEN 1
-                ELSE ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0)
-            END
-        {where_extra}
-    """)
-    _run(conn, f"""
-        UPDATE [{alloc_table}]
-        SET [SZ_REQ] = CASE
-                WHEN ISNULL([SZ_MBQ], 0) - ISNULL([STK_TTL], 0) > 0
-                    THEN ISNULL([SZ_MBQ], 0) - ISNULL([STK_TTL], 0)
+        SET [SZ_MBQ] = ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0),
+            [SZ_REQ] = CASE
+                WHEN ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0) > 0
+                    THEN ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0)
                 ELSE 0
             END,
+            [SZ_MBQ_WH] = ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0),
             [SZ_REQ_WH] = CASE
-                WHEN ISNULL([SZ_MBQ_WH], 0) - ISNULL([STK_TTL], 0) > 0
-                    THEN ISNULL([SZ_MBQ_WH], 0) - ISNULL([STK_TTL], 0)
+                WHEN ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0) > 0
+                    THEN ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0)
                 ELSE 0
             END
         {where_extra}
@@ -963,38 +937,22 @@ def _scale_demand_for_round(conn, alloc_table, opt_type: str, round_num: int):
 
     _run(conn, f"""
         UPDATE [{alloc_table}]
-        SET [SZ_MBQ] = CASE
-                WHEN ISNULL([CONT], 0) > 0
-                     AND ISNULL([OPT_MBQ], 0) > 0
-                     AND ROUND(ISNULL([OPT_MBQ], 0) * :rnd * ISNULL([CONT], 0), 0) = 0
-                    THEN 1
-                ELSE ROUND(ISNULL([OPT_MBQ], 0) * :rnd * ISNULL([CONT], 0), 0)
-            END,
-            [SZ_MBQ_WH] = CASE
-                WHEN ISNULL([CONT], 0) > 0
-                     AND ISNULL([OPT_MBQ_WH], 0) > 0
-                     AND ROUND(ISNULL([OPT_MBQ_WH], 0) * :rnd * ISNULL([CONT], 0), 0) = 0
-                    THEN 1
-                ELSE ROUND(ISNULL([OPT_MBQ_WH], 0) * :rnd * ISNULL([CONT], 0), 0)
-            END
-        WHERE [OPT_TYPE] = :ot
-          AND ISNULL(CAST([I_ROD] AS INT), 1) >= :rnd
-          AND ISNULL([SKIP_FLAG], 0) = 0
-    """, {"ot": opt_type, "rnd": round_num})
-    _run(conn, f"""
-        UPDATE [{alloc_table}]
-        SET [SZ_REQ] = CASE
-                WHEN ISNULL([SZ_MBQ], 0)
+        SET [SZ_MBQ] = ROUND(ISNULL([OPT_MBQ], 0) * :rnd * ISNULL([CONT], 0), 0),
+            [SZ_REQ] = CASE
+                WHEN (ISNULL([OPT_MBQ], 0) * :rnd * ISNULL([CONT], 0))
                      - ISNULL([STK_TTL], 0) - ISNULL([ALLOC_QTY], 0) - ISNULL([HOLD_QTY], 0) > 0
-                THEN ISNULL([SZ_MBQ], 0)
-                     - ISNULL([STK_TTL], 0) - ISNULL([ALLOC_QTY], 0) - ISNULL([HOLD_QTY], 0)
+                THEN ROUND(
+                    (ISNULL([OPT_MBQ], 0) * :rnd * ISNULL([CONT], 0))
+                    - ISNULL([STK_TTL], 0) - ISNULL([ALLOC_QTY], 0) - ISNULL([HOLD_QTY], 0), 0)
                 ELSE 0
             END,
+            [SZ_MBQ_WH] = ROUND(ISNULL([OPT_MBQ_WH], 0) * :rnd * ISNULL([CONT], 0), 0),
             [SZ_REQ_WH] = CASE
-                WHEN ISNULL([SZ_MBQ_WH], 0)
+                WHEN (ISNULL([OPT_MBQ_WH], 0) * :rnd * ISNULL([CONT], 0))
                      - ISNULL([STK_TTL], 0) - ISNULL([ALLOC_QTY], 0) - ISNULL([HOLD_QTY], 0) > 0
-                THEN ISNULL([SZ_MBQ_WH], 0)
-                     - ISNULL([STK_TTL], 0) - ISNULL([ALLOC_QTY], 0) - ISNULL([HOLD_QTY], 0)
+                THEN ROUND(
+                    (ISNULL([OPT_MBQ_WH], 0) * :rnd * ISNULL([CONT], 0))
+                    - ISNULL([STK_TTL], 0) - ISNULL([ALLOC_QTY], 0) - ISNULL([HOLD_QTY], 0), 0)
                 ELSE 0
             END
         WHERE [OPT_TYPE] = :ot
@@ -1532,6 +1490,303 @@ def _allocate_batch_round(
 
     result["seconds"] = round(time.time() - t0, 1)
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FALLBACK BOOST HELPER
+# ═══════════════════════════════════════════════════════════════════════
+
+def _apply_fallback_boost(conn, alloc_table, final_table, boost_mode, static_pct, str_tiers="30:150,45:130,60:120,90:110"):
+    """Boost demand during fallback. Modes: full_mbq, sales_only, str."""
+    # Backward compat: "static" → "full_mbq"
+    if boost_mode == "static":
+        boost_mode = "full_mbq"
+    if boost_mode == "str":
+        # Parse configurable tiers
+        tiers = []
+        for tier in str_tiers.split(","):
+            parts = tier.strip().split(":")
+            if len(parts) == 2:
+                tiers.append((float(parts[0]), float(parts[1])))
+        tiers.sort(key=lambda x: x[0])  # sort by days ascending
+
+        # Build dynamic CASE WHEN
+        case_parts = []
+        # First: if STR/7 = 0, can't calculate -> use static fallback
+        case_parts.append(f"""
+            WHEN ISNULL(TRY_CAST(W.[STR] AS FLOAT), 0) / 7.0 <= 0
+                THEN {static_pct}""")
+        for days, pct in tiers:
+            case_parts.append(f"""
+            WHEN ISNULL(W.[STK_TTL], 0) / (TRY_CAST(W.[STR] AS FLOAT) / 7.0) < {days}
+                THEN {pct}""")
+        case_parts.append("\n            ELSE 100")
+        case_sql = "".join(case_parts)
+
+        _run(conn, f"""
+            UPDATE A SET A.[STR_BOOST_PCT] = CASE {case_sql} END
+            FROM [{alloc_table}] A
+            INNER JOIN [{final_table}] W
+                ON A.[WERKS] = W.[WERKS] AND A.[MAJ_CAT] = W.[MAJ_CAT]
+                AND A.[GEN_ART_NUMBER] = W.[GEN_ART_NUMBER] AND A.[CLR] = W.[CLR]
+            WHERE ISNULL(A.[ALLOC_ROUND], 0) = 0 AND ISNULL(A.[ALLOC_QTY], 0) = 0
+        """)
+    else:
+        _run(conn, f"""
+            UPDATE [{alloc_table}] SET [STR_BOOST_PCT] = {static_pct}
+            WHERE ISNULL([ALLOC_ROUND], 0) = 0 AND ISNULL([ALLOC_QTY], 0) = 0
+        """)
+
+    # Apply boost: increase OPT_MBQ/OPT_MBQ_WH, then recalculate SZ columns
+    # Two modes:
+    #   full_mbq/static: OPT_MBQ × growth% (everything boosted)
+    #   sales_only:      ACS_D + (OPT_MBQ - ACS_D) × growth% (only velocity boosted)
+    new_only_filter = "WHERE ISNULL([ALLOC_ROUND], 0) = 0 AND ISNULL([ALLOC_QTY], 0) = 0 AND ISNULL([STR_BOOST_PCT], 100) > 100"
+    if boost_mode == "sales_only":
+        # sales_only: ACS_D stays fixed, only (OPT_MBQ - ACS_D) = rate×ALC_D gets boosted
+        _run(conn, f"""
+            UPDATE [{alloc_table}]
+            SET [OPT_MBQ]    = ROUND(ISNULL([ACS_D], 0)
+                + (ISNULL([OPT_MBQ], 0) - ISNULL([ACS_D], 0)) * ISNULL([STR_BOOST_PCT], 100) / 100.0, 0),
+                [OPT_MBQ_WH] = ROUND(ISNULL([ACS_D], 0)
+                + (ISNULL([OPT_MBQ_WH], 0) - ISNULL([ACS_D], 0)) * ISNULL([STR_BOOST_PCT], 100) / 100.0, 0)
+            {new_only_filter}
+        """)
+    else:
+        # full_mbq (default): entire MBQ × growth%
+        _run(conn, f"""
+            UPDATE [{alloc_table}]
+            SET [OPT_MBQ]    = ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([STR_BOOST_PCT], 100) / 100.0, 0),
+                [OPT_MBQ_WH] = ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([STR_BOOST_PCT], 100) / 100.0, 0)
+            {new_only_filter}
+        """)
+    # Recalculate SZ_MBQ/SZ_REQ + SZ_MBQ_WH/SZ_REQ_WH from boosted OPT_MBQ/WH
+    _run(conn, f"""
+        UPDATE [{alloc_table}]
+        SET [SZ_MBQ] = ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0),
+            [SZ_REQ] = CASE
+                WHEN ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0) > 0
+                THEN ROUND(ISNULL([OPT_MBQ], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0)
+                ELSE 0 END,
+            [SZ_MBQ_WH] = ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0),
+            [SZ_REQ_WH] = CASE
+                WHEN ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0) > 0
+                THEN ROUND(ISNULL([OPT_MBQ_WH], 0) * ISNULL([CONT], 0), 0) - ISNULL([STK_TTL], 0)
+                ELSE 0 END
+        {new_only_filter}
+    """)
+    # Also update OPT_REQ_WH on the working table for consistency
+    _run(conn, f"""
+        UPDATE W SET
+            W.[OPT_MBQ] = ROUND(ISNULL(W.[OPT_MBQ], 0) * ISNULL(A.[STR_BOOST_PCT], 100) / 100.0, 0),
+            W.[OPT_REQ_WH] = CASE
+                WHEN ROUND(ISNULL(W.[OPT_MBQ], 0) * ISNULL(A.[STR_BOOST_PCT], 100) / 100.0, 0)
+                     - ISNULL(W.[STK_TTL], 0) > 0
+                THEN ROUND(ISNULL(W.[OPT_MBQ], 0) * ISNULL(A.[STR_BOOST_PCT], 100) / 100.0, 0)
+                     - ISNULL(W.[STK_TTL], 0)
+                ELSE 0 END
+        FROM [{final_table}] W
+        INNER JOIN (
+            SELECT DISTINCT [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR], MAX([STR_BOOST_PCT]) AS STR_BOOST_PCT
+            FROM [{alloc_table}]
+            WHERE ISNULL([STR_BOOST_PCT], 100) > 100
+            GROUP BY [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR]
+        ) A ON W.[WERKS] = A.[WERKS] AND W.[MAJ_CAT] = A.[MAJ_CAT]
+           AND W.[GEN_ART_NUMBER] = A.[GEN_ART_NUMBER] AND W.[CLR] = A.[CLR]
+    """)
+
+    boosted = conn.execute(text(f"""
+        SELECT COUNT(*) FROM [{alloc_table}]
+        WHERE ISNULL([STR_BOOST_PCT], 100) > 100
+          AND ISNULL([ALLOC_ROUND], 0) = 0
+    """)).scalar() or 0
+    logger.info(f"Fallback boost: mode={boost_mode}, boosted {boosted} rows (OPT_MBQ increased, SZ_MBQ/SZ_REQ recalculated)")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  STEP 7: FALLBACK — GRID DEMOTION
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_fallback(conn, final_table, alloc_table, threshold,
+                  boost_mode="static", static_pct=130.0,
+                  str_tiers="30:150,45:130,60:120,90:110",
+                  min_size_count: int = 3) -> Dict:
+    """
+    Demote last primary grid → secondary, one level at a time.
+    Re-check ALLOC_FLAG, run allocation for ONLY newly eligible OPTs.
+    Grid seq=1 always stays primary.
+
+    Key safeguards:
+      - Tracks demoted grids to restore ONLY those (not originally Secondary)
+      - Re-eligibility uses condition checks (not string matching)
+      - Enrichment uses new_only=True to protect already-allocated rows
+      - _run_primary(only_new=True) skips already-processed OPTs
+      - Calls _enrich_variant_stock for new rows (STK_TTL)
+    """
+    stats = {"levels": 0, "newly_eligible": 0, "allocated": 0}
+
+    if not _exists(conn, "ARS_GRID_BUILDER"):
+        return stats
+
+    primary_grids = conn.execute(text("""
+        SELECT grid_name, hierarchy_columns, seq, ISNULL(grid_group, 'None') AS grid_group
+        FROM [ARS_GRID_BUILDER]
+        WHERE UPPER(status) = 'ACTIVE'
+          AND ISNULL(grid_group, 'None') = 'Primary'
+        ORDER BY seq DESC
+    """)).fetchall()
+
+    if len(primary_grids) <= 1:
+        logger.info("Fallback: only 1 primary grid (seq=1), no demotion possible")
+        return stats
+
+    # Track which grids WE demote (so we only restore those, not originals)
+    demoted_grids = []
+
+    for grid in primary_grids:
+        gname, ghier_json, seq, _ = grid
+
+        if seq <= 1:
+            break
+
+        stats["levels"] += 1
+        demoted_grids.append(gname)
+        logger.info(f"Fallback level {stats['levels']}: demoting {gname} (seq={seq}) to Secondary")
+
+        _run(conn, """
+            UPDATE [ARS_GRID_BUILDER] SET grid_group = 'Secondary'
+            WHERE grid_name = :gn
+        """, {"gn": gname})
+
+        _recalc_alloc_flag(conn, final_table)
+
+        # ── Re-mark eligibility: condition-based (not string matching) ──
+        # Only re-enable rows where ALLOC_FLAG just became 1 AND
+        # all other eligibility checks still pass
+        lvl = stats["levels"]
+        _run(conn, f"""
+            UPDATE [{final_table}]
+            SET [ALLOC_STATUS] = 'PENDING',
+                [ALLOC_REMARKS] = ISNULL([ALLOC_REMARKS], '')
+                    + 'FALLBACK_LVL={lvl}:ALLOC_FLAG->1; '
+            WHERE [ALLOC_FLAG] = 1
+              AND [ALLOC_STATUS] = 'INELIGIBLE'
+              AND ISNULL(TRY_CAST([LISTING] AS INT), 1) = 1
+              AND ISNULL([OPT_TYPE], '') != 'MIX'
+              AND ISNULL(TRY_CAST([MSA_FNL_Q] AS FLOAT), 0) > 0
+              AND ISNULL(TRY_CAST([OPT_REQ_WH] AS FLOAT), 0) >= 1
+        """)
+
+        # ── Count newly eligible OPTs (PENDING + not yet in alloc_table) ──
+        new_opts = conn.execute(text(f"""
+            SELECT COUNT(*)
+            FROM [{final_table}] W
+            WHERE W.[ALLOC_FLAG] = 1
+              AND W.[ALLOC_STATUS] = 'PENDING'
+              AND NOT EXISTS (
+                  SELECT 1 FROM [{alloc_table}] A
+                  WHERE A.[WERKS] = W.[WERKS] AND A.[MAJ_CAT] = W.[MAJ_CAT]
+                    AND A.[GEN_ART_NUMBER] = W.[GEN_ART_NUMBER] AND A.[CLR] = W.[CLR]
+              )
+        """)).scalar() or 0
+
+        if new_opts == 0:
+            logger.info(f"Fallback level {stats['levels']}: no newly eligible OPTs, continuing")
+            continue
+
+        stats["newly_eligible"] += new_opts
+        logger.info(f"Fallback level {stats['levels']}: {new_opts} newly eligible OPTs")
+
+        # ── Insert newly eligible into alloc_table ────────────────────
+        _run(conn, f"""
+            INSERT INTO [{alloc_table}]
+            ([WERKS],[RDC],[MAJ_CAT],[GEN_ART_NUMBER],[CLR],
+             [GEN_ART_DESC],[OPT_TYPE],[ST_RANK],[ACS_D],[ALC_D],[I_ROD],
+             [OPT_MBQ],[OPT_REQ],[OPT_MBQ_WH],[OPT_REQ_WH],
+             [MAX_DAILY_SALE],[ALLOC_FLAG],
+             [FOCUS_W_CAP],[FOCUS_WO_CAP],
+             [PRI_CT%],[SEC_CT%],
+             [CLR_MIN],[CLR_MAX],
+             [VAR_ART],[VAR_DESC],[SZ],[MRP],[PAK_SZ],
+             [FNL_Q],[STK_QTY],[PEND_QTY],[VAR_RDC],[VAR_FAB],[VAR_SSN],
+             [STK_TTL],[CONT],[SZ_MBQ],[SZ_REQ],
+             [ALLOC_QTY],[ALLOC_ROUND],[SKIP_FLAG],[ROUND_ALLOC],
+             [ALLOC_STATUS],[SKIP_REASON])
+            SELECT
+                W.[WERKS], W.[RDC], W.[MAJ_CAT], W.[GEN_ART_NUMBER], W.[CLR],
+                W.[GEN_ART_DESC], W.[OPT_TYPE], W.[ST_RANK], W.[ACS_D], W.[ALC_D], W.[I_ROD],
+                W.[OPT_MBQ], W.[OPT_REQ], W.[OPT_MBQ_WH], W.[OPT_REQ_WH],
+                W.[MAX_DAILY_SALE], W.[ALLOC_FLAG],
+                W.[FOCUS_W_CAP], W.[FOCUS_WO_CAP],
+                W.[PRI_CT%], W.[SEC_CT%],
+                W.[CLR_MIN], W.[CLR_MAX],
+                V.[ARTICLE_NUMBER], V.[ARTICLE_DESC], V.[SZ], V.[MRP], V.[PAK_SZ],
+                TRY_CAST(V.[FNL_Q] AS FLOAT), TRY_CAST(V.[STK_QTY] AS FLOAT),
+                TRY_CAST(V.[PEND_QTY] AS FLOAT),
+                V.[RDC], V.[FAB], V.[SSN],
+                0, 0, 0, 0,   -- STK_TTL, CONT, SZ_MBQ, SZ_REQ (enriched below)
+                0, 0, 0, 0,   -- ALLOC_QTY, ALLOC_ROUND, SKIP_FLAG, ROUND_ALLOC
+                'PENDING', NULL  -- ALLOC_STATUS, SKIP_REASON
+            FROM [{final_table}] W
+            INNER JOIN [ARS_MSA_VAR_ART] V WITH (NOLOCK)
+                ON  W.[MAJ_CAT] = LTRIM(RTRIM(CAST(V.[MAJ_CAT] AS NVARCHAR(200))))
+                AND W.[GEN_ART_NUMBER] = TRY_CAST(TRY_CAST(V.[GEN_ART_NUMBER] AS FLOAT) AS BIGINT)
+                AND W.[CLR] = LTRIM(RTRIM(CAST(V.[CLR] AS NVARCHAR(200))))
+                AND LTRIM(RTRIM(CAST(W.[RDC] AS NVARCHAR(50)))) = LTRIM(RTRIM(CAST(V.[RDC] AS NVARCHAR(50))))
+            WHERE W.[ALLOC_FLAG] = 1
+              AND W.[ALLOC_STATUS] = 'PENDING'
+              AND TRY_CAST(V.[FNL_Q] AS FLOAT) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM [{alloc_table}] A
+                  WHERE A.[WERKS] = W.[WERKS] AND A.[MAJ_CAT] = W.[MAJ_CAT]
+                    AND A.[GEN_ART_NUMBER] = W.[GEN_ART_NUMBER] AND A.[CLR] = W.[CLR]
+                    AND A.[VAR_ART] = V.[ARTICLE_NUMBER] AND A.[SZ] = V.[SZ]
+              )
+        """)
+
+        # ── Enrich new rows (new_only=True protects existing rows) ────
+        _enrich_variant_stock(conn, alloc_table, "ARS_GRID_MJ_VAR_ART")
+        _enrich_size_cont(conn, alloc_table, "Master_CONT_SZ")
+        _calc_sz_mbq_req(conn, alloc_table, new_only=True)
+        _apply_fallback_boost(conn, alloc_table, final_table, boost_mode, static_pct, str_tiers)
+
+        # ── Add pools for new OPTs only ───────────────────────────────
+        _run(conn, f"""
+            INSERT INTO {POOL_TABLE}
+                ([RDC],[MAJ_CAT],[GEN_ART_NUMBER],[CLR],[VAR_ART],[SZ],[FNL_Q_ORIG],[FNL_Q_REM])
+            SELECT A.[RDC], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR], A.[VAR_ART], A.[SZ],
+                   MAX(ISNULL(A.[FNL_Q], 0)), MAX(ISNULL(A.[FNL_Q], 0))
+            FROM [{alloc_table}] A
+            WHERE A.[ALLOC_QTY] = 0 AND A.[SKIP_FLAG] = 0
+              AND ISNULL(A.[ALLOC_ROUND], 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM {POOL_TABLE} P
+                  WHERE P.[RDC] = A.[RDC] AND P.[MAJ_CAT] = A.[MAJ_CAT]
+                    AND P.[GEN_ART_NUMBER] = A.[GEN_ART_NUMBER] AND P.[CLR] = A.[CLR]
+                    AND P.[VAR_ART] = A.[VAR_ART] AND P.[SZ] = A.[SZ]
+              )
+            GROUP BY A.[RDC], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR], A.[VAR_ART], A.[SZ]
+        """)
+
+        # ── Run allocation for ONLY newly eligible OPTs ───────────────
+        fb_primary = _run_primary(
+            conn, alloc_table, final_table, threshold, only_new=True,
+            min_size_count=min_size_count
+        )
+        stats["allocated"] += fb_primary.get("allocated", 0)
+
+    # ── Restore ONLY the grids WE demoted (not originally Secondary) ──
+    for gname in demoted_grids:
+        _run(conn, """
+            UPDATE [ARS_GRID_BUILDER] SET grid_group = 'Primary'
+            WHERE grid_name = :gn
+        """, {"gn": gname})
+
+    if demoted_grids:
+        logger.info(f"Fallback: restored {len(demoted_grids)} demoted grids to Primary")
+
+    return stats
+
 
 def _recalc_req_and_flags(conn, final_table, alloc_table):
     """Recalculate all _REQ_REM → H_ → PRI_CT%/SEC_CT% → ALLOC_FLAG after allocation.

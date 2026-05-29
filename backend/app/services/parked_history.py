@@ -539,13 +539,6 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
             # Snapshot ARS_NL_TBL_HOLD_TRACKING BEFORE we modify it so any
             # future "undo approve" tooling can restore the pre-approval
             # state. Idempotent — second call for the same session is a no-op.
-            #
-            # SCOPED snapshot (May 2026): only rows whose (WERKS, VAR_ART, SZ)
-            # are touched by this session's alloc are captured. The full-table
-            # copy used to dominate approve latency on production datasets
-            # (50k–100k rows × every approve). Step A/B only modify keys that
-            # appear in ARS_ALLOC_HISTORY for this session, so a scoped
-            # snapshot is sufficient for the revert path to restore them.
             try:
                 _ensure_hold_snapshot_tables(conn)
                 already = conn.execute(text(
@@ -554,29 +547,16 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 ), {"sid": session_id}).scalar() or 0
                 if already == 0:
                     res = conn.execute(text(f"""
-                        ;WITH touched AS (
-                            SELECT DISTINCT
-                                   A.[WERKS],
-                                   TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
-                                   A.[SZ]
-                            FROM [ARS_ALLOC_HISTORY] A
-                            WHERE A.[SESSION_ID] = :sid
-                              AND A.[OPT_TYPE] IN ('RL','TBC','TBL','NL')
-                        )
                         INSERT INTO [{_HOLD_SNAPSHOT_TABLE}]
                             (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
                              VAR_ART, SZ, OPT_STATUS, LISTED_DATE,
                              HOLD_QTY_INITIAL, HOLD_REM,
                              LAST_UPDATED, IS_CLOSED, CLOSED_DATE)
-                        SELECT :sid, H.WERKS, H.RDC, H.MAJ_CAT, H.GEN_ART_NUMBER, H.CLR,
-                               H.VAR_ART, H.SZ, H.OPT_STATUS, H.LISTED_DATE,
-                               H.HOLD_QTY_INITIAL, H.HOLD_REM,
-                               H.LAST_UPDATED, H.IS_CLOSED, H.CLOSED_DATE
-                        FROM [ARS_NL_TBL_HOLD_TRACKING] H
-                        INNER JOIN touched T
-                            ON  T.WERKS   = H.WERKS
-                            AND T.VAR_ART = H.VAR_ART
-                            AND T.SZ      = H.SZ
+                        SELECT :sid, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                               VAR_ART, SZ, OPT_STATUS, LISTED_DATE,
+                               HOLD_QTY_INITIAL, HOLD_REM,
+                               LAST_UPDATED, IS_CLOSED, CLOSED_DATE
+                        FROM [ARS_NL_TBL_HOLD_TRACKING]
                     """), {"sid": session_id})
                     conn.execute(text(f"""
                         INSERT INTO [{_HOLD_SNAPSHOT_SESSIONS}]
@@ -584,10 +564,6 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                         VALUES (:sid, GETDATE(), :rc)
                     """), {"sid": session_id, "rc": int(res.rowcount or 0)})
                     conn.commit()
-                    logger.info(
-                        f"[hold] pre-approve snapshot (scoped): "
-                        f"session={session_id} rows={int(res.rowcount or 0)}"
-                    )
             except Exception as _se:
                 logger.warning(f"[hold] pre-approve snapshot failed: {_se}")
 
@@ -1323,29 +1299,9 @@ def _revert_hold_tracking(conn, session_id: str) -> Dict[str, Any]:
             # No snapshot — this session predates the feature; don't touch the table.
             return result
 
-        # 1. Delete rows inserted by this run (present in live table but NOT
-        # in snapshot). Scoped to (WERKS, VAR_ART, SZ) keys actually touched
-        # by this session — without this scope, a scoped snapshot (May 2026
-        # change) would cause this DELETE to wipe every row not in the
-        # snapshot's session, including rows that pre-existed and were
-        # never touched by this session. We resolve the touched keys from
-        # ARS_ALLOC_HISTORY for this session (matches the symmetric scope
-        # used by approve_parked's snapshot INSERT).
+        # 1. Delete rows inserted by this run (present in live table but NOT in snapshot).
         r_del = conn.execute(text(f"""
-            ;WITH touched AS (
-                SELECT DISTINCT
-                       A.[WERKS],
-                       TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
-                       A.[SZ]
-                FROM [ARS_ALLOC_HISTORY] A
-                WHERE A.[SESSION_ID] = :sid
-                  AND A.[OPT_TYPE] IN ('RL','TBC','TBL','NL')
-            )
             DELETE T FROM [ARS_NL_TBL_HOLD_TRACKING] T
-            INNER JOIN touched K
-                ON  K.WERKS   = T.WERKS
-                AND K.VAR_ART = T.VAR_ART
-                AND K.SZ      = T.SZ
             WHERE NOT EXISTS (
                 SELECT 1 FROM [{_HOLD_SNAPSHOT_TABLE}] S
                 WHERE S.SESSION_ID = :sid

@@ -94,6 +94,10 @@ export default function ContribMappingsPage() {
     try { await contribAPI.deleteAssignment(id); toast.success('Deleted'); load() }
     catch { toast.error('Failed') }
   }
+  const activateAssignment = async (id) => {
+    try { await contribAPI.activateAssignment(id); toast.success('Set as active'); load() }
+    catch { toast.error('Failed to activate') }
+  }
 
   // SSN values not yet used in current mapping
   const usedSsns = Object.keys(mForm.suffix_mapping)
@@ -309,9 +313,31 @@ export default function ContribMappingsPage() {
               {assignments.length} Assignments
             </div>
             {assignments.map(a => (
-              <div key={a.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 14px', borderBottom:`1px solid ${C.cardBorder}` }}>
+              <div key={a.id} style={{
+                display:'flex', alignItems:'center', gap:10, padding:'10px 14px',
+                borderBottom:`1px solid ${C.cardBorder}`,
+                background: a.is_active ? C.primaryLight : 'transparent',
+              }}>
+                <label
+                  title={a.is_active ? 'Active — used by Execute' : 'Click to make this the active assignment'}
+                  style={{ display:'flex', alignItems:'center', cursor:'pointer', flexShrink:0 }}
+                >
+                  <input
+                    type="radio"
+                    name="active_assignment"
+                    checked={!!a.is_active}
+                    onChange={() => activateAssignment(a.id)}
+                    style={{ cursor:'pointer', width:16, height:16, accentColor: C.primary }}
+                  />
+                </label>
                 <div style={{ flex:1 }}>
-                  <div style={{ fontSize:13, fontWeight:700 }}>{a.col_name}</div>
+                  <div style={{ fontSize:13, fontWeight:700, display:'flex', alignItems:'center', gap:6 }}>
+                    {a.col_name}
+                    {a.is_active && (
+                      <span style={{ padding:'1px 6px', fontSize:9, fontWeight:700, color:'#fff',
+                                     background:C.primary, borderRadius:10 }}>ACTIVE</span>
+                    )}
+                  </div>
                   <div style={{ fontSize:11, color:C.textMuted }}>Mapping: {a.mapping_name} · Target: {a.target}</div>
                   <div style={{ fontSize:10, color:C.textMuted }}>Prefix: {a.prefix}</div>
                 </div>
@@ -319,6 +345,11 @@ export default function ContribMappingsPage() {
               </div>
             ))}
             {assignments.length === 0 && <div style={{ padding:30, textAlign:'center', color:C.textMuted, fontSize:13 }}>No assignments yet</div>}
+            {assignments.length > 0 && !assignments.some(a => a.is_active) && (
+              <div style={{ padding:'8px 14px', background:C.amberBg, color:C.amber, fontSize:11, borderTop:`1px solid ${C.amberBd}` }}>
+                ⚠ No active assignment selected — Execute will fall back to running every assignment (legacy mode). Tick a radio button above to pin one.
+              </div>
+            )}
           </div>
         </div>
       )}

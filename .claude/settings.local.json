@@ -85,30 +85,7 @@
       "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_inspect_stk_ttl.py' 2>&1 | Select-Object -Last 80)",
       "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_profile_approve.py' 2>&1 | Select-Object -Last 25)",
       "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_stk_ttl_and_scoped.py' 2>&1 | Select-Object -Last 40)",
-      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_stk_ttl_and_scoped.py' 2>&1 | Select-Object -Last 50)",
-      "Bash(backend/venv/Scripts/python.exe *)",
-      "Skill(schedule)",
-      "Bash(\\\\.docx)",
-      "Bash(CLAUDE\")",
-      "Bash(node -e \"require\\('./frontend/node_modules/@babel/parser'\\).parse\\(require\\('fs'\\).readFileSync\\('frontend/src/pages/ListingPage.jsx','utf8'\\),{sourceType:'module',plugins:['jsx']}\\); console.log\\('OK'\\)\")",
-      "Bash(awk NR>=378 && NR<=395 {printf \"%d|%s|\\\\n\", NR, $0} *)",
-      "Bash(awk NR>=840 && NR<=850 {printf \"%d|%s|\\\\n\", NR, $0} *)",
-      "Bash(awk NR>=785 && NR<=795 {printf \"%d|%s|\\\\n\", NR, $0} *)",
-      "Bash(awk NR>=275 && NR<=283 {printf \"%d|%s|\\\\n\", NR, $0} *)",
-      "PowerShell($env:PYTHONPATH = \"D:\\\\ARS_PROD\\\\ars_prod\\\\backend\"; & \"D:\\\\ARS_PROD\\\\ars_prod\\\\backend\\\\venv\\\\Scripts\\\\python.exe\" -c \"import sys; sys.path.insert\\(0, r'D:\\\\ARS_PROD\\\\ars_prod\\\\backend'\\); from app.api.v1.endpoints.ars_dashboard import router; print\\('OK -', len\\(router.routes\\), 'routes registered'\\); [print\\(' ', r.methods, r.path\\) for r in router.routes]\")",
-      "PowerShell(& \"D:\\\\ARS_PROD\\\\ars_prod\\\\backend\\\\venv\\\\Scripts\\\\python.exe\" \"D:\\\\ARS_PROD\\\\ars_prod\\\\backend\\\\_discover_cols.py\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const src=fs.readFileSync\\('src/pages/ArsDashboardPage.jsx','utf8'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(src,{sourceType:'module',plugins:['jsx']}\\);console.log\\('OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR:',e.message\\)}\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const src=fs.readFileSync\\('src/pages/ArsDashboardPage.jsx','utf8'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(src,{sourceType:'module',plugins:['jsx']}\\);console.log\\('frontend OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR:',e.message\\)}\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const src=fs.readFileSync\\('src/pages/ArsDashboardPage.jsx','utf8'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(src,{sourceType:'module',plugins:['jsx']}\\);console.log\\('frontend OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);for\\(const f of ['src/pages/ArsDashboardPage.jsx','src/pages/AlcReviewPage.jsx','src/App.jsx','src/components/layout/Sidebar.jsx']\\){try{babel.parse\\(fs.readFileSync\\(f,'utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\(f,'OK'\\)}catch\\(e\\){console.error\\(f,'PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}}\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const src=fs.readFileSync\\('src/pages/AlcReviewPage.jsx','utf8'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(src,{sourceType:'module',plugins:['jsx']}\\);console.log\\('AlcReviewPage OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);for\\(const f of ['src/pages/ArsDashboardPage.jsx','src/pages/AlcReviewPage.jsx']\\){try{babel.parse\\(fs.readFileSync\\(f,'utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\(f,'OK'\\)}catch\\(e\\){console.error\\(f,'PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}}\")",
-      "Bash(cd /d/ARS_PROD/ars_prod/backend && ls app/database/)",
-      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);for\\(const f of ['src/pages/AlcReviewPage.jsx']\\){try{babel.parse\\(fs.readFileSync\\(f,'utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\(f,'OK'\\)}catch\\(e\\){console.error\\(f,'PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}}\")",
-      "Bash(./venv/Scripts/python.exe -c ' *)",
-      "Bash(node --check frontend/src/services/api.js)",
-      "Bash(node --check frontend/src/pages/GapReportPage.jsx)",
-      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(fs.readFileSync\\('src/pages/AlcReviewPage.jsx','utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\('OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")"
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd 'E:\\\\projects\\\\ARS_V2\\\\backend'; & 'venv\\\\Scripts\\\\python.exe' '_test_stk_ttl_and_scoped.py' 2>&1 | Select-Object -Last 50)"
     ]
   }
 }

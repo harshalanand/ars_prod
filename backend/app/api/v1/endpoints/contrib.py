@@ -169,6 +169,20 @@ def _ensure_assignment_table(engine):
         if not r:
             _run(c, f"ALTER TABLE {ASSIGNMENT_TABLE} ADD target NVARCHAR(20) NOT NULL DEFAULT 'Both'")
 
+        # Migration: add is_active flag for radio-button selection.
+        # Only one assignment can have is_active=1 at a time; that one is the
+        # one Execute will use. When none is active, the engine falls back to
+        # the legacy "most recent wins" behaviour.
+        r = c.execute(text(f"SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{ASSIGNMENT_TABLE}' AND COLUMN_NAME='is_active'")).fetchone()
+        if not r:
+            _run(c, f"ALTER TABLE {ASSIGNMENT_TABLE} ADD is_active BIT NOT NULL DEFAULT 0")
+            # Seed: mark the most recent existing row as active so current setups don't break
+            _run(c, f"""
+                UPDATE {ASSIGNMENT_TABLE}
+                SET is_active = 1
+                WHERE id = (SELECT MAX(id) FROM {ASSIGNMENT_TABLE})
+            """)
+
 
 def _ensure_job_table(engine):
     with engine.connect() as c:
@@ -432,8 +446,11 @@ def list_assignments(current_user: User = Depends(get_current_user)):
     engine = get_data_engine()
     _ensure_assignment_table(engine)
     with engine.connect() as c:
-        rows = c.execute(text(f"SELECT id, col_name, mapping_name, prefix, target FROM {ASSIGNMENT_TABLE} ORDER BY id")).fetchall()
-    items = [{"id": r[0], "col_name": r[1], "mapping_name": r[2], "prefix": r[3], "target": r[4]} for r in rows]
+        rows = c.execute(text(
+            f"SELECT id, col_name, mapping_name, prefix, target, is_active FROM {ASSIGNMENT_TABLE} ORDER BY id"
+        )).fetchall()
+    items = [{"id": r[0], "col_name": r[1], "mapping_name": r[2], "prefix": r[3],
+              "target": r[4], "is_active": bool(r[5])} for r in rows]
     return APIResponse(success=True, data={"assignments": items})
 
 
@@ -453,6 +470,30 @@ def delete_assignment(aid: int, current_user: User = Depends(get_current_user)):
     with engine.connect() as c:
         _run(c, f"DELETE FROM {ASSIGNMENT_TABLE} WHERE id=:id", {"id": aid})
     return APIResponse(success=True, message="Assignment deleted.")
+
+
+@router.post("/assignments/{aid}/activate", response_model=APIResponse)
+def activate_assignment(aid: int, current_user: User = Depends(get_current_user)):
+    """Make this assignment the active one. Clears `is_active` on every other row."""
+    engine = get_data_engine()
+    _ensure_assignment_table(engine)
+    with engine.connect() as c:
+        exists = c.execute(text(f"SELECT 1 FROM {ASSIGNMENT_TABLE} WHERE id = :id"), {"id": aid}).fetchone()
+        if not exists:
+            raise HTTPException(404, "Assignment not found")
+        _run(c, f"UPDATE {ASSIGNMENT_TABLE} SET is_active = 0")
+        _run(c, f"UPDATE {ASSIGNMENT_TABLE} SET is_active = 1 WHERE id = :id", {"id": aid})
+    return APIResponse(success=True, message=f"Assignment {aid} is now active.")
+
+
+@router.post("/assignments/clear-active", response_model=APIResponse)
+def clear_active_assignment(current_user: User = Depends(get_current_user)):
+    """Clear all is_active flags — pipeline falls back to 'all assignments run'."""
+    engine = get_data_engine()
+    _ensure_assignment_table(engine)
+    with engine.connect() as c:
+        _run(c, f"UPDATE {ASSIGNMENT_TABLE} SET is_active = 0")
+    return APIResponse(success=True, message="Active assignment cleared.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -533,7 +574,7 @@ def _compute_kpis(df, avg_days, grouping_column):
     gr = 2 if grouping_column == 'M_VND_CD' else 1
     algo_raw = df['SALE_CONT%'] * np.where(df['SALE_CONT%']<0.05, 5.0, 3.0)
     algo_adj = df['SALE_CONT%'] * (1 + (df['GM_PSF_ACH%']-1)*gr)
-    df['ALGO'] = np.minimum(algo_raw, np.maximum(algo_adj, 0))
+    df['ALGO'] = np.minimum(algo_raw, np.maximum(np.maximum(algo_adj, df['SALE_CONT%']*0.5), 0))
     algo_sum = grp['ALGO'].transform('sum')
     df['INITIAL AUTO CONT%'] = np.where(algo_sum==0, 0, df['ALGO']/algo_sum)
 
@@ -575,20 +616,11 @@ def _process_single_preset(engine, preset_name, preset_cfg, majcats, grouping_co
 
     # Step 1: Data query (stock + product join)
     t = time.time()
-    # NOTE: do NOT ROUND() these averages in SQL — per-store, per-active-month
-    # values for GM_V/SALE_V are in lakhs and often < 0.005 (e.g. 0.0007 lakhs),
-    # which would round to 0.00 and then SUM across stores stays 0, hiding real
-    # contribution at the company level. Final 2-dp rounding happens once at
-    # the end of _compute_kpis().
     data_query = f"""
         SELECT ST_CD, MAJ_CAT, {grouping_column},
-               AVG(NULLIF(OP_STK_Q, 0)) AS OP_STK_Q,
-               AVG(NULLIF(OP_STK_V, 0)) AS OP_STK_V,
-               AVG(NULLIF(CL_STK_Q, 0)) AS CL_STK_Q,
-               AVG(NULLIF(CL_STK_V, 0)) AS CL_STK_V,
-               AVG(CASE WHEN SALE_Q <> 0 THEN SALE_Q END) AS SALE_Q,
-               AVG(CASE WHEN SALE_Q <> 0 THEN SALE_V END) AS SALE_V,
-               AVG(CASE WHEN SALE_Q <> 0 THEN GM_V   END) AS GM_V
+               ROUND(AVG(OP_STK_Q), 2) AS OP_STK_Q, ROUND(AVG(OP_STK_V), 2) AS OP_STK_V,
+               ROUND(AVG(CL_STK_Q), 2) AS CL_STK_Q, ROUND(AVG(CL_STK_V), 2) AS CL_STK_V,
+               ROUND(AVG(SALE_Q), 2) AS SALE_Q, ROUND(AVG(SALE_V), 2) AS SALE_V, ROUND(AVG(GM_V), 2) AS GM_V
         FROM (
             SELECT sal_stk.STOCK_DATE, sal_stk.WERKS AS ST_CD,
                    prod.MAJ_CAT, prod.{grouping_column},
@@ -729,12 +761,488 @@ def _combine_dataframes(dataframes, is_aggregated, grouping_column, engine):
     return combined
 
 
+def _apply_auto_cont_derivations(df, engine=None, vendor_col=None):
+    """Append `AUTO CONT% 2` and `AUTO CONT% (FINAL)` columns derived from the mapping output.
+
+    Input-column resolution (in priority order):
+      1. The `col_name` of the most-recently-added row in `Cont_mapping_assignments`
+         (max id). This means whatever name the user typed in the Assignments UI
+         is automatically the input — no hardcoding.
+      2. Fallback: known names `AUTO CONT%` / `AUTO SEG CONT%` (case-insensitive)
+         for backward compatibility with data created before this change.
+
+    AUTO CONT% 2:
+        input    when  ACT_INACT == 'ACT'  AND  input >= 0.01
+        0        otherwise
+
+    AUTO CONT% (FINAL):
+        Row's AUTO CONT% 2 / SUM(AUTO CONT% 2 within same (RDC_CD, MAJ_CAT) bucket).
+        Within every (RDC_CD, MAJ_CAT), all rows' AUTO CONT% (FINAL) add up to 100%.
+        Falls back to MAJ_CAT-only grouping if RDC_CD is missing.
+    """
+    if df is None or df.empty:
+        return df
+
+    # Default to zero so the pipeline can't NPE on missing inputs
+    df['AUTO CONT% 2']        = 0.0
+    df['AUTO CONT% (FINAL)']  = 0.0
+    df['BGT CONT% (FINAL)']   = 0.0
+
+    # 1) Try the user-selected active assignment first; fall back to most-recent (highest id)
+    input_col = None
+    if engine is not None:
+        try:
+            with engine.connect() as c:
+                # Active first
+                active_rows = c.execute(text(
+                    f"SELECT col_name FROM {ASSIGNMENT_TABLE} WHERE is_active = 1 ORDER BY id DESC"
+                )).fetchall()
+                rest_rows = c.execute(text(
+                    f"SELECT col_name FROM {ASSIGNMENT_TABLE} WHERE is_active = 0 ORDER BY id DESC"
+                )).fetchall()
+            assignment_cols = [r[0] for r in active_rows if r[0]] + [r[0] for r in rest_rows if r[0]]
+            # Pick the first one that actually exists in df (case-insensitive)
+            lower_map = {c.lower(): c for c in df.columns}
+            for name in assignment_cols:
+                hit = lower_map.get(name.lower())
+                if hit:
+                    input_col = hit
+                    break
+        except Exception as e:
+            logger.warning(f"[contrib] Could not query {ASSIGNMENT_TABLE} for AUTO CONT% input: {e}")
+
+    # 2) Fallback to the canonical names for backward compatibility
+    if input_col is None:
+        lower_map = {c.lower(): c for c in df.columns}
+        input_col = next((lower_map[k] for k in ('auto cont%', 'auto seg cont%') if k in lower_map), None)
+
+    if not input_col:
+        logger.info("[contrib] No mapping-output column found for AUTO CONT% 2 derivation. "
+                    "AUTO CONT% 2 / (FINAL) left at 0. Configure an assignment in Mappings.")
+        return df
+
+    auto_seg = pd.to_numeric(df[input_col], errors='coerce').fillna(0)
+
+    if 'ACT_INACT' in df.columns:
+        act = df['ACT_INACT'].astype(str).str.strip().str.upper().eq('ACT')
+    else:
+        act = pd.Series(True, index=df.index)
+
+    df['AUTO CONT% 2'] = np.where(act & (auto_seg >= 0.01), auto_seg, 0.0)
+
+    if 'MAJ_CAT' not in df.columns:
+        logger.warning("[contrib] MAJ_CAT missing — AUTO CONT% (FINAL) left at 0.")
+        return df
+
+    auto2 = pd.to_numeric(df['AUTO CONT% 2'], errors='coerce').fillna(0)
+
+    # Sum AUTO CONT% 2 within (RDC_CD, MAJ_CAT) when RDC_CD is available; else within MAJ_CAT only
+    group_cols = [c for c in ['RDC_CD', 'MAJ_CAT'] if c in df.columns]
+    if not group_cols:
+        return df
+    grp_sum = auto2.groupby([df[c] for c in group_cols], dropna=False).transform('sum')
+
+    df['AUTO CONT% (FINAL)'] = np.where(
+        grp_sum == 0, 0.0,
+        auto2 / grp_sum.replace(0, np.nan),
+    )
+    df['AUTO CONT% (FINAL)'] = pd.to_numeric(df['AUTO CONT% (FINAL)'], errors='coerce').fillna(0).round(4)
+    df['AUTO CONT% 2']       = df['AUTO CONT% 2'].round(4)
+
+    # ── BGT CONT% (FINAL) ──────────────────────────────────────────────────
+    # Per row, decide based on the SUM of MERCH_INPUT within the chosen group:
+    #   if group_sum > 0  → BGT CONT% (FINAL) = this row's MERCH_INPUT
+    #   else              → BGT CONT% (FINAL) = this row's AUTO CONT% (FINAL)
+    #
+    # Grouping rules:
+    #   - Store-level table (ST_CD present) + vendor_col known → (MAJ_CAT, vendor_col)
+    #     so the merch decision is per (MAJCAT, vendor) — same decision across all
+    #     stores carrying that vendor in that MAJCAT.
+    #   - Otherwise                                            → MAJ_CAT only
+    #     (company-level behaviour unchanged).
+    df['BGT CONT% (FINAL)'] = 0.0
+    if 'MAJ_CAT' in df.columns and 'MERCH_INPUT' in df.columns:
+        merch = pd.to_numeric(df['MERCH_INPUT'], errors='coerce').fillna(0)
+        store_level = 'ST_CD' in df.columns
+        use_vendor  = store_level and vendor_col and vendor_col in df.columns
+        if use_vendor:
+            group_keys = [df['MAJ_CAT'], df[vendor_col]]
+        else:
+            group_keys = [df['MAJ_CAT']]
+        merch_grp_sum = merch.groupby(group_keys, dropna=False).transform('sum')
+        df['BGT CONT% (FINAL)'] = np.where(
+            merch_grp_sum > 0,
+            merch,
+            pd.to_numeric(df['AUTO CONT% (FINAL)'], errors='coerce').fillna(0),
+        )
+        df['BGT CONT% (FINAL)'] = pd.to_numeric(df['BGT CONT% (FINAL)'], errors='coerce').fillna(0).round(4)
+        if use_vendor:
+            logger.debug(f"[contrib] BGT CONT% (FINAL) grouped by (MAJ_CAT, {vendor_col}) — store-level table")
+    else:
+        logger.warning("[contrib] MAJ_CAT or MERCH_INPUT missing — BGT CONT% (FINAL) left at 0.")
+
+    # ── Trim intermediate columns from store-level output ──────────────────
+    # At store level the calculation for these columns isn't meaningful —
+    # only BGT CONT% (FINAL) is kept, and it's inherited from the company
+    # table downstream. Company tables keep all columns unchanged.
+    if 'ST_CD' in df.columns:
+        drop_cols = ['AUTO CONT% 2', 'AUTO CONT% (FINAL)']
+        if input_col and input_col in df.columns and input_col not in ('MAJ_CAT', 'ST_CD', 'MERCH_INPUT'):
+            drop_cols.append(input_col)
+        df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True, errors='ignore')
+
+    return df
+
+
+def _inherit_company_bgt_final(df_store, df_company_mem, engine, gc_col):
+    """Overwrite df_store['BGT CONT% (FINAL)'] with the value from the company-level
+    table for the same (MAJ_CAT, vendor) pair. This propagates the merchant's
+    national decision down to every store row carrying that vendor.
+
+    Lookup priority:
+      1. `df_company_mem` (in-memory company frame from the same run, target=Both)
+      2. Latest `Cont_Percentage_<gc>_CO_<month>` table in DB (target=Store standalone)
+      3. None → fall back to df_store's locally-computed BGT CONT% (FINAL)
+
+    Required columns in df_store: MAJ_CAT, vendor_col (=gc_col), BGT CONT% (FINAL).
+    If any are missing, df_store is returned unchanged.
+
+    Returns (df_store, inherited: bool). The flag is True only when a real
+    company source was found and at least one row's BGT CONT% (FINAL) was
+    overwritten — used to gate the V-0015 store contribution chain.
+    """
+    if df_store is None or df_store.empty:
+        return df_store, False
+    if 'BGT CONT% (FINAL)' not in df_store.columns:
+        return df_store, False
+    if 'MAJ_CAT' not in df_store.columns or not gc_col or gc_col not in df_store.columns:
+        logger.info("[contrib] Cannot inherit company BGT CONT% (FINAL) — MAJ_CAT or grouping column missing in store frame.")
+        return df_store, False
+
+    company_bgt = None
+    source = None
+    needed = ['MAJ_CAT', gc_col, 'BGT CONT% (FINAL)']
+
+    if df_company_mem is not None and not df_company_mem.empty and all(c in df_company_mem.columns for c in needed):
+        company_bgt = df_company_mem[needed].copy()
+        source = "in-memory company df"
+    else:
+        month_tag = datetime.now().strftime('%Y_%m')
+        safe_gc = gc_col.upper().replace(' ', '_').replace('-', '_')
+        co_table = f"{TABLE_PREFIX}_{safe_gc}_CO_{month_tag}"
+        try:
+            with engine.connect() as c:
+                exists = c.execute(text(
+                    "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME=:t"
+                ), {"t": co_table}).fetchone()
+            if not exists:
+                logger.info(f"[contrib] No company table '{co_table}' — store BGT CONT% (FINAL) keeps local value.")
+                return df_store, False
+            company_bgt = _read_sql_nolock(
+                f"SELECT [MAJ_CAT], [{gc_col}], [BGT CONT% (FINAL)] FROM [{co_table}] WITH (NOLOCK)",
+                engine,
+            )
+            source = co_table
+        except Exception as e:
+            logger.warning(f"[contrib] Could not read company table for inheritance: {e}")
+            return df_store, False
+
+    if company_bgt is None or company_bgt.empty:
+        return df_store, False
+
+    # Type-align merge keys
+    df_store['MAJ_CAT'] = df_store['MAJ_CAT'].astype(str).str.strip()
+    df_store[gc_col]    = df_store[gc_col].astype(str).str.strip()
+    company_bgt['MAJ_CAT'] = company_bgt['MAJ_CAT'].astype(str).str.strip()
+    company_bgt[gc_col]    = company_bgt[gc_col].astype(str).str.strip()
+
+    # Drop duplicate (MAJ_CAT, vendor) pairs on the company side (defensive)
+    company_bgt = company_bgt.drop_duplicates(subset=['MAJ_CAT', gc_col])
+    company_bgt = company_bgt.rename(columns={'BGT CONT% (FINAL)': '_co_bgt_final'})
+
+    before_cols = list(df_store.columns)
+    df_store = df_store.merge(company_bgt, on=['MAJ_CAT', gc_col], how='left')
+    co_vals = pd.to_numeric(df_store['_co_bgt_final'], errors='coerce')
+    df_store['BGT CONT% (FINAL)'] = np.where(
+        co_vals.notna(),
+        co_vals,
+        pd.to_numeric(df_store['BGT CONT% (FINAL)'], errors='coerce').fillna(0),
+    )
+    df_store['BGT CONT% (FINAL)'] = pd.to_numeric(df_store['BGT CONT% (FINAL)'], errors='coerce').fillna(0).round(4)
+    df_store.drop(columns=['_co_bgt_final'], inplace=True, errors='ignore')
+
+    matched = int(co_vals.notna().sum())
+    logger.info(f"[contrib] BGT CONT% (FINAL) inherited from {source}: {matched}/{len(df_store)} store rows updated")
+    return df_store, matched > 0
+
+
+def _apply_store_contribution_chain(df, engine=None, vendor_col=None):
+    """V-0015 store-level contribution chain (sheet ST-MJ-CAT-SEG).
+
+    Runs only when ST_CD is present (store-level dataframe). Produces 13 columns
+    that match the V-0015 store sheet, in the order they appear there:
+
+        NAT CONT%, NAT CONT% @ MAJ,
+        AUTO CONT%-1, BGT CONT%, RMN AUTO,
+        BGT CONT%@MAJ_CAT, RMN AUTO @ MAJCAT, ALGO, AUTO CONT%-2,
+        OLD ST CONT%,
+        INT ST CONT%, INT-2 ST CONT%, FINAL ST CONT%
+
+    NEW-store pipeline (AQ..BC in the Excel) is computed internally and the
+    intermediate columns are NOT surfaced. Only the OLD-pipeline visible cols
+    and the final INT/INT-2/FINAL stay.
+
+    Inputs required in df:
+        STATUS, SSN, ST_CD, MAJ_CAT, RNG_SEG, LISTING,
+        REF_GRP_NEW, REF_GRP_OLD,
+        BGT CONT% (FINAL) (will be renamed to NAT CONT%),
+        INITIAL AUTO CONT%|<period> for L7D, L30D, SSN_TLM, SSN-2.
+    """
+    if df is None or df.empty or 'ST_CD' not in df.columns:
+        return df
+    if 'MAJ_CAT' not in df.columns:
+        logger.warning("[contrib] Store chain skipped — MAJ_CAT missing")
+        return df
+
+    # ── NAT CONT% (renamed from inherited 'BGT CONT% (FINAL)') ──
+    if 'BGT CONT% (FINAL)' in df.columns:
+        df['NAT CONT%'] = pd.to_numeric(df['BGT CONT% (FINAL)'], errors='coerce').fillna(0).astype(float)
+    elif 'NAT CONT%' not in df.columns:
+        df['NAT CONT%'] = 0.0
+    nat = pd.to_numeric(df['NAT CONT%'], errors='coerce').fillna(0).astype(float)
+
+    # ── STATUS / SSN / LISTING input series ──
+    status = df['STATUS'].astype(str).str.strip().str.upper() if 'STATUS' in df.columns else pd.Series([''] * len(df), index=df.index)
+    is_old  = status.eq('OLD')
+    is_new  = status.eq('NEW')
+    is_old1 = status.eq('OLD-1')
+    is_upc  = status.eq('UPC')
+
+    ssn = df['SSN'].astype(str).str.strip().str.upper() if 'SSN' in df.columns else pd.Series([''] * len(df), index=df.index)
+    is_w_pw = ssn.isin(['W', 'PW'])
+    is_sao  = ssn.isin(['S', 'A', 'OC'])
+
+    if 'LISTING' in df.columns:
+        listing = pd.to_numeric(df['LISTING'], errors='coerce').fillna(0).astype(float)
+    else:
+        listing = pd.Series(1.0, index=df.index)
+
+    # ── Period columns ── (best-effort match on suffix)
+    def _find_period(*hints):
+        norm = lambda s: s.upper().replace(' ', '').replace('-', '').replace('_', '')
+        for c in df.columns:
+            if not c.startswith('INITIAL AUTO CONT%|'):
+                continue
+            suf_norm = norm(c.split('|', 1)[1])
+            for h in hints:
+                if norm(h) in suf_norm:
+                    return c
+        return None
+
+    def _period(col):
+        if col and col in df.columns:
+            return pd.to_numeric(df[col], errors='coerce').fillna(0).astype(float)
+        return pd.Series(0.0, index=df.index)
+
+    l7d     = _period(_find_period('L7D'))
+    l30d    = _period(_find_period('L30D'))
+    ssn_tlm = _period(_find_period('SSNTLM'))
+    ssn2    = _period(_find_period('SSN2'))
+
+    # SUMIFS within (ST_CD, MAJ_CAT)
+    grp_keys = [df['ST_CD'], df['MAJ_CAT']]
+    def _sum_within(series):
+        return series.groupby(grp_keys, dropna=False).transform('sum')
+
+    # ── 1. NAT CONT% @ MAJ ──
+    df['NAT CONT% @ MAJ'] = _sum_within(nat).round(4)
+
+    # ── 2. BGT CONT% ── (50% OLD, 70% else)
+    bgt = pd.Series(np.where(is_old, nat * 0.5, nat * 0.7), index=df.index).astype(float)
+    df['BGT CONT%'] = bgt.round(4)
+
+    # ── 3. AUTO CONT%-1 (OLD pipeline) ──
+    val_default = pd.concat(
+        [pd.Series(0.0, index=df.index), l7d, l30d, ssn_tlm, ssn2], axis=1
+    ).max(axis=1)
+    auto1_old = np.where(is_w_pw, ssn2.clip(lower=0),
+                np.where(is_sao, l30d.clip(lower=0), val_default))
+    auto1 = pd.Series(np.where(is_old, auto1_old * listing, 0.0), index=df.index).astype(float)
+    df['AUTO CONT%-1'] = auto1.round(4)
+
+    # ── 4. RMN AUTO ──
+    rmn = pd.Series(np.maximum(auto1 - bgt, 0.0), index=df.index)
+    df['RMN AUTO'] = rmn.round(4)
+
+    # ── 5. BGT @ MAJCAT, RMN @ MAJCAT ──
+    bgt_maj = _sum_within(bgt)
+    rmn_maj = _sum_within(rmn)
+    df['BGT CONT%@MAJ_CAT'] = bgt_maj.round(4)
+    df['RMN AUTO @ MAJCAT']        = rmn_maj.round(4)
+
+    # ── 6. ALGO ──
+    rmn_share = np.where(rmn_maj > 0, rmn.values / rmn_maj.replace(0, np.nan).values, 0.0)
+    algo = pd.Series(rmn_share, index=df.index).fillna(0) * np.maximum(1 - bgt_maj, 0.0)
+    df['ALGO'] = algo.round(4)
+
+    # ── 7. AUTO CONT%-2 (OLD pipeline) ──
+    auto2 = pd.Series(np.where(is_old, (algo + bgt) * listing, 0.0), index=df.index)
+    df['AUTO CONT%-2'] = auto2.round(4)
+
+    # ── 8. OLD ST CONT% ──
+    auto2_maj = _sum_within(auto2)
+    old_st = np.where(auto2_maj > 0, auto2.values / auto2_maj.replace(0, np.nan).values, 0.0)
+    df['OLD ST CONT%'] = pd.Series(old_st, index=df.index).fillna(0).round(4)
+    old_st_s = df['OLD ST CONT%']
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  NEW-store pipeline — computed internally, not surfaced as columns
+    # ──────────────────────────────────────────────────────────────────────
+
+    # Peer-store reference: average OLD ST CONT% across stores where
+    #   (peer.MAJ_CAT, peer.RNG_SEG, peer.REF_GRP_OLD) == (my.MAJ_CAT, my.RNG_SEG, my.REF_GRP_NEW)
+    # AND peer.OLD ST CONT% > 0
+    has_ref = 'REF_GRP_NEW' in df.columns and 'REF_GRP_OLD' in df.columns and 'RNG_SEG' in df.columns
+    new_ref = pd.Series(0.0, index=df.index)
+    if has_ref:
+        pos_mask = old_st_s > 0
+        peer = df.loc[pos_mask, ['MAJ_CAT', 'RNG_SEG', 'REF_GRP_OLD']].copy()
+        peer['_old_ct'] = old_st_s.loc[pos_mask].values
+        peer_avg = (peer.groupby(['MAJ_CAT', 'RNG_SEG', 'REF_GRP_OLD'], dropna=False)
+                        ['_old_ct'].mean()
+                        .rename('_peer_avg').reset_index()
+                        .rename(columns={'REF_GRP_OLD': 'REF_GRP_NEW'}))
+        left = df[['MAJ_CAT', 'RNG_SEG', 'REF_GRP_NEW']].reset_index().rename(columns={'index': '_orig_idx'})
+        merged = left.merge(peer_avg, on=['MAJ_CAT', 'RNG_SEG', 'REF_GRP_NEW'], how='left')
+        new_ref = pd.Series(
+            pd.to_numeric(merged['_peer_avg'], errors='coerce').fillna(0).values,
+            index=df.index,
+        )
+    new_ref = pd.Series(np.where(is_old, 0.0, new_ref.values), index=df.index)
+
+    # ALGO CONT% (AR)
+    new_ref_maj = _sum_within(new_ref)
+    algo_cont = pd.Series(
+        np.where(new_ref_maj > 0, new_ref.values / new_ref_maj.replace(0, np.nan).values, 0.0),
+        index=df.index,
+    ).fillna(0)
+
+    # NEW AUTO-1 (AS)
+    new_auto1_old1 = np.where(is_w_pw, ssn2.clip(lower=0),
+                     np.where(is_sao, l30d.clip(lower=0), 0.0))
+    new_auto1_new  = pd.concat([l7d, l30d], axis=1).max(axis=1).values
+    new_auto1 = np.where(is_old, 0.0,
+                np.where(is_old1, new_auto1_old1,
+                np.where(is_new, new_auto1_new, val_default.values)))
+    new_auto1 = new_auto1 * listing.values
+
+    # NEW AUTO-2 (AT)
+    new_auto2 = np.where(new_auto1 > 0, new_auto1, algo_cont.values * 0.5) * listing.values
+
+    # RMN AUTO new (AU)
+    rmn_new = pd.Series(
+        np.where(is_old, 0.0, np.maximum(new_auto2 - bgt.values, 0.0)),
+        index=df.index,
+    )
+
+    # ALGO new (AW)
+    rmn_new_maj = _sum_within(rmn_new)
+    rmn_new_share = np.where(rmn_new_maj > 0, rmn_new.values / rmn_new_maj.replace(0, np.nan).values, 0.0)
+    algo_new = pd.Series(rmn_new_share, index=df.index).fillna(0) * np.maximum(1 - bgt_maj, 0.0)
+    algo_new = pd.Series(np.where(is_old, 0.0, algo_new.values), index=df.index)
+
+    # AUTO CONT%-2 new (AX)
+    auto2_new = pd.Series(
+        np.where(is_old, 0.0, (algo_new + bgt) * listing),
+        index=df.index,
+    )
+
+    # NEW ST CONT% (AY)
+    auto2_new_maj = _sum_within(auto2_new)
+    ay = pd.Series(
+        np.where(auto2_new_maj > 0, auto2_new.values / auto2_new_maj.replace(0, np.nan).values, 0.0),
+        index=df.index,
+    ).fillna(0)
+
+    # AZ: OLD→0, UPC→AR, AY>0→AY, else→AR
+    az = pd.Series(
+        np.where(is_old, 0.0,
+        np.where(is_upc, algo_cont.values,
+        np.where(ay > 0, ay.values, algo_cont.values))),
+        index=df.index,
+    )
+
+    # ALGO COINT% (BA)
+    az_maj = _sum_within(az)
+    ba = pd.Series(
+        np.where(az_maj > 0, az.values / az_maj.replace(0, np.nan).values, 0.0),
+        index=df.index,
+    ).fillna(0)
+
+    # BB (col 53): OLD→0, else (BA>0 ? BA : NAT) × LISTING
+    bb = pd.Series(
+        np.where(is_old, 0.0, np.where(ba > 0, ba.values, nat.values)) * listing.values,
+        index=df.index,
+    )
+
+    # NEW ST CONT% (BC)
+    bb_maj = _sum_within(bb)
+    bc = pd.Series(
+        np.where(bb_maj > 0, bb.values / bb_maj.replace(0, np.nan).values, 0.0),
+        index=df.index,
+    ).fillna(0)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Final output columns
+    # ──────────────────────────────────────────────────────────────────────
+
+    # ── 9. INT ST CONT% (BD): OLD path or NEW path ──
+    int_st = pd.Series(
+        np.where(is_old, old_st_s.values, bc.values),
+        index=df.index,
+    )
+    df['INT ST CONT%'] = int_st.fillna(0).round(4)
+
+    # ── 10. INT-2 ST CONT% (BE): 1% threshold ──
+    df['INT-2 ST CONT%'] = pd.Series(
+        np.where(int_st < 0.01, 0.0, int_st.values), index=df.index,
+    ).fillna(0).round(4)
+    int2 = pd.to_numeric(df['INT-2 ST CONT%'], errors='coerce').fillna(0)
+
+    # ── 11. FINAL ST CONT% (BF): normalise per (ST_CD, MAJ_CAT) ──
+    int2_maj = _sum_within(int2)
+    final_st = np.where(int2_maj > 0, int2.values / int2_maj.replace(0, np.nan).values, 0.0)
+    df['FINAL ST CONT%'] = pd.Series(final_st, index=df.index).fillna(0).round(4)
+
+    # Drop the inherited BGT CONT% (FINAL) — replaced by NAT CONT% in store table
+    if 'BGT CONT% (FINAL)' in df.columns:
+        df.drop(columns=['BGT CONT% (FINAL)'], inplace=True, errors='ignore')
+
+    return df
+
+
 def _apply_mapping_assignments(df, engine):
-    """Apply mapping assignments to compute final columns."""
+    """Apply mapping assignments to compute final columns.
+
+    Selection rule:
+      • Only the assignment row with `is_active = 1` runs.
+      • If no row is active, falls back to legacy "all assignments run" behaviour
+        so existing setups don't silently break.
+    """
     _ensure_assignment_table(engine)
     _ensure_mapping_table(engine)
     with engine.connect() as c:
-        assignments = [dict(r._mapping) for r in c.execute(text(f"SELECT col_name, mapping_name, prefix, target FROM {ASSIGNMENT_TABLE}"))]
+        active = c.execute(text(
+            f"SELECT col_name, mapping_name, prefix, target FROM {ASSIGNMENT_TABLE} WHERE is_active = 1"
+        )).fetchall()
+        if active:
+            assignments = [dict(r._mapping) for r in active]
+            logger.info(f"[contrib] Using active assignment(s): {len(assignments)} row(s)")
+        else:
+            assignments = [dict(r._mapping) for r in c.execute(text(
+                f"SELECT col_name, mapping_name, prefix, target FROM {ASSIGNMENT_TABLE}"
+            ))]
+            logger.info(f"[contrib] No active assignment — fallback to all {len(assignments)} row(s) (legacy mode)")
         mappings_raw = {r[0]: {"suffix_mapping": json.loads(r[1]) if r[1] else {}, "fallback_suffixes": json.loads(r[2]) if r[2] else []}
                         for r in c.execute(text(f"SELECT mapping_name, mapping_json, fallback_json FROM {MAPPING_TABLE}"))}
 
@@ -767,7 +1275,12 @@ def _apply_mapping_assignments(df, engine):
             fb_max = np.zeros(nrows)
 
         has_map = ssn.isin(m["suffix_mapping"].keys()).to_numpy()
-        df[col_name] = np.where(has_map, result, fb_max)
+        # Compute the chosen value, then fill any leftover NaN with 0 so the
+        # column never carries blanks into downstream steps (AUTO CONT% 2, FINAL, BGT).
+        # NaN arises when an SSN matched a mapping key but every suffix column
+        # for that row was NaN (typical after the outer-merge across presets).
+        chosen = np.where(has_map, result, fb_max)
+        df[col_name] = pd.to_numeric(pd.Series(chosen), errors='coerce').fillna(0).to_numpy()
 
     return df
 
@@ -983,6 +1496,42 @@ def _run_job(job_id):
             df_company = _apply_mapping_assignments(df_company, engine)
         log.append({"step": "mappings", "duration": round(time.time()-t, 2)})
 
+        # Derived contribution columns (AUTO CONT% 2, AUTO CONT% (FINAL), BGT CONT% (FINAL))
+        # Pass gc_col as the vendor column so BGT CONT% (FINAL) can group by
+        # (MAJ_CAT, vendor) when running on store-level data.
+        t = time.time()
+        if not df_store.empty:
+            df_store = _apply_auto_cont_derivations(df_store, engine, vendor_col=gc_col)
+        if not df_company.empty:
+            df_company = _apply_auto_cont_derivations(df_company, engine, vendor_col=gc_col)
+        log.append({"step": "auto_cont_derivations", "duration": round(time.time()-t, 2)})
+
+        # Store-level BGT CONT% (FINAL) inherits from the company table for the
+        # same (MAJ_CAT, vendor). Falls back to local value when no company table
+        # exists. This enforces the workflow: run Company → merchant decides →
+        # run Store → store rows pick up the national decision.
+        co_inherited = False
+        if not df_store.empty:
+            t = time.time()
+            df_store, co_inherited = _inherit_company_bgt_final(df_store, df_company, engine, gc_col)
+            log.append({"step": "store_inherit_company_bgt", "duration": round(time.time()-t, 2),
+                        "inherited": co_inherited})
+
+        # V-0015 store contribution chain — 13 derived columns ending at FINAL ST CONT%.
+        # Only run when a real company source was found (in-memory df_company or
+        # an existing Cont_Percentage_<gc>_CO_<month> table). When the user runs
+        # target=Store alone and no company table exists, the chain is skipped so
+        # the store table doesn't carry meaningless V-0015 columns.
+        if not df_store.empty and co_inherited:
+            t = time.time()
+            df_store = _apply_store_contribution_chain(df_store, engine, vendor_col=gc_col)
+            log.append({"step": "store_contribution_chain", "duration": round(time.time()-t, 2)})
+        elif not df_store.empty:
+            logger.info("[contrib] Skipping V-0015 store chain — no company source found. "
+                        "Run target=Company first (with save_to_db=true) to enable the chain.")
+            log.append({"step": "store_contribution_chain", "skipped": True,
+                        "reason": "no_company_source"})
+
         compute_dur = round(time.time()-t0, 2)
 
         # ── Save preview + pickle FIRST so user can view/download immediately ──
@@ -1057,7 +1606,7 @@ def _run_job(job_id):
         _update_job(job_id, persist=True, status="failed", error=str(e)[:1000], finished_at=datetime.now().isoformat())
 
 
-JOB_AUTO_DELETE_DELAY = 60  # seconds after completion before auto-delete
+JOB_AUTO_DELETE_DELAY = 1800  # seconds after completion before auto-delete (30 min — gives users time to download)
 
 def _auto_delete_job(job_id, delay=JOB_AUTO_DELETE_DELAY):
     """Auto-delete a completed/failed job after a delay to allow frontend to fetch results."""
@@ -1157,6 +1706,7 @@ def list_jobs(current_user: User = Depends(get_current_user)):
 @router.get("/jobs/{job_id}", response_model=APIResponse)
 def get_job(job_id: str, current_user: User = Depends(get_current_user)):
     """Get full job details including preview data."""
+    _lazy_load_jobs()
     with _job_lock:
         job = _jobs.get(job_id)
     if not job:
@@ -1268,6 +1818,9 @@ def download_job_result(job_id: str, result_type: str,
                         current_user: User = Depends(get_current_user)):
     """Download job result — from pkl if available, else from DB table."""
     logger.info(f"[Job {job_id}] Download requested: {result_type}")
+    # Ensure persisted jobs are loaded — covers the case where the backend
+    # restarted after the job ran and the in-memory _jobs dict is empty.
+    _lazy_load_jobs()
     with _job_lock:
         job = _jobs.get(job_id)
 
@@ -1320,6 +1873,20 @@ def download_job_result(job_id: str, result_type: str,
         table_name = f"{TABLE_PREFIX}_{safe_gc}_CO_{month_tag}"
     else:
         table_name = f"{TABLE_PREFIX}_{safe_gc}_{month_tag}"
+
+    # Check the table actually exists before querying — give a useful error otherwise.
+    engine = get_data_engine()
+    with engine.connect() as conn:
+        exists = conn.execute(text(
+            "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME=:t"
+        ), {"t": table_name}).fetchone()
+    if not exists:
+        raise HTTPException(
+            410,
+            f"Job result is no longer available. The temporary file expired after "
+            f"{JOB_AUTO_DELETE_DELAY//60} minutes and no '{table_name}' table exists "
+            f"in the database. Re-run the job with 'Save to database' checked, or "
+            f"download within {JOB_AUTO_DELETE_DELAY//60} minutes of completion.")
 
     label = f"contrib_{result_type}"
     try:
@@ -1715,3 +2282,456 @@ def delete_export_job(export_id: str, current_user: User = Depends(get_current_u
         except Exception:
             pass
     return APIResponse(success=True, message=f"Export {export_id} deleted")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONTRIBUTION REPORT — MAJ_CAT Cockpit (Design A)
+#
+#  One MAJ_CAT at a time. Shows the full 5-step contribution chain per vendor:
+#    L7D | L30D | AUTO CONT% | AUTO CONT% 2 | AUTO CONT% (FINAL) | MERCH_INPUT
+#    | BGT CONT% (FINAL)
+#
+#  Merchant edits MERCH_INPUT inline; live 100% sum check at the bottom of the
+#  grid. Edits persist in `Cont_Report_Merch` (separate from source data).
+# ══════════════════════════════════════════════════════════════════════════════
+
+COCKPIT_MERCH_TABLE = "Cont_Report_Merch"
+
+# Columns from a Cont_Percentage_* table that are NOT the per-vendor grouping column.
+# Used to detect the grouping column at runtime (whatever's left over is the vendor key).
+_COCKPIT_IDENTITY = {
+    "SEG", "DIV", "SUB_DIV", "MAJ_CAT", "RNG_SEG", "RDC_CD", "RDC_NM",
+    "ST_CD", "ST_NM", "SSN", "ACT_INACT", "MAJ-CAT STS", "RNG_SEG STS",
+    "APF", "AVG_DNSTY", "MERCH_INPUT", "LISTING", "Generated_Date",
+    "AUTO CONT%", "AUTO SEG CONT%", "Auto cont%",
+    "AUTO CONT% 2", "AUTO CONT% (FINAL)", "BGT CONT% (FINAL)",
+}
+
+
+def _ensure_cockpit_merch_table(engine):
+    with engine.connect() as c:
+        _run(c, f"""
+            IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='{COCKPIT_MERCH_TABLE}')
+            CREATE TABLE {COCKPIT_MERCH_TABLE} (
+                id            INT IDENTITY(1,1) PRIMARY KEY,
+                table_name    NVARCHAR(255) NOT NULL,
+                maj_cat       NVARCHAR(150) NOT NULL,
+                vendor_cd     NVARCHAR(100) NOT NULL,
+                merch_input   FLOAT         NULL,
+                modified_by   NVARCHAR(255) NULL,
+                modified_at   DATETIME      DEFAULT GETDATE(),
+                CONSTRAINT UQ_{COCKPIT_MERCH_TABLE} UNIQUE (table_name, maj_cat, vendor_cd)
+            )
+        """)
+
+
+def _detect_vendor_col(columns):
+    """Return the grouping column used in this result table — anything that isn't a
+    known identity column, an INITIAL/STOCK/SALE/ALGO KPI column, or a derived one."""
+    # Exclude the identity set, any pipe-suffixed period columns, and known masters.
+    for c in columns:
+        if c in _COCKPIT_IDENTITY:
+            continue
+        if "|" in c:
+            continue
+        if c.startswith(("OP_STK_", "CL_STK_", "0001_STK_", "STR", "FIX",
+                          "DISP_AREA", "GM_", "SALES_PSF", "SALE_PSF", "STOCK_CONT",
+                          "SALE_CONT", "ALGO", "INITIAL AUTO")):
+            continue
+        # First survivor is our grouping column (M_VND_CD, MACRO_MVGR, etc.)
+        return c
+    return None
+
+
+def _vendor_label_col(vendor_cd_col):
+    """For M_VND_CD → M_VND_NM, for MACRO_MVGR → none, etc."""
+    if vendor_cd_col == "M_VND_CD":
+        return "M_VND_NM"
+    return None
+
+
+def _fetch_cockpit_merch(engine, table_name):
+    """Pre-load merchant overrides for a table → dict[(maj_cat, vendor_cd)] -> merch_input."""
+    _ensure_cockpit_merch_table(engine)
+    df = _read_sql_nolock(
+        f"SELECT maj_cat, vendor_cd, merch_input FROM {COCKPIT_MERCH_TABLE} WITH (NOLOCK) "
+        f"WHERE table_name = '{table_name.replace(chr(39), chr(39)*2)}'", engine)
+    out = {}
+    for _, r in df.iterrows():
+        if pd.notna(r["merch_input"]):
+            out[(str(r["maj_cat"]), str(r["vendor_cd"]))] = float(r["merch_input"])
+    return out
+
+
+@router.get("/report/tables", response_model=APIResponse)
+def report_list_tables(current_user: User = Depends(get_current_user)):
+    """List `Cont_Percentage_*` tables with their detected grouping column and row count."""
+    engine = get_data_engine()
+    try:
+        insp = inspect(engine)
+        names = sorted([t for t in insp.get_table_names() if t.upper().startswith(TABLE_PREFIX.upper())])
+    except Exception:
+        names = []
+    out = []
+    with engine.connect() as c:
+        for t in names:
+            try:
+                cols = [r[0] for r in c.execute(text(
+                    f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{t}'"
+                )).fetchall()]
+                rc = c.execute(text(f"SELECT COUNT(*) FROM [{t}] WITH (NOLOCK)")).scalar() or 0
+                out.append({
+                    "table_name": t,
+                    "level": "store" if "ST_CD" in cols else "company",
+                    "vendor_col": _detect_vendor_col(cols),
+                    "rows": int(rc),
+                })
+            except Exception:
+                pass
+    return APIResponse(success=True, data={"tables": out})
+
+
+@router.get("/report/majcats", response_model=APIResponse)
+def report_list_majcats(table: str = Query(...), current_user: User = Depends(get_current_user)):
+    """List MAJ_CATs in a result table with vendor counts and AUTO CONT% (FINAL) sums."""
+    if not table.upper().startswith(TABLE_PREFIX.upper()):
+        raise HTTPException(400, "Invalid table name")
+    engine = get_data_engine()
+    safe = table.replace("'", "").replace(";", "")
+
+    with engine.connect() as c:
+        cols = [r[0] for r in c.execute(text(
+            f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{safe}'"
+        )).fetchall()]
+    if "MAJ_CAT" not in cols:
+        raise HTTPException(400, "Table has no MAJ_CAT column")
+
+    final_col = "AUTO CONT% (FINAL)" if "AUTO CONT% (FINAL)" in cols else None
+    select_extra = f", SUM(COALESCE([{final_col}], 0)) AS auto_sum" if final_col else ", NULL AS auto_sum"
+    df = _read_sql_nolock(
+        f"SELECT MAJ_CAT, COUNT(*) AS vendor_count {select_extra} "
+        f"FROM [{safe}] WITH (NOLOCK) GROUP BY MAJ_CAT ORDER BY MAJ_CAT",
+        engine,
+    )
+    items = []
+    for _, r in df.iterrows():
+        items.append({
+            "maj_cat": r["MAJ_CAT"],
+            "vendor_count": int(r["vendor_count"]),
+            "auto_sum": round(float(r["auto_sum"]), 4) if pd.notna(r["auto_sum"]) else None,
+        })
+    return APIResponse(success=True, data={"maj_cats": items, "has_final": bool(final_col)})
+
+
+@router.get("/report/cockpit", response_model=APIResponse)
+def report_cockpit(table: str = Query(...), maj_cat: str = Query(...),
+                   current_user: User = Depends(get_current_user)):
+    """Return the vendor rows for one (table, maj_cat) with the full contribution chain
+    plus the merchant's persisted override (if any).
+
+    Response shape:
+      {
+        "vendor_col": "M_VND_CD",
+        "vendor_label_col": "M_VND_NM" | null,
+        "periods": ["L7D","L30D",...],
+        "rows": [{...}],
+        "totals": {"auto_final": float, "merch": float, "bgt_final": float}
+      }
+    """
+    if not table.upper().startswith(TABLE_PREFIX.upper()):
+        raise HTTPException(400, "Invalid table name")
+    engine = get_data_engine()
+    safe = table.replace("'", "").replace(";", "")
+
+    with engine.connect() as c:
+        all_cols = [r[0] for r in c.execute(text(
+            f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{safe}'"
+        )).fetchall()]
+    if not all_cols:
+        raise HTTPException(404, "Table not found")
+    if "MAJ_CAT" not in all_cols:
+        raise HTTPException(400, "Table has no MAJ_CAT column")
+
+    vendor_cd = _detect_vendor_col(all_cols)
+    if not vendor_cd:
+        raise HTTPException(400, "Could not detect a vendor grouping column in this table")
+    vendor_nm = _vendor_label_col(vendor_cd) if _vendor_label_col(vendor_cd) in all_cols else None
+
+    # Find the per-period INITIAL AUTO CONT% columns
+    periods = []
+    for c in all_cols:
+        if c.startswith("INITIAL AUTO CONT%|"):
+            p = c.split("|", 1)[1]
+            periods.append(p)
+    # Cap to first 2 periods for the cockpit display (L7D + L30D in usual sequence)
+    display_periods = periods[:2]
+
+    select_cols = []
+    for c in ("SEG", "DIV", "SUB_DIV", "MAJ_CAT", "RDC_CD", "SSN", "ACT_INACT",
+              vendor_cd, vendor_nm, "MERCH_INPUT",
+              "AUTO CONT%", "Auto cont%", "AUTO SEG CONT%",
+              "AUTO CONT% 2", "AUTO CONT% (FINAL)", "BGT CONT% (FINAL)"):
+        if c and c in all_cols and c not in select_cols:
+            select_cols.append(c)
+    for p in display_periods:
+        col = f"INITIAL AUTO CONT%|{p}"
+        if col in all_cols:
+            select_cols.append(col)
+
+    bracketed = ", ".join(f"[{c}]" for c in select_cols)
+    safe_mc = maj_cat.replace("'", "''")
+    df = _read_sql_nolock(
+        f"SELECT {bracketed} FROM [{safe}] WITH (NOLOCK) WHERE MAJ_CAT = '{safe_mc}'", engine)
+
+    if df.empty:
+        return APIResponse(success=True, data={
+            "vendor_col": vendor_cd, "vendor_label_col": vendor_nm,
+            "periods": display_periods, "rows": [], "totals": {"auto_final": 0, "merch": 0, "bgt_final": 0}
+        })
+
+    merch_overrides = _fetch_cockpit_merch(engine, safe)
+
+    # Normalise mapped column to a single 'auto_cont_mapped' field
+    mapped_col = next((c for c in ("AUTO CONT%", "Auto cont%", "AUTO SEG CONT%") if c in df.columns), None)
+
+    rows_out = []
+    for _, r in df.iterrows():
+        vcd = str(r.get(vendor_cd, ""))
+        merch_override = merch_overrides.get((str(maj_cat), vcd))
+        row = {
+            "vendor_cd":  r.get(vendor_cd),
+            "vendor_nm":  r.get(vendor_nm) if vendor_nm else None,
+            "SEG":        r.get("SEG"),
+            "DIV":        r.get("DIV"),
+            "SUB_DIV":    r.get("SUB_DIV"),
+            "SSN":        r.get("SSN"),
+            "ACT_INACT":  r.get("ACT_INACT"),
+            "MERCH_INPUT":      _num_or_none(r.get("MERCH_INPUT")),
+            "MERCH_INPUT_OVR":  merch_override,            # persisted override (if any)
+            "auto_cont_mapped": _num_or_none(r.get(mapped_col)) if mapped_col else None,
+            "AUTO CONT% 2":     _num_or_none(r.get("AUTO CONT% 2")),
+            "AUTO CONT% (FINAL)": _num_or_none(r.get("AUTO CONT% (FINAL)")),
+            "BGT CONT% (FINAL)":  _num_or_none(r.get("BGT CONT% (FINAL)")),
+        }
+        for p in display_periods:
+            row[f"INITIAL_AUTO_{p}"] = _num_or_none(r.get(f"INITIAL AUTO CONT%|{p}"))
+        rows_out.append(row)
+
+    totals = {
+        "auto_final": round(sum((r["AUTO CONT% (FINAL)"] or 0) for r in rows_out), 4),
+        "merch":      round(sum(((r["MERCH_INPUT_OVR"] if r["MERCH_INPUT_OVR"] is not None else r["MERCH_INPUT"]) or 0) for r in rows_out), 4),
+        "bgt_final":  round(sum((r["BGT CONT% (FINAL)"] or 0) for r in rows_out), 4),
+    }
+    return APIResponse(success=True, data={
+        "vendor_col": vendor_cd,
+        "vendor_label_col": vendor_nm,
+        "periods": display_periods,
+        "rows": rows_out,
+        "totals": totals,
+    })
+
+
+def _num_or_none(v):
+    try:
+        if v is None or pd.isna(v):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+class CockpitMerchItem(BaseModel):
+    vendor_cd: str
+    merch_input: Optional[float] = None  # null clears the override
+
+
+class CockpitMerchBulk(BaseModel):
+    table_name: str
+    maj_cat: str
+    items: List[CockpitMerchItem]
+
+
+@router.post("/report/cockpit/save", response_model=APIResponse)
+def report_cockpit_save(payload: CockpitMerchBulk, current_user: User = Depends(get_current_user)):
+    """Bulk upsert merchant inputs for a (table, MAJ_CAT) — one row per vendor."""
+    if not payload.table_name.upper().startswith(TABLE_PREFIX.upper()):
+        raise HTTPException(400, "Invalid table name")
+    if not payload.items:
+        return APIResponse(success=True, message="No items", data={"saved": 0})
+
+    engine = get_data_engine()
+    _ensure_cockpit_merch_table(engine)
+    user = getattr(current_user, "username", None) or getattr(current_user, "user_name", None) or "unknown"
+
+    with engine.connect() as c:
+        saved = 0
+        for it in payload.items:
+            params = {
+                "tn": payload.table_name, "mc": payload.maj_cat,
+                "vc": it.vendor_cd, "v": it.merch_input, "u": user,
+            }
+            _run(c, f"""
+                MERGE {COCKPIT_MERCH_TABLE} AS tgt
+                USING (SELECT :tn AS table_name, :mc AS maj_cat, :vc AS vendor_cd) AS src
+                ON  tgt.table_name = src.table_name
+                AND tgt.maj_cat    = src.maj_cat
+                AND tgt.vendor_cd  = src.vendor_cd
+                WHEN MATCHED THEN
+                    UPDATE SET merch_input = :v, modified_by = :u, modified_at = GETDATE()
+                WHEN NOT MATCHED THEN
+                    INSERT (table_name, maj_cat, vendor_cd, merch_input, modified_by, modified_at)
+                    VALUES (:tn, :mc, :vc, :v, :u, GETDATE());
+            """, params)
+            saved += 1
+    return APIResponse(success=True, message=f"Saved {saved} merchant input(s)",
+                       data={"saved": saved})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONTRIBUTION REPORT — Full-table paginated view (replaces MAJ_CAT cockpit)
+#
+#  Shows the whole Cont_Percentage_* table as-is, paginated 500 rows at a time,
+#  with curated columns (only the contribution-relevant ones). A "show_all"
+#  toggle reveals every column for power users / debugging.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _select_curated_columns(all_cols, is_store, vendor_col, vendor_name_col):
+    """Return the curated default column list (skip per-period KPIs and vendor code)."""
+    out = []
+
+    # Identity columns
+    for c in ['ST_CD', 'ST_NM', 'STATUS', 'SEG', 'DIV', 'SUB_DIV', 'MAJ_CAT', 'RNG_SEG', 'RDC_CD']:
+        if c in all_cols and c not in out:
+            out.append(c)
+
+    # Vendor name only — drop the code. For non-M_VND_CD groupings show the value.
+    if vendor_name_col and vendor_name_col in all_cols:
+        out.append(vendor_name_col)
+    elif vendor_col and vendor_col != 'M_VND_CD' and vendor_col in all_cols:
+        out.append(vendor_col)
+
+    # Stable per-row attributes
+    for c in ['SSN', 'ACT_INACT', 'APF', 'AVG_DNSTY', 'LISTING', 'MERCH_INPUT']:
+        if c in all_cols and c not in out:
+            out.append(c)
+
+    # Reference period inputs (just two — L30D + SSN_TLM if available)
+    if 'INITIAL AUTO CONT%|L30D' in all_cols:
+        out.append('INITIAL AUTO CONT%|L30D')
+    for c in all_cols:
+        if c.startswith('INITIAL AUTO CONT%|') and 'SSN' in c.upper():
+            out.append(c)
+            break
+
+    # Contribution chain — different per level
+    if is_store:
+        chain = ['NAT CONT%', 'NAT CONT% @ MAJ', 'BGT CONT%',
+                 'AUTO CONT%-1', 'RMN AUTO', 'BGT CONT%@MAJ_CAT', 'RMN AUTO @ MAJCAT',
+                 'ALGO', 'AUTO CONT%-2', 'OLD ST CONT%',
+                 'INT ST CONT%', 'INT-2 ST CONT%', 'FINAL ST CONT%']
+    else:
+        chain = ['Auto cont%', 'AUTO CONT%', 'AUTO SEG CONT%',
+                 'AUTO CONT% 2', 'AUTO CONT% (FINAL)', 'BGT CONT% (FINAL)']
+    for c in chain:
+        if c in all_cols and c not in out:
+            out.append(c)
+
+    if 'Generated_Date' in all_cols:
+        out.append('Generated_Date')
+
+    return out
+
+
+@router.get("/report/page", response_model=APIResponse)
+def report_page(table: str = Query(...),
+                page: int = Query(1, ge=1),
+                page_size: int = Query(500, ge=1, le=5000),
+                majcat: Optional[str] = Query(None),
+                seg: Optional[str] = Query(None),
+                status: Optional[str] = Query(None),
+                q: Optional[str] = Query(None),
+                show_all: bool = Query(False),
+                current_user: User = Depends(get_current_user)):
+    """Paginated report view for a Cont_Percentage_* table.
+
+    Defaults to a curated column set (essential contribution columns + identity).
+    Pass `show_all=true` to reveal every column. Supports filtering by MAJ_CAT,
+    SEG, STATUS, and a free-text vendor-name search.
+    """
+    if not table.upper().startswith(TABLE_PREFIX.upper()):
+        raise HTTPException(400, "Invalid table name")
+    engine = get_data_engine()
+    safe = table.replace("'", "").replace(";", "")
+
+    with engine.connect() as c:
+        all_cols = [r[0] for r in c.execute(text(
+            f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{safe}'"
+        )).fetchall()]
+    if not all_cols:
+        raise HTTPException(404, "Table not found")
+
+    is_store = 'ST_CD' in all_cols
+    vendor_col = _detect_vendor_col(all_cols)
+    vendor_name_col = _vendor_label_col(vendor_col) if _vendor_label_col(vendor_col) in all_cols else None
+
+    selected = all_cols if show_all else _select_curated_columns(all_cols, is_store, vendor_col, vendor_name_col)
+    selected = [c for c in selected if c in all_cols]  # safety filter
+
+    # Build WHERE
+    where_parts = []
+    if majcat and 'MAJ_CAT' in all_cols:
+        safe_v = majcat.replace("'", "''")
+        where_parts.append(f"[MAJ_CAT] = '{safe_v}'")
+    if seg and 'SEG' in all_cols:
+        safe_v = seg.replace("'", "''")
+        where_parts.append(f"[SEG] = '{safe_v}'")
+    if status and 'STATUS' in all_cols:
+        safe_v = status.replace("'", "''")
+        where_parts.append(f"[STATUS] = '{safe_v}'")
+    if q and vendor_name_col:
+        safe_v = q.replace("'", "''").replace("%", "")
+        where_parts.append(f"[{vendor_name_col}] LIKE '%{safe_v}%'")
+    where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    with engine.connect() as c:
+        total = c.execute(text(f"SELECT COUNT(*) FROM [{safe}] WITH (NOLOCK){where_sql}")).scalar() or 0
+
+    # Distinct filter options (for dropdowns) — only on first page request, cheap
+    filter_options = {}
+    if page == 1:
+        with engine.connect() as c:
+            for fc in ('SEG', 'MAJ_CAT', 'STATUS'):
+                if fc not in all_cols:
+                    continue
+                try:
+                    vals = [r[0] for r in c.execute(text(
+                        f"SELECT DISTINCT [{fc}] FROM [{safe}] WITH (NOLOCK) WHERE [{fc}] IS NOT NULL ORDER BY [{fc}]"
+                    )).fetchall()]
+                    filter_options[fc] = [str(v) for v in vals if v is not None]
+                except Exception:
+                    pass
+
+    offset = (page - 1) * page_size
+    order_col = vendor_name_col or 'MAJ_CAT' if 'MAJ_CAT' in all_cols else selected[0]
+    bracketed = ", ".join(f"[{c}]" for c in selected)
+    rows_sql = (
+        f"SELECT {bracketed} FROM [{safe}] WITH (NOLOCK){where_sql} "
+        f"ORDER BY [{order_col}] "
+        f"OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY"
+    )
+    df = _read_sql_nolock(rows_sql, engine)
+    for col in df.select_dtypes(include=['float64', 'float32', 'float']).columns:
+        df[col] = df[col].round(4)
+
+    return APIResponse(success=True, data={
+        "columns": selected,
+        "rows": json.loads(df.to_json(orient='records', date_format='iso')),
+        "total": int(total),
+        "page": page,
+        "page_size": page_size,
+        "is_store": is_store,
+        "vendor_col": vendor_col,
+        "vendor_name_col": vendor_name_col,
+        "all_columns": all_cols,
+        "filter_options": filter_options,
+    })

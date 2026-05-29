@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate, Navigate } from 'react-router-dom'
-import { Lock, User } from 'lucide-react'
+import { Lock, User, Box } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 
 export default function LoginPage() {
@@ -21,7 +21,9 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
       <div className="w-full max-w-sm">
         <div className="text-center mb-6">
-          <img src="/v2-logo.png" alt="V2" className="w-14 h-14 object-contain mx-auto mb-3 drop-shadow-lg" />
+          <div className="w-12 h-12 rounded-xl bg-primary-600 flex items-center justify-center mx-auto mb-3 shadow-lg shadow-primary-600/30">
+            <Box size={24} className="text-white" />
+          </div>
           <h1 className="text-2xl font-bold text-white">ARS</h1>
           <p className="text-slate-400 text-[12px] mt-0.5">Auto Replenishment System</p>
         </div>

@@ -579,9 +579,10 @@ export default function ListingPage() {
   const [ageThreshold, setAgeThreshold] = useState(15)              // AGE < X → use PER_OPT_SALE
   const [reqWeight, setReqWeight] = useState(0.4)                   // Store ranking: req weight
   const [fillWeight, setFillWeight] = useState(0.6)                 // Store ranking: fill weight
-  // Secondary-grid dispatch cap toggle (default ON). Main pass enforces
-  // cap = 130% on every Secondary grid.
-  const [applySecCapInNormal, setApplySecCapInNormal] = useState(true)
+  const [enableFallback, setEnableFallback] = useState(false)       // Fallback allocation (grid demotion)
+  const [boostMode, setBoostMode] = useState('static')             // 'str' | 'static'
+  const [staticGrowth, setStaticGrowth] = useState(130)            // static growth % (130 = 1.3x)
+  const [strTiers, setStrTiers] = useState('30:150,45:130,60:120,90:110')
   const [defaultAcsD, setDefaultAcsD] = useState(18)              // Default ACS_D fallback
   const [enableMinSize, setEnableMinSize] = useState(false)        // Toggle min size check
   const [minSizeCount, setMinSizeCount] = useState(3)             // Min sizes for TBL listing
@@ -591,125 +592,14 @@ export default function ListingPage() {
   const [priCheckTBC, setPriCheckTBC] = useState(false)
   // MBQ cap — active only when the corresponding PRI gate is OFF (unchecked).
   // Prevents over-allocation: total SHIP_QTY per store ≤ cap% of MJ_MBQ.
-  // TBL has no MJ-cap (removed 2026-05-16) — bounded only by SZ_REQ.
   const [rlMbqCapPct,  setRlMbqCapPct]  = useState(110)
   const [tbcMbqCapPct, setTbcMbqCapPct] = useState(110)
-  // MJ_MBQ growth headroom (Allocation Gate).  Slider value applies only
-  // when mbqGrowthUseDefault is OFF.  Checked = force 100% (strict cap).
-  // Unchecked = scale MJ_MBQ → MJ_MBQ_REV by this %, then MJ_REQ_REV is
-  // re-derived from the scaled MBQ.
-  const [mjReqGrowthPct, setMjReqGrowthPct] = useState(110)
-  const [mbqGrowthUseDefault, setMbqGrowthUseDefault] = useState(true)
-  // Parking mode: false (default) = single-parked (block new runs while a
-  // session is awaiting review); true = multi-parked (stack snapshots).
-  const [allowMultiParked, setAllowMultiParked] = useState(false)
   const [previewExpanded, setPreviewExpanded] = useState(false)
   const [majCatModalOpen, setMajCatModalOpen] = useState(false)
   const [storeModalOpen, setStoreModalOpen] = useState(false)
   const [mcFilter, setMcFilter]   = useState('')
   const [mcSortCol, setMcSortCol] = useState('totalAlloc')
   const [mcSortDir, setMcSortDir] = useState('desc')
-  // Store-wise drill-down from the MAJ_CAT modal: maj_cat + (optional) rdc.
-  const [storeDrillOpen,     setStoreDrillOpen]     = useState(false)
-  const [storeDrillMajCat,   setStoreDrillMajCat]   = useState('')
-  const [storeDrillRdc,      setStoreDrillRdc]      = useState(null)
-  const [storeDrillData,     setStoreDrillData]     = useState([])
-  const [storeDrillLoading,  setStoreDrillLoading]  = useState(false)
-  const [storeDrillSortCol,  setStoreDrillSortCol]  = useState('alloc_qty')
-  const [storeDrillSortDir,  setStoreDrillSortDir]  = useState('desc')
-
-  // ── Per-cell calc popover (Phase 1B) ─────────────────────────────────
-  // Anchored panel showing the formula + values for the metric clicked.
-  // calcPopover = { metric, mc, rdc, cell, anchor: {x,y}, sloc?: [...] }
-  const [calcPopover, setCalcPopover] = useState(null)
-
-  // ── OPT-wise drill modal (Phase 2) ───────────────────────────────────
-  // Triggered when the user clicks the MAJ_CAT name (or an aggregate
-  // cell) — shows one row per (WERKS, GEN_ART_NUMBER, CLR).
-  const [optModalOpen,     setOptModalOpen]     = useState(false)
-  const [optModalMajCat,   setOptModalMajCat]   = useState('')
-  const [optModalRdc,      setOptModalRdc]      = useState(null)
-  const [optModalWerks,    setOptModalWerks]    = useState(null)
-  const [optModalData,     setOptModalData]     = useState([])
-  const [optModalLoading,  setOptModalLoading]  = useState(false)
-  const [optModalSortCol,  setOptModalSortCol]  = useState('OPT_PRIORITY_RANK')
-  const [optModalSortDir,  setOptModalSortDir]  = useState('asc')
-
-  // ── VAR_ART-wise drill modal (Phase 2) ───────────────────────────────
-  // Triggered when the user clicks an OPT row in the OPT modal — shows
-  // one row per (VAR_ART, SZ) for that OPT.
-  const [varModalOpen,    setVarModalOpen]    = useState(false)
-  const [varModalCtx,     setVarModalCtx]     = useState(null)   // { mc, werks, gen_art, clr, rdc }
-  const [varModalData,    setVarModalData]    = useState([])
-  const [varModalLoading, setVarModalLoading] = useState(false)
-  const [varModalSortCol, setVarModalSortCol] = useState('SZ')
-  const [varModalSortDir, setVarModalSortDir] = useState('asc')
-
-  // Drill stack — single source of truth for current drill level within
-  // the MAJ_CAT modal. The same modal frame swaps content based on the
-  // current entry; user navigates back via the Back button (popDrill).
-  //   null                                       → MAJ_CAT root view
-  //   { view: 'store', mc, rdc }                 → store-wise table
-  //   { view: 'opt',   mc, rdc, werks }          → OPT-wise table
-  //   { view: 'var',   mc, rdc, werks, gen_art,
-  //                    clr, opt }                → VAR_ART × SZ table
-  const [drill, setDrill] = useState(null)
-
-  // Pop one level off the drill (back navigation). At root → no-op
-  // (close button is what exits the modal entirely).
-  const popDrill = () => {
-    setDrill(d => {
-      if (!d) return null
-      if (d.view === 'var')
-        return { view: 'opt', mc: d.mc, rdc: d.rdc, werks: d.werks }
-      if (d.view === 'opt')
-        return { view: 'store', mc: d.mc, rdc: d.rdc }
-      return null
-    })
-  }
-
-  // Store-wise drill — sets drill state and fires the data fetch.
-  // Called from MAJ_CAT row name click. rdc=null means all RDCs.
-  const openStoreDrillNew = (mc, rdc) => {
-    setStoreDrillMajCat(mc)
-    setStoreDrillRdc(rdc || null)
-    setStoreDrillData([])
-    setStoreDrillLoading(true)
-    setDrill({ view: 'store', mc, rdc: rdc || null })
-    setMajCatModalOpen(true)
-    listingAPI.storeByMajCat(mc, rdc || undefined)
-      .then(res => setStoreDrillData(res?.data?.data || []))
-      .catch(() => setStoreDrillData([]))
-      .finally(() => setStoreDrillLoading(false))
-  }
-
-  // OPT-wise drill — accepts an optional `werks` so the store-drill view
-  // can pass through to a per-store OPT view. mc/rdc/werks may be null.
-  const openOptModal = (mc, rdc, werks) => {
-    setOptModalMajCat(mc)
-    setOptModalRdc(rdc || null)
-    setOptModalWerks(werks || null)
-    setOptModalData([])
-    setOptModalLoading(true)
-    setDrill({ view: 'opt', mc, rdc: rdc || null, werks: werks || null })
-    listingAPI.optSummary(mc, rdc || undefined, werks || undefined)
-      .then(res => setOptModalData(res?.data?.data || []))
-      .catch(() => setOptModalData([]))
-      .finally(() => setOptModalLoading(false))
-  }
-
-  // VAR_ART × SZ drill — fired from an OPT row click. Filters to that
-  // specific store + OPT.
-  const openVarDrill = (mc, werks, genArt, clr, rdc, opt) => {
-    setVarModalCtx({ mc, werks, gen_art: genArt, clr: clr || '', rdc: rdc || null, opt })
-    setVarModalData([])
-    setVarModalLoading(true)
-    setDrill({ view: 'var', mc, rdc: rdc || null, werks, gen_art: genArt, clr: clr || '', opt })
-    listingAPI.varSummary(mc, werks, genArt, clr || '', rdc || undefined)
-      .then(res => setVarModalData(res?.data?.data || []))
-      .catch(() => setVarModalData([]))
-      .finally(() => setVarModalLoading(false))
-  }
 
   // ── Parallel allocation (Part 8) ─────────────────────────────────────
   const [allocationMode, setAllocationMode] = useState('pandas') // 'sequential' | 'pandas'
@@ -798,8 +688,10 @@ export default function ListingPage() {
         if (s.run_mode) setRunMode(s.run_mode)
         if (s.req_weight) setReqWeight(parseFloat(s.req_weight))
         if (s.fill_weight) setFillWeight(parseFloat(s.fill_weight))
-        if (s.apply_sec_cap_in_normal !== undefined)
-          setApplySecCapInNormal(s.apply_sec_cap_in_normal === 'true' || s.apply_sec_cap_in_normal === true)
+        if (s.enable_fallback !== undefined) setEnableFallback(s.enable_fallback === 'true' || s.enable_fallback === true)
+        if (s.fallback_boost_mode) setBoostMode(s.fallback_boost_mode)
+        if (s.static_growth_pct) setStaticGrowth(parseFloat(s.static_growth_pct))
+        if (s.str_tiers) setStrTiers(s.str_tiers)
         if (s.default_acs_d) setDefaultAcsD(parseFloat(s.default_acs_d))
         if (s.min_size_count) setMinSizeCount(parseInt(s.min_size_count, 10))
         if (s.pri_ct_check_rl !== undefined)
@@ -808,14 +700,6 @@ export default function ListingPage() {
           setPriCheckTBC(s.pri_ct_check_tbc === 'true' || s.pri_ct_check_tbc === true)
         if (s.rl_mbq_cap_pct !== undefined)  setRlMbqCapPct(parseFloat(s.rl_mbq_cap_pct) || 110)
         if (s.tbc_mbq_cap_pct !== undefined) setTbcMbqCapPct(parseFloat(s.tbc_mbq_cap_pct) || 110)
-        if (s.mj_req_growth_pct !== undefined) {
-          const v = parseFloat(s.mj_req_growth_pct) || 100
-          // Reflect persisted value: 100 → use-default checked; >100 → unchecked + slider.
-          setMjReqGrowthPct(v === 100 ? 110 : v)
-          setMbqGrowthUseDefault(v === 100)
-        }
-        if (s.allow_multi_parked !== undefined)
-          setAllowMultiParked(s.allow_multi_parked === 'true' || s.allow_multi_parked === true)
       }
     } catch {
       // Only toast for foreground (user-initiated) calls — the api.js
@@ -1020,8 +904,8 @@ export default function ListingPage() {
   }
 
   const handleGenerate = async () => {
-    if (parkedRuns.length > 0 && !allowMultiParked) {
-      toast.error('A parked session is awaiting review — approve or reject it from the Parked Runs section, or enable "Allow multiple parked" to stack snapshots.')
+    if (parkedRuns.length > 0) {
+      toast.error('A parked session is awaiting review — approve or reject it from the Parked Runs section before generating.')
       return
     }
     const missingCount = hierGaps?.missing?.length || 0
@@ -1046,19 +930,21 @@ export default function ListingPage() {
         age_threshold: parseInt(ageThreshold, 10) || 15,
         req_weight: parseFloat(reqWeight) || 0.4,
         fill_weight: parseFloat(fillWeight) || 0.6,
-        apply_sec_cap_in_normal: !!applySecCapInNormal,
+        enable_fallback: !!enableFallback,
+        fallback_boost_mode: boostMode,
+        static_growth_pct: parseFloat(staticGrowth) || 130,
+        str_tiers: strTiers,
         default_acs_d: parseFloat(defaultAcsD) || 18,
         min_size_count: enableMinSize ? (parseInt(minSizeCount, 10) || 3) : 0,
         pri_ct_check_rl: !!priCheckRL,
         pri_ct_check_tbc: !!priCheckTBC,
-        // Checkbox forces strict 100%; otherwise the slider value applies.
-        mj_req_growth_pct: mbqGrowthUseDefault ? 100 : (parseFloat(mjReqGrowthPct) || 100),
+        rl_mbq_cap_pct: parseFloat(rlMbqCapPct) || 110,
+        tbc_mbq_cap_pct: parseFloat(tbcMbqCapPct) || 110,
         allocation_mode: allocationMode,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
         use_writer_queue: useWriterQueue,
         ssn_values: selectedSsn,
         opt_types: ({ all: ['RL','TBC','TBL'], rl: ['RL'], rl_tbc: ['RL','TBC'] })[allocOtFilter] || ['RL','TBC','TBL'],
-        allow_multi_parked: !!allowMultiParked,
       }
       if (rdcMode === 'own') {
         payload.rdc_values = autoRdcs
@@ -1435,11 +1321,9 @@ export default function ListingPage() {
     ? Object.entries(summary.alloc_by_opt_type).filter(([, v]) => v > 0).map(([k, v]) => ({ name: k, qty: v, color: OPT_COLOR[k] || '#4f46e5' }))
     : []
 
-  // Derived metrics for the new layout — REQ/MBQ/ALLOC_QTY/HOLD_QTY are
-  // backed by FLOAT in SQL but represent unit counts, so round to int
-  // before display.
-  const totalAllocQty = Math.round(summary?.by_rdc ? summary.by_rdc.reduce((s,r) => s + (r.alloc_qty || 0), 0) : 0)
-  const totalHoldQty  = Math.round(summary?.totals?.hold_qty ?? (summary?.by_rdc ? summary.by_rdc.reduce((s,r) => s + (r.hold_qty || 0), 0) : 0))
+  // Derived metrics for the new layout
+  const totalAllocQty = summary?.by_rdc ? summary.by_rdc.reduce((s,r) => s + (r.alloc_qty || 0), 0) : 0
+  const totalHoldQty  = summary?.totals?.hold_qty ?? (summary?.by_rdc ? summary.by_rdc.reduce((s,r) => s + (r.hold_qty || 0), 0) : 0)
   const holdByRdc     = (summary?.by_rdc || []).map(r => ({ rdc: String(r.rdc ?? ''), hold_qty: r.hold_qty || 0 }))
   const newPct = summary?.totals?.total ? Math.round((summary.totals.new / summary.totals.total) * 100) : 0
   const allocPct = summary?.totals?.total && summary?.alloc_rows ? Math.round((summary.alloc_rows / summary.totals.total) * 100) : 0
@@ -1694,45 +1578,17 @@ export default function ListingPage() {
                   </>
                 )}
               </div>
-              {/* Parking mode — single (block while parked pending) vs multiple (stack). */}
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px',
-                background: '#fff', border: `1px solid ${C.cardBorder}`,
-                borderRadius: 8, height: 38,
-              }} title={allowMultiParked
-                ? 'Multi-parked: new runs stack alongside pending parked sessions.'
-                : 'Single-parked (default): new runs blocked until pending parked session is approved/rejected.'}>
-                <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
-                  textTransform: 'uppercase', letterSpacing: 0.4 }}>Parking</span>
-                {[['single','Single'],['multi','Multiple']].map(([v, l]) => {
-                  const on = (v === 'multi') === !!allowMultiParked
-                  return (
-                    <button key={v} type="button"
-                      onClick={() => setAllowMultiParked(v === 'multi')}
-                      style={{ height: 26, padding: '0 9px', fontSize: 10, fontWeight: 600,
-                        borderRadius: 5, cursor: 'pointer',
-                        border: on ? `1.5px solid ${C.amber || '#d97706'}` : `1px solid ${C.cardBorder}`,
-                        background: on ? '#fef3c7' : '#fff',
-                        color: on ? '#92400e' : C.textSub }}>{l}</button>
-                  )
-                })}
-              </div>
-              {(() => {
-                const parkedBlocks = parkedRuns.length > 0 && !allowMultiParked
-                return (
-                  <button onClick={handleGenerate}
-                    disabled={parkedBlocks}
-                    title={parkedBlocks ? 'A parked session is awaiting review — approve/reject it or switch Parking to Multiple' : undefined}
-                    style={{ height: 38, borderRadius: 8, fontSize: 13, fontWeight: 700, color: '#fff', padding: '0 22px',
-                      cursor: parkedBlocks ? 'not-allowed' : 'pointer',
-                      background: parkedBlocks ? '#94a3b8' : runMode === 'full' ? 'linear-gradient(135deg, #7c3aed, #9333ea)' : 'linear-gradient(135deg, #4f46e5, #7c3aed)',
-                      border: 'none', display: 'flex', alignItems: 'center', gap: 6,
-                      boxShadow: parkedBlocks ? 'none' : '0 3px 8px rgba(79,70,229,0.3)',
-                      opacity: parkedBlocks ? 0.7 : 1 }}>
-                    <Play size={15}/> Generate {runMode === 'full' ? 'Full Pipeline' : 'Listing'}
-                  </button>
-                )
-              })()}
+              <button onClick={handleGenerate}
+                disabled={parkedRuns.length > 0}
+                title={parkedRuns.length > 0 ? 'A parked session is awaiting review — approve or reject it first' : undefined}
+                style={{ height: 38, borderRadius: 8, fontSize: 13, fontWeight: 700, color: '#fff', padding: '0 22px',
+                  cursor: parkedRuns.length > 0 ? 'not-allowed' : 'pointer',
+                  background: parkedRuns.length > 0 ? '#94a3b8' : runMode === 'full' ? 'linear-gradient(135deg, #7c3aed, #9333ea)' : 'linear-gradient(135deg, #4f46e5, #7c3aed)',
+                  border: 'none', display: 'flex', alignItems: 'center', gap: 6,
+                  boxShadow: parkedRuns.length > 0 ? 'none' : '0 3px 8px rgba(79,70,229,0.3)',
+                  opacity: parkedRuns.length > 0 ? 0.7 : 1 }}>
+                <Play size={15}/> Generate {runMode === 'full' ? 'Full Pipeline' : 'Listing'}
+              </button>
               {config?.listing_exists && (
                 <button onClick={handleExport}
                   style={{ height: 38, borderRadius: 8, fontSize: 12, fontWeight: 600, color: C.green, padding: '0 14px',
@@ -1791,6 +1647,70 @@ export default function ListingPage() {
           accent="#f59e0b"
           sub={totalHoldQty > 0 ? 'reserved for NL/TBL' : 'no hold'}/>
       </div>
+
+      {/* ═══════════ Tables Affected (last completed run) ═══════════ */}
+      {(() => {
+        const ta = activeSession?.tables_affected
+        if (!activeSession || activeSession.status !== 'SUCCESS') return null
+        if (!ta) {
+          return (
+            <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`,
+              borderRadius: 10, padding: '8px 12px', fontSize: 11, color: C.textSub,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+              <span style={{ fontWeight: 700, color: C.text, marginRight: 6 }}>
+                Tables affected:
+              </span>
+              not captured for this run
+            </div>
+          )
+        }
+        const ACTION_COLOR = {
+          CREATED:   '#059669',
+          RECREATED: '#7c3aed',
+          TRUNCATED: '#0891b2',
+          UPSERTED:  '#0284c7',
+          MISSING:   '#dc2626',
+        }
+        return (
+          <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`,
+            borderRadius: 10, padding: '8px 12px',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              marginBottom: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: C.text,
+                display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Database size={12} color={C.textSub}/> Tables affected by this run
+              </span>
+              <span style={{ fontSize: 9, color: C.textMuted }}>
+                session {activeSession.session_id}
+              </span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 6 }}>
+              {ta.map(t => (
+                <div key={t.table} style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6,
+                  padding: '5px 8px', fontSize: 10,
+                }}>
+                  <span style={{ fontWeight: 700, color: C.text,
+                    fontFamily: 'ui-monospace, Menlo, Consolas, monospace' }}>
+                    {t.table}
+                  </span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={pillStyle(ACTION_COLOR[t.action] || '#64748b')}>
+                      {t.action}
+                    </span>
+                    <span style={{ fontWeight: 700, color: C.textSub,
+                      minWidth: 60, textAlign: 'right' }}>
+                      {(t.rows || 0).toLocaleString()}
+                    </span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
 
       {/* ═══════════ Parked Runs — review queue ═══════════ */}
       {(() => {
@@ -2417,18 +2337,18 @@ export default function ListingPage() {
             <ToggleRow checked={priCheckRL}  setChecked={setPriCheckRL}
               label="PRI ≥ 100% (RL)"  color="#0891b2"
               hint="When ON, RL options must have PRI_CT% ≥ 100 to be listed/allocated"/>
+            {!priCheckRL && (
+              <ParamInput label="RL MBQ Cap %" value={rlMbqCapPct} setter={setRlMbqCapPct} step={5} min={100}
+                hint={`≤ ${rlMbqCapPct}% of MJ_MBQ`}
+                tip="Cap total RL allocation per store at this % of MAJ_CAT MBQ (prevents over-stock when PRI gate is off)"/>
+            )}
             <ToggleRow checked={priCheckTBC} setChecked={setPriCheckTBC}
               label="PRI ≥ 100% (TBC)" color="#0891b2"
               hint="When ON, TBC options must have PRI_CT% ≥ 100 to be listed/allocated"/>
-            <ToggleRow checked={mbqGrowthUseDefault} setChecked={setMbqGrowthUseDefault}
-              label="Use Default 100% (MBQ)" color={C.green}
-              hint={mbqGrowthUseDefault
-                ? "strict cap — MBQ growth disabled"
-                : `MJ_MBQ → MJ_MBQ_REV at ${mjReqGrowthPct}%`}/>
-            {!mbqGrowthUseDefault && (
-              <ParamInput label="MJ_MBQ Growth %" value={mjReqGrowthPct} setter={setMjReqGrowthPct} step={5} min={100} max={200}
-                hint={`+${mjReqGrowthPct - 100}% headroom`}
-                tip="Scale MJ_MBQ to MJ_MBQ_REV (the original MJ_MBQ stays untouched). MJ_REQ_REV is re-derived as MAX(0, MJ_MBQ_REV − MJ_STK_TTL). Engine consumes MJ_REQ_REV via MJ_REQ for the allocation ceiling. Original MJ_REQ kept in MJ_REQ_ORIG."/>
+            {!priCheckTBC && (
+              <ParamInput label="TBC MBQ Cap %" value={tbcMbqCapPct} setter={setTbcMbqCapPct} step={5} min={100}
+                hint={`≤ ${tbcMbqCapPct}% of MJ_MBQ`}
+                tip="Cap total TBC allocation per store at this % of MAJ_CAT MBQ (prevents over-stock when PRI gate is off)"/>
             )}
             <ToggleRow checked={enableMinSize} setChecked={setEnableMinSize}
               label="Min sizes for TBL" color="#7c3aed"
@@ -2448,14 +2368,29 @@ export default function ListingPage() {
               hint={`def=${defaultAcsD}`}             tip="Default AGE-of-Comparable-Stock fallback"/>
           </ParamGroup>
 
-          {/* Fallback Allocation panel removed 2026-05-16. See
-              backend/app/docs/processes/fallback_archived.md for the
-              previous F0–F5 design. Sec-grid Cap toggle was preserved
-              and moved here as a standalone control. */}
-          <ParamGroup title="Secondary-grid Cap" color={C.amber}>
-            <ToggleRow checked={applySecCapInNormal} setChecked={setApplySecCapInNormal}
-              label="Sec-grid Cap 130%" color={C.primary}
-              hint="Cap Secondary grids at 130% of MBQ in main pass"/>
+          <ParamGroup title="Fallback Allocation" color={C.amber}>
+            <ToggleRow checked={enableFallback} setChecked={setEnableFallback}
+              label="Enable Fallback" color={C.primary}
+              hint="Demote grid when primary doesn't cover demand"/>
+            {enableFallback && (
+              <>
+                <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                  {[['str','STR (Sell-Thru)'],['static','Static']].map(([v, l]) => (
+                    <button key={v} onClick={() => setBoostMode(v)}
+                      style={{ ..._btn(boostMode===v, '#7c3aed'), height: 22, fontSize: 9, padding: '0 8px', flex: 1 }}>{l}</button>
+                  ))}
+                </div>
+                {boostMode === 'static' && (
+                  <ParamInput label="Growth %" value={staticGrowth} setter={setStaticGrowth} step={10}
+                    hint={`${(staticGrowth/100).toFixed(1)}× boost`}/>
+                )}
+                {boostMode === 'str' && (
+                  <input value={strTiers} onChange={e => setStrTiers(e.target.value)}
+                    placeholder="30:150,45:130,60:120,90:110"
+                    style={{ ..._inp, width: '100%', textAlign: 'left', fontSize: 9, marginTop: 2 }}/>
+                )}
+              </>
+            )}
           </ParamGroup>
         </div>
       </div>
@@ -2655,7 +2590,7 @@ export default function ListingPage() {
               subtitle="Allocated qty grouped by store hub"
               right={<div style={{ fontSize: 10, color: C.textMuted }}>
                 Total: <b style={{ color: C.text }}>
-                  {Math.round(hubChartData.reduce((s, e) => s + (e.alloc_qty || 0), 0)).toLocaleString()}
+                  {hubChartData.reduce((s, e) => s + (e.alloc_qty || 0), 0).toLocaleString()}
                 </b>
               </div>}>
               {(h) => hubChartData.length > 0 ? (
@@ -2996,47 +2931,19 @@ export default function ListingPage() {
         const raw     = summary?.by_maj_cat_rdc || []
         const rdcs    = [...new Set(raw.map(r => r.rdc))].sort()
         const majcats = [...new Set(raw.map(r => r.maj_cat))].sort()
-        // Residual FNL_Q = stock − alloc − hold (clamped at 0). REQ_REM = req − alloc
-        // (also clamped). Both computed here so the modal stays in sync with
-        // whatever the backend returns.
-        const residual = c => Math.max(0, (c.stock_avail || 0) - (c.alloc_qty || 0) - (c.hold_qty || 0))
-        const reqRem   = c => Math.max(0, (c.req_qty || 0) - (c.alloc_qty || 0))
-        // REQ% = ALLOC / REQ × 100 (how much of REQ got filled). FILL% =
-        // (STORE_STK + ALLOC) / MBQ × 100 (post-alloc fill rate against MBQ).
-        const reqPct  = c => (c.req_qty || 0) > 0 ? (c.alloc_qty || 0) / c.req_qty * 100 : 0
-        const fillPct = c => (c.mbq_qty || 0) > 0 ? ((c.store_stk || 0) + (c.alloc_qty || 0)) / c.mbq_qty * 100 : 0
-        // lookup[maj_cat][rdc] = {alloc_qty, stock_avail, hold_qty, req_qty, mbq_qty, store_stk, excess_stk}
+        // lookup[maj_cat][rdc] = {alloc_qty, stock_avail}
         const lookup = {}
         raw.forEach(r => {
           if (!lookup[r.maj_cat]) lookup[r.maj_cat] = {}
-          lookup[r.maj_cat][r.rdc] = {
-            alloc_qty:   r.alloc_qty   || 0,
-            stock_avail: r.stock_avail || 0,
-            hold_qty:    r.hold_qty    || 0,
-            req_qty:     r.req_qty     || 0,
-            mbq_qty:     r.mbq_qty     || 0,
-            store_stk:   r.store_stk   || 0,
-            excess_stk:  r.excess_stk  || 0,
-          }
+          lookup[r.maj_cat][r.rdc] = { alloc_qty: r.alloc_qty || 0, stock_avail: r.stock_avail || 0 }
         })
         let rows = majcats.map(mc => {
           const d          = lookup[mc] || {}
-          const totalAlloc = rdcs.reduce((s, rdc) => s + (d[rdc]?.alloc_qty   || 0), 0)
+          const totalAlloc = rdcs.reduce((s, rdc) => s + (d[rdc]?.alloc_qty  || 0), 0)
           const totalStock = rdcs.reduce((s, rdc) => s + (d[rdc]?.stock_avail || 0), 0)
-          const totalHold  = rdcs.reduce((s, rdc) => s + (d[rdc]?.hold_qty    || 0), 0)
-          const totalReq   = rdcs.reduce((s, rdc) => s + (d[rdc]?.req_qty     || 0), 0)
-          const totalMbq   = rdcs.reduce((s, rdc) => s + (d[rdc]?.mbq_qty     || 0), 0)
-          const totalStkS  = rdcs.reduce((s, rdc) => s + (d[rdc]?.store_stk   || 0), 0)
-          const totalExcess= rdcs.reduce((s, rdc) => s + (d[rdc]?.excess_stk  || 0), 0)
-          const totalFnl   = Math.max(0, totalStock - totalAlloc - totalHold)
-          const totalReqRem= Math.max(0, totalReq - totalAlloc)
           const totalPct   = totalStock > 0 ? totalAlloc / totalStock * 100 : 0
-          const totalReqPct  = totalReq > 0 ? totalAlloc / totalReq * 100 : 0
-          const totalFillPct = totalMbq > 0 ? (totalStkS + totalAlloc) / totalMbq * 100 : 0
-          return { maj_cat: mc, d, totalAlloc, totalStock, totalHold, totalReq,
-                   totalReqRem, totalFnl, totalPct, totalMbq, totalStkS, totalExcess,
-                   totalReqPct, totalFillPct }
-        }).filter(r => r.totalAlloc > 0 || r.totalStock > 0 || r.totalReq > 0 || r.totalHold > 0 || r.totalMbq > 0)
+          return { maj_cat: mc, d, totalAlloc, totalStock, totalPct }
+        }).filter(r => r.totalAlloc > 0 || r.totalStock > 0)
 
         // filter
         if (mcFilter.trim()) {
@@ -3049,27 +2956,9 @@ export default function ListingPage() {
           if (mcSortCol === 'maj_cat') { av = a.maj_cat; bv = b.maj_cat }
           else if (mcSortCol === 'totalAlloc') { av = a.totalAlloc; bv = b.totalAlloc }
           else if (mcSortCol === 'totalStock') { av = a.totalStock; bv = b.totalStock }
-          else if (mcSortCol === 'totalHold')  { av = a.totalHold;  bv = b.totalHold }
-          else if (mcSortCol === 'totalReq')   { av = a.totalReq;   bv = b.totalReq }
-          else if (mcSortCol === 'totalReqRem'){ av = a.totalReqRem;bv = b.totalReqRem }
-          else if (mcSortCol === 'totalFnl')   { av = a.totalFnl;   bv = b.totalFnl }
-          else if (mcSortCol === 'totalPct')     { av = a.totalPct;     bv = b.totalPct }
-          else if (mcSortCol === 'totalMbq')     { av = a.totalMbq;     bv = b.totalMbq }
-          else if (mcSortCol === 'totalStkS')    { av = a.totalStkS;    bv = b.totalStkS }
-          else if (mcSortCol === 'totalExcess')  { av = a.totalExcess;  bv = b.totalExcess }
-          else if (mcSortCol === 'totalReqPct')  { av = a.totalReqPct;  bv = b.totalReqPct }
-          else if (mcSortCol === 'totalFillPct') { av = a.totalFillPct; bv = b.totalFillPct }
+          else if (mcSortCol === 'totalPct')  { av = a.totalPct;  bv = b.totalPct }
           else if (mcSortCol.startsWith('alloc_')) { const rdc = mcSortCol.slice(6); av = a.d[rdc]?.alloc_qty || 0; bv = b.d[rdc]?.alloc_qty || 0 }
           else if (mcSortCol.startsWith('stock_')) { const rdc = mcSortCol.slice(6); av = a.d[rdc]?.stock_avail || 0; bv = b.d[rdc]?.stock_avail || 0 }
-          else if (mcSortCol.startsWith('stkS_'))  { const rdc = mcSortCol.slice(5); av = a.d[rdc]?.store_stk  || 0; bv = b.d[rdc]?.store_stk  || 0 }
-          else if (mcSortCol.startsWith('excess_')){ const rdc = mcSortCol.slice(7); av = a.d[rdc]?.excess_stk || 0; bv = b.d[rdc]?.excess_stk || 0 }
-          else if (mcSortCol.startsWith('hold_'))  { const rdc = mcSortCol.slice(5); av = a.d[rdc]?.hold_qty   || 0; bv = b.d[rdc]?.hold_qty   || 0 }
-          else if (mcSortCol.startsWith('req_'))   { const rdc = mcSortCol.slice(4); av = a.d[rdc]?.req_qty    || 0; bv = b.d[rdc]?.req_qty    || 0 }
-          else if (mcSortCol.startsWith('mbq_'))   { const rdc = mcSortCol.slice(4); av = a.d[rdc]?.mbq_qty    || 0; bv = b.d[rdc]?.mbq_qty    || 0 }
-          else if (mcSortCol.startsWith('rrem_'))  { const rdc = mcSortCol.slice(5); av = reqRem(a.d[rdc] || {}); bv = reqRem(b.d[rdc] || {}) }
-          else if (mcSortCol.startsWith('fnl_'))   { const rdc = mcSortCol.slice(4); av = residual(a.d[rdc] || {}); bv = residual(b.d[rdc] || {}) }
-          else if (mcSortCol.startsWith('rpct_'))  { const rdc = mcSortCol.slice(5); av = reqPct(a.d[rdc] || {}); bv = reqPct(b.d[rdc] || {}) }
-          else if (mcSortCol.startsWith('fpct_'))  { const rdc = mcSortCol.slice(5); av = fillPct(a.d[rdc] || {}); bv = fillPct(b.d[rdc] || {}) }
           else if (mcSortCol.startsWith('pct_'))   { const rdc = mcSortCol.slice(4);  const ca = a.d[rdc] || {}; const cb = b.d[rdc] || {}; av = ca.stock_avail > 0 ? ca.alloc_qty / ca.stock_avail : 0; bv = cb.stock_avail > 0 ? cb.alloc_qty / cb.stock_avail : 0 }
           else { av = a.totalAlloc; bv = b.totalAlloc }
           if (av === bv) return 0
@@ -3079,103 +2968,37 @@ export default function ListingPage() {
 
         const grandAlloc = rows.reduce((s, r) => s + r.totalAlloc, 0)
         const grandStock = rows.reduce((s, r) => s + r.totalStock, 0)
-        const grandHold  = rows.reduce((s, r) => s + r.totalHold,  0)
-        const grandReq   = rows.reduce((s, r) => s + r.totalReq,   0)
-        const grandMbq   = rows.reduce((s, r) => s + r.totalMbq,   0)
-        const grandStkS  = rows.reduce((s, r) => s + r.totalStkS,  0)
-        const grandExcess= rows.reduce((s, r) => s + r.totalExcess,0)
-        const grandFnl   = Math.max(0, grandStock - grandAlloc - grandHold)
-        const grandReqRem= Math.max(0, grandReq - grandAlloc)
-        const grandReqPct  = grandReq > 0 ? grandAlloc / grandReq * 100 : 0
-        const grandFillPct = grandMbq > 0 ? (grandStkS + grandAlloc) / grandMbq * 100 : 0
 
         const exportMajCatExcel = () => {
-          // Column order matches the on-screen modal:
-          // MBQ, STOCK, STORE_STK, EXCESS_STK, REQ, ALLOC, REQ%, FILL%, REQ_REM, HOLD, MSA_REM, STK%.
           const headers = ['#', 'MAJ_CAT']
-          rdcs.forEach(rdc => {
-            headers.push(
-              `${rdc} MBQ`,        `${rdc} STOCK`,     `${rdc} STORE_STK`,
-              `${rdc} EXCESS_STK`, `${rdc} REQ`,       `${rdc} ALLOC`,
-              `${rdc} REQ%`,       `${rdc} FILL%`,     `${rdc} REQ_REM`,
-              `${rdc} HOLD`,       `${rdc} MSA_REM`,   `${rdc} STK%`,
-            )
-          })
-          headers.push(
-            'TOTAL MBQ',        'TOTAL STOCK',     'TOTAL STORE_STK',
-            'TOTAL EXCESS_STK', 'TOTAL REQ',       'TOTAL ALLOC',
-            'TOTAL REQ%',       'TOTAL FILL%',     'TOTAL REQ_REM',
-            'TOTAL HOLD',       'TOTAL MSA_REM',   'TOTAL STK%',
-          )
+          rdcs.forEach(rdc => { headers.push(`${rdc} STOCK`, `${rdc} ALLOC`, `${rdc} %`) })
+          headers.push('TOTAL STOCK', 'TOTAL ALLOC', 'TOTAL %')
           const data = rows.map((row, i) => {
             const r = { '#': i + 1, MAJ_CAT: row.maj_cat }
             rdcs.forEach(rdc => {
-              const cell = row.d[rdc] || { alloc_qty: 0, stock_avail: 0, hold_qty: 0, req_qty: 0, mbq_qty: 0, store_stk: 0, excess_stk: 0 }
-              const pct   = cell.stock_avail > 0 ? parseFloat((cell.alloc_qty / cell.stock_avail * 100).toFixed(1)) : 0
-              const rpct  = parseFloat(reqPct(cell).toFixed(1))
-              const fpct  = parseFloat(fillPct(cell).toFixed(1))
-              r[`${rdc} MBQ`]        = cell.mbq_qty
-              r[`${rdc} STOCK`]      = cell.stock_avail
-              r[`${rdc} STORE_STK`]  = cell.store_stk
-              r[`${rdc} EXCESS_STK`] = cell.excess_stk
-              r[`${rdc} REQ`]        = cell.req_qty
-              r[`${rdc} ALLOC`]      = cell.alloc_qty
-              r[`${rdc} REQ%`]       = rpct
-              r[`${rdc} FILL%`]      = fpct
-              r[`${rdc} REQ_REM`]    = reqRem(cell)
-              r[`${rdc} HOLD`]       = cell.hold_qty
-              r[`${rdc} MSA_REM`]    = residual(cell)
-              r[`${rdc} STK%`]       = pct
+              const cell = row.d[rdc] || { alloc_qty: 0, stock_avail: 0 }
+              const pct  = cell.stock_avail > 0 ? parseFloat((cell.alloc_qty / cell.stock_avail * 100).toFixed(1)) : 0
+              r[`${rdc} STOCK`] = cell.stock_avail
+              r[`${rdc} ALLOC`] = cell.alloc_qty
+              r[`${rdc} %`]     = pct
             })
-            r['TOTAL MBQ']        = row.totalMbq
-            r['TOTAL STOCK']      = row.totalStock
-            r['TOTAL STORE_STK']  = row.totalStkS
-            r['TOTAL EXCESS_STK'] = row.totalExcess
-            r['TOTAL REQ']        = row.totalReq
-            r['TOTAL ALLOC']      = row.totalAlloc
-            r['TOTAL REQ%']       = parseFloat(row.totalReqPct.toFixed(1))
-            r['TOTAL FILL%']      = parseFloat(row.totalFillPct.toFixed(1))
-            r['TOTAL REQ_REM']    = row.totalReqRem
-            r['TOTAL HOLD']       = row.totalHold
-            r['TOTAL MSA_REM']    = row.totalFnl
-            r['TOTAL STK%']       = row.totalStock > 0 ? parseFloat(row.totalPct.toFixed(1)) : 0
+            r['TOTAL STOCK'] = row.totalStock
+            r['TOTAL ALLOC'] = row.totalAlloc
+            r['TOTAL %']     = row.totalStock > 0 ? parseFloat(row.totalPct.toFixed(1)) : 0
             return r
           })
           // Grand total row
           const grand = { '#': '', MAJ_CAT: 'TOTAL' }
           rdcs.forEach(rdc => {
-            const s  = rows.reduce((a, row) => a + (row.d[rdc]?.stock_avail || 0), 0)
-            const q  = rows.reduce((a, row) => a + (row.d[rdc]?.alloc_qty  || 0), 0)
-            const h  = rows.reduce((a, row) => a + (row.d[rdc]?.hold_qty   || 0), 0)
-            const rq = rows.reduce((a, row) => a + (row.d[rdc]?.req_qty    || 0), 0)
-            const mb = rows.reduce((a, row) => a + (row.d[rdc]?.mbq_qty    || 0), 0)
-            const sk = rows.reduce((a, row) => a + (row.d[rdc]?.store_stk  || 0), 0)
-            const ex = rows.reduce((a, row) => a + (row.d[rdc]?.excess_stk || 0), 0)
-            grand[`${rdc} MBQ`]        = mb
-            grand[`${rdc} STOCK`]      = s
-            grand[`${rdc} STORE_STK`]  = sk
-            grand[`${rdc} EXCESS_STK`] = ex
-            grand[`${rdc} REQ`]        = rq
-            grand[`${rdc} ALLOC`]      = q
-            grand[`${rdc} REQ%`]       = rq > 0 ? parseFloat((q / rq * 100).toFixed(1)) : 0
-            grand[`${rdc} FILL%`]      = mb > 0 ? parseFloat(((sk + q) / mb * 100).toFixed(1)) : 0
-            grand[`${rdc} REQ_REM`]    = Math.max(0, rq - q)
-            grand[`${rdc} HOLD`]       = h
-            grand[`${rdc} MSA_REM`]    = Math.max(0, s - q - h)
-            grand[`${rdc} STK%`]       = s > 0 ? parseFloat((q / s * 100).toFixed(1)) : 0
+            const s = rows.reduce((a, row) => a + (row.d[rdc]?.stock_avail || 0), 0)
+            const q = rows.reduce((a, row) => a + (row.d[rdc]?.alloc_qty  || 0), 0)
+            grand[`${rdc} STOCK`] = s
+            grand[`${rdc} ALLOC`] = q
+            grand[`${rdc} %`]     = s > 0 ? parseFloat((q / s * 100).toFixed(1)) : 0
           })
-          grand['TOTAL MBQ']        = grandMbq
-          grand['TOTAL STOCK']      = grandStock
-          grand['TOTAL STORE_STK']  = grandStkS
-          grand['TOTAL EXCESS_STK'] = grandExcess
-          grand['TOTAL REQ']        = grandReq
-          grand['TOTAL ALLOC']      = grandAlloc
-          grand['TOTAL REQ%']       = parseFloat(grandReqPct.toFixed(1))
-          grand['TOTAL FILL%']      = parseFloat(grandFillPct.toFixed(1))
-          grand['TOTAL REQ_REM']    = grandReqRem
-          grand['TOTAL HOLD']       = grandHold
-          grand['TOTAL MSA_REM']    = grandFnl
-          grand['TOTAL STK%']       = grandStock > 0 ? parseFloat((grandAlloc / grandStock * 100).toFixed(1)) : 0
+          grand['TOTAL STOCK'] = grandStock
+          grand['TOTAL ALLOC'] = grandAlloc
+          grand['TOTAL %']     = grandStock > 0 ? parseFloat((grandAlloc / grandStock * 100).toFixed(1)) : 0
           data.push(grand)
           const ws = XLSX.utils.json_to_sheet(data, { header: headers })
           const wb = XLSX.utils.book_new()
@@ -3193,54 +3016,16 @@ export default function ListingPage() {
           )
         }
 
-        // Per-cell calc popover. metric tells the popover which formula
-        // to render; cell carries the values (mbq, stock, alloc, etc.).
-        // For STORE_STOCK the popover also fires an async fetch to load
-        // the SLOC inventory breakdown.
-        const openCalc = (metric, mc, rdc, cell, ev) => {
-          ev?.stopPropagation?.()
-          const rect = ev?.currentTarget?.getBoundingClientRect?.()
-          const anchor = rect ? { x: rect.right, y: rect.bottom } : { x: 0, y: 0 }
-          setCalcPopover({ metric, mc, rdc, cell, anchor, sloc: null, slocLoading: false })
-          if (metric === 'STORE_STK') {
-            setCalcPopover(p => p ? { ...p, slocLoading: true } : p)
-            listingAPI.slocBreakdown(mc, rdc || undefined)
-              .then(res => setCalcPopover(p => p
-                ? { ...p, sloc: res?.data?.data || [], stkTtl: res?.data?.stk_ttl || 0, slocLoading: false }
-                : p))
-              .catch(() => setCalcPopover(p => p ? { ...p, sloc: [], slocLoading: false } : p))
-          }
-        }
-
-        // Local alias — pushes to the unified drill stack so the store
-        // table renders in the same modal frame instead of opening a
-        // separate overlay.
-        const openStoreDrill = (mc, rdc) => openStoreDrillNew(mc, rdc)
-
-        // Only render the MAJ_CAT root table when no drill is active.
-        // When the user drills (drill.view set), one of the conditional
-        // drill modals below renders inside the same frame instead.
-        if (drill) return null
-
         return (
-          <div onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-            style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', display: 'flex', alignItems: 'stretch', justifyContent: 'stretch', zIndex: 1000 }}>
+          <div onClick={() => setMajCatModalOpen(false)}
+            style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
             <div onClick={e => e.stopPropagation()}
-              style={{ background: '#fff', width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
+              style={{ background: '#fff', borderRadius: 10, width: `${Math.min(96, 36 + rdcs.length * 20)}vw`, maxWidth: '96vw', maxHeight: '82vh', display: 'flex', flexDirection: 'column', boxShadow: '0 12px 40px rgba(0,0,0,0.18)' }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #e2e8f0' }}>
                 <div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>MAJ_CATs that ran ({rows.length})</div>
                   <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
-                    Stock {grandStock.toLocaleString()}
-                    {grandStkS   > 0 ? ` · STORE_STK ${grandStkS.toLocaleString()}`   : ''}
-                    {grandExcess > 0 ? ` · EXCESS ${grandExcess.toLocaleString()}`    : ''}
-                    {grandReq    > 0 ? ` · REQ ${grandReq.toLocaleString()}`          : ''}
-                    {' '}· ALLOC {grandAlloc.toLocaleString()}
-                    {grandReq    > 0 ? ` · REQ% ${grandReqPct.toFixed(1)}%`           : ''}
-                    {grandMbq    > 0 ? ` · MBQ ${grandMbq.toLocaleString()} · FILL% ${grandFillPct.toFixed(1)}%` : ''}
-                    {grandReqRem > 0 ? ` · REQ_REM ${grandReqRem.toLocaleString()}`   : ''}
-                    {grandHold   > 0 ? ` · HOLD ${grandHold.toLocaleString()}`        : ''}
-                    {' '}· MSA_REM {grandFnl.toLocaleString()}
+                    Stock {grandStock.toLocaleString()} · ALLOC {grandAlloc.toLocaleString()}
                     {grandStock > 0 ? ` · utilisation ${(grandAlloc / grandStock * 100).toFixed(1)}%` : ''}
                   </div>
                 </div>
@@ -3273,885 +3058,61 @@ export default function ListingPage() {
                         <th style={{ padding: '4px 10px', textAlign: 'left', width: 28, background: '#f8fafc' }}>#</th>
                         <th style={{ padding: '4px 10px', textAlign: 'left', minWidth: 130, background: '#f8fafc', fontSize: 9, color: C.textSub, letterSpacing: '.04em' }}>MAJ_CAT</th>
                         {rdcs.map(rdc => (
-                          <th key={rdc} colSpan={12} style={{ padding: '4px 6px', textAlign: 'center', borderLeft: '1px solid #e2e8f0', fontSize: 9, fontWeight: 700, color: C.text, letterSpacing: '.03em' }}>
+                          <th key={rdc} colSpan={3} style={{ padding: '4px 6px', textAlign: 'center', borderLeft: '1px solid #e2e8f0', fontSize: 9, fontWeight: 700, color: C.text, letterSpacing: '.03em' }}>
                             {rdc}
                           </th>
                         ))}
-                        <th colSpan={12} style={{ padding: '4px 6px', textAlign: 'center', borderLeft: '2px solid #cbd5e1', fontSize: 9, color: C.textSub, letterSpacing: '.03em', background: '#f8fafc' }}>TOTAL</th>
+                        <th colSpan={3} style={{ padding: '4px 6px', textAlign: 'center', borderLeft: '2px solid #cbd5e1', fontSize: 9, color: C.textSub, letterSpacing: '.03em', background: '#f8fafc' }}>TOTAL</th>
                       </tr>
-                      {/* Sub-column labels — sortable. Order:
-                          MBQ, STOCK, STORE_STK, EXCESS_STK, REQ, ALLOC, REQ%,
-                          FILL%, REQ_REM, HOLD, MSA_REM, STK%. */}
+                      {/* Sub-column labels — sortable */}
                       <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
                         <th/>
                         {thSort('maj_cat', 'MAJ_CAT', { padding: '3px 10px', textAlign: 'left', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
                         {rdcs.map(rdc => (
                           <React.Fragment key={rdc}>
-                            {thSort(`mbq_${rdc}`,    'MBQ',        { padding: '3px 6px', textAlign: 'right', borderLeft: '1px solid #e8edf3', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`stock_${rdc}`,  'STOCK',      { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`stkS_${rdc}`,   'STORE_STK',  { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`excess_${rdc}`, 'EXCESS_STK', { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`req_${rdc}`,    'REQ',        { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`alloc_${rdc}`,  'ALLOC',      { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`rpct_${rdc}`,   'REQ%',       { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 46 })}
-                            {thSort(`fpct_${rdc}`,   'FILL%',      { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 48 })}
-                            {thSort(`rrem_${rdc}`,   'REQ_REM',    { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            {thSort(`hold_${rdc}`,   'HOLD',       { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                            <th onClick={() => { if (mcSortCol === `fnl_${rdc}`) setMcSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setMcSortCol(`fnl_${rdc}`); setMcSortDir('desc') } }}
-                                title="MSA pool remaining after alloc & hold"
-                                style={{ cursor: 'pointer', userSelect: 'none', padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 }}>
-                              MSA_REM{mcSortCol === `fnl_${rdc}` ? (mcSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                            </th>
-                            <th onClick={() => { if (mcSortCol === `pct_${rdc}`) setMcSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setMcSortCol(`pct_${rdc}`); setMcSortDir('desc') } }}
-                                title="% of stock consumption (alloc / stock)"
-                                style={{ cursor: 'pointer', userSelect: 'none', padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 50 }}>
-                              STK%{mcSortCol === `pct_${rdc}` ? (mcSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                            </th>
+                            {thSort(`stock_${rdc}`, 'STOCK', { padding: '3px 6px', textAlign: 'right', borderLeft: '1px solid #e8edf3', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
+                            {thSort(`alloc_${rdc}`, 'ALLOC', { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
+                            {thSort(`pct_${rdc}`, '%', { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 46 })}
                           </React.Fragment>
                         ))}
-                        {thSort('totalMbq',     'MBQ',        { padding: '3px 6px', textAlign: 'right', borderLeft: '2px solid #cbd5e1', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalStock',   'STOCK',      { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalStkS',    'STORE_STK',  { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalExcess',  'EXCESS_STK', { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalReq',     'REQ',        { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalAlloc',   'ALLOC',      { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalReqPct',  'REQ%',       { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 46 })}
-                        {thSort('totalFillPct', 'FILL%',      { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 48 })}
-                        {thSort('totalReqRem',  'REQ_REM',    { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        {thSort('totalHold',    'HOLD',       { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
-                        <th onClick={() => { if (mcSortCol === 'totalFnl') setMcSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setMcSortCol('totalFnl'); setMcSortDir('desc') } }}
-                            title="MSA pool remaining after alloc & hold"
-                            style={{ cursor: 'pointer', userSelect: 'none', padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 }}>
-                          MSA_REM{mcSortCol === 'totalFnl' ? (mcSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                        </th>
-                        <th onClick={() => { if (mcSortCol === 'totalPct') setMcSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setMcSortCol('totalPct'); setMcSortDir('desc') } }}
-                            title="% of stock consumption (alloc / stock)"
-                            style={{ cursor: 'pointer', userSelect: 'none', padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 50 }}>
-                          STK%{mcSortCol === 'totalPct' ? (mcSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                        </th>
+                        {thSort('totalStock', 'STOCK', { padding: '3px 6px', textAlign: 'right', borderLeft: '2px solid #cbd5e1', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
+                        {thSort('totalAlloc', 'ALLOC', { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400 })}
+                        {thSort('totalPct', '%', { padding: '3px 6px', textAlign: 'right', fontSize: 8, color: C.textMuted, fontWeight: 400, width: 46 })}
                       </tr>
                     </thead>
                     <tbody>
-                      {rows.map((row, i) => {
-                        // Cells are clickable — open store drill-down filtered to
-                        // (MAJ_CAT, RDC) for per-RDC blocks, or (MAJ_CAT, null)
-                        // for TOTAL columns / the MAJ_CAT name itself.
-                        const drillStyle = { cursor: 'pointer' }
-                        return (
+                      {rows.map((row, i) => (
                         <tr key={row.maj_cat} style={{ borderTop: '1px solid #f1f5f9' }}>
                           <td style={{ padding: '5px 10px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i + 1}</td>
-                          <td onClick={() => openStoreDrill(row.maj_cat, null)}
-                              title="Click for store-wise breakdown (all RDCs)"
-                              style={{ padding: '5px 10px', fontWeight: 600, color: C.primary, whiteSpace: 'nowrap', cursor: 'pointer', textDecoration: 'underline dotted' }}>
-                            {row.maj_cat}
-                          </td>
+                          <td style={{ padding: '5px 10px', fontWeight: 600, color: C.text, whiteSpace: 'nowrap' }}>{row.maj_cat}</td>
                           {rdcs.map(rdc => {
-                            const cell = row.d[rdc] || { alloc_qty: 0, stock_avail: 0, hold_qty: 0, req_qty: 0, mbq_qty: 0, store_stk: 0, excess_stk: 0 }
-                            const pct   = cell.stock_avail > 0 ? cell.alloc_qty / cell.stock_avail * 100 : 0
-                            const rpct  = reqPct(cell)
-                            const fpct  = fillPct(cell)
-                            const fnl   = residual(cell)
-                            const rrem  = reqRem(cell)
-                            const dash  = <span style={{ color: '#d1d5db' }}>—</span>
-                            // Per-cell click: each metric opens its own calc popover.
-                            const onCalc = (metric) => (e) =>
-                              openCalc(metric, row.maj_cat, rdc, cell, e)
+                            const cell = row.d[rdc] || { alloc_qty: 0, stock_avail: 0 }
+                            const pct  = cell.stock_avail > 0 ? cell.alloc_qty / cell.stock_avail * 100 : 0
                             return (
                               <React.Fragment key={rdc}>
-                                <td onClick={onCalc('MBQ')} title="Click for MBQ calc (ACS_D + rate × ALC_D)"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', borderLeft: '1px solid #f1f5f9', ...drillStyle }}>
-                                  {cell.mbq_qty > 0 ? Math.round(cell.mbq_qty).toLocaleString() : dash}
+                                <td style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', borderLeft: '1px solid #f1f5f9' }}>
+                                  {cell.stock_avail > 0 ? cell.stock_avail.toLocaleString() : <span style={{ color: '#d1d5db' }}>—</span>}
                                 </td>
-                                <td onClick={onCalc('STOCK')} title="MSA pool stock available for this RDC (Σ FNL_Q across sizes)"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {cell.stock_avail > 0 ? cell.stock_avail.toLocaleString() : dash}
+                                <td style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                                  {cell.alloc_qty > 0 ? cell.alloc_qty.toLocaleString() : <span style={{ color: '#d1d5db' }}>—</span>}
                                 </td>
-                                <td onClick={onCalc('STORE_STK')} title="Click for SLOC-wise inventory breakdown"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {cell.store_stk > 0 ? Math.round(cell.store_stk).toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('EXCESS')} title="STK_TTL > excess_multiplier × OPT_MBQ"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: cell.excess_stk > 0 ? '#ea580c' : C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {cell.excess_stk > 0 ? Math.round(cell.excess_stk).toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('REQ')} title="REQ = max(0, MBQ − STORE_STK)"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {cell.req_qty > 0 ? Math.round(cell.req_qty).toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('ALLOC')} title="Click for alloc/hold/fill details"
-                                    style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {cell.alloc_qty > 0 ? Math.round(cell.alloc_qty).toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: rpct >= 90 ? '#10b981' : rpct >= 60 ? '#f59e0b' : C.textMuted, ...drillStyle }}>
-                                  {cell.req_qty > 0 ? `${rpct.toFixed(0)}%` : dash}
-                                </td>
-                                <td onClick={onCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: fpct >= 100 ? '#10b981' : fpct >= 70 ? '#f59e0b' : C.textMuted, ...drillStyle }}>
-                                  {cell.mbq_qty > 0 ? `${fpct.toFixed(0)}%` : dash}
-                                </td>
-                                <td onClick={onCalc('REQ_REM')} title="REQ − ALLOC (clamped to 0)"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {rrem > 0 ? rrem.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('ALLOC')} title="Warehouse hold (TBL buffer / RL-TBC from-hold)"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {cell.hold_qty > 0 ? Math.round(cell.hold_qty).toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('MSA_REM')} title="MSA pool remaining after alloc & hold"
-                                    style={{ padding: '5px 6px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums', ...drillStyle }}>
-                                  {fnl > 0 ? fnl.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: pct >= 90 ? '#10b981' : pct >= 60 ? '#f59e0b' : C.textMuted, ...drillStyle }}>
-                                  {cell.stock_avail > 0 ? `${pct.toFixed(0)}%` : dash}
+                                <td style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: pct >= 90 ? '#10b981' : pct >= 60 ? '#f59e0b' : C.textMuted }}>
+                                  {cell.stock_avail > 0 ? `${pct.toFixed(0)}%` : <span style={{ color: '#d1d5db' }}>—</span>}
                                 </td>
                               </React.Fragment>
                             )
                           })}
-                          {(() => {
-                            // Aggregate cell pretending to be a "TOTAL RDC".
-                            const totCell = {
-                              alloc_qty:   row.totalAlloc,
-                              stock_avail: row.totalStock,
-                              hold_qty:    row.totalHold,
-                              req_qty:     row.totalReq,
-                              mbq_qty:     row.totalMbq,
-                              store_stk:   row.totalStkS,
-                              excess_stk:  row.totalExcess,
-                            }
-                            const onTotCalc = (metric) => (e) =>
-                              openCalc(metric, row.maj_cat, null, totCell, e)
-                            const dash = <span style={{ color: '#d1d5db' }}>—</span>
-                            return (
-                              <React.Fragment>
-                                <td onClick={onTotCalc('MBQ')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, borderLeft: '2px solid #e2e8f0', ...drillStyle }}>
-                                  {row.totalMbq > 0 ? row.totalMbq.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('STOCK')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, ...drillStyle }}>
-                                  {row.totalStock > 0 ? row.totalStock.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('STORE_STK')} title="Click for SLOC-wise inventory breakdown"
-                                    style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, ...drillStyle }}>
-                                  {row.totalStkS > 0 ? row.totalStkS.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('EXCESS')} title="Sum of EXCESS_STK from ARS_LISTING"
-                                    style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: row.totalExcess > 0 ? '#ea580c' : C.textSub, ...drillStyle }}>
-                                  {row.totalExcess > 0 ? row.totalExcess.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('REQ')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, ...drillStyle }}>
-                                  {row.totalReq > 0 ? row.totalReq.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600, ...drillStyle }}>
-                                  {row.totalAlloc.toLocaleString()}
-                                </td>
-                                <td onClick={onTotCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: row.totalReqPct >= 90 ? '#10b981' : row.totalReqPct >= 60 ? '#f59e0b' : C.textMuted, ...drillStyle }}>
-                                  {row.totalReq > 0 ? `${row.totalReqPct.toFixed(0)}%` : dash}
-                                </td>
-                                <td onClick={onTotCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: row.totalFillPct >= 100 ? '#10b981' : row.totalFillPct >= 70 ? '#f59e0b' : C.textMuted, ...drillStyle }}>
-                                  {row.totalMbq > 0 ? `${row.totalFillPct.toFixed(0)}%` : dash}
-                                </td>
-                                <td onClick={onTotCalc('REQ_REM')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, ...drillStyle }}>
-                                  {row.totalReqRem > 0 ? row.totalReqRem.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, ...drillStyle }}>
-                                  {row.totalHold > 0 ? row.totalHold.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('MSA_REM')} title="MSA pool remaining after alloc & hold"
-                                    style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, ...drillStyle }}>
-                                  {row.totalFnl > 0 ? row.totalFnl.toLocaleString() : dash}
-                                </td>
-                                <td onClick={onTotCalc('ALLOC')} style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: row.totalPct >= 90 ? '#10b981' : row.totalPct >= 60 ? '#f59e0b' : C.textMuted, ...drillStyle }}>
-                                  {row.totalStock > 0 ? `${row.totalPct.toFixed(0)}%` : '—'}
-                                </td>
-                              </React.Fragment>
-                            )
-                          })()}
+                          <td style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.textSub, borderLeft: '2px solid #e2e8f0' }}>
+                            {row.totalStock > 0 ? row.totalStock.toLocaleString() : <span style={{ color: '#d1d5db' }}>—</span>}
+                          </td>
+                          <td style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
+                            {row.totalAlloc.toLocaleString()}
+                          </td>
+                          <td style={{ padding: '5px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: row.totalPct >= 90 ? '#10b981' : row.totalPct >= 60 ? '#f59e0b' : C.textMuted }}>
+                            {row.totalStock > 0 ? `${row.totalPct.toFixed(0)}%` : '—'}
+                          </td>
                         </tr>
-                      )})}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-          </div>
-        )
-      })()}
-
-      {/* ═══ Store drill-down — per-store breakdown for ONE MAJ_CAT (+ optional RDC) ═══ */}
-      {majCatModalOpen && drill?.view === 'store' && (() => {
-        const items = [...(storeDrillData || [])]
-        const sd = storeDrillSortDir === 'asc' ? 1 : -1
-        const reqPctRow  = r => (r.req_qty || 0) > 0 ? (r.alloc_qty || 0) / r.req_qty * 100 : 0
-        const fillPctRow = r => (r.mbq_qty || 0) > 0 ? ((r.store_stk || 0) + (r.alloc_qty || 0)) / r.mbq_qty * 100 : 0
-        const fnlRow     = r => Math.max(0, (r.store_stk || 0) + (r.alloc_qty || 0) - (r.hold_qty || 0))
-        const reqRemRow  = r => Math.max(0, (r.req_qty || 0) - (r.alloc_qty || 0))
-        items.sort((a, b) => {
-          let av, bv
-          if (storeDrillSortCol === 'werks')          { av = a.werks || ''; bv = b.werks || ''; return sd * av.localeCompare(bv) }
-          if (storeDrillSortCol === 'req_pct')        { av = reqPctRow(a);  bv = reqPctRow(b) }
-          else if (storeDrillSortCol === 'fill_pct')  { av = fillPctRow(a); bv = fillPctRow(b) }
-          else if (storeDrillSortCol === 'req_rem')   { av = reqRemRow(a);  bv = reqRemRow(b) }
-          else if (storeDrillSortCol === 'fnl_rem')   { av = fnlRow(a);     bv = fnlRow(b) }
-          else { av = a[storeDrillSortCol] || 0; bv = b[storeDrillSortCol] || 0 }
-          return av === bv ? 0 : sd * (av - bv)
-        })
-        const tAlloc = items.reduce((s, r) => s + (r.alloc_qty || 0), 0)
-        const tHold  = items.reduce((s, r) => s + (r.hold_qty  || 0), 0)
-        const tReq   = items.reduce((s, r) => s + (r.req_qty   || 0), 0)
-        const tMbq   = items.reduce((s, r) => s + (r.mbq_qty   || 0), 0)
-        const tStk   = items.reduce((s, r) => s + (r.store_stk || 0), 0)
-        const tReqPct  = tReq > 0 ? tAlloc / tReq * 100 : 0
-        const tFillPct = tMbq > 0 ? (tStk + tAlloc) / tMbq * 100 : 0
-
-        const exportDrill = () => {
-          // Order matches the parent MAJ_CAT modal:
-          // MBQ, STORE_STK, REQ, ALLOC, REQ%, FILL%, REQ_REM, HOLD, FNL_Q_REM.
-          const data = items.map((r, i) => ({
-            '#': i + 1,
-            STORE:        r.werks,
-            MBQ:          r.mbq_qty   || 0,
-            STORE_STK:    r.store_stk || 0,
-            REQ:          r.req_qty   || 0,
-            ALLOC:        r.alloc_qty || 0,
-            'REQ%':       parseFloat(reqPctRow(r).toFixed(1)),
-            'FILL%':      parseFloat(fillPctRow(r).toFixed(1)),
-            REQ_REM:      reqRemRow(r),
-            HOLD:         r.hold_qty  || 0,
-            FNL_Q_REM:    fnlRow(r),
-          }))
-          data.push({
-            '#': '', STORE: 'TOTAL',
-            MBQ: tMbq, STORE_STK: tStk, REQ: tReq, ALLOC: tAlloc,
-            'REQ%':  parseFloat(tReqPct.toFixed(1)),
-            'FILL%': parseFloat(tFillPct.toFixed(1)),
-            REQ_REM: Math.max(0, tReq - tAlloc), HOLD: tHold,
-            FNL_Q_REM: Math.max(0, tStk + tAlloc - tHold),
-          })
-          const ws = XLSX.utils.json_to_sheet(data)
-          const wb = XLSX.utils.book_new()
-          const sn = `${storeDrillMajCat}${storeDrillRdc ? '_' + storeDrillRdc : ''}`.slice(0, 28)
-          XLSX.utils.book_append_sheet(wb, ws, sn || 'StoreDrill')
-          XLSX.writeFile(wb, `store_drill_${sn}_${new Date().toISOString().slice(0,10)}.xlsx`)
-        }
-
-        const sdTh = (col, label, style = {}) => {
-          const active = storeDrillSortCol === col
-          return (
-            <th onClick={() => { if (active) setStoreDrillSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setStoreDrillSortCol(col); setStoreDrillSortDir('desc') } }}
-              style={{ cursor: 'pointer', userSelect: 'none', padding: '4px 8px', fontSize: 9, color: C.textMuted, fontWeight: 500, ...style }}>
-              {label}{active ? (storeDrillSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-            </th>
-          )
-        }
-
-        const dash = <span style={{ color: '#d1d5db' }}>—</span>
-
-        return (
-          <div onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-            style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', display: 'flex', alignItems: 'stretch', justifyContent: 'stretch', zIndex: 1000 }}>
-            <div onClick={e => e.stopPropagation()}
-              style={{ background: '#fff', width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #e2e8f0' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <button onClick={popDrill} title="Back to MAJ_CATs"
-                    style={{ display: 'flex', alignItems: 'center', gap: 4,
-                             height: 28, padding: '0 10px', fontSize: 11, fontWeight: 600,
-                             background: '#f1f5f9', color: C.text,
-                             border: '1px solid #e2e8f0', borderRadius: 6,
-                             cursor: 'pointer' }}>
-                    ← Back
-                  </button>
-                  <div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
-                      MAJ_CATs <span style={{ color: C.textMuted }}>›</span> Stores — {storeDrillMajCat}
-                      {storeDrillRdc ? <span style={{ color: C.textSub, fontWeight: 500 }}> · RDC {storeDrillRdc}</span> : <span style={{ color: C.textSub, fontWeight: 500 }}> · all RDCs</span>}
-                      {' '}({items.length})
-                    </div>
-                    <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
-                      {storeDrillLoading
-                        ? 'Loading…'
-                        : <>
-                            STK {tStk.toLocaleString()} · REQ {tReq.toLocaleString()} · ALLOC {tAlloc.toLocaleString()}
-                            {tReq > 0 ? ` · REQ% ${tReqPct.toFixed(1)}%` : ''}
-                            {tMbq > 0 ? ` · MBQ ${tMbq.toLocaleString()} · FILL% ${tFillPct.toFixed(1)}%` : ''}
-                            {tHold > 0 ? ` · HOLD ${tHold.toLocaleString()}` : ''}
-                            {' '}· Click any row for OPT-wise drill.
-                          </>}
-                    </div>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <button onClick={exportDrill} disabled={!items.length}
-                    style={{ display: 'flex', alignItems: 'center', gap: 4, height: 28, padding: '0 10px', fontSize: 11, fontWeight: 600, background: items.length ? '#16a34a' : '#94a3b8', color: '#fff', border: 'none', borderRadius: 6, cursor: items.length ? 'pointer' : 'not-allowed' }}>
-                    <Download size={12}/> Excel
-                  </button>
-                  <button onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-                    title="Close all"
-                    style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 4, color: C.textSub }}>
-                    <X size={16}/>
-                  </button>
-                </div>
-              </div>
-              <div style={{ overflow: 'auto', padding: '4px 0' }}>
-                {storeDrillLoading ? (
-                  <div style={{ padding: 32, textAlign: 'center', fontSize: 11, color: C.textMuted }}>Loading store-wise breakdown…</div>
-                ) : items.length === 0 ? (
-                  <div style={{ padding: 32, textAlign: 'center', fontSize: 11, color: C.textMuted }}>No stores received allocation for this MAJ_CAT{storeDrillRdc ? ` × ${storeDrillRdc}` : ''}.</div>
-                ) : (
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-                    <thead style={{ position: 'sticky', top: 0, background: '#f8fafc', borderBottom: '1px solid #e2e8f0', zIndex: 1 }}>
-                      <tr>
-                        <th style={{ padding: '4px 8px', textAlign: 'left', width: 32, fontSize: 9, color: C.textMuted }}>#</th>
-                        {sdTh('werks',     'STORE',     { textAlign: 'left'  })}
-                        {sdTh('mbq_qty',   'MBQ',       { textAlign: 'right' })}
-                        {sdTh('store_stk', 'STORE_STK', { textAlign: 'right' })}
-                        {sdTh('req_qty',   'REQ',       { textAlign: 'right' })}
-                        {sdTh('alloc_qty', 'ALLOC',     { textAlign: 'right' })}
-                        {sdTh('req_pct',   'REQ%',      { textAlign: 'right', width: 60 })}
-                        {sdTh('fill_pct',  'FILL%',     { textAlign: 'right', width: 64 })}
-                        {sdTh('req_rem',   'REQ_REM',   { textAlign: 'right' })}
-                        {sdTh('hold_qty',  'HOLD',      { textAlign: 'right' })}
-                        {sdTh('fnl_rem',   'FNL_Q_REM', { textAlign: 'right' })}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {items.map((r, i) => {
-                        const rp = reqPctRow(r), fp = fillPctRow(r), rr = reqRemRow(r), fq = fnlRow(r)
-                        // Drill down to OPT-wise for this store within the
-                        // current (MAJ_CAT, RDC) context.
-                        const onRowClick = () =>
-                          openOptModal(storeDrillMajCat, storeDrillRdc, r.werks)
-                        return (
-                          <tr key={r.werks} onClick={onRowClick}
-                              title="Click for OPT-wise breakdown at this store"
-                              style={{ borderTop: '1px solid #f1f5f9', cursor: 'pointer' }}>
-                            <td style={{ padding: '5px 8px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i + 1}</td>
-                            <td style={{ padding: '5px 8px', fontWeight: 600, color: C.primary, textDecoration: 'underline dotted' }}>{r.werks}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{(r.mbq_qty   || 0) > 0 ? r.mbq_qty.toLocaleString()   : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{(r.store_stk || 0) > 0 ? r.store_stk.toLocaleString() : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{(r.req_qty   || 0) > 0 ? r.req_qty.toLocaleString()   : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>{(r.alloc_qty || 0) > 0 ? r.alloc_qty.toLocaleString() : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: rp >= 90 ? '#10b981' : rp >= 60 ? '#f59e0b' : C.textMuted }}>{(r.req_qty || 0) > 0 ? `${rp.toFixed(0)}%` : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: fp >= 100 ? '#10b981' : fp >= 70 ? '#f59e0b' : C.textMuted }}>{(r.mbq_qty || 0) > 0 ? `${fp.toFixed(0)}%` : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{rr > 0 ? rr.toLocaleString() : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{(r.hold_qty || 0) > 0 ? r.hold_qty.toLocaleString() : dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fq > 0 ? fq.toLocaleString() : dash}</td>
-                          </tr>
-                        )
-                      })}
-                      <tr style={{ borderTop: '2px solid #cbd5e1', background: '#f8fafc', fontWeight: 700 }}>
-                        <td/>
-                        <td style={{ padding: '6px 8px', color: C.text }}>TOTAL</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{tMbq.toLocaleString()}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{tStk.toLocaleString()}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{tReq.toLocaleString()}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{tAlloc.toLocaleString()}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: tReqPct >= 90 ? '#10b981' : tReqPct >= 60 ? '#f59e0b' : C.textMuted }}>{tReq > 0 ? `${tReqPct.toFixed(0)}%` : '—'}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 10, color: tFillPct >= 100 ? '#10b981' : tFillPct >= 70 ? '#f59e0b' : C.textMuted }}>{tMbq > 0 ? `${tFillPct.toFixed(0)}%` : '—'}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{Math.max(0, tReq - tAlloc).toLocaleString()}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{tHold.toLocaleString()}</td>
-                        <td style={{ padding: '6px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{Math.max(0, tStk + tAlloc - tHold).toLocaleString()}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-          </div>
-        )
-      })()}
-
-      {/* ═══════════ Per-cell calc popover (Phase 1B) ═══════════
-          Anchored near the clicked cell. metric determines which formula
-          + values to render. STORE_STK additionally lazy-loads the SLOC
-          inventory breakdown via /listing/sloc-breakdown. */}
-      {calcPopover && (() => {
-        const { metric, mc, rdc, cell, anchor, sloc, slocLoading, stkTtl } = calcPopover
-        const reqPctV  = (cell.req_qty || 0) > 0 ? (cell.alloc_qty || 0) / cell.req_qty * 100 : 0
-        const fillPctV = (cell.mbq_qty || 0) > 0 ? ((cell.store_stk || 0) + (cell.alloc_qty || 0)) / cell.mbq_qty * 100 : 0
-        const msaRem   = Math.max(0, (cell.stock_avail || 0) - (cell.alloc_qty || 0) - (cell.hold_qty || 0))
-        const reqRemV  = Math.max(0, (cell.req_qty || 0) - (cell.alloc_qty || 0))
-        const convPct  = (cell.req_qty || 0) > 0 ? (cell.alloc_qty || 0) / cell.req_qty * 100 : 0
-
-        // Position: prefer right-below the cell; clamp to viewport.
-        const W = 360, H = 280
-        const vw = typeof window !== 'undefined' ? window.innerWidth : 1280
-        const vh = typeof window !== 'undefined' ? window.innerHeight : 800
-        let x = (anchor?.x || 0) - W   // align right edge with cell right
-        let y = (anchor?.y || 0) + 4
-        if (x < 8) x = 8
-        if (x + W > vw - 8) x = vw - W - 8
-        if (y + H > vh - 8) y = (anchor?.y || 0) - H - 6
-        if (y < 8) y = 8
-
-        const Row = ({ label, val, accent }) => (
-          <div style={{ display: 'flex', justifyContent: 'space-between',
-                        padding: '3px 0', fontSize: 11, color: C.text }}>
-            <span style={{ color: C.textSub }}>{label}</span>
-            <span style={{ fontWeight: 600, color: accent || C.text,
-                           fontVariantNumeric: 'tabular-nums' }}>{val}</span>
-          </div>
-        )
-        const fmt = (n, d=0) =>
-          (n === null || n === undefined || isNaN(n)) ? '—'
-          : d === 0 ? Math.round(n).toLocaleString()
-          : Number(n).toLocaleString(undefined, { maximumFractionDigits: d })
-
-        const titles = {
-          MBQ:       'MBQ — Minimum Buying Quantity',
-          STOCK:     'STOCK — MSA Pool Stock',
-          STORE_STK: 'STORE_STK — Store on-hand stock',
-          EXCESS:    'EXCESS_STK — Surplus over 2× MBQ',
-          REQ:       'REQ — Requirement',
-          ALLOC:     'ALLOC — Allocation summary',
-          REQ_REM:   'REQ_REM — Remaining requirement',
-          MSA_REM:   'MSA_REM — Remaining MSA pool',
-        }
-
-        let body
-        if (metric === 'MBQ') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              OPT_MBQ = round(ACS_D + rate × ALC_D, 0).<br/>
-              rate = max(L-7 daily sale, AUTO_GEN_ART_SALE) when established;<br/>
-              max(PER_OPT_SALE, L-7, AUTO_GEN_ART_SALE) when AGE &lt; threshold.
-            </div>
-            <Row label="MBQ (aggregate)" val={fmt(cell.mbq_qty)} accent={C.primary}/>
-            <Row label="STORE_STK"       val={fmt(cell.store_stk)}/>
-            <Row label="REQ = max(0, MBQ − STORE_STK)" val={fmt(cell.req_qty)}/>
-          </>)
-        } else if (metric === 'STOCK') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              MSA pool size for this RDC. Σ FNL_Q across (GEN_ART × CLR × VAR_ART × SZ).
-              This is the supply pool stage C draws from.
-            </div>
-            <Row label="STOCK"        val={fmt(cell.stock_avail)} accent={C.primary}/>
-            <Row label="ALLOC"        val={fmt(cell.alloc_qty)}/>
-            <Row label="HOLD"         val={fmt(cell.hold_qty)}/>
-            <Row label="MSA_REM = STOCK − ALLOC − HOLD" val={fmt(msaRem)}/>
-            <Row label="STK% = ALLOC / STOCK"
-                 val={cell.stock_avail > 0 ? `${(cell.alloc_qty/cell.stock_avail*100).toFixed(1)}%` : '—'}/>
-          </>)
-        } else if (metric === 'STORE_STK') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              Σ MJ_STK_TTL across stores. Breakdown by SLOC below — every
-              SLOC column on ARS_LISTING is summed for this (MAJ_CAT{rdc ? `, ${rdc}` : ''}).
-            </div>
-            <Row label="STORE_STK (aggregate)" val={fmt(cell.store_stk)} accent={C.primary}/>
-            <div style={{ borderTop: '1px solid #f1f5f9', marginTop: 6, paddingTop: 6,
-                          maxHeight: 180, overflow: 'auto' }}>
-              {slocLoading
-                ? <div style={{ fontSize: 10, color: C.textMuted, padding: 4 }}>Loading SLOCs…</div>
-                : (!sloc || sloc.length === 0)
-                  ? <div style={{ fontSize: 10, color: C.textMuted, padding: 4 }}>No SLOC inventory.</div>
-                  : (
-                    <>
-                      {sloc.map(s => (
-                        <Row key={s.sloc} label={s.sloc} val={fmt(s.qty)}/>
                       ))}
-                      {stkTtl !== undefined && (
-                        <div style={{ borderTop: '1px dashed #e2e8f0', marginTop: 4, paddingTop: 4 }}>
-                          <Row label="STK_TTL (Σ all SLOC)" val={fmt(stkTtl)} accent={C.primary}/>
-                        </div>
-                      )}
-                    </>
-                  )
-              }
-            </div>
-          </>)
-        } else if (metric === 'EXCESS') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              EXCESS_STK = max(0, STK_TTL − excess_multiplier × OPT_MBQ).<br/>
-              Computed per-OPT in ARS_LISTING (Part 4d). MIX rows skipped.<br/>
-              Default excess_multiplier = 2× (rows with stock above 2× their
-              target are flagged excess and don't add to grid REQ).
-            </div>
-            <Row label="EXCESS_STK"  val={fmt(cell.excess_stk)} accent="#ea580c"/>
-            <Row label="STORE_STK"   val={fmt(cell.store_stk)}/>
-            <Row label="MBQ"         val={fmt(cell.mbq_qty)}/>
-          </>)
-        } else if (metric === 'REQ') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              REQ = max(0, MBQ − STORE_STK). Drives Stage C waterfall demand.
-            </div>
-            <Row label="MBQ"        val={fmt(cell.mbq_qty)}/>
-            <Row label="STORE_STK"  val={fmt(cell.store_stk)}/>
-            <Row label="REQ"        val={fmt(cell.req_qty)} accent={C.primary}/>
-            <Row label="ALLOC"      val={fmt(cell.alloc_qty)}/>
-            <Row label="REQ_REM"    val={fmt(reqRemV)}/>
-          </>)
-        } else if (metric === 'ALLOC') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              ALLOC = Σ SHIP_QTY from Stage C; HOLD = warehouse buffer.<br/>
-              REQ% = ALLOC / REQ. FILL% = (STORE_STK + ALLOC) / MBQ.
-            </div>
-            <Row label="MBQ"         val={fmt(cell.mbq_qty)}/>
-            <Row label="REQ"         val={fmt(cell.req_qty)}/>
-            <Row label="REQ_REM"     val={fmt(reqRemV)}/>
-            <Row label="ALLOC"       val={fmt(cell.alloc_qty)} accent={C.primary}/>
-            <Row label="HOLD"        val={fmt(cell.hold_qty)}/>
-            <Row label="REQ%"        val={cell.req_qty > 0 ? `${reqPctV.toFixed(1)}%` : '—'}
-                 accent={reqPctV >= 90 ? '#10b981' : reqPctV >= 60 ? '#f59e0b' : C.text}/>
-            <Row label="FILL%"       val={cell.mbq_qty > 0 ? `${fillPctV.toFixed(1)}%` : '—'}
-                 accent={fillPctV >= 100 ? '#10b981' : fillPctV >= 70 ? '#f59e0b' : C.text}/>
-          </>)
-        } else if (metric === 'REQ_REM') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              REQ_REM = max(0, REQ − ALLOC). What's left unfilled.<br/>
-              Conversion = ALLOC / REQ.
-            </div>
-            <Row label="MBQ"          val={fmt(cell.mbq_qty)}/>
-            <Row label="REQ"          val={fmt(cell.req_qty)}/>
-            <Row label="ALLOC"        val={fmt(cell.alloc_qty)}/>
-            <Row label="REQ_REM"      val={fmt(reqRemV)} accent={C.primary}/>
-            <Row label="Conversion %" val={cell.req_qty > 0 ? `${convPct.toFixed(1)}%` : '—'}
-                 accent={convPct >= 90 ? '#10b981' : convPct >= 60 ? '#f59e0b' : C.text}/>
-          </>)
-        } else if (metric === 'MSA_REM') {
-          body = (<>
-            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6 }}>
-              MSA_REM = max(0, STOCK − ALLOC − HOLD). What's left in the MSA
-              pool at this RDC after the run. Was called FNL_Q_REM.
-            </div>
-            <Row label="STOCK (Int. WH)" val={fmt(cell.stock_avail)}/>
-            <Row label="REQ"             val={fmt(cell.req_qty)}/>
-            <Row label="ALLOC"           val={fmt(cell.alloc_qty)}/>
-            <Row label="HOLD"            val={fmt(cell.hold_qty)}/>
-            <Row label="MSA_REM"         val={fmt(msaRem)} accent={C.primary}/>
-          </>)
-        } else {
-          body = <div style={{ fontSize: 11, color: C.textMuted }}>No details.</div>
-        }
-
-        return (
-          <>
-            <div onClick={() => setCalcPopover(null)}
-                 style={{ position: 'fixed', inset: 0, background: 'transparent', zIndex: 1100 }}/>
-            <div onClick={e => e.stopPropagation()}
-                 style={{ position: 'fixed', left: x, top: y, width: W,
-                          background: '#fff', border: '1px solid #e2e8f0',
-                          borderRadius: 8, boxShadow: '0 10px 25px rgba(15,23,42,0.18)',
-                          zIndex: 1101, padding: 12 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between',
-                            alignItems: 'center', marginBottom: 6 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>
-                  {titles[metric] || metric}
-                </div>
-                <button onClick={() => setCalcPopover(null)}
-                        style={{ background: 'none', border: 'none', cursor: 'pointer',
-                                 padding: 2, color: C.textSub }}><X size={12}/></button>
-              </div>
-              <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 8 }}>
-                {mc}{rdc ? ` · ${rdc}` : ' · TOTAL'}
-              </div>
-              {body}
-            </div>
-          </>
-        )
-      })()}
-
-      {/* ═══════════ OPT-wise drill modal (Phase 2) ═══════════
-          Opens when the user clicks a MAJ_CAT name or aggregate row.
-          Shows one row per (WERKS, GEN_ART_NUMBER, CLR) with OPT-grain
-          MBQ/REQ/ALLOC/HOLD/MSA_REM + ALLOC_REMARKS audit trail.
-          Click a row → opens VAR-art modal. */}
-      {majCatModalOpen && drill?.view === 'opt' && (() => {
-        const rows = [...(optModalData || [])]
-        // Sort
-        rows.sort((a, b) => {
-          const av = a[optModalSortCol]
-          const bv = b[optModalSortCol]
-          const an = (av === null || av === undefined) ? -Infinity : av
-          const bn = (bv === null || bv === undefined) ? -Infinity : bv
-          if (typeof an === 'string' || typeof bn === 'string') {
-            return optModalSortDir === 'asc'
-              ? String(an).localeCompare(String(bn))
-              : String(bn).localeCompare(String(an))
-          }
-          return optModalSortDir === 'asc' ? an - bn : bn - an
-        })
-        const tShip  = rows.reduce((s, r) => s + (r.ALLOC_QTY || 0), 0)
-        const tHold  = rows.reduce((s, r) => s + (r.HOLD_QTY  || 0), 0)
-        const tReq   = rows.reduce((s, r) => s + (r.OPT_REQ   || 0), 0)
-        const tMbq   = rows.reduce((s, r) => s + (r.OPT_MBQ   || 0), 0)
-        const tStk   = rows.reduce((s, r) => s + (r.STK_TTL   || 0), 0)
-        const tEx    = rows.reduce((s, r) => s + (r.EXCESS_STK|| 0), 0)
-        const tMsa   = rows.reduce((s, r) => s + (r.MSA_FNL_Q_REM || 0), 0)
-
-        const th = (col, label, extraStyle={}) => (
-          <th onClick={() => {
-                if (optModalSortCol === col)
-                  setOptModalSortDir(d => d === 'asc' ? 'desc' : 'asc')
-                else { setOptModalSortCol(col); setOptModalSortDir('desc') }
-              }}
-              style={{ cursor: 'pointer', userSelect: 'none', padding: '4px 8px',
-                       textAlign: 'right', fontSize: 9, color: C.textMuted,
-                       fontWeight: 600, ...extraStyle }}>
-            {label}{optModalSortCol === col ? (optModalSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-          </th>
-        )
-        const dash = <span style={{ color: '#d1d5db' }}>—</span>
-        const fmt0 = v => (v === null || v === undefined || v === 0) ? dash : Math.round(v).toLocaleString()
-
-        return (
-          <div onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-            style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
-                     display: 'flex', alignItems: 'stretch', justifyContent: 'stretch',
-                     zIndex: 1000 }}>
-            <div onClick={e => e.stopPropagation()}
-              style={{ background: '#fff', width: '100vw', height: '100vh',
-                       display: 'flex', flexDirection: 'column' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                            padding: '12px 16px', borderBottom: '1px solid #e2e8f0' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <button onClick={popDrill} title="Back to Stores"
-                    style={{ display: 'flex', alignItems: 'center', gap: 4,
-                             height: 28, padding: '0 10px', fontSize: 11, fontWeight: 600,
-                             background: '#f1f5f9', color: C.text,
-                             border: '1px solid #e2e8f0', borderRadius: 6,
-                             cursor: 'pointer' }}>
-                    ← Back
-                  </button>
-                  <div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
-                      MAJ_CATs <span style={{ color: C.textMuted }}>›</span> Stores <span style={{ color: C.textMuted }}>›</span> OPTs — {optModalMajCat}
-                      {optModalRdc   ? ` · ${optModalRdc}`     : ' · ALL RDCs'}
-                      {optModalWerks ? ` · STORE ${optModalWerks}` : ''}
-                      {!optModalLoading && ` (${rows.length} OPTs)`}
-                    </div>
-                    <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
-                      MBQ {Math.round(tMbq).toLocaleString()} · STK_TTL {Math.round(tStk).toLocaleString()}
-                      {tEx > 0  ? ` · EXCESS ${Math.round(tEx).toLocaleString()}`  : ''}
-                      {' '}· REQ {Math.round(tReq).toLocaleString()} · ALLOC {Math.round(tShip).toLocaleString()}
-                      {tHold > 0 ? ` · HOLD ${Math.round(tHold).toLocaleString()}` : ''}
-                      {' '}· MSA_REM {Math.round(tMsa).toLocaleString()}
-                      {' '}· Click any row for VAR_ART × SZ drill.
-                    </div>
-                  </div>
-                </div>
-                <button onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-                  title="Close all"
-                  style={{ background: 'transparent', border: 'none', cursor: 'pointer',
-                           padding: 4, color: C.textSub }}><X size={16}/></button>
-              </div>
-              <div style={{ overflow: 'auto', padding: '4px 0' }}>
-                {optModalLoading
-                  ? <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: C.textMuted }}>Loading…</div>
-                  : rows.length === 0
-                    ? <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: C.textMuted }}>No OPTs for this filter.</div>
-                    : (
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-                    <thead style={{ position: 'sticky', top: 0, zIndex: 1, background: '#f8fafc' }}>
-                      <tr style={{ borderBottom: '1px solid #e2e8f0' }}>
-                        <th style={{ padding: '4px 8px', textAlign: 'left',  fontSize: 9, color: C.textMuted, fontWeight: 600 }}>#</th>
-                        {th('WERKS',             'WERKS',     { textAlign: 'left' })}
-                        {th('GEN_ART_NUMBER',    'GEN_ART',   { textAlign: 'left' })}
-                        {th('CLR',               'CLR',       { textAlign: 'left' })}
-                        {th('OPT_TYPE',          'OPT',       { textAlign: 'left' })}
-                        {th('OPT_PRIORITY_RANK', 'RANK')}
-                        {th('ACS_D',             'ACS_D')}
-                        {th('OPT_MBQ',           'MBQ')}
-                        {th('STK_TTL',           'STK_TTL')}
-                        {th('EXCESS_STK',        'EXCESS')}
-                        {th('OPT_REQ',           'REQ')}
-                        {th('ALLOC_QTY',         'ALLOC')}
-                        {th('HOLD_QTY',          'HOLD')}
-                        {th('MSA_FNL_Q_REM',     'MSA_REM')}
-                        {th('ALLOC_STATUS',      'STATUS',    { textAlign: 'left' })}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((r, i) => {
-                        const onRowClick = () => openVarDrill(
-                          optModalMajCat, r.WERKS, r.GEN_ART_NUMBER, r.CLR || '',
-                          optModalRdc || null, { ...r }
-                        )
-                        const reqV  = r.OPT_REQ   || 0
-                        const reqRm = Math.max(0, reqV - (r.ALLOC_QTY || 0))
-                        const statusColor =
-                          r.ALLOC_STATUS === 'ALLOCATED' ? '#10b981'
-                          : r.ALLOC_STATUS === 'PARTIAL'   ? '#f59e0b'
-                          : r.ALLOC_STATUS === 'SKIPPED'   ? '#ef4444'
-                          : C.textSub
-                        return (
-                          <tr key={i} onClick={onRowClick}
-                              title="Click for VAR_ART × SZ drill"
-                              style={{ borderTop: '1px solid #f1f5f9', cursor: 'pointer' }}>
-                            <td style={{ padding: '5px 8px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i+1}</td>
-                            <td style={{ padding: '5px 8px', color: C.text, fontWeight: 600 }}>{r.WERKS}</td>
-                            <td style={{ padding: '5px 8px', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{r.GEN_ART_NUMBER}</td>
-                            <td style={{ padding: '5px 8px', color: C.textSub }}>{r.CLR || dash}</td>
-                            <td style={{ padding: '5px 8px', color: C.text }}>{r.OPT_TYPE || dash}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.OPT_PRIORITY_RANK)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.ACS_D)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.OPT_MBQ)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.STK_TTL)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: (r.EXCESS_STK || 0) > 0 ? '#ea580c' : C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.EXCESS_STK)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.OPT_REQ)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.ALLOC_QTY)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.HOLD_QTY)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.MSA_FNL_Q_REM)}</td>
-                            <td style={{ padding: '5px 8px', color: statusColor, fontWeight: 600, fontSize: 10 }}>{r.ALLOC_STATUS || dash}</td>
-                          </tr>
-                        )
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-          </div>
-        )
-      })()}
-
-      {/* ═══════════ VAR_ART × SZ drill modal (Phase 2) ═══════════ */}
-      {majCatModalOpen && drill?.view === 'var' && (() => {
-        const ctx  = varModalCtx || {}
-        const rows = [...(varModalData || [])]
-        rows.sort((a, b) => {
-          const av = a[varModalSortCol]
-          const bv = b[varModalSortCol]
-          const an = (av === null || av === undefined) ? -Infinity : av
-          const bn = (bv === null || bv === undefined) ? -Infinity : bv
-          if (typeof an === 'string' || typeof bn === 'string') {
-            return varModalSortDir === 'asc'
-              ? String(an).localeCompare(String(bn))
-              : String(bn).localeCompare(String(an))
-          }
-          return varModalSortDir === 'asc' ? an - bn : bn - an
-        })
-
-        const th = (col, label, extraStyle={}) => (
-          <th onClick={() => {
-                if (varModalSortCol === col)
-                  setVarModalSortDir(d => d === 'asc' ? 'desc' : 'asc')
-                else { setVarModalSortCol(col); setVarModalSortDir('desc') }
-              }}
-              style={{ cursor: 'pointer', userSelect: 'none', padding: '4px 8px',
-                       textAlign: 'right', fontSize: 9, color: C.textMuted,
-                       fontWeight: 600, ...extraStyle }}>
-            {label}{varModalSortCol === col ? (varModalSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-          </th>
-        )
-        const dash = <span style={{ color: '#d1d5db' }}>—</span>
-        const fmt0 = v => (v === null || v === undefined || v === 0) ? dash : Math.round(v).toLocaleString()
-
-        const tShip = rows.reduce((s, r) => s + (r.ALLOC_QTY || r.SHIP_QTY || 0), 0)
-        const tHold = rows.reduce((s, r) => s + (r.HOLD_QTY  || 0), 0)
-        const tMbq  = rows.reduce((s, r) => s + (r.SZ_MBQ    || 0), 0)
-        const tReq  = rows.reduce((s, r) => s + (r.SZ_REQ    || 0), 0)
-        const tStk  = rows.reduce((s, r) => s + (r.SZ_STK    || 0), 0)
-        const tFnl  = rows.reduce((s, r) => s + (r.FNL_Q     || 0), 0)
-        const tRem  = rows.reduce((s, r) => s + (r.FNL_Q_REM || 0), 0)
-
-        return (
-          <div onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-            style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
-                     display: 'flex', alignItems: 'stretch', justifyContent: 'stretch',
-                     zIndex: 1000 }}>
-            <div onClick={e => e.stopPropagation()}
-              style={{ background: '#fff', width: '100vw', height: '100vh',
-                       display: 'flex', flexDirection: 'column' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                            padding: '12px 16px', borderBottom: '1px solid #e2e8f0' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <button onClick={popDrill} title="Back to OPTs"
-                    style={{ display: 'flex', alignItems: 'center', gap: 4,
-                             height: 28, padding: '0 10px', fontSize: 11, fontWeight: 600,
-                             background: '#f1f5f9', color: C.text,
-                             border: '1px solid #e2e8f0', borderRadius: 6,
-                             cursor: 'pointer' }}>
-                    ← Back
-                  </button>
-                  <div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
-                      MAJ_CATs <span style={{ color: C.textMuted }}>›</span> Stores <span style={{ color: C.textMuted }}>›</span> OPTs <span style={{ color: C.textMuted }}>›</span> VAR_ART × SZ — {ctx.werks} · {ctx.gen_art}
-                      {ctx.clr ? ` · ${ctx.clr}` : ''}
-                      {ctx.rdc ? ` · ${ctx.rdc}` : ''}
-                      {!varModalLoading && ` (${rows.length} rows)`}
-                    </div>
-                    <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
-                      MBQ {Math.round(tMbq).toLocaleString()} · STK {Math.round(tStk).toLocaleString()}
-                      {' '}· REQ {Math.round(tReq).toLocaleString()} · ALLOC {Math.round(tShip).toLocaleString()}
-                      {tHold > 0 ? ` · HOLD ${Math.round(tHold).toLocaleString()}` : ''}
-                      {' '}· FNL_Q {Math.round(tFnl).toLocaleString()} · MSA_REM {Math.round(tRem).toLocaleString()}
-                    </div>
-                  </div>
-                </div>
-                <button onClick={() => { setMajCatModalOpen(false); setDrill(null) }}
-                  title="Close all"
-                  style={{ background: 'transparent', border: 'none', cursor: 'pointer',
-                           padding: 4, color: C.textSub }}><X size={16}/></button>
-              </div>
-              <div style={{ overflow: 'auto', padding: '4px 0' }}>
-                {varModalLoading
-                  ? <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: C.textMuted }}>Loading…</div>
-                  : rows.length === 0
-                    ? <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: C.textMuted }}>No allocation rows.</div>
-                    : (
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-                    <thead style={{ position: 'sticky', top: 0, zIndex: 1, background: '#f8fafc' }}>
-                      <tr style={{ borderBottom: '1px solid #e2e8f0' }}>
-                        <th style={{ padding: '4px 8px', textAlign: 'left', fontSize: 9, color: C.textMuted, fontWeight: 600 }}>#</th>
-                        {th('VAR_ART',     'VAR_ART', { textAlign: 'left' })}
-                        {th('SZ',          'SZ',      { textAlign: 'left' })}
-                        {th('CONT',        'CONT')}
-                        {th('PAK_SZ',      'PAK_SZ')}
-                        {th('SZ_MBQ',      'SZ_MBQ')}
-                        {th('SZ_STK',      'SZ_STK')}
-                        {th('SZ_REQ',      'SZ_REQ')}
-                        {th('FNL_Q',       'FNL_Q')}
-                        {th('FNL_Q_REM',   'MSA_REM')}
-                        {th('SHIP_QTY',    'SHIP')}
-                        {th('FROM_HOLD_QTY','from_HOLD')}
-                        {th('HOLD_QTY',    'HOLD')}
-                        {th('ALLOC_QTY',   'ALLOC')}
-                        {th('ALLOC_STATUS','STATUS',  { textAlign: 'left' })}
-                        {th('SKIP_REASON', 'REASON',  { textAlign: 'left' })}
-                        <th style={{ padding: '4px 8px', textAlign: 'left', fontSize: 9, color: C.textMuted, fontWeight: 600 }}>BAND TRACE</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((r, i) => {
-                        const statusColor =
-                          r.ALLOC_STATUS === 'ALLOCATED' ? '#10b981'
-                          : r.ALLOC_STATUS === 'PARTIAL'   ? '#f59e0b'
-                          : r.ALLOC_STATUS === 'SKIPPED'   ? '#ef4444'
-                          : C.textSub
-                        return (
-                          <tr key={i} style={{ borderTop: '1px solid #f1f5f9' }}>
-                            <td style={{ padding: '5px 8px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i+1}</td>
-                            <td style={{ padding: '5px 8px', color: C.text, fontVariantNumeric: 'tabular-nums' }}>{r.VAR_ART}</td>
-                            <td style={{ padding: '5px 8px', color: C.text, fontWeight: 600 }}>{r.SZ}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>
-                              {r.CONT != null ? Number(r.CONT).toFixed(3) : dash}
-                            </td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.PAK_SZ)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.SZ_MBQ)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.SZ_STK)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.SZ_REQ)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.FNL_Q)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.FNL_Q_REM)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.SHIP_QTY)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: '#a16207', fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.FROM_HOLD_QTY)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', color: '#b45309', fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.HOLD_QTY)}</td>
-                            <td style={{ padding: '5px 8px', textAlign: 'right', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{fmt0(r.ALLOC_QTY)}</td>
-                            <td style={{ padding: '5px 8px', color: statusColor, fontWeight: 600, fontSize: 10 }}>{r.ALLOC_STATUS || dash}</td>
-                            <td style={{ padding: '5px 8px', color: C.textSub, fontSize: 10 }}>{r.SKIP_REASON || dash}</td>
-                            <td style={{ padding: '5px 8px', color: C.textMuted, fontSize: 9, maxWidth: 360,
-                                          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
-                                title={r.ALLOC_REMARKS || ''}>
-                              {r.ALLOC_REMARKS
-                                ? <span style={{ fontFamily: 'monospace' }}>{r.ALLOC_REMARKS}</span>
-                                : dash}
-                            </td>
-                          </tr>
-                        )
-                      })}
                     </tbody>
                   </table>
                 )}
@@ -4165,10 +3126,9 @@ export default function ListingPage() {
       {storeModalOpen && (() => {
         const items = [...(summary?.by_store || [])]
           .sort((a, b) => (b.alloc_qty || 0) - (a.alloc_qty || 0))
-        // REQ/MBQ/ALLOC_QTY/HOLD_QTY are unit counts — round before display/export.
-        const totalAlloc = Math.round(items.reduce((s, r) => s + (r.alloc_qty || 0), 0))
-        const totalHold  = Math.round(items.reduce((s, r) => s + (r.hold_qty  || 0), 0))
-        const totalReq   = Math.round(items.reduce((s, r) => s + (r.mj_req   || 0), 0))
+        const totalAlloc = items.reduce((s, r) => s + (r.alloc_qty || 0), 0)
+        const totalHold  = items.reduce((s, r) => s + (r.hold_qty  || 0), 0)
+        const totalReq   = items.reduce((s, r) => s + (r.mj_req   || 0), 0)
         const hasReq = items.some(r => (r.mj_req || 0) > 0)
 
         const exportStoreExcel = () => {
@@ -4178,10 +3138,10 @@ export default function ListingPage() {
             const row = {
               '#':         i + 1,
               STORE:       r.werks,
-              ALLOC_QTY:   Math.round(r.alloc_qty || 0),
-              HOLD_QTY:    Math.round(r.hold_qty  || 0),
+              ALLOC_QTY:   r.alloc_qty || 0,
+              HOLD_QTY:    r.hold_qty  || 0,
             }
-            if (hasReq) { row.REQ = Math.round(r.mj_req || 0); row['REQ%'] = reqPct }
+            if (hasReq) { row.REQ = r.mj_req || 0; row['REQ%'] = reqPct }
             row.ROWS      = r.row_count || 0
             row['SHARE%'] = share
             return row
@@ -4264,14 +3224,14 @@ export default function ListingPage() {
                             <td style={{ padding: '6px 14px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i + 1}</td>
                             <td style={{ padding: '6px 14px', fontWeight: 600, color: C.text }}>{r.werks}</td>
                             <td style={{ padding: '6px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-                              {Math.round(r.alloc_qty || 0).toLocaleString()}
+                              {(r.alloc_qty || 0).toLocaleString()}
                             </td>
                             <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>
-                              {Math.round(r.hold_qty || 0).toLocaleString()}
+                              {(r.hold_qty || 0).toLocaleString()}
                             </td>
                             {hasReq && (
                               <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>
-                                {Math.round(r.mj_req || 0).toLocaleString()}
+                                {(r.mj_req || 0).toLocaleString()}
                               </td>
                             )}
                             {hasReq && (

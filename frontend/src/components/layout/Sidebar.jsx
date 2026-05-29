@@ -3,17 +3,19 @@ import {
   LayoutDashboard, Table2, Upload, PackageCheck, Users, Shield, Eye, ScrollText,
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
-  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
-  HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
-  AlertTriangle
+  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
+  HardDrive, Code2, Lock, CalendarDays, History, FolderKanban, ListTodo
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
 import { useState, useRef, useEffect } from 'react'
 
 const navItems = [
-  { label: 'ARS Dashboard', path: '/ars-dashboard', icon: LayoutGrid, permission: 'ALLOC_READ' },
-  { label: 'Alloc Review', path: '/alc-review', icon: History, permission: 'ALLOC_READ' },
+  { label: 'Dashboard', path: '/', icon: LayoutDashboard, end: true },
+  { label: 'Allocations', path: '/allocations', icon: PackageCheck, permission: 'ALLOC_READ' },
+  { label: 'Process', path: '/process', icon: BookOpen },
+  // Developer Guide — superadmin only. Auto-introspecting, no SOP rot.
+  { label: 'Developer Guide', path: '/dev-guide', icon: Code2, superadminOnly: true },
 ]
 
 // Data Management submenu
@@ -29,14 +31,11 @@ const dataManagementItems = [
 // Data Preparation submenu
 const dataPreparationItems = [
   { label: 'MSA Stock Calculation', path: '/msa', icon: BarChart3, permission: 'MSA_VIEW' },
+  { label: 'OneSize', path: '/onesize', icon: Box },
+  { label: 'BDC Creation', path: '/bdc', icon: FileText, permission: 'BDC_VIEW' },
   { label: 'Grid Builder', path: '/data-prep/store-stock', icon: LayoutGrid, permission: 'GRID_VIEW' },
-  { label: 'Merge Rules', path: '/data-prep/merge-rules', icon: GitMerge, permission: 'GRID_VIEW' },
-  { label: 'Listing', path: '/data-prep/listing', icon: List },
-]
-
-// Adhoc submenu
-const adhocItems = [
   { label: 'Lookup Art Master', path: '/data-prep/lookup-art-master', icon: Search, permission: 'LOOKUP_VIEW' },
+  { label: 'Listing', path: '/data-prep/listing', icon: List },
 ]
 
 // Contribution Percentage submenu
@@ -45,12 +44,12 @@ const contributionItems = [
   { label: 'Mappings', path: '/contribution/mappings', icon: Columns, permission: 'CONTRIB_MAPPINGS' },
   { label: 'Execute', path: '/contribution/execute', icon: Cpu, permission: 'CONTRIB_EXECUTE' },
   { label: 'Review', path: '/contribution/review', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
+  { label: 'Report', path: '/contribution/report', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
 ]
 
 // Reports submenu
 const reportsItems = [
   { label: 'Hold Dashboard', path: '/reports/hold', icon: Lock },
-  { label: 'GAP Report',     path: '/reports/gap',  icon: AlertTriangle, permission: 'ALLOC_READ' },
 ]
 
 // Pending Allocation lifecycle submenu
@@ -229,7 +228,9 @@ export default function Sidebar({ collapsed, onToggle }) {
     )}>
       {/* Logo */}
       <div className="flex items-center gap-2.5 px-3 py-4 border-b border-gray-800">
-        <img src="/v2-logo.png" alt="V2" className="h-7 w-7 object-contain shrink-0" />
+        <div className="w-7 h-7 rounded-lg bg-primary-600 flex items-center justify-center">
+          <Box size={16} className="text-white" />
+        </div>
         {!collapsed && <span className="text-white font-bold text-base tracking-tight">ARS</span>}
       </div>
 
@@ -254,19 +255,10 @@ export default function Sidebar({ collapsed, onToggle }) {
         />
 
         {/* Data Preparation submenu */}
-        <SubMenu
-          title="Listing & Alloc"
-          icon={Cpu}
-          items={dataPreparationItems}
-          collapsed={collapsed}
-          hasPermission={hasPermission}
-        />
-
-        {/* Adhoc submenu */}
-        <SubMenu
-          title="Adhoc"
-          icon={FolderOpen}
-          items={adhocItems}
+        <SubMenu 
+          title="Data Preparation" 
+          icon={Cpu} 
+          items={dataPreparationItems} 
           collapsed={collapsed}
           hasPermission={hasPermission}
         />
