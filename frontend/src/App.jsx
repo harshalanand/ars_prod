@@ -24,10 +24,12 @@ const RLSPage                = lazy(() => import('@/pages/RLSPage'))
 const TableManagementPage    = lazy(() => import('@/pages/TableManagementPage'))
 const SettingsPage           = lazy(() => import('@/pages/SettingsPage'))
 const MSAStockCalculationPage= lazy(() => import('@/pages/MSAStockCalculationPage'))
+const OneSizePage            = lazy(() => import('@/pages/OneSizePage'))
 const ContribPresetsPage     = lazy(() => import('@/pages/ContribPresetsPage'))
 const ContribMappingsPage    = lazy(() => import('@/pages/ContribMappingsPage'))
 const ContribExecutePage     = lazy(() => import('@/pages/ContribExecutePage'))
 const ContribReviewPage      = lazy(() => import('@/pages/ContribReviewPage'))
+const ContribReportPage      = lazy(() => import('@/pages/ContribReportPage'))
 const JobsDashboardPage      = lazy(() => import('@/pages/JobsDashboardPage'))
 const BDCCreationPage        = lazy(() => import('@/pages/BDCCreationPage'))
 const StoreStockPage         = lazy(() => import('@/pages/StoreStockPage'))
@@ -124,10 +126,12 @@ export default function App() {
         <Route path="editor" element={<ProtectedRoute permission="DATA_EDITOR"><DataEditorPage /></ProtectedRoute>} />
         {/* Data Preparation */}
         <Route path="msa" element={<ProtectedRoute permission="MSA_VIEW"><MSAStockCalculationPage /></ProtectedRoute>} />
+        <Route path="onesize" element={<ErrorBoundary><OneSizePage /></ErrorBoundary>} />
         <Route path="contribution/presets" element={<ProtectedRoute permission="CONTRIB_PRESETS"><ContribPresetsPage /></ProtectedRoute>} />
         <Route path="contribution/mappings" element={<ProtectedRoute permission="CONTRIB_MAPPINGS"><ContribMappingsPage /></ProtectedRoute>} />
         <Route path="contribution/execute" element={<ProtectedRoute permission="CONTRIB_EXECUTE"><ContribExecutePage /></ProtectedRoute>} />
         <Route path="contribution/review" element={<ProtectedRoute permission="CONTRIB_REVIEW"><ContribReviewPage /></ProtectedRoute>} />
+        <Route path="contribution/report" element={<ProtectedRoute permission="CONTRIB_REVIEW"><ContribReportPage /></ProtectedRoute>} />
         <Route path="bdc" element={<ProtectedRoute permission="BDC_VIEW"><BDCCreationPage /></ProtectedRoute>} />
         <Route path="data-validation/store-sloc" element={<ProtectedRoute permission="STORE_SLOC_VIEW"><StoreStockPage /></ProtectedRoute>} />
         <Route path="data-validation/checklist" element={<ProtectedRoute permission="CHECKLIST_VIEW"><ChecklistPage /></ProtectedRoute>} />

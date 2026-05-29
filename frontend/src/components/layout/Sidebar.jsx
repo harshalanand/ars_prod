@@ -31,6 +31,7 @@ const dataManagementItems = [
 // Data Preparation submenu
 const dataPreparationItems = [
   { label: 'MSA Stock Calculation', path: '/msa', icon: BarChart3, permission: 'MSA_VIEW' },
+  { label: 'OneSize', path: '/onesize', icon: Box },
   { label: 'BDC Creation', path: '/bdc', icon: FileText, permission: 'BDC_VIEW' },
   { label: 'Grid Builder', path: '/data-prep/store-stock', icon: LayoutGrid, permission: 'GRID_VIEW' },
   { label: 'Lookup Art Master', path: '/data-prep/lookup-art-master', icon: Search, permission: 'LOOKUP_VIEW' },
@@ -43,6 +44,7 @@ const contributionItems = [
   { label: 'Mappings', path: '/contribution/mappings', icon: Columns, permission: 'CONTRIB_MAPPINGS' },
   { label: 'Execute', path: '/contribution/execute', icon: Cpu, permission: 'CONTRIB_EXECUTE' },
   { label: 'Review', path: '/contribution/review', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
+  { label: 'Report', path: '/contribution/report', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
 ]
 
 // Reports submenu

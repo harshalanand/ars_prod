@@ -136,3 +136,7 @@ api_router.include_router(dev_guide_router)
 # Project Tracker — hierarchical projects, status/priority/phase, dashboard
 from app.api.v1.endpoints.project_tracker import router as project_tracker_router
 api_router.include_router(project_tracker_router)
+
+# OneSize — post-MSA filter that keeps GEN_ART/CLR combos appearing N times or fewer
+from app.api.v1.endpoints.onesize import router as onesize_router
+api_router.include_router(onesize_router)

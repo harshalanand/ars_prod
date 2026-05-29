@@ -5,6 +5,7 @@ import { tablesAPI, dataAPI, checklistAPI } from '@/services/api'
 import { AgGridReact } from 'ag-grid-react'
 import 'ag-grid-community/styles/ag-grid.css'
 import 'ag-grid-community/styles/ag-theme-alpine.css'
+import DropdownFilter from '@/components/grid/DropdownFilter'
 import toast from 'react-hot-toast'
 import useAuthStore from '@/store/authStore'
 
@@ -267,6 +268,10 @@ export default function DataEditorPage() {
   const [preFilters, setPreFilters] = useState({})
   const [filterColumns, setFilterColumns] = useState([])
   const [showAddColumnModal, setShowAddColumnModal] = useState(false)
+  // Ref-mirror of preFilters so closures (e.g. AG Grid filterParams fetchers)
+  // always see the latest value without re-creating columnDefs on every change.
+  const preFiltersRef = useRef(preFilters)
+  useEffect(() => { preFiltersRef.current = preFilters }, [preFilters])
   
   // State management
   const [dataLoaded, setDataLoaded] = useState(false)
@@ -347,21 +352,24 @@ export default function DataEditorPage() {
   useEffect(() => {
     const updateFilteredCount = async () => {
       if (!selectedTable) return
-      
-      const hasFilters = Object.values(preFilters).some(arr => arr && arr.length > 0)
+
+      const isActive = (v) => (Array.isArray(v) ? v.length > 0 : !!(v && typeof v === 'object' && v.type))
+      const hasFilters = Object.values(preFilters).some(isActive)
       if (!hasFilters) {
         setFilteredRowCount(null)
         return
       }
-      
+
       try {
         const filterObj = {}
-        Object.entries(preFilters).forEach(([col, vals]) => {
-          if (vals && vals.length > 0) {
-            filterObj[col] = { type: 'in', filter: vals }
+        Object.entries(preFilters).forEach(([col, val]) => {
+          if (Array.isArray(val)) {
+            if (val.length > 0) filterObj[col] = { type: 'in', filter: val }
+          } else if (val && typeof val === 'object' && val.type) {
+            filterObj[col] = val
           }
         })
-        
+
         const { data } = await tablesAPI.data(selectedTable, {
           page: 1,
           page_size: 1,
@@ -372,35 +380,33 @@ export default function DataEditorPage() {
         setFilteredRowCount(null)
       }
     }
-    
+
     const debounce = setTimeout(updateFilteredCount, 400)
     return () => clearTimeout(debounce)
   }, [preFilters, selectedTable])
 
   const loadData = useCallback(async () => {
     if (!selectedTable || !schema) return
-    
+
     setLoading(true)
     try {
       const filterObj = {}
-      Object.entries(preFilters).forEach(([col, vals]) => {
-        if (vals && vals.length > 0) {
-          filterObj[col] = { type: 'in', filter: vals }
+      Object.entries(preFilters).forEach(([col, val]) => {
+        if (Array.isArray(val)) {
+          // Dropdown multi-select → IN clause
+          if (val.length > 0) filterObj[col] = { type: 'in', filter: val }
+        } else if (val && typeof val === 'object' && val.type) {
+          // Numeric filter — pass through AG Grid model shape
+          filterObj[col] = val
         }
       })
-      
-      const params = { 
-        page, 
+
+      const params = {
+        page,
         page_size: pageSize,
         filters: Object.keys(filterObj).length > 0 ? JSON.stringify(filterObj) : undefined
       }
       const { data } = await tablesAPI.data(selectedTable, params)
-      
-      // Debug logging
-      console.log('API Response:', data)
-      console.log('Row count from API:', data.data?.data?.length)
-      console.log('Total from API:', data.data?.total)
-      
       setRowData(data.data?.data || [])
       setTotal(data.data?.total || 0)
       setDataLoaded(true)
@@ -417,6 +423,18 @@ export default function DataEditorPage() {
       loadData()
     }
   }, [page, pageSize])
+
+  // Reload when preFilters changes (dropdown selections + numeric filters).
+  // Debounced so rapid checkbox toggles batch into one server call.
+  useEffect(() => {
+    if (!dataLoaded || !selectedTable || !schema) return
+    const t = setTimeout(() => {
+      setPage(1)
+      loadData()
+    }, 300)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(preFilters)])
 
   const handleLoadData = () => {
     setPage(1)
@@ -476,13 +494,61 @@ export default function DataEditorPage() {
       const isPK = col.is_primary_key
       const field = col.column_name
       const canEdit = col.is_editable && hasPermission('DATA_EDIT')
+      // Pick a filter type by data type — number for numeric, dropdown for everything else.
+      const dt = (col.data_type || '').toLowerCase()
+      const isNumeric = /int|decimal|numeric|float|real|money|bigint|smallint|tinyint/.test(dt)
+      const filterCfg = isNumeric
+        ? { filter: 'agNumberColumnFilter', filterParams: { filterOptions: ['equals', 'greaterThan', 'lessThan', 'inRange'], debounceMs: 300 } }
+        : {
+            filter: DropdownFilter,
+            filterParams: {
+              // Server-side distinct fetcher — used by the dropdown to
+              // show ALL values (not just from the currently loaded page),
+              // with cascading from any other filters already applied.
+              fetchDistinct: async (column, search) => {
+                try {
+                  const cascade = {}
+                  Object.entries(preFiltersRef.current || {}).forEach(([col, vals]) => {
+                    if (col !== column && Array.isArray(vals) && vals.length > 0) {
+                      cascade[col] = vals
+                    }
+                  })
+                  const { data } = await tablesAPI.distinct(selectedTable, column, {
+                    filters: Object.keys(cascade).length ? JSON.stringify(cascade) : undefined,
+                    search: search || undefined,
+                    limit: 1000,
+                  })
+                  return data?.data?.values || []
+                } catch {
+                  return []
+                }
+              },
+              // Direct selection callback — bypasses AG Grid's flaky
+              // filterChangedCallback chain on Community v32. Updates
+              // preFilters directly so the debounced reload fires.
+              onSelectionChange: (column, values) => {
+                setPreFilters((prev) => {
+                  const next = { ...prev }
+                  if (!values || values.length === 0) {
+                    delete next[column]
+                  } else {
+                    next[column] = values
+                  }
+                  return next
+                })
+              },
+              // Seed initial selection from existing preFilters so the
+              // dropdown reflects state if the user reopens it.
+              initialValues: preFiltersRef.current?.[field] || [],
+            },
+          }
       return {
         field,
         headerName: col.display_name || col.column_name,
         sortable: true,
         resizable: true,
-        filter: 'agTextColumnFilter',
         floatingFilter: true,
+        ...filterCfg,
         editable: (params) => params.data?.__isNew ? true : canEdit,
         cellStyle: (params) => {
           if (isPK) {
@@ -497,13 +563,8 @@ export default function DataEditorPage() {
           }
           return null
         },
-        minWidth: 100,
+        minWidth: 90,
         flex: 1,
-        filterParams: {
-          filterOptions: ['contains', 'equals', 'startsWith', 'endsWith'],
-          defaultOption: 'contains',
-          debounceMs: 300,
-        },
       }
     })
     
@@ -672,7 +733,9 @@ export default function DataEditorPage() {
   }
 
   const totalPages = Math.ceil(total / pageSize)
-  const activeFilterCount = Object.values(preFilters).filter(arr => arr && arr.length > 0).length
+  const activeFilterCount = Object.values(preFilters).filter(
+    (v) => (Array.isArray(v) ? v.length > 0 : !!(v && typeof v === 'object' && v.type))
+  ).length
 
   return (
     <div className="space-y-4">
@@ -929,7 +992,10 @@ export default function DataEditorPage() {
                 )}
               </div>
             </div>
-            <div className="ag-theme-alpine" style={{ width: '100%', height: 'calc(100vh - 380px)', minHeight: '400px' }}>
+            <div
+              className="ag-theme-alpine ag-compact"
+              style={{ width: '100%', height: 'calc(100vh - 380px)', minHeight: '400px' }}
+            >
               <AgGridReact
                 ref={gridRef}
                 rowData={rowData}
@@ -942,6 +1008,9 @@ export default function DataEditorPage() {
                   if (rowKey && pendingChangesRef.current.has(rowKey)) return { background: '#f0fdf4' }
                   return undefined
                 }}
+                rowHeight={28}
+                headerHeight={32}
+                floatingFiltersHeight={36}
                 animateRows
                 undoRedoCellEditing
                 undoRedoCellEditingLimit={20}
@@ -951,7 +1020,62 @@ export default function DataEditorPage() {
                 suppressRowClickSelection
                 getRowId={(params) => getRowKey(params.data) || String(Math.random())}
                 stopEditingWhenCellsLoseFocus
+                // Dropdown filters now update preFilters directly via
+                // filterParams.onSelectionChange. We keep this handler ONLY
+                // for AG Grid's built-in numeric filters (agNumberColumnFilter)
+                // so their values also drive preFilters.
+                onFilterChanged={(params) => {
+                  try {
+                    const model = params.api.getFilterModel() || {}
+                    setPreFilters((prev) => {
+                      const next = { ...prev }
+                      Object.entries(model).forEach(([col, m]) => {
+                        // Only sync numeric filter shapes here — dropdown
+                        // filters already updated preFilters directly.
+                        if (m && m.type && 'filter' in m) {
+                          next[col] = { type: m.type, filter: m.filter, filterTo: m.filterTo }
+                        }
+                      })
+                      return next
+                    })
+                  } catch (e) {
+                    console.warn('[DataEditor] filter sync error', e)
+                  }
+                }}
               />
+              <style>{`
+                .ag-compact .ag-cell {
+                  padding-left: 8px !important;
+                  padding-right: 8px !important;
+                  font-size: 12px !important;
+                  line-height: 28px !important;
+                }
+                .ag-compact .ag-header-cell-label {
+                  font-size: 11px !important;
+                  font-weight: 600 !important;
+                  text-transform: uppercase;
+                  letter-spacing: 0.3px;
+                  color: #475569 !important;
+                }
+                .ag-compact .ag-header,
+                .ag-compact .ag-header-row {
+                  background: #f8fafc !important;
+                  border-bottom: 1px solid #e2e8f0 !important;
+                }
+                .ag-compact .ag-row-odd  { background-color: #fbfcfe; }
+                .ag-compact .ag-row-even { background-color: #ffffff; }
+                .ag-compact .ag-row-hover { background-color: #eef2ff !important; }
+                .ag-compact .ag-row-selected { background-color: #e0e7ff !important; }
+                .ag-compact .ag-floating-filter-input,
+                .ag-compact .ag-floating-filter-button {
+                  font-size: 11px !important;
+                }
+                .ag-compact .ag-floating-filter-body input {
+                  height: 26px !important;
+                  font-size: 11px !important;
+                  padding: 0 6px !important;
+                }
+              `}</style>
             </div>
           </div>
 

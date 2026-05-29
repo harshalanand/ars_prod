@@ -11,7 +11,7 @@ console.log(`🔌 API Configuration:
   Prod: ${import.meta.env.PROD}
 `);
 
-const api = axios.create({ baseURL: API_BASE, timeout: 300000 }) // 5 minute timeout for complex calculations
+const api = axios.create({ baseURL: API_BASE, timeout: 900000 }) // 15 minute timeout for complex calculations (OneSize, allocation, etc.)
 
 // Request interceptor: attach JWT
 api.interceptors.request.use((config) => {
@@ -230,6 +230,44 @@ export const msaAPI = {
   run: (payload) => api.post('/msa/run', payload),
 }
 
+// ============== OneSize ==============
+// FastAPI's `List[str] = Query(...)` expects ?rdc=X&rdc=Y (repeat, no brackets).
+// Axios 1.x defaults to ?rdc[]=X which FastAPI silently drops — so we serialize
+// arrays manually via URLSearchParams.append() to emit the repeat form.
+const repeatedArrayParams = (params) => {
+  const sp = new URLSearchParams()
+  Object.entries(params).forEach(([k, v]) => {
+    if (v == null) return
+    if (Array.isArray(v)) v.forEach((item) => sp.append(k, item))
+    else sp.append(k, v)
+  })
+  return sp.toString()
+}
+
+export const oneSizeAPI = {
+  listRdcs: () => api.get('/onesize/rdcs'),
+  listSsns: () => api.get('/onesize/ssns'),
+  run: (previewLimit = 1000, rdcs = [], ssns = []) =>
+    api.post('/onesize/run', null, {
+      params: {
+        preview_limit: previewLimit,
+        rdc: rdcs,
+        ssn: ssns,
+      },
+      paramsSerializer: repeatedArrayParams,
+    }),
+  exportCsvBlob: (cacheKey = '', rdcs = [], ssns = []) =>
+    api.get('/onesize/export.csv', {
+      params: {
+        cache_key: cacheKey || undefined,
+        rdc: rdcs,
+        ssn: ssns,
+      },
+      paramsSerializer: repeatedArrayParams,
+      responseType: 'blob',
+    }),
+}
+
 // ============== Audit ==============
 export const auditAPI = {
   list: (params) => api.get('/audit', { params }),
@@ -411,9 +449,11 @@ export const contribAPI = {
   saveMapping:   (data)     => api.post('/contrib/mappings', data),
   deleteMapping: (name)     => api.delete(`/contrib/mappings/${encodeURIComponent(name)}`),
   // Assignments
-  listAssignments: ()       => api.get('/contrib/assignments'),
-  saveAssignment:  (data)   => api.post('/contrib/assignments', data),
-  deleteAssignment:(id)     => api.delete(`/contrib/assignments/${id}`),
+  listAssignments:     ()    => api.get('/contrib/assignments'),
+  saveAssignment:      (data)=> api.post('/contrib/assignments', data),
+  deleteAssignment:    (id)  => api.delete(`/contrib/assignments/${id}`),
+  activateAssignment:  (id)  => api.post(`/contrib/assignments/${id}/activate`),
+  clearActiveAssignment: ()  => api.post('/contrib/assignments/clear-active'),
   // Execute (creates background job)
   execute: (data)           => api.post('/contrib/execute', data),
   // Jobs
@@ -439,6 +479,9 @@ export const contribAPI = {
   getExport:        (id)    => api.get(`/contrib/review/exports/${id}`),
   downloadExport:   (id)    => api.get(`/contrib/review/exports/${id}/download`, { responseType: 'blob', timeout: 600000 }),
   deleteExport:     (id)    => api.delete(`/contrib/review/exports/${id}`),
+  // Contribution Report — paginated full-table view
+  reportTables: () => api.get('/contrib/report/tables'),
+  reportPage:   (params) => api.get('/contrib/report/page', { params }),
 }
 
 // ============== Data Checklist ==============
