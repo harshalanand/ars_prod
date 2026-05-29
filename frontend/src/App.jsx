@@ -3,9 +3,8 @@ import { useEffect, Component, lazy, Suspense } from 'react'
 import useAuthStore from '@/store/authStore'
 import Layout from '@/components/layout/Layout'
 
-// Eager-load: login + dashboard (always needed on first paint)
+// Eager-load: login (always needed on first paint)
 import LoginPage from '@/pages/LoginPage'
-import DashboardPage from '@/pages/DashboardPage'
 
 // Lazy-load: all other pages (loaded on-demand, reduces initial bundle ~35%)
 const TablesPage             = lazy(() => import('@/pages/TablesPage'))
@@ -14,9 +13,6 @@ const CreateTablePage        = lazy(() => import('@/pages/CreateTablePage'))
 const UploadPage             = lazy(() => import('@/pages/UploadPage'))
 const ExportPage             = lazy(() => import('@/pages/ExportPage'))
 const DataEditorPage         = lazy(() => import('@/pages/DataEditorPage'))
-const AllocationsPage        = lazy(() => import('@/pages/AllocationsPage'))
-const AllocationDetailPage   = lazy(() => import('@/pages/AllocationDetailPage'))
-const NewAllocationPage      = lazy(() => import('@/pages/NewAllocationPage'))
 const UsersPage              = lazy(() => import('@/pages/UsersPage'))
 const RolesPage              = lazy(() => import('@/pages/RolesPage'))
 const AuditPage              = lazy(() => import('@/pages/AuditPage'))
@@ -29,9 +25,9 @@ const ContribMappingsPage    = lazy(() => import('@/pages/ContribMappingsPage'))
 const ContribExecutePage     = lazy(() => import('@/pages/ContribExecutePage'))
 const ContribReviewPage      = lazy(() => import('@/pages/ContribReviewPage'))
 const JobsDashboardPage      = lazy(() => import('@/pages/JobsDashboardPage'))
-const BDCCreationPage        = lazy(() => import('@/pages/BDCCreationPage'))
 const StoreStockPage         = lazy(() => import('@/pages/StoreStockPage'))
 const GridBuilderPage        = lazy(() => import('@/pages/GridBuilderPage'))
+const MergeRulesPage         = lazy(() => import('@/pages/MergeRulesPage'))
 const LookupArtMasterPage    = lazy(() => import('@/pages/LookupArtMasterPage'))
 const ListingPage            = lazy(() => import('@/pages/ListingPage'))
 const ListingLogsPage        = lazy(() => import('@/pages/ListingLogsPage'))
@@ -44,14 +40,15 @@ const ScheduleAuditPage          = lazy(() => import('@/pages/ScheduleAuditPage'
 const PendAlcOperationsPage      = lazy(() => import('@/pages/PendAlcOperationsPage'))
 const ManualPendAlcPage          = lazy(() => import('@/pages/ManualPendAlcPage'))
 const HoldDashboardPage      = lazy(() => import('@/pages/HoldDashboardPage'))
+const ArsDashboardPage       = lazy(() => import('@/pages/ArsDashboardPage'))
+const AlcReviewPage          = lazy(() => import('@/pages/AlcReviewPage'))
+const GapReportPage          = lazy(() => import('@/pages/GapReportPage'))
 const ChecklistPage          = lazy(() => import('@/pages/ChecklistPage'))
 const TrendUploadPage        = lazy(() => import('@/pages/TrendUploadPage'))
 const TrendReviewPage        = lazy(() => import('@/pages/TrendReviewPage'))
 const TrendAdminPage         = lazy(() => import('@/pages/TrendAdminPage'))
 const TrendDashboardPage     = lazy(() => import('@/pages/TrendDashboardPage'))
-const ProcessPage            = lazy(() => import('@/pages/ProcessPage'))
 const TempDBAdminPage        = lazy(() => import('@/pages/TempDBAdminPage'))
-const DeveloperGuidePage     = lazy(() => import('@/pages/DeveloperGuidePage'))
 // Project Tracker
 const PTDashboardPage        = lazy(() => import('@/pages/pt/PTDashboardPage'))
 const PTProjectsPage         = lazy(() => import('@/pages/pt/PTProjectsPage'))
@@ -113,7 +110,11 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-        <Route index element={<DashboardPage />} />
+        <Route index element={<Navigate to="/ars-dashboard" replace />} />
+        {/* ARS Dashboard — unified allocation analytics (Overview/Drill/Date/Hold/Pending/Gap) */}
+        <Route path="ars-dashboard" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><ArsDashboardPage /></ErrorBoundary></ProtectedRoute>} />
+        {/* Allocation Review — session-wise listing/alloc review from PARKED + HISTORY archives */}
+        <Route path="alc-review" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><AlcReviewPage /></ErrorBoundary></ProtectedRoute>} />
         {/* Data Management */}
         <Route path="tables" element={<ProtectedRoute permission="DATA_VIEW"><TablesPage /></ProtectedRoute>} />
         <Route path="tables/create" element={<ProtectedRoute permission="TABLE_CREATE"><CreateTablePage /></ProtectedRoute>} />
@@ -128,16 +129,14 @@ export default function App() {
         <Route path="contribution/mappings" element={<ProtectedRoute permission="CONTRIB_MAPPINGS"><ContribMappingsPage /></ProtectedRoute>} />
         <Route path="contribution/execute" element={<ProtectedRoute permission="CONTRIB_EXECUTE"><ContribExecutePage /></ProtectedRoute>} />
         <Route path="contribution/review" element={<ProtectedRoute permission="CONTRIB_REVIEW"><ContribReviewPage /></ProtectedRoute>} />
-        <Route path="bdc" element={<ProtectedRoute permission="BDC_VIEW"><BDCCreationPage /></ProtectedRoute>} />
         <Route path="data-validation/store-sloc" element={<ProtectedRoute permission="STORE_SLOC_VIEW"><StoreStockPage /></ProtectedRoute>} />
         <Route path="data-validation/checklist" element={<ProtectedRoute permission="CHECKLIST_VIEW"><ChecklistPage /></ProtectedRoute>} />
         {/* Data Preparation - Grid Builder */}
         <Route path="data-prep/store-stock" element={<ProtectedRoute permission="GRID_VIEW"><GridBuilderPage /></ProtectedRoute>} />
+        <Route path="data-prep/merge-rules" element={<ProtectedRoute permission="GRID_VIEW"><MergeRulesPage /></ProtectedRoute>} />
         <Route path="data-prep/lookup-art-master" element={<ProtectedRoute permission="LOOKUP_VIEW"><LookupArtMasterPage /></ProtectedRoute>} />
         <Route path="data-prep/listing" element={<ErrorBoundary><ListingPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />
-        <Route path="process" element={<ErrorBoundary><ProcessPage /></ErrorBoundary>} />
-        <Route path="dev-guide" element={<ErrorBoundary><DeveloperGuidePage /></ErrorBoundary>} />
         {/* Project Tracker */}
         <Route path="pt"                   element={<ErrorBoundary><PTDashboardPage /></ErrorBoundary>} />
         <Route path="pt/projects"          element={<ErrorBoundary><PTProjectsPage /></ErrorBoundary>} />
@@ -151,6 +150,7 @@ export default function App() {
         {/* Reports */}
         <Route path="reports/pend-alc" element={<PendAlcReportPage />} />
         <Route path="reports/hold" element={<ErrorBoundary><HoldDashboardPage /></ErrorBoundary>} />
+        <Route path="reports/gap" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><GapReportPage /></ErrorBoundary></ProtectedRoute>} />
         {/* Pending Allocation Lifecycle */}
         <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />
@@ -159,10 +159,6 @@ export default function App() {
         <Route path="pend-alc/schedule"        element={<ErrorBoundary><StoreBdcSchedulePage /></ErrorBoundary>} />
         <Route path="pend-alc/schedule-audit"  element={<ErrorBoundary><ScheduleAuditPage /></ErrorBoundary>} />
         <Route path="pend-alc/operations"      element={<ErrorBoundary><PendAlcOperationsPage /></ErrorBoundary>} />
-        {/* Allocations */}
-        <Route path="allocations" element={<ProtectedRoute permission="ALLOC_READ"><AllocationsPage /></ProtectedRoute>} />
-        <Route path="allocations/new" element={<ProtectedRoute permission="ALLOC_CREATE"><NewAllocationPage /></ProtectedRoute>} />
-        <Route path="allocations/:id" element={<ProtectedRoute permission="ALLOC_READ"><AllocationDetailPage /></ProtectedRoute>} />
         {/* Settings / Admin */}
         <Route path="settings" element={<ProtectedRoute permission="ADMIN_SETTINGS"><SettingsPage /></ProtectedRoute>} />
         <Route path="settings/tables" element={<ProtectedRoute permission="TABLE_CREATE"><TableManagementPage /></ProtectedRoute>} />

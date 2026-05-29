@@ -1,0 +1,1117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ARS Dashboard — Mockup (rev 2)</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .badge { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:500; }
+  .row-click { cursor: pointer; }
+  .row-click:hover { background: #f9fafb; }
+  .pill-tab { padding:8px 14px; font-size:13px; font-weight:500; border-bottom:2px solid transparent; color:#6b7280; cursor:pointer; white-space:nowrap; }
+  .pill-tab.active { color:#4f46e5; border-bottom-color:#4f46e5; }
+  .crumb { color:#6b7280; }
+  .crumb a { color:#4f46e5; cursor:pointer; }
+  .crumb a:hover { text-decoration: underline; }
+  table { border-collapse: separate; border-spacing: 0; }
+  thead th { background:#f9fafb; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:#6b7280; padding:8px 12px; border-bottom:1px solid #e5e7eb; text-align:left; }
+  tbody td { padding:9px 12px; border-bottom:1px solid #f3f4f6; font-size:13px; color:#111827; }
+  tbody tr:last-child td { border-bottom:none; }
+  .num { text-align:right; font-variant-numeric: tabular-nums; }
+  .mini-bar { display:inline-block; height:8px; border-radius:4px; }
+  .seg { display:inline-flex; border:1px solid #e5e7eb; border-radius:6px; overflow:hidden; }
+  .seg button { padding:4px 10px; font-size:11px; background:#fff; color:#6b7280; }
+  .seg button.on { background:#4f46e5; color:#fff; }
+  .filter-pill { display:inline-flex; align-items:center; gap:6px; background:#fff; border:1px solid #e5e7eb; border-radius:6px; padding:6px 10px; font-size:12px; cursor:pointer; }
+  .filter-pill:hover { background:#f9fafb; }
+  .chip { background:#eef2ff; color:#4f46e5; font-size:10px; padding:1px 6px; border-radius:4px; font-weight:600; }
+  select.dd { font-size:12px; border:1px solid #e5e7eb; border-radius:6px; padding:6px 8px; background:#fff; min-width:140px; }
+  .lv-card { background:white; border:1px solid #e5e7eb; border-radius:12px; padding:12px; }
+  .lv-card .lv-hdr { display:flex; align-items:center; justify-content:space-between; }
+  .lv-card .lv-title { font-size:10px; font-weight:700; color:#6b7280; letter-spacing:0.05em; text-transform:uppercase; }
+  .lv-card .lv-kpi { font-size:18px; font-weight:700; color:#111827; margin-top:6px; }
+  .lv-card .lv-sub { font-size:11px; color:#6b7280; }
+  .lv-card .lv-bar-row { display:flex; align-items:center; gap:6px; font-size:11px; margin-top:4px; }
+  .lv-card .lv-bar { flex:1; height:6px; background:#f1f5f9; border-radius:3px; overflow:hidden; }
+  .lv-card .lv-bar > div { height:100%; background:#4f46e5; }
+</style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+
+<div class="min-h-screen flex">
+  <!-- Sidebar mock -->
+  <aside class="w-60 bg-gray-900 text-gray-300 flex flex-col">
+    <div class="px-4 py-4 border-b border-gray-800 flex items-center gap-2">
+      <div class="w-7 h-7 rounded bg-indigo-500 grid place-items-center text-white font-bold text-xs">V2</div>
+      <span class="text-white font-bold tracking-tight">ARS</span>
+    </div>
+    <nav class="flex-1 px-2 py-3 space-y-1 text-[12px]">
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800">Dashboard</div>
+      <div class="px-2.5 py-1.5 rounded bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow font-medium">ARS Dashboard <span class="ml-1 text-[9px] bg-white/20 px-1.5 py-0.5 rounded">NEW</span></div>
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800">Allocations</div>
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800">Listing</div>
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800">Process</div>
+      <div class="px-2.5 py-1.5 mt-2 text-[10px] uppercase tracking-wider text-gray-500">Reports</div>
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800 ml-2">Hold Dashboard</div>
+      <div class="px-2.5 py-1.5 mt-2 text-[10px] uppercase tracking-wider text-gray-500">Pending Allocation</div>
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800 ml-2">Overview</div>
+      <div class="px-2.5 py-1.5 rounded hover:bg-gray-800 ml-2">Report</div>
+    </nav>
+    <div class="border-t border-gray-800 px-3 py-2 text-[9px] text-gray-500">ARS v2.0 · mockup rev 2</div>
+  </aside>
+
+  <!-- Main -->
+  <main class="flex-1 p-5 overflow-x-hidden">
+
+    <!-- Header -->
+    <header class="flex items-start justify-between mb-3">
+      <div>
+        <h1 class="text-xl font-bold">ARS Dashboard</h1>
+        <p class="text-xs text-gray-500 mt-0.5">High-level allocation analytics — date, session &amp; hierarchy</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <button class="bg-white border border-gray-200 rounded-lg px-3 py-1.5 text-xs flex items-center gap-1 hover:bg-gray-50">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Refresh
+        </button>
+      </div>
+    </header>
+
+    <!-- Global filter bar -->
+    <section class="bg-white border border-gray-200 rounded-xl px-3 py-2.5 mb-4 flex items-center gap-2 flex-wrap shadow-sm">
+      <span class="text-[10px] font-bold text-gray-500 uppercase tracking-wider mr-1">Filters</span>
+
+      <div class="flex items-center gap-1">
+        <label class="text-[11px] text-gray-500">Date</label>
+        <select class="dd" id="fDate" onchange="onDateChange()">
+          <option value="">All dates (7d)</option>
+          <option>2026-05-22</option>
+          <option>2026-05-21</option>
+          <option>2026-05-20</option>
+          <option>2026-05-19</option>
+          <option>2026-05-18</option>
+          <option>2026-05-16</option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-1">
+        <label class="text-[11px] text-gray-500">Session</label>
+        <select class="dd" id="fSession" disabled>
+          <option>— pick a date first —</option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-1">
+        <label class="text-[11px] text-gray-500">MAJ_CAT</label>
+        <select class="dd" id="fMajCat" onchange="reRenderAll()">
+          <option value="">All</option>
+          <option>MENWEAR</option>
+          <option>WOMENWEAR</option>
+          <option>KIDS</option>
+          <option>FOOTWEAR</option>
+          <option>ACCESS</option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-1">
+        <label class="text-[11px] text-gray-500">Store</label>
+        <select class="dd" id="fStore" onchange="reRenderAll()">
+          <option value="">All</option>
+          <option>V001</option><option>V002</option><option>V004</option>
+          <option>V008</option><option>V011</option><option>V019</option>
+          <option>V051</option><option>V112</option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-1">
+        <label class="text-[11px] text-gray-500">RDC</label>
+        <select class="dd" id="fRdc" onchange="reRenderAll()">
+          <option value="">All</option>
+          <option>2700</option><option>1100</option><option>1300</option>
+        </select>
+      </div>
+
+      <div class="ml-auto flex items-center gap-2">
+        <label class="text-[11px] text-gray-500">Drill path</label>
+        <div class="seg">
+          <button id="pathMJST" class="on"  onclick="setPath('mjst')">MAJ_CAT → Store</button>
+          <button id="pathSTMJ"          onclick="setPath('stmj')">Store → MAJ_CAT</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- KPI strip -->
+    <section class="grid grid-cols-4 gap-3 mb-4">
+      <div class="bg-white border border-gray-200 rounded-xl p-3 shadow-sm cursor-pointer hover:shadow-md transition-shadow" onclick="goTab('overview')">
+        <div class="flex items-center gap-2">
+          <div class="p-1.5 rounded-lg bg-indigo-50 text-indigo-600">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+          </div>
+          <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Allocated</div>
+        </div>
+        <div class="mt-2 text-2xl font-bold" id="kpiAlloc">12,438</div>
+        <div class="text-xs text-gray-500" id="kpiAllocSub">14 sessions · 287 stores</div>
+      </div>
+      <div class="bg-white border border-gray-200 rounded-xl p-3 shadow-sm cursor-pointer hover:shadow-md transition-shadow" onclick="goTab('pending')">
+        <div class="flex items-center gap-2">
+          <div class="p-1.5 rounded-lg bg-amber-50 text-amber-600">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13" rx="2"/><path d="M16 8h4l3 3v5h-7"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+          </div>
+          <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Pending</div>
+        </div>
+        <div class="mt-2 text-2xl font-bold" id="kpiPend">3,201</div>
+        <div class="text-xs text-gray-500">28% of allocated · 142 open rows</div>
+      </div>
+      <div class="bg-white border border-gray-200 rounded-xl p-3 shadow-sm cursor-pointer hover:shadow-md transition-shadow" onclick="goTab('hold')">
+        <div class="flex items-center gap-2">
+          <div class="p-1.5 rounded-lg bg-cyan-50 text-cyan-600">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">On Hold</div>
+        </div>
+        <div class="mt-2 text-2xl font-bold" id="kpiHold">1,876</div>
+        <div class="text-xs text-gray-500">91 articles · 14 RDCs</div>
+      </div>
+      <div class="bg-white border border-gray-200 rounded-xl p-3 shadow-sm cursor-pointer hover:shadow-md transition-shadow" onclick="goTab('gap')">
+        <div class="flex items-center gap-2">
+          <div class="p-1.5 rounded-lg bg-rose-50 text-rose-600">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          </div>
+          <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Open Gaps</div>
+        </div>
+        <div class="mt-2 text-2xl font-bold" id="kpiGap">428</div>
+        <div class="text-xs text-gray-500">87 articles · oldest 23 days</div>
+      </div>
+    </section>
+
+    <!-- Tabs -->
+    <div class="bg-white border border-gray-200 rounded-xl shadow-sm">
+      <div class="flex items-center border-b border-gray-200 px-3 overflow-x-auto">
+        <div class="pill-tab active" data-tab="overview" onclick="goTab('overview')">Overview</div>
+        <div class="pill-tab"        data-tab="drill"    onclick="goTab('drill')">Product Drill</div>
+        <div class="pill-tab"        data-tab="date"     onclick="goTab('date')">Date &amp; Session</div>
+        <div class="pill-tab"        data-tab="hold"     onclick="goTab('hold')">Hold</div>
+        <div class="pill-tab"        data-tab="pending"  onclick="goTab('pending')">Pending Alloc</div>
+        <div class="pill-tab"        data-tab="gap"      onclick="goTab('gap')">Gap Report</div>
+      </div>
+
+      <!-- ============ TAB OVERVIEW — 6 charts ============ -->
+      <div id="tab-overview" class="p-4">
+        <div class="grid grid-cols-3 gap-4">
+          <!-- Chart 1 — OPT_TYPE pie -->
+          <div class="border border-gray-200 rounded-xl p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-sm font-semibold">Alloc by OPT_TYPE</div>
+              <span class="chip">RL / TBC / TBL</span>
+            </div>
+            <div class="text-[11px] text-gray-500 mb-2">Distribution of allocated units by listing type</div>
+            <svg viewBox="0 0 200 160" class="w-full h-44" id="chartOptType"></svg>
+          </div>
+
+          <!-- Chart 2 — RDC pie -->
+          <div class="border border-gray-200 rounded-xl p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-sm font-semibold">Alloc by RDC</div>
+              <span class="chip">source warehouse</span>
+            </div>
+            <div class="text-[11px] text-gray-500 mb-2">Share of allocated units per RDC</div>
+            <svg viewBox="0 0 200 160" class="w-full h-44" id="chartRdc"></svg>
+          </div>
+
+          <!-- Chart 3 — Top/Bottom MAJ_CAT -->
+          <div class="border border-gray-200 rounded-xl p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-sm font-semibold" id="chartMcTitle">Top 5 MAJ_CATs by alloc qty</div>
+              <div class="seg">
+                <button id="mcTop" class="on" onclick="setMcDir('top')">Top</button>
+                <button id="mcBot"          onclick="setMcDir('bot')">Bottom</button>
+              </div>
+            </div>
+            <div class="text-[11px] text-gray-500 mb-2">Click a bar to focus the filters</div>
+            <div id="chartMajCat" class="space-y-1.5 mt-1"></div>
+          </div>
+
+          <!-- Chart 4 — Top/Bottom Stores -->
+          <div class="border border-gray-200 rounded-xl p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-sm font-semibold" id="chartStTitle">Top 5 Stores by alloc qty</div>
+              <div class="seg">
+                <button id="stTop" class="on" onclick="setStDir('top')">Top</button>
+                <button id="stBot"          onclick="setStDir('bot')">Bottom</button>
+              </div>
+            </div>
+            <div class="text-[11px] text-gray-500 mb-2">Click a bar to focus the filters</div>
+            <div id="chartStore" class="space-y-1.5 mt-1"></div>
+          </div>
+
+          <!-- Chart 5 — 7-day stacked trend -->
+          <div class="border border-gray-200 rounded-xl p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-sm font-semibold">Alloc / Pend / Hold — last 7 days</div>
+              <span class="chip">trend</span>
+            </div>
+            <div class="text-[11px] text-gray-500 mb-2">Stacked daily totals across the window</div>
+            <svg viewBox="0 0 280 160" class="w-full h-44" id="chartTrend"></svg>
+            <div class="flex items-center gap-3 text-[10px] text-gray-600 mt-1">
+              <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-sm bg-indigo-500"></span> Alloc</span>
+              <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-sm bg-amber-500"></span> Pending</span>
+              <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-sm bg-cyan-500"></span> Hold</span>
+            </div>
+          </div>
+
+          <!-- Chart 6 — Gap by MAJ_CAT -->
+          <div class="border border-gray-200 rounded-xl p-3">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-sm font-semibold">Gap qty by MAJ_CAT</div>
+              <span class="chip text-rose-600 bg-rose-50">PEND_QTY &gt; 0</span>
+            </div>
+            <div class="text-[11px] text-gray-500 mb-2">Unshipped allocations rolled up to category</div>
+            <div id="chartGapMc" class="space-y-1.5 mt-1"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ TAB PRODUCT DRILL ============ -->
+      <div id="tab-drill" class="p-4 hidden">
+
+        <!-- Drill breadcrumb -->
+        <div class="crumb text-xs mb-3" id="drillCrumb">
+          <span id="drillPathLabel">MAJ_CAT → Store → OPT → VAR</span>
+        </div>
+
+        <!-- 4 dropdown level cards -->
+        <div class="grid grid-cols-4 gap-3 mb-4">
+          <div class="lv-card" id="lvA">
+            <div class="lv-hdr">
+              <div class="lv-title" id="lvATitle">L1 · MAJ_CAT</div>
+              <span class="chip">12 items</span>
+            </div>
+            <select class="dd mt-2 w-full" id="ddA" onchange="onLvAChange()"></select>
+            <div class="lv-kpi" id="lvAKpi">—</div>
+            <div class="lv-sub"  id="lvASub">pick a value</div>
+            <div class="lv-bar-row"><div class="lv-bar"><div id="lvABar" style="width:0%"></div></div><span id="lvAPct"></span></div>
+          </div>
+          <div class="lv-card opacity-60" id="lvB">
+            <div class="lv-hdr">
+              <div class="lv-title" id="lvBTitle">L2 · Store</div>
+              <span class="chip" id="lvBChip">—</span>
+            </div>
+            <select class="dd mt-2 w-full" id="ddB" disabled onchange="onLvBChange()"><option>—</option></select>
+            <div class="lv-kpi" id="lvBKpi">—</div>
+            <div class="lv-sub" id="lvBSub">pick L1 first</div>
+            <div class="lv-bar-row"><div class="lv-bar"><div id="lvBBar" style="width:0%"></div></div><span id="lvBPct"></span></div>
+          </div>
+          <div class="lv-card opacity-60" id="lvC">
+            <div class="lv-hdr">
+              <div class="lv-title">L3 · OPT</div>
+              <span class="chip" id="lvCChip">—</span>
+            </div>
+            <select class="dd mt-2 w-full" id="ddC" disabled onchange="onLvCChange()"><option>—</option></select>
+            <div class="lv-kpi" id="lvCKpi">—</div>
+            <div class="lv-sub" id="lvCSub">pick L2 first</div>
+            <div class="lv-bar-row"><div class="lv-bar"><div id="lvCBar" style="width:0%"></div></div><span id="lvCPct"></span></div>
+          </div>
+          <div class="lv-card opacity-60" id="lvD">
+            <div class="lv-hdr">
+              <div class="lv-title">L4 · VAR × SZ</div>
+              <span class="chip" id="lvDChip">—</span>
+            </div>
+            <div class="lv-kpi" id="lvDKpi">—</div>
+            <div class="lv-sub mb-1" id="lvDSub">pick L3 first</div>
+            <div id="lvDList" class="space-y-1 text-[11px]"></div>
+          </div>
+        </div>
+
+        <!-- Wide distribution chart for current deepest level -->
+        <div class="border border-gray-200 rounded-xl p-3 mb-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-semibold" id="drillChartTitle">Distribution within scope</div>
+            <span class="chip" id="drillChartChip">All</span>
+          </div>
+          <div id="drillChart" class="space-y-1.5"></div>
+        </div>
+
+        <!-- Detail table at current deepest -->
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-semibold" id="drillTblTitle">Rows at current level</div>
+            <button class="bg-emerald-600 text-white text-xs px-3 py-1.5 rounded hover:bg-emerald-700">Export Excel</button>
+          </div>
+          <table class="w-full bg-white">
+            <thead id="drillThead"></thead>
+            <tbody id="drillTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ============ TAB DATE / SESSION ============ -->
+      <div id="tab-date" class="p-4 hidden">
+        <div id="crumb" class="crumb text-xs mb-3"><span>All Dates</span></div>
+        <div id="lvl-date">
+          <div class="text-sm font-semibold mb-2">Allocation runs by date</div>
+          <table class="w-full bg-white">
+            <thead><tr><th>Date</th><th class="num">Sessions</th><th class="num">Allocated</th><th class="num">DO</th><th class="num">Pending</th><th class="num">Hold</th><th class="num">Stores</th><th>Status</th></tr></thead>
+            <tbody id="dates-body"></tbody>
+          </table>
+        </div>
+        <div id="lvl-session" class="hidden">
+          <div class="text-sm font-semibold mb-2">Sessions on <span id="sel-date"></span></div>
+          <table class="w-full bg-white">
+            <thead><tr><th>Session</th><th>MAJ_CAT</th><th>RDC</th><th class="num">Articles</th><th class="num">Stores</th><th class="num">Alloc</th><th class="num">DO</th><th class="num">Pending</th><th class="num">Hold</th><th>Mode</th><th>Status</th></tr></thead>
+            <tbody id="sessions-body"></tbody>
+          </table>
+        </div>
+        <div id="lvl-detail" class="hidden">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-semibold">Detail for session <span id="sel-session" class="text-indigo-600"></span></div>
+            <button class="bg-emerald-600 text-white text-xs px-3 py-1.5 rounded hover:bg-emerald-700">Export Excel</button>
+          </div>
+          <table class="w-full bg-white">
+            <thead><tr><th>Article</th><th>Store</th><th>Size</th><th class="num">Alloc</th><th class="num">DO</th><th class="num">Pending</th><th class="num">Hold</th><th class="num">Gap %</th><th>Status</th></tr></thead>
+            <tbody id="detail-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ============ TAB HOLD ============ -->
+      <div id="tab-hold" class="p-4 hidden">
+        <div class="text-sm text-gray-500 mb-3">Quick view. For deeper analysis: <a class="text-indigo-600 hover:underline" href="#">Open full Hold Dashboard →</a></div>
+        <div class="grid grid-cols-3 gap-3 mb-4">
+          <div class="bg-cyan-50 border border-cyan-100 rounded-lg p-3"><div class="text-xs text-cyan-700 uppercase font-semibold">Open Hold Qty</div><div class="text-2xl font-bold mt-1">1,876</div></div>
+          <div class="bg-cyan-50 border border-cyan-100 rounded-lg p-3"><div class="text-xs text-cyan-700 uppercase font-semibold">Articles On Hold</div><div class="text-2xl font-bold mt-1">91</div></div>
+          <div class="bg-cyan-50 border border-cyan-100 rounded-lg p-3"><div class="text-xs text-cyan-700 uppercase font-semibold">Oldest Hold</div><div class="text-2xl font-bold mt-1">47 <span class="text-sm font-normal text-gray-500">days</span></div></div>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <div class="text-sm font-semibold mb-2">Hold qty by RDC</div>
+            <div class="space-y-1.5" id="hold-rdc"></div>
+          </div>
+          <div>
+            <div class="text-sm font-semibold mb-2">Top articles on hold</div>
+            <table class="w-full bg-white">
+              <thead><tr><th>Article</th><th class="num">Qty</th><th class="num">Age</th></tr></thead>
+              <tbody id="hold-art"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ TAB PENDING ============ -->
+      <div id="tab-pending" class="p-4 hidden">
+        <div class="grid grid-cols-3 gap-3 mb-4">
+          <div class="bg-amber-50 border border-amber-100 rounded-lg p-3"><div class="text-xs text-amber-700 uppercase font-semibold">Open Rows</div><div class="text-2xl font-bold mt-1">142</div></div>
+          <div class="bg-amber-50 border border-amber-100 rounded-lg p-3"><div class="text-xs text-amber-700 uppercase font-semibold">Total Pending Qty</div><div class="text-2xl font-bold mt-1">3,201</div></div>
+          <div class="bg-amber-50 border border-amber-100 rounded-lg p-3"><div class="text-xs text-amber-700 uppercase font-semibold">Avg Age</div><div class="text-2xl font-bold mt-1">9.4 <span class="text-sm font-normal text-gray-500">days</span></div></div>
+        </div>
+        <table class="w-full bg-white">
+          <thead><tr><th>Session</th><th>RDC</th><th>Store</th><th>Article</th><th class="num">Alloc</th><th class="num">DO</th><th class="num">Pending</th><th class="num">% Pend</th><th class="num">Age</th><th>Status</th></tr></thead>
+          <tbody id="pending-body"></tbody>
+        </table>
+      </div>
+
+      <!-- ============ TAB GAP ============ -->
+      <div id="tab-gap" class="p-4 hidden">
+        <div class="bg-rose-50 border border-rose-200 text-rose-800 text-xs rounded-lg p-3 mb-4">
+          <b>Gap definition:</b> rows in <code>ARS_PEND_ALC</code> where <code>PEND_QTY = ALLOC_QTY − DO_QTY &gt; 0</code> and <code>IS_CLOSED = 0</code>.
+        </div>
+        <table class="w-full bg-white">
+          <thead><tr><th>RDC</th><th>Article</th><th class="num">Stores</th><th class="num">Alloc</th><th class="num">DO</th><th class="num">Gap Qty</th><th class="num">% Pend</th><th class="num">Oldest (d)</th></tr></thead>
+          <tbody id="gap-body"></tbody>
+        </table>
+      </div>
+
+    </div>
+
+    <footer class="mt-3 text-[10px] text-gray-400">
+      Mockup rev 2 · Tailwind via CDN · sample data only · plan: <code>backend/app/docs/processes/ars_dashboard_plan.md</code>
+    </footer>
+  </main>
+</div>
+
+<script>
+/* ============================================================================
+   SAMPLE DATA — would come from APIs at runtime
+============================================================================ */
+
+const sessionsByDate = {
+  '2026-05-22': ['AW26-001 · MENWEAR · 2700 · AUTO', 'AW26-002 · WOMENWEAR · 2700 · AUTO', 'AW26-003 · KIDS · 1100 · MANUAL'],
+  '2026-05-21': ['AW26-019 · MENWEAR · 2700 · AUTO', 'AW26-020 · WOMENWEAR · 1100 · AUTO', 'AW26-021 · FOOTWEAR · 2700 · AUTO', 'AW26-022 · ACCESS · 2700 · AUTO', 'AW26-023 · KIDS · 1100 · MANUAL'],
+  '2026-05-20': ['AW26-040 · MENWEAR · 2700 · AUTO', 'AW26-041 · WOMENWEAR · 2700 · AUTO', 'AW26-042 · FOOTWEAR · 1100 · AUTO', 'AW26-043 · KIDS · 1100 · AUTO'],
+  '2026-05-19': ['AW26-060 · MENWEAR · 2700 · AUTO', 'AW26-061 · WOMENWEAR · 2700 · AUTO'],
+  '2026-05-18': ['AW26-080 · MENWEAR · 2700 · AUTO', 'AW26-081 · WOMENWEAR · 1100 · AUTO', 'AW26-082 · FOOTWEAR · 2700 · AUTO', 'AW26-083 · ACCESS · 2700 · AUTO', 'AW26-084 · KIDS · 1100 · AUTO', 'AW26-085 · MENWEAR · 1100 · MANUAL'],
+  '2026-05-16': ['AW26-100 · MENWEAR · 2700 · AUTO', 'AW26-101 · WOMENWEAR · 2700 · AUTO', 'AW26-102 · FOOTWEAR · 1100 · AUTO', 'AW26-103 · KIDS · 1100 · AUTO'],
+};
+
+// Overview chart data
+const optTypeData = [
+  { name: 'RL',  qty: 7820, color: '#4f46e5' },
+  { name: 'TBC', qty: 2918, color: '#06b6d4' },
+  { name: 'TBL', qty: 1700, color: '#f59e0b' },
+];
+const rdcData = [
+  { name: '2700', qty: 7280, color: '#4f46e5' },
+  { name: '1100', qty: 3420, color: '#10b981' },
+  { name: '1300', qty: 1280, color: '#f59e0b' },
+  { name: '4400', qty:  458, color: '#ef4444' },
+];
+const majCatAll = [
+  { name: 'MENWEAR',   qty: 4210 },
+  { name: 'WOMENWEAR', qty: 5108 },
+  { name: 'KIDS',      qty: 1620 },
+  { name: 'FOOTWEAR',  qty: 920  },
+  { name: 'ACCESS',    qty: 580  },
+];
+const storeAll = [
+  { name: 'V004',  qty: 740 },
+  { name: 'V011',  qty: 612 },
+  { name: 'V019',  qty: 520 },
+  { name: 'V051',  qty: 450 },
+  { name: 'V008',  qty: 420 },
+  { name: 'V112',  qty: 220 },
+  { name: 'V073',  qty: 110 },
+  { name: 'V091',  qty:  88 },
+];
+const trendData = [
+  { day:'05/16', alloc:16330, pend: 200, hold: 180 },
+  { day:'05/17', alloc:    0, pend:   0, hold:   0 },
+  { day:'05/18', alloc:22100, pend: 820, hold: 460 },
+  { day:'05/19', alloc: 8740, pend: 110, hold: 120 },
+  { day:'05/20', alloc:14520, pend: 280, hold: 240 },
+  { day:'05/21', alloc:18210, pend: 520, hold: 890 },
+  { day:'05/22', alloc:12438, pend:3201, hold:1876 },
+];
+const gapByMc = [
+  { name: 'WOMENWEAR', qty: 1907 },
+  { name: 'KIDS',       qty:  884 },
+  { name: 'MENWEAR',    qty:  410 },
+  { name: 'FOOTWEAR',   qty:    0 },
+  { name: 'ACCESS',     qty:    0 },
+];
+
+// Drill data — MAJ_CAT level
+const drillByMajCat = {
+  MENWEAR: {
+    alloc: 4210, stores: 120, articles: 142, optTypeSplit: { RL: 2900, TBC: 880, TBL: 430 },
+    stores_list: [
+      { werks:'V004', alloc: 640, articles: 28 },
+      { werks:'V011', alloc: 520, articles: 22 },
+      { werks:'V019', alloc: 460, articles: 19 },
+      { werks:'V008', alloc: 420, articles: 17 },
+      { werks:'V112', alloc: 220, articles: 12 },
+    ]
+  },
+  WOMENWEAR: {
+    alloc: 5108, stores: 140, articles: 188, optTypeSplit: { RL: 3200, TBC: 1100, TBL: 808 },
+    stores_list: [
+      { werks:'V004', alloc: 820, articles: 41 },
+      { werks:'V011', alloc: 700, articles: 36 },
+      { werks:'V019', alloc: 510, articles: 28 },
+      { werks:'V112', alloc: 320, articles: 18 },
+    ]
+  },
+  KIDS: {
+    alloc: 3120, stores: 95, articles: 96, optTypeSplit: { RL: 1900, TBC: 800, TBL: 420 },
+    stores_list: [
+      { werks:'V051', alloc: 540, articles: 22 },
+      { werks:'V052', alloc: 420, articles: 18 },
+      { werks:'V004', alloc: 380, articles: 16 },
+    ]
+  },
+  FOOTWEAR: { alloc: 2900, stores: 95, articles: 64, optTypeSplit: { RL: 2000, TBC: 600, TBL: 300 }, stores_list: [{ werks:'V004', alloc:430, articles:18 }, { werks:'V011', alloc:380, articles:14 }] },
+  ACCESS:   { alloc: 2200, stores: 80, articles: 48, optTypeSplit: { RL: 1500, TBC: 500, TBL: 200 }, stores_list: [{ werks:'V019', alloc:380, articles:18 }] },
+};
+
+// OPTs per (MAJ_CAT, Store) — small sample
+const optsByMjSt = {
+  'MENWEAR|V004':    [
+    { id:'10239812 · CHARCOAL', gen:'10239812', clr:'CHARCOAL', alloc: 60, sizes: 4, type:'RL'  },
+    { id:'10298110 · NAVY',     gen:'10298110', clr:'NAVY',     alloc: 30, sizes: 3, type:'TBC' },
+    { id:'10410998 · BLACK',    gen:'10410998', clr:'BLACK',    alloc:  6, sizes: 1, type:'TBL' },
+  ],
+  'WOMENWEAR|V004':  [
+    { id:'20011001 · ROSE',     gen:'20011001', clr:'ROSE',     alloc: 96, sizes: 5, type:'RL' },
+    { id:'20019921 · TEAL',     gen:'20019921', clr:'TEAL',     alloc: 84, sizes: 4, type:'RL' },
+  ],
+  'KIDS|V051':       [
+    { id:'30900145 · MULTI',    gen:'30900145', clr:'MULTI',    alloc: 30, sizes: 3, type:'RL' },
+  ],
+};
+
+// VAR × SZ per OPT (small sample)
+const varBySig = {
+  '10298110|NAVY': [
+    { var_art:'10298110-NAVY-S',  sz:'S',  alloc:12, do_: 0, pend:12, hold: 6 },
+    { var_art:'10298110-NAVY-M',  sz:'M',  alloc:18, do_: 0, pend:18, hold: 0 },
+    { var_art:'10298110-NAVY-L',  sz:'L',  alloc: 0, do_: 0, pend: 0, hold: 0 },
+  ],
+  '10239812|CHARCOAL': [
+    { var_art:'10239812-CHAR-S',  sz:'S',  alloc:18, do_:14, pend: 4, hold: 0 },
+    { var_art:'10239812-CHAR-M',  sz:'M',  alloc:24, do_:24, pend: 0, hold: 0 },
+    { var_art:'10239812-CHAR-L',  sz:'L',  alloc:12, do_: 8, pend: 4, hold: 0 },
+    { var_art:'10239812-CHAR-XL', sz:'XL', alloc: 6, do_: 6, pend: 0, hold: 0 },
+  ],
+  '20011001|ROSE': [
+    { var_art:'20011001-ROSE-XS', sz:'XS', alloc:18, do_:12, pend: 6, hold: 0 },
+    { var_art:'20011001-ROSE-S',  sz:'S',  alloc:24, do_:18, pend: 6, hold: 0 },
+    { var_art:'20011001-ROSE-M',  sz:'M',  alloc:30, do_:30, pend: 0, hold: 0 },
+    { var_art:'20011001-ROSE-L',  sz:'L',  alloc:24, do_:24, pend: 0, hold: 0 },
+  ],
+};
+
+// Date drill
+const datesData = [
+  { date: '2026-05-22', sessions: 3, alloc: 12438, do_: 9237, pend: 3201, hold: 1876, stores: 287, status: 'open' },
+  { date: '2026-05-21', sessions: 5, alloc: 18210, do_: 17690, pend:  520, hold:  890, stores: 315, status: 'partial' },
+  { date: '2026-05-20', sessions: 4, alloc: 14520, do_: 14520, pend:    0, hold:  240, stores: 298, status: 'closed' },
+  { date: '2026-05-19', sessions: 2, alloc:  8740, do_:  8740, pend:    0, hold:  120, stores: 211, status: 'closed' },
+  { date: '2026-05-18', sessions: 6, alloc: 22100, do_: 21280, pend:  820, hold:  460, stores: 320, status: 'partial' },
+  { date: '2026-05-16', sessions: 4, alloc: 16330, do_: 16330, pend:    0, hold:  180, stores: 302, status: 'closed' },
+];
+const sessionsByDateRows = {
+  '2026-05-22': [
+    { sid:'AW26-001', mc:'MENWEAR',   rdc:'2700', arts:142, stores:120, alloc:4210, do_:3800, pend:410, hold:120, mode:'AUTO',   status:'open' },
+    { sid:'AW26-002', mc:'WOMENWEAR', rdc:'2700', arts:188, stores:140, alloc:5108, do_:3201, pend:1907, hold:980, mode:'AUTO',  status:'open' },
+    { sid:'AW26-003', mc:'KIDS',      rdc:'1100', arts: 96, stores: 95, alloc:3120, do_:2236, pend:884, hold:776, mode:'MANUAL', status:'open' },
+  ],
+};
+const detailBySession = {
+  'AW26-001': [
+    { art:'10239812', store:'V001', sz:'M',  alloc:36, do_:24, pend:12, hold:0, gap:33 },
+    { art:'10298110', store:'V002', sz:'S',  alloc:12, do_: 0, pend:12, hold:6, gap:100 },
+    { art:'10298110', store:'V008', sz:'M',  alloc:18, do_: 0, pend:18, hold:0, gap:100 },
+  ],
+};
+const holdRdc = [{ rdc:'2700', qty: 980 }, { rdc:'1100', qty: 520 }, { rdc:'1300', qty: 220 }, { rdc:'4400', qty: 100 }, { rdc:'5500', qty: 56 }];
+const holdArticles = [{ art:'10298110', qty: 240, age: 47 }, { art:'20019921', qty: 198, age: 34 }, { art:'30900145', qty: 176, age: 28 }, { art:'40811220', qty: 140, age: 22 }];
+const pendingRows = [
+  { sid:'AW26-002', rdc:'2700', store:'V004', art:'20019921', alloc:60, do_:10, pend:50, age: 1, status:'open' },
+  { sid:'AW26-002', rdc:'2700', store:'V112', art:'20019921', alloc:24, do_: 0, pend:24, age: 1, status:'open' },
+  { sid:'AW26-003', rdc:'1100', store:'V051', art:'30900145', alloc:18, do_: 4, pend:14, age: 1, status:'open' },
+  { sid:'AW25-432', rdc:'1100', store:'V091', art:'30700112', alloc:36, do_:14, pend:22, age:23, status:'aged' },
+];
+const gapRows = [
+  { rdc:'2700', art:'20019921', stores:2, alloc:84, do_:10, gap:74, pct:88, oldest: 1 },
+  { rdc:'2700', art:'10298110', stores:4, alloc:62, do_:14, gap:48, pct:77, oldest: 2 },
+  { rdc:'1100', art:'30700112', stores:5, alloc:80, do_:32, gap:48, pct:60, oldest:23 },
+];
+
+/* ============================================================================
+   FORMAT HELPERS
+============================================================================ */
+const fmt = n => n == null ? '-' : Number(n).toLocaleString('en-IN');
+const statusBadge = s => {
+  if (s === 'open')    return '<span class="badge bg-rose-50 text-rose-700">● open</span>';
+  if (s === 'partial') return '<span class="badge bg-amber-50 text-amber-700">● partial</span>';
+  if (s === 'closed')  return '<span class="badge bg-emerald-50 text-emerald-700">● closed</span>';
+  if (s === 'aged')    return '<span class="badge bg-rose-100 text-rose-800">● aged 31+</span>';
+  return '';
+};
+
+/* ============================================================================
+   STATE
+============================================================================ */
+let mcDir = 'top';  // top | bot
+let stDir = 'top';
+let drillPath = 'mjst'; // mjst | stmj
+
+/* ============================================================================
+   FILTERS
+============================================================================ */
+function onDateChange() {
+  const d = document.getElementById('fDate').value;
+  const sel = document.getElementById('fSession');
+  if (!d) {
+    sel.innerHTML = '<option>— pick a date first —</option>';
+    sel.disabled = true;
+  } else {
+    const list = sessionsByDate[d] || [];
+    sel.innerHTML = '<option value="">All sessions on ' + d + '</option>' + list.map(s => '<option>' + s + '</option>').join('');
+    sel.disabled = false;
+  }
+  reRenderAll();
+}
+function setPath(p) {
+  drillPath = p;
+  document.getElementById('pathMJST').classList.toggle('on', p === 'mjst');
+  document.getElementById('pathSTMJ').classList.toggle('on', p === 'stmj');
+  renderDrill();
+}
+function reRenderAll() {
+  renderOverview();
+  renderDrill();
+  renderDates();
+  renderHold();
+  renderPending();
+  renderGap();
+}
+
+/* ============================================================================
+   OVERVIEW — 6 charts
+============================================================================ */
+function donutPath(cx, cy, r, startAngle, endAngle) {
+  const polarToCart = (a) => [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  const [x1, y1] = polarToCart(startAngle);
+  const [x2, y2] = polarToCart(endAngle);
+  const largeArc = (endAngle - startAngle) > Math.PI ? 1 : 0;
+  return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+}
+function renderPie(svgId, data) {
+  const svg = document.getElementById(svgId);
+  const cx = 80, cy = 80, r = 64;
+  const total = data.reduce((s, d) => s + d.qty, 0);
+  let angle = -Math.PI / 2;
+  let slices = '';
+  let legend = '';
+  data.forEach(d => {
+    const frac = d.qty / total;
+    const next = angle + frac * Math.PI * 2;
+    if (frac > 0) slices += `<path d="${donutPath(cx, cy, r, angle, next)}" fill="${d.color}" stroke="white" stroke-width="2"/>`;
+    angle = next;
+  });
+  data.forEach((d, i) => {
+    legend += `<g transform="translate(160 ${24 + i*16})"><rect width="10" height="10" fill="${d.color}" rx="2"/><text x="14" y="9" font-size="10" fill="#374151">${d.name} ${fmt(d.qty)}</text></g>`;
+  });
+  svg.innerHTML = slices + legend;
+}
+function renderHbar(containerId, data, colorFn) {
+  const max = Math.max(...data.map(d => d.qty), 1);
+  document.getElementById(containerId).innerHTML = data.map((d, i) => `
+    <div class="flex items-center gap-2 text-xs">
+      <div class="w-24 text-gray-700 truncate" title="${d.name}">${d.name}</div>
+      <div class="flex-1 bg-gray-100 rounded h-5 relative overflow-hidden">
+        <div class="${colorFn ? colorFn(d, i) : 'bg-indigo-500'} h-full transition-all" style="width:${(d.qty/max*100).toFixed(1)}%"></div>
+      </div>
+      <div class="w-14 num text-[11px] font-semibold">${fmt(d.qty)}</div>
+    </div>`).join('');
+}
+function renderTrend() {
+  const svg = document.getElementById('chartTrend');
+  const W = 280, H = 160, pad = { l: 30, r: 8, t: 8, b: 22 };
+  const max = Math.max(...trendData.map(d => d.alloc + d.pend + d.hold));
+  const bw = (W - pad.l - pad.r) / trendData.length - 4;
+  let bars = '';
+  let labels = '';
+  trendData.forEach((d, i) => {
+    const x = pad.l + i * ((W - pad.l - pad.r) / trendData.length) + 2;
+    const total = d.alloc + d.pend + d.hold;
+    const sc = (q) => (q / max) * (H - pad.t - pad.b);
+    let y = H - pad.b;
+    const hh = sc(d.hold);  y -= hh;
+    bars += `<rect x="${x}" y="${y}" width="${bw}" height="${hh}" fill="#06b6d4"/>`;
+    const ph = sc(d.pend);  y -= ph;
+    bars += `<rect x="${x}" y="${y}" width="${bw}" height="${ph}" fill="#f59e0b"/>`;
+    const ah = sc(d.alloc); y -= ah;
+    bars += `<rect x="${x}" y="${y}" width="${bw}" height="${ah}" fill="#4f46e5"/>`;
+    labels += `<text x="${x + bw/2}" y="${H - 6}" font-size="9" text-anchor="middle" fill="#6b7280">${d.day}</text>`;
+  });
+  // y-axis ticks
+  let ticks = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = Math.round(max / 4 * i / 1000) * 1000;
+    const y = H - pad.b - (i/4) * (H - pad.t - pad.b);
+    ticks += `<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" stroke="#f3f4f6"/>`;
+    ticks += `<text x="${pad.l - 4}" y="${y + 3}" font-size="9" text-anchor="end" fill="#9ca3af">${(v/1000).toFixed(0)}k</text>`;
+  }
+  svg.innerHTML = ticks + bars + labels;
+}
+function renderOverview() {
+  renderPie('chartOptType', optTypeData);
+  renderPie('chartRdc',     rdcData);
+
+  const mcSorted = [...majCatAll].sort((a,b) => mcDir === 'top' ? b.qty - a.qty : a.qty - b.qty).slice(0, 5);
+  document.getElementById('chartMcTitle').textContent = (mcDir === 'top' ? 'Top' : 'Bottom') + ' 5 MAJ_CATs by alloc qty';
+  document.getElementById('mcTop').classList.toggle('on', mcDir === 'top');
+  document.getElementById('mcBot').classList.toggle('on', mcDir === 'bot');
+  renderHbar('chartMajCat', mcSorted, (_, i) => mcDir === 'top' ? 'bg-indigo-500' : 'bg-gray-400');
+
+  const stSorted = [...storeAll].sort((a,b) => stDir === 'top' ? b.qty - a.qty : a.qty - b.qty).slice(0, 5);
+  document.getElementById('chartStTitle').textContent = (stDir === 'top' ? 'Top' : 'Bottom') + ' 5 Stores by alloc qty';
+  document.getElementById('stTop').classList.toggle('on', stDir === 'top');
+  document.getElementById('stBot').classList.toggle('on', stDir === 'bot');
+  renderHbar('chartStore', stSorted, (_, i) => stDir === 'top' ? 'bg-cyan-500' : 'bg-gray-400');
+
+  renderTrend();
+  renderHbar('chartGapMc', gapByMc, (d) => d.qty > 0 ? 'bg-rose-500' : 'bg-gray-300');
+}
+function setMcDir(d) { mcDir = d; renderOverview(); }
+function setStDir(d) { stDir = d; renderOverview(); }
+
+/* ============================================================================
+   DATE / SESSION
+============================================================================ */
+function renderDates() {
+  document.getElementById('dates-body').innerHTML = datesData.map(d => `
+    <tr class="row-click" onclick="openDate('${d.date}')">
+      <td><span class="text-indigo-600 font-medium">${d.date}</span></td>
+      <td class="num">${d.sessions}</td>
+      <td class="num">${fmt(d.alloc)}</td>
+      <td class="num">${fmt(d.do_)}</td>
+      <td class="num ${d.pend>0?'text-amber-700 font-semibold':''}">${fmt(d.pend)}</td>
+      <td class="num ${d.hold>0?'text-cyan-700':''}">${fmt(d.hold)}</td>
+      <td class="num">${fmt(d.stores)}</td>
+      <td>${statusBadge(d.status)}</td>
+    </tr>`).join('');
+}
+function openDate(date) {
+  document.getElementById('lvl-date').classList.add('hidden');
+  document.getElementById('lvl-detail').classList.add('hidden');
+  document.getElementById('lvl-session').classList.remove('hidden');
+  document.getElementById('sel-date').textContent = date;
+  document.getElementById('crumb').innerHTML = `<a onclick="goLvl(1)">All Dates</a> <span class="mx-1">›</span> <span>${date}</span>`;
+  const rows = (sessionsByDateRows[date] || []);
+  document.getElementById('sessions-body').innerHTML = rows.length === 0
+    ? `<tr><td colspan="11" class="text-center text-xs text-gray-500 py-6">No sessions on this date.</td></tr>`
+    : rows.map(s => `
+        <tr class="row-click" onclick="openSession('${s.sid}','${date}')">
+          <td><span class="text-indigo-600 font-medium">${s.sid}</span></td>
+          <td>${s.mc}</td><td>${s.rdc}</td>
+          <td class="num">${fmt(s.arts)}</td><td class="num">${fmt(s.stores)}</td>
+          <td class="num">${fmt(s.alloc)}</td><td class="num">${fmt(s.do_)}</td>
+          <td class="num ${s.pend>0?'text-amber-700 font-semibold':''}">${fmt(s.pend)}</td>
+          <td class="num ${s.hold>0?'text-cyan-700':''}">${fmt(s.hold)}</td>
+          <td><span class="badge ${s.mode==='AUTO'?'bg-indigo-50 text-indigo-700':'bg-purple-50 text-purple-700'}">${s.mode}</span></td>
+          <td>${statusBadge(s.status)}</td>
+        </tr>`).join('');
+}
+function openSession(sid, date) {
+  document.getElementById('lvl-session').classList.add('hidden');
+  document.getElementById('lvl-detail').classList.remove('hidden');
+  document.getElementById('sel-session').textContent = sid;
+  document.getElementById('crumb').innerHTML = `<a onclick="goLvl(1)">All Dates</a> <span class="mx-1">›</span> <a onclick="openDate('${date}')">${date}</a> <span class="mx-1">›</span> <span>${sid}</span>`;
+  const rows = detailBySession[sid] || [];
+  document.getElementById('detail-body').innerHTML = rows.length === 0
+    ? `<tr><td colspan="9" class="text-center text-xs text-gray-500 py-6">No detail rows (mock).</td></tr>`
+    : rows.map(r => {
+        const status = r.pend === 0 ? 'closed' : (r.hold > 0 ? 'open' : 'partial');
+        return `<tr>
+          <td class="font-mono text-xs">${r.art}</td><td>${r.store}</td><td>${r.sz}</td>
+          <td class="num">${r.alloc}</td><td class="num">${r.do_}</td>
+          <td class="num ${r.pend>0?'text-amber-700 font-semibold':''}">${r.pend}</td>
+          <td class="num ${r.hold>0?'text-cyan-700':''}">${r.hold}</td>
+          <td class="num">${r.gap}%</td><td>${statusBadge(status)}</td>
+        </tr>`;
+      }).join('');
+}
+function goLvl(n) {
+  if (n === 1) {
+    document.getElementById('lvl-date').classList.remove('hidden');
+    document.getElementById('lvl-session').classList.add('hidden');
+    document.getElementById('lvl-detail').classList.add('hidden');
+    document.getElementById('crumb').innerHTML = '<span>All Dates</span>';
+  }
+}
+
+/* ============================================================================
+   PRODUCT DRILL  —  L1 → L2 → L3 → L4
+   Path mjst:  L1=MAJ_CAT  L2=Store  L3=OPT  L4=VAR
+   Path stmj:  L1=Store    L2=MAJ_CAT L3=OPT  L4=VAR
+============================================================================ */
+function renderDrill() {
+  // titles per path
+  const pathLbl = drillPath === 'mjst' ? 'MAJ_CAT → Store → OPT → VAR' : 'Store → MAJ_CAT → OPT → VAR';
+  document.getElementById('drillPathLabel').textContent = pathLbl;
+  document.getElementById('lvATitle').textContent = drillPath === 'mjst' ? 'L1 · MAJ_CAT' : 'L1 · Store';
+  document.getElementById('lvBTitle').textContent = drillPath === 'mjst' ? 'L2 · Store'    : 'L2 · MAJ_CAT';
+
+  // populate L1 dropdown
+  const ddA = document.getElementById('ddA');
+  if (drillPath === 'mjst') {
+    ddA.innerHTML = '<option value="">— pick MAJ_CAT —</option>' +
+      Object.keys(drillByMajCat).map(k => `<option>${k}</option>`).join('');
+  } else {
+    // Store-first: aggregate all stores from all maj_cats
+    const stores = new Set();
+    Object.values(drillByMajCat).forEach(mc => mc.stores_list.forEach(s => stores.add(s.werks)));
+    ddA.innerHTML = '<option value="">— pick Store —</option>' + [...stores].sort().map(s => `<option>${s}</option>`).join('');
+  }
+  resetFrom('A');
+}
+function resetFrom(level) {
+  // Reset levels at or below the given one
+  if (level <= 'A') {
+    setCardStub('lvA', 'lvAKpi', 'lvASub', 'lvABar', 'lvAPct');
+  }
+  if (level <= 'B') {
+    document.getElementById('ddB').innerHTML = '<option>—</option>';
+    document.getElementById('ddB').disabled = true;
+    setCardStub('lvB', 'lvBKpi', 'lvBSub', 'lvBBar', 'lvBPct', drillPath === 'mjst' ? 'pick L1 first' : 'pick L1 first');
+    document.getElementById('lvB').classList.add('opacity-60');
+  }
+  if (level <= 'C') {
+    document.getElementById('ddC').innerHTML = '<option>—</option>';
+    document.getElementById('ddC').disabled = true;
+    setCardStub('lvC', 'lvCKpi', 'lvCSub', 'lvCBar', 'lvCPct', 'pick L2 first');
+    document.getElementById('lvC').classList.add('opacity-60');
+  }
+  if (level <= 'D') {
+    setCardStub('lvD', 'lvDKpi', 'lvDSub', null, null, 'pick L3 first');
+    document.getElementById('lvDList').innerHTML = '';
+    document.getElementById('lvD').classList.add('opacity-60');
+  }
+  document.getElementById('drillChart').innerHTML = '<div class="text-xs text-gray-400 italic text-center py-6">Make selections above to see distribution</div>';
+  document.getElementById('drillChip').textContent = 'All';
+  document.getElementById('drillChartTitle').textContent = 'Distribution within scope';
+  document.getElementById('drillThead').innerHTML = '';
+  document.getElementById('drillTbody').innerHTML = '';
+  document.getElementById('drillTblTitle').textContent = 'Rows at current level';
+  document.getElementById('drillCrumb').innerHTML = `<span id="drillPathLabel">${drillPath === 'mjst' ? 'MAJ_CAT → Store → OPT → VAR' : 'Store → MAJ_CAT → OPT → VAR'}</span>`;
+}
+function setCardStub(card, kpi, sub, bar, pct, subText) {
+  document.getElementById(kpi).textContent = '—';
+  if (subText !== undefined) document.getElementById(sub).textContent = subText;
+  else document.getElementById(sub).textContent = 'pick a value';
+  if (bar) document.getElementById(bar).style.width = '0%';
+  if (pct) document.getElementById(pct).textContent = '';
+}
+
+function onLvAChange() {
+  const v = document.getElementById('ddA').value;
+  if (!v) { resetFrom('A'); return; }
+
+  if (drillPath === 'mjst') {
+    // L1=MAJ_CAT
+    const mc = drillByMajCat[v];
+    document.getElementById('lvAKpi').textContent = fmt(mc.alloc) + ' pcs';
+    document.getElementById('lvASub').textContent = `${mc.stores} stores · ${mc.articles} articles`;
+    document.getElementById('lvABar').style.width = '100%';
+    document.getElementById('lvAPct').textContent = '';
+    // populate L2 (Stores within selected MAJ_CAT)
+    const stores = mc.stores_list;
+    document.getElementById('ddB').innerHTML = '<option value="">— pick Store —</option>' + stores.map(s => `<option data-alloc="${s.alloc}" data-art="${s.articles}">${s.werks}</option>`).join('');
+    document.getElementById('ddB').disabled = false;
+    document.getElementById('lvBChip').textContent = `${stores.length} stores`;
+    document.getElementById('lvB').classList.remove('opacity-60');
+    // Distribution chart: Stores within selected MAJ_CAT
+    renderDrillDistribution('Stores within ' + v,
+      stores.map(s => ({ name: s.werks, qty: s.alloc })),
+      'pick a Store',
+      'bg-indigo-500');
+    // Crumb
+    document.getElementById('drillCrumb').innerHTML = `<span>${v}</span> <span class="mx-1">›</span> <span class="text-gray-400">Store</span>`;
+    // Reset L3/L4
+    resetFromKeep('C');
+    // Table: stores list
+    renderDrillTable(['Store', 'Alloc', 'Articles'],
+      stores.map(s => [s.werks, fmt(s.alloc), s.articles]),
+      'Stores within ' + v);
+  } else {
+    // L1=Store. Build MAJ_CATs that contain this store
+    const werks = v;
+    const mcs = [];
+    Object.entries(drillByMajCat).forEach(([k, mc]) => {
+      const hit = mc.stores_list.find(s => s.werks === werks);
+      if (hit) mcs.push({ name: k, alloc: hit.alloc, articles: hit.articles });
+    });
+    const total = mcs.reduce((s, m) => s + m.alloc, 0);
+    document.getElementById('lvAKpi').textContent = fmt(total) + ' pcs';
+    document.getElementById('lvASub').textContent = `${mcs.length} categories · across this store`;
+    document.getElementById('lvABar').style.width = '100%';
+    document.getElementById('ddB').innerHTML = '<option value="">— pick MAJ_CAT —</option>' + mcs.map(m => `<option>${m.name}</option>`).join('');
+    document.getElementById('ddB').disabled = false;
+    document.getElementById('lvBChip').textContent = `${mcs.length} cats`;
+    document.getElementById('lvB').classList.remove('opacity-60');
+    renderDrillDistribution('MAJ_CATs at store ' + werks,
+      mcs.map(m => ({ name: m.name, qty: m.alloc })), 'pick a MAJ_CAT', 'bg-cyan-500');
+    document.getElementById('drillCrumb').innerHTML = `<span>${werks}</span> <span class="mx-1">›</span> <span class="text-gray-400">MAJ_CAT</span>`;
+    resetFromKeep('C');
+    renderDrillTable(['MAJ_CAT','Alloc','Articles'],
+      mcs.map(m => [m.name, fmt(m.alloc), m.articles]),
+      'Categories at store ' + werks);
+  }
+}
+
+function resetFromKeep(level) {
+  // Like resetFrom but leaves L1 and L2 alone
+  if (level <= 'C') {
+    document.getElementById('ddC').innerHTML = '<option>—</option>';
+    document.getElementById('ddC').disabled = true;
+    setCardStub('lvC', 'lvCKpi', 'lvCSub', 'lvCBar', 'lvCPct', 'pick L2 first');
+    document.getElementById('lvC').classList.add('opacity-60');
+  }
+  if (level <= 'D') {
+    setCardStub('lvD', 'lvDKpi', 'lvDSub', null, null, 'pick L3 first');
+    document.getElementById('lvDList').innerHTML = '';
+    document.getElementById('lvD').classList.add('opacity-60');
+  }
+}
+
+function onLvBChange() {
+  const v = document.getElementById('ddB').value;
+  if (!v) { resetFromKeep('C'); return; }
+
+  // Resolve the (MAJ_CAT, Store) pair regardless of path
+  let majCat, werks;
+  if (drillPath === 'mjst') {
+    majCat = document.getElementById('ddA').value;
+    werks  = v;
+    const mc = drillByMajCat[majCat];
+    const store = mc.stores_list.find(s => s.werks === werks);
+    document.getElementById('lvBKpi').textContent = fmt(store.alloc) + ' pcs';
+    document.getElementById('lvBSub').textContent = `${store.articles} articles · in ${majCat}`;
+    document.getElementById('lvBBar').style.width = ((store.alloc / mc.alloc) * 100).toFixed(0) + '%';
+    document.getElementById('lvBPct').textContent = ((store.alloc / mc.alloc) * 100).toFixed(0) + '%';
+    document.getElementById('drillCrumb').innerHTML = `<span>${majCat}</span> <span class="mx-1">›</span> <span>${werks}</span> <span class="mx-1">›</span> <span class="text-gray-400">OPT</span>`;
+  } else {
+    werks  = document.getElementById('ddA').value;
+    majCat = v;
+    const mc = drillByMajCat[majCat];
+    const store = mc.stores_list.find(s => s.werks === werks);
+    const allocForStore = store ? store.alloc : 0;
+    document.getElementById('lvBKpi').textContent = fmt(allocForStore) + ' pcs';
+    document.getElementById('lvBSub').textContent = `${store ? store.articles : 0} articles · in ${werks}`;
+    document.getElementById('lvBBar').style.width = '60%';
+    document.getElementById('drillCrumb').innerHTML = `<span>${werks}</span> <span class="mx-1">›</span> <span>${majCat}</span> <span class="mx-1">›</span> <span class="text-gray-400">OPT</span>`;
+  }
+
+  const key = `${majCat}|${werks}`;
+  const opts = optsByMjSt[key] || [];
+  document.getElementById('ddC').innerHTML = '<option value="">— pick OPT —</option>' + opts.map(o => `<option value="${o.gen}|${o.clr}">${o.id} · ${o.type}</option>`).join('');
+  document.getElementById('ddC').disabled = false;
+  document.getElementById('lvCChip').textContent = `${opts.length} OPTs`;
+  document.getElementById('lvC').classList.remove('opacity-60');
+  // Distribution chart: OPTs within (MAJ_CAT, store)
+  renderDrillDistribution(`OPTs at ${werks} / ${majCat}`,
+    opts.map(o => ({ name: o.id, qty: o.alloc, type: o.type })),
+    `${opts.length === 0 ? 'no OPTs in sample data' : 'pick an OPT'}`,
+    'bg-emerald-500');
+  resetFromKeep('D');
+  renderDrillTable(
+    ['OPT', 'OPT_TYPE', 'Alloc', 'Sizes'],
+    opts.map(o => [o.id, o.type, fmt(o.alloc), o.sizes]),
+    `OPTs at ${werks} / ${majCat}`
+  );
+}
+
+function onLvCChange() {
+  const v = document.getElementById('ddC').value;
+  if (!v) { setCardStub('lvD','lvDKpi','lvDSub'); document.getElementById('lvDList').innerHTML=''; return; }
+  const [gen, clr] = v.split('|');
+  const rows = varBySig[`${gen}|${clr}`] || [];
+  const allocTotal = rows.reduce((s, r) => s + r.alloc, 0);
+  const pendTotal  = rows.reduce((s, r) => s + r.pend,  0);
+
+  document.getElementById('lvCKpi').textContent = fmt(allocTotal) + ' pcs';
+  document.getElementById('lvCSub').textContent = `${rows.length} sizes · ${fmt(pendTotal)} pending`;
+  document.getElementById('lvCBar').style.width = '85%';
+
+  // L4 — VAR list inside the card
+  document.getElementById('lvDKpi').textContent = fmt(rows.length) + ' VARs';
+  document.getElementById('lvDSub').textContent = `${gen} · ${clr}`;
+  document.getElementById('lvDChip').textContent = `${rows.length} sizes`;
+  document.getElementById('lvD').classList.remove('opacity-60');
+  document.getElementById('lvDList').innerHTML = rows.map(r => `
+    <div class="flex items-center justify-between bg-gray-50 px-2 py-1 rounded">
+      <span class="font-mono">${r.sz}</span>
+      <span>${r.alloc} / ${r.do_} / <span class="${r.pend>0?'text-amber-700 font-semibold':''}">${r.pend}</span></span>
+    </div>`).join('');
+
+  // Distribution: sizes
+  renderDrillDistribution(`Size breakdown — ${gen} · ${clr}`,
+    rows.map(r => ({ name: r.sz, qty: r.alloc })),
+    `${rows.length} sizes`, 'bg-amber-500');
+
+  // Detail table
+  const majCat = drillPath === 'mjst' ? document.getElementById('ddA').value : document.getElementById('ddB').value;
+  const werks  = drillPath === 'mjst' ? document.getElementById('ddB').value : document.getElementById('ddA').value;
+  document.getElementById('drillCrumb').innerHTML = `
+    <span>${drillPath === 'mjst' ? majCat : werks}</span> <span class="mx-1">›</span>
+    <span>${drillPath === 'mjst' ? werks : majCat}</span> <span class="mx-1">›</span>
+    <span>${gen}/${clr}</span> <span class="mx-1">›</span>
+    <span>VAR × SZ</span>`;
+  renderDrillTable(
+    ['VAR_ART', 'SZ', 'Alloc', 'DO', 'Pending', 'Hold', 'Gap %'],
+    rows.map(r => [
+      `<span class="font-mono text-xs">${r.var_art}</span>`, r.sz, fmt(r.alloc), fmt(r.do_),
+      `<span class="${r.pend>0?'text-amber-700 font-semibold':''}">${fmt(r.pend)}</span>`,
+      `<span class="${r.hold>0?'text-cyan-700':''}">${fmt(r.hold)}</span>`,
+      r.alloc > 0 ? Math.round(r.pend/r.alloc*100)+'%' : '-',
+    ]),
+    `VAR × SZ — ${gen} · ${clr}`
+  );
+}
+
+function renderDrillDistribution(title, items, chip, color) {
+  document.getElementById('drillChartTitle').textContent = title;
+  document.getElementById('drillChartChip').textContent = chip;
+  if (items.length === 0) {
+    document.getElementById('drillChart').innerHTML = '<div class="text-xs text-gray-400 italic text-center py-6">No data at this level</div>';
+    return;
+  }
+  const max = Math.max(...items.map(i => i.qty), 1);
+  document.getElementById('drillChart').innerHTML = items.map(i => `
+    <div class="flex items-center gap-2 text-xs">
+      <div class="w-40 text-gray-700 truncate" title="${i.name}">${i.name}${i.type ? ` <span class="chip ml-1">${i.type}</span>`:''}</div>
+      <div class="flex-1 bg-gray-100 rounded h-5 overflow-hidden">
+        <div class="${color} h-full" style="width:${(i.qty/max*100).toFixed(1)}%"></div>
+      </div>
+      <div class="w-16 num text-[11px] font-semibold">${fmt(i.qty)}</div>
+    </div>`).join('');
+}
+function renderDrillTable(headers, rows, title) {
+  document.getElementById('drillTblTitle').textContent = title;
+  document.getElementById('drillThead').innerHTML = '<tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr>';
+  document.getElementById('drillTbody').innerHTML = rows.length === 0
+    ? `<tr><td colspan="${headers.length}" class="text-center text-xs text-gray-500 py-6">No rows</td></tr>`
+    : rows.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('');
+}
+
+/* ============================================================================
+   HOLD / PENDING / GAP
+============================================================================ */
+function renderHold() {
+  const max = Math.max(...holdRdc.map(r => r.qty));
+  document.getElementById('hold-rdc').innerHTML = holdRdc.map(r => `
+    <div class="flex items-center gap-2 text-sm">
+      <div class="w-12 font-mono text-xs text-gray-500">${r.rdc}</div>
+      <div class="flex-1 bg-gray-100 rounded h-5 overflow-hidden"><div class="bg-cyan-500 h-full" style="width:${(r.qty/max*100).toFixed(1)}%"></div></div>
+      <div class="w-16 num text-xs font-medium">${fmt(r.qty)}</div>
+    </div>`).join('');
+  document.getElementById('hold-art').innerHTML = holdArticles.map(a => `<tr><td class="font-mono text-xs">${a.art}</td><td class="num">${fmt(a.qty)}</td><td class="num">${a.age}d</td></tr>`).join('');
+}
+function renderPending() {
+  document.getElementById('pending-body').innerHTML = pendingRows.map(p => `
+    <tr>
+      <td><span class="text-indigo-600 font-medium">${p.sid}</span></td>
+      <td>${p.rdc}</td><td>${p.store}</td><td class="font-mono text-xs">${p.art}</td>
+      <td class="num">${p.alloc}</td><td class="num">${p.do_}</td>
+      <td class="num text-amber-700 font-semibold">${p.pend}</td>
+      <td class="num">${(p.pend/p.alloc*100).toFixed(0)}%</td><td class="num">${p.age}d</td>
+      <td>${statusBadge(p.status)}</td>
+    </tr>`).join('');
+}
+function renderGap() {
+  document.getElementById('gap-body').innerHTML = gapRows.map(g => `
+    <tr>
+      <td>${g.rdc}</td><td class="font-mono text-xs">${g.art}</td><td class="num">${g.stores}</td>
+      <td class="num">${g.alloc}</td><td class="num">${g.do_}</td>
+      <td class="num text-rose-700 font-semibold">${g.gap}</td>
+      <td class="num">${g.pct}%</td><td class="num">${g.oldest}</td>
+    </tr>`).join('');
+}
+
+/* ============================================================================
+   TAB SWITCH
+============================================================================ */
+function goTab(name) {
+  ['overview','drill','date','hold','pending','gap'].forEach(n => {
+    document.getElementById('tab-' + n).classList.toggle('hidden', n !== name);
+    document.querySelectorAll('.pill-tab').forEach(el => {
+      el.classList.toggle('active', el.dataset.tab === name);
+    });
+  });
+}
+
+/* ============================================================================
+   INIT
+============================================================================ */
+renderOverview();
+renderDrill();
+renderDates();
+renderHold();
+renderPending();
+renderGap();
+</script>
+</body>
+</html>

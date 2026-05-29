@@ -63,6 +63,18 @@ async def lifespan(app: FastAPI):
     # Enable RCSI so readers never block during uploads
     enable_rcsi()
 
+    # Prewarm ARS_PEND_ALC / ARS_BDC_HISTORY / ARS_PEND_ALC_OPERATIONS once at
+    # startup. This is what /pend-alc/bdc-generate used to do per-request,
+    # which took Sch-M (schema-modification) locks on ARS_PEND_ALC and blocked
+    # every other session until "Generate BDC" finished. Doing it once here
+    # means the hot path never runs DDL.
+    try:
+        from app.database.session import data_engine
+        from app.services.pend_alc_service import prewarm_pend_alc_tables
+        prewarm_pend_alc_tables(data_engine)
+    except Exception as e:
+        logger.warning(f"pend_alc prewarm skipped: {e}")
+
     # Ensure all model tables exist (auto-create new ones)
     try:
         import app.models.rbac  # noqa - register models with Base

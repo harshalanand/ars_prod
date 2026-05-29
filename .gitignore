@@ -52,6 +52,10 @@ frontend/build/
 # Database
 *.mdf
 *.ldf
+*.docs
+*.xlsx
+*.xls
+*.csv
 
 # Temp/cache
 *.pkl

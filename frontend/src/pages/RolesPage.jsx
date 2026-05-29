@@ -25,7 +25,7 @@ const MENU_SECTIONS = [
     key: 'data_preparation',
     label: 'Data Preparation',
     icon: Cpu,
-    prefixes: ['MSA_', 'BDC_', 'GRID_', 'LOOKUP_'],
+    prefixes: ['MSA_', 'GRID_', 'LOOKUP_'],
   },
   {
     key: 'contribution',
@@ -81,7 +81,6 @@ const PERM_LABELS = {
   JOBS_VIEW: 'Jobs Dashboard',
   // Data Preparation
   MSA_VIEW: 'MSA Stock Calculation',
-  BDC_VIEW: 'BDC Creation',
   GRID_VIEW: 'Grid Builder',
   LOOKUP_VIEW: 'Lookup Art Master',
   // Contribution %

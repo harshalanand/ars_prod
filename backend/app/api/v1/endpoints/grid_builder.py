@@ -59,6 +59,8 @@ class GridCreate(BaseModel):
     weightage:         Optional[float] = 1.0    # priority weight for this grid
     grid_group:        Optional[str] = "Primary" # Primary / Secondary / None
     use_for_opt_sale:  bool = False              # use this grid's MBQ/DISP_Q for listing PER_OPT_SALE
+    sec_cap_applicable: bool = False             # participate in Secondary-grid cap math
+    sec_cap_pct:       Optional[float] = None    # per-grid cap %; None → use global SEC_CAP_DEFAULT_PCT
 
     @validator("status")
     def _chk(cls, v):
@@ -91,6 +93,8 @@ class GridUpdate(BaseModel):
     weightage:         Optional[float]     = None
     grid_group:        Optional[str]       = None
     use_for_opt_sale:  Optional[bool]      = None
+    sec_cap_applicable: Optional[bool]     = None
+    sec_cap_pct:       Optional[float]     = None
 
     @validator("status")
     def _chk(cls, v):
@@ -233,6 +237,22 @@ def _ensure_grid_table(engine):
                 ALTER TABLE {GRID_TABLE} ADD use_for_opt_sale BIT NOT NULL DEFAULT 0
             END
         """)
+        # Per-grid sec-cap applicability + optional per-grid % override.
+        # Backfill: OFF for every existing row (opt-in path chosen 2026-05-17).
+        _run(c, f"""
+            IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                           WHERE TABLE_NAME='{GRID_TABLE}' AND COLUMN_NAME='sec_cap_applicable')
+            BEGIN
+                ALTER TABLE {GRID_TABLE} ADD sec_cap_applicable BIT NOT NULL DEFAULT 0
+            END
+        """)
+        _run(c, f"""
+            IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                           WHERE TABLE_NAME='{GRID_TABLE}' AND COLUMN_NAME='sec_cap_pct')
+            BEGIN
+                ALTER TABLE {GRID_TABLE} ADD sec_cap_pct FLOAT NULL
+            END
+        """)
         # Auto-assign sequence where seq=0 based on id order
         _run(c, f"""
             ;WITH CTE AS (
@@ -359,6 +379,95 @@ def _ensure_hierarchy_table(engine):
             logger.info(f"{GRID_HIER_TABLE}: rebuilt with column order: {expected_ordered}")
 
 
+def _populate_merge_columns(engine) -> None:
+    """
+    For every MERGE_<X> column in ARS_GRID_HIERARCHY, re-derive its values
+    from the parent column [X] using the active mapping in ARS_MERGE_RULES.
+
+    Idempotent: runs after _ensure_hierarchy_table and after merge-rule edits.
+    Skips (with a logged warning) if the parent column is missing or no
+    active rules exist for the parent source_col.
+    """
+    from app.services import derived_masters as dm
+
+    with engine.connect() as conn:
+        tbl_exists = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = :t"
+        ), {"t": GRID_HIER_TABLE}).scalar() > 0
+        if not tbl_exists:
+            return
+
+        cols = [r[0] for r in conn.execute(text(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = :t"
+        ), {"t": GRID_HIER_TABLE}).fetchall()]
+        cols_upper = {c.upper(): c for c in cols}
+
+        for col in cols:
+            if not col.upper().startswith(dm.MERGE_COL_PREFIX):
+                continue
+            parent = col[len(dm.MERGE_COL_PREFIX):]
+            parent_actual = cols_upper.get(parent.upper())
+            if not parent_actual:
+                logger.warning(
+                    f"{GRID_HIER_TABLE}: {col} present but parent column "
+                    f"{parent} missing — skipping populate"
+                )
+                continue
+
+            mapping = dm.get_mapping(conn, parent)
+            if not mapping:
+                logger.warning(
+                    f"{GRID_HIER_TABLE}: no active ARS_MERGE_RULES for {parent} — "
+                    f"{col} left as-is"
+                )
+                continue
+
+            def _q(s: str) -> str:
+                return "'" + s.replace("'", "''") + "'"
+            case_parts = " ".join(
+                f"WHEN {_q(sv)} THEN {_q(tv)}" for sv, tv in mapping.items()
+            )
+            case_sql = (
+                f"CASE [{parent_actual}] {case_parts} "
+                f"ELSE [{parent_actual}] END"
+            )
+            _run(conn, f"UPDATE [{GRID_HIER_TABLE}] SET [{col}] = {case_sql}")
+            conn.commit()
+            logger.info(
+                f"{GRID_HIER_TABLE}: re-populated [{col}] from [{parent_actual}] "
+                f"via ARS_MERGE_RULES ({len(mapping)} rule(s))"
+            )
+
+
+def _ensure_merge_parent_grid_exists(conn, hierarchy_columns: List[str]) -> None:
+    """
+    If hierarchy ends with MERGE_<X>, require an Active grid whose last
+    hierarchy column = X already exists. Raises 400 otherwise.
+    """
+    if not hierarchy_columns:
+        return
+    last = hierarchy_columns[-1].upper()
+    if not last.startswith("MERGE_"):
+        return
+    parent = last[len("MERGE_"):]
+    rows = conn.execute(text(
+        f"SELECT hierarchy_columns FROM {GRID_TABLE} WHERE UPPER(status) = 'ACTIVE'"
+    )).fetchall()
+    for (hj,) in rows:
+        try:
+            h = json.loads(hj) if isinstance(hj, str) else hj
+        except Exception:
+            continue
+        if h and str(h[-1]).upper() == parent:
+            return
+    raise HTTPException(
+        400,
+        f"Cannot create/update grid with last column [{last}]: "
+        f"no Active parent grid found whose last hierarchy column = [{parent}]. "
+        f"Create the parent grid first."
+    )
+
+
 def _row_to_dict(r) -> dict:
     """Convert a row tuple to dict. Column order must match SELECT statements."""
     hier = r[3]
@@ -382,10 +491,12 @@ def _row_to_dict(r) -> dict:
         "last_run_rows":     r[12],
         "last_run_error":    r[13],
         "duration_sec":      r[14] if len(r) > 14 else None,
-        "pivot_only":        bool(r[15]) if len(r) > 15 else False,
-        "weightage":         r[16] if len(r) > 16 else 1.0,
-        "grid_group":        r[17] if len(r) > 17 else "Primary",
-        "use_for_opt_sale":  bool(r[18]) if len(r) > 18 else False,
+        "pivot_only":         bool(r[15]) if len(r) > 15 else False,
+        "weightage":          r[16] if len(r) > 16 else 1.0,
+        "grid_group":         r[17] if len(r) > 17 else "Primary",
+        "use_for_opt_sale":   bool(r[18]) if len(r) > 18 else False,
+        "sec_cap_applicable": bool(r[19]) if len(r) > 19 else False,
+        "sec_cap_pct":        r[20] if len(r) > 20 else None,
     }
 
 
@@ -475,16 +586,32 @@ def _resolve_template(template: str, hier_cols: List[str]) -> str:
 _get_col_type_sql = get_col_type_sql  # shared helper
 
 
-def _apply_post_lookups(conn, out_table: str, hier_cols: List[str], skip_cont: bool = False) -> List[str]:
+def _apply_post_lookups(
+    conn,
+    out_table: str,
+    hier_cols: List[str],
+    skip_cont: bool = False,
+    filters_only: bool = False,
+) -> List[str]:
     """
     After pivot INSERT, join lookup tables and add extra columns.
-    skip_cont: if True, skip CONT lookup (for article-level grids).
+    skip_cont:    if True, skip CONT lookup (for article-level grids).
+    filters_only: if True, process only entries that DELETE rows (currently
+                  just the LISTING filter). Used by pivot_only grids that
+                  don't need CONT / MBQ / OPT_CNT but MUST still respect the
+                  listed-store universe — otherwise unlisted warehouses
+                  survive in VAR_ART/GEN_ART and inflate SUM(STK_TTL) vs
+                  the rollup grids that do filter.
     Returns list of warning messages (e.g. missing tables).
     """
     hier_upper = {c.upper(): c for c in hier_cols}
     warnings = []
 
     for cfg in POST_PIVOT_LOOKUPS:
+        # filters_only: only run entries that DELETE rows (have a "filter" key)
+        if filters_only and not cfg.get("filter"):
+            continue
+
         # Skip CONT lookup for article-level grids
         if skip_cont and "CONT" in cfg.get("columns", []):
             logger.info(f"Skipping CONT lookup for article-level grid {out_table}")
@@ -496,6 +623,16 @@ def _apply_post_lookups(conn, out_table: str, hier_cols: List[str], skip_cont: b
 
         # Resolve template in table name
         lookup_table = _resolve_template(cfg["lookup_table"], hier_cols)
+
+        # Self-heal: if this is a derived Master_CONT_MERGE_* table, rebuild
+        # from its parent before the existence check. No-op if not a MERGE table
+        # or if the parent doesn't exist / has no active rules.
+        try:
+            from app.services import derived_masters as _dm
+            if _dm.is_derived_master_table(lookup_table):
+                _dm.ensure_derived_master(conn, lookup_table)
+        except Exception as _e:
+            logger.warning(f"derived_masters.ensure failed for {lookup_table}: {_e}")
 
         # Check lookup table exists in DB
         exists = conn.execute(text(
@@ -682,6 +819,7 @@ def _apply_post_lookups(conn, out_table: str, hier_cols: List[str], skip_cont: b
 #           Default 1 if BGT_SL_GR_DGR or DISP_GR_DGR is blank/null
 #           Then: MBQ = ROUND(MBQ * CONT, 1)
 # OPT_CNT = ROUND(DISP_Q * CONT / ACS_D, 1)
+# [L-7 DAYS SALE-Q] = [L-7 DAYS SALE-Q] * LW_ACT_SL_GR_DGR (default 1 if null/0)
 # ==========================================================================
 
 _col_exists_in = column_exists  # shared helper
@@ -753,8 +891,22 @@ def _calculate_grid_columns(conn, out_table: str) -> List[str]:
         except Exception as e:
             warnings.append(f"OPT_CNT error: {str(e)[:150]}")
 
-    # ── STR = STK_TTL / ([L-7 DAYS SALE-Q] / 7)  (days of stock cover)
+    # ── [L-7 DAYS SALE-Q] *= LW_ACT_SL_GR_DGR  (default 1 if null/0) ────────
+    # Mutates the column in-place so downstream STR uses the grown value.
     _sale_q_col = "L-7 DAYS SALE-Q"
+    if _col_exists_in(conn, out_table, _sale_q_col) and _col_exists_in(conn, out_table, "LW_ACT_SL_GR_DGR"):
+        try:
+            _run(conn, f"""
+                UPDATE [{out_table}] SET [{_sale_q_col}] = ROUND(
+                    ISNULL(TRY_CAST([{_sale_q_col}] AS FLOAT), 0)
+                    * CASE WHEN ISNULL(TRY_CAST([LW_ACT_SL_GR_DGR] AS FLOAT), 0) = 0 THEN 1
+                           ELSE TRY_CAST([LW_ACT_SL_GR_DGR] AS FLOAT) END, 2)
+            """)
+            logger.info(f"[{_sale_q_col}] multiplied by LW_ACT_SL_GR_DGR in {out_table}")
+        except Exception as e:
+            warnings.append(f"[{_sale_q_col}] * LW_ACT_SL_GR_DGR error: {str(e)[:150]}")
+
+    # ── STR = STK_TTL / ([L-7 DAYS SALE-Q] / 7)  (days of stock cover)
     if _col_exists_in(conn, out_table, "STK_TTL") and _col_exists_in(conn, out_table, _sale_q_col):
         _ensure_output_col(conn, out_table, "STR")
         try:
@@ -811,16 +963,20 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
             ORDER BY STK.SLOC ASC
         """)).fetchall()
 
-        # Include PEND_ALC if active in settings and table exists
-        pend_row = conn.execute(text(
-            "SELECT S.SLOC, S.KPI FROM ARS_STORE_SLOC_SETTINGS S WITH (NOLOCK) WHERE S.SLOC='PEND_ALC' AND UPPER(S.STATUS)='ACTIVE'"
-        )).fetchone()
-        if pend_row:
-            pend_table_exists = conn.execute(text(
-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_pend_alc'"
-            )).scalar() > 0
-            if pend_table_exists:
-                sloc_rows = list(sloc_rows) + [(pend_row[0], pend_row[1])]
+        # Include PEND_ALC whenever dbo.ARS_PEND_ALC (V2 schema) exists. The
+        # SLOC-settings row is optional: if present its KPI wins so admins can
+        # still flag PEND_ALC as KPI='STK'; if absent we default to a non-STK
+        # KPI so PEND_ALC appears as a column without rolling into STK_TTL.
+        pend_table_exists = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_PEND_ALC'"
+        )).scalar() > 0
+        if pend_table_exists:
+            pend_row = conn.execute(text(
+                "SELECT S.SLOC, S.KPI FROM ARS_STORE_SLOC_SETTINGS S WITH (NOLOCK) "
+                "WHERE S.SLOC='PEND_ALC' AND UPPER(S.STATUS)='ACTIVE'"
+            )).fetchone()
+            pend_kpi = (pend_row[1] if pend_row else 'PEND') or 'PEND'
+            sloc_rows = list(sloc_rows) + [('PEND_ALC', pend_kpi)]
 
     sloc_kpi_pairs = [(r[0], (r[1] or '').upper()) for r in sloc_rows if r[0]]
     if not sloc_kpi_pairs:
@@ -836,7 +992,19 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
     # ── 2. Build quoted column lists ─────────────────────────────────────────
     q_slocs      = ", ".join(f"[{s}]" for s in slocs)
     isnull_cols  = ", ".join(f"ISNULL([{s}],0) AS [{s}]" for s in slocs)
-    sum_expr     = " + ".join(f"ISNULL([{s}],0)" for s in stk_slocs) if stk_slocs else "0"
+    # SLOC columns in the OUTER SELECT after aggregation to hier_cols grain:
+    # raw signed sums (user instruction: clip only STK_TTL, not individual SLOCs).
+    sum_isnull_cols = ", ".join(
+        f"SUM(ISNULL([{s}],0)) AS [{s}]" for s in slocs
+    )
+    # Negative SLOC totals (from stock adjustments/returns) are clamped to 0:
+    # downstream OPT_REQ = MAX(0, OPT_MBQ - STK_TTL) would otherwise over-order.
+    # IMPORTANT: this clip is applied INSIDE the FineStage CTE at (WERKS, MATNR)
+    # grain — the finest practical grain — so every grid (coarse or fine)
+    # SUMs the same already-non-negative per-article values, guaranteeing
+    # SUM(STK_TTL) parity across all grids regardless of grouping.
+    _raw_sum     = " + ".join(f"ISNULL([{s}],0)" for s in stk_slocs) if stk_slocs else "0"
+    sum_expr     = f"CASE WHEN ({_raw_sum}) < 0 THEN 0 ELSE ({_raw_sum}) END"
 
     # ── 3. Hierarchy columns SELECT & JOIN ────────────────────────────────────
     # Determine which columns come from vw_master_product vs ET_STORE_STOCK
@@ -875,6 +1043,23 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
     # Fallback set for columns that might exist in ET_STORE_STOCK but not enumerated
     _BIGINT_COLS = {"ARTICLE_NUMBER", "GEN_ART_NUMBER", "MATNR"}
 
+    # Resolve MERGE_<col> hierarchy cols (e.g. MERGE_RNG_SEG) by reading the
+    # mapping from ARS_MERGE_RULES and emitting a CASE on the parent MP column.
+    # Parent must exist in vw_master_product; otherwise we fall through to the
+    # generic resolution and the grid will error visibly.
+    from app.services import derived_masters as _dm
+    _merge_case_cache: dict = {}
+    with engine.connect() as _mc:
+        for _col in hier_cols:
+            if not _dm.is_merge_col(_col):
+                continue
+            _parent = _dm.parent_col(_col) or ""
+            if _parent.upper() not in mp_cols_upper:
+                continue
+            _expr = _dm.build_case_expr(_mc, _col, table_alias="MP")
+            if _expr:
+                _merge_case_cache[_col.upper()] = _expr
+
     hier_select_parts = []
     has_mp_cols       = False
     numeric_hier: Set[str] = set()   # hier cols that should be numeric (for DDL + PK)
@@ -883,7 +1068,12 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
         # then vw_master_product (LEFT JOIN — can be NULL if no match)
         # ISNULL wraps MP columns: numeric→0, text→'NA' (prevents NULL PKs)
         cu = col.upper()
-        if cu in stk_cols_upper:
+        if cu in _merge_case_cache:
+            # MERGE_<col> resolved via ARS_MERGE_RULES → CASE on parent MP col
+            expr = f"ISNULL({_merge_case_cache[cu]}, 'NA') AS [{col}]"
+            hier_select_parts.append(expr)
+            has_mp_cols = True
+        elif cu in stk_cols_upper:
             is_num = _is_num(cu, 'stk') or cu in _BIGINT_COLS
             if is_num:
                 numeric_hier.add(cu)
@@ -958,39 +1148,76 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
         # Truncate before inserting fresh data
         _run(conn, f"TRUNCATE TABLE [{out_table}]")
 
-        # Check if ARS_pend_alc exists and PEND_ALC is an active SLOC
+        # Check if PEND_ALC is an active SLOC AND the V2 source table exists.
         pend_active = 'PEND_ALC' in [s.upper() for s in slocs]
         has_pend_table = False
         if pend_active:
             has_pend_table = conn.execute(text(
-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_pend_alc'"
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_PEND_ALC'"
             )).scalar() > 0
 
         pend_union = ""
         if pend_active and has_pend_table:
-            # Build hierarchy select for pend_alc — join MATNR with vw_master_product
+            # Build hierarchy select for pend_alc. Columns carried natively by
+            # ARS_PEND_ALC (ST_CD/MAJ_CAT/GEN_ART_NUMBER/CLR/ARTICLE_NUMBER) are
+            # read from PA directly so rows match even when vw_master_product
+            # is stale; anything else (FAB/RNG_SEG/MACRO_MVGR/MICRO_MVGR/vendor
+            # codes) still resolves via MP2 on ARTICLE_NUMBER.
+            _pa_cols = {'WERKS', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'ARTICLE_NUMBER'}
             pend_hier_parts = []
             for col in hier_cols:
                 cu = col.upper()
+                default = "0" if cu in numeric_hier else "'NA'"
                 if cu == 'WERKS':
                     pend_hier_parts.append(f"PA.[ST_CD] AS [{col}]")
+                elif cu in _pa_cols:
+                    src = f"PA.[{cu}]"
+                    if cu in numeric_hier:
+                        pend_hier_parts.append(
+                            f"ISNULL(TRY_CAST({src} AS BIGINT), {default}) AS [{col}]"
+                        )
+                    else:
+                        pend_hier_parts.append(f"ISNULL({src}, {default}) AS [{col}]")
+                elif cu in _merge_case_cache:
+                    # Derived MERGE_<col> — compute via the SAME CASE expression
+                    # as the stock branch, but rooted at MP2 (the pend-side
+                    # master alias). Without this, MERGE_RNG_SEG (and any other
+                    # derived column) resolves to 'NA' for every pend row and
+                    # the pend qty lands in a phantom 'NA' bucket — separate
+                    # from the corresponding stock row — making PEND_ALC=0 in
+                    # merge grids. The original expression uses [MP].[col] with
+                    # bracket-quoted alias, so we replace both bracketed and
+                    # unbracketed forms.
+                    expr_mp2 = (_merge_case_cache[cu]
+                                .replace("[MP].", "[MP2].")
+                                .replace("MP.", "MP2."))
+                    pend_hier_parts.append(f"ISNULL({expr_mp2}, {default}) AS [{col}]")
                 elif cu in mp_cols_upper:
                     actual = mp_cols_upper[cu]
-                    default = "0" if cu in numeric_hier else "'NA'"
-                    pend_hier_parts.append(f"ISNULL(MP2.[{actual}], {default}) AS [{col}]")
+                    pend_hier_parts.append(
+                        f"ISNULL(MP2.[{actual}], {default}) AS [{col}]"
+                    )
                 else:
-                    default = "0" if cu in numeric_hier else "'NA'"
                     pend_hier_parts.append(f"{default} AS [{col}]")
             pend_hier_select = ", ".join(pend_hier_parts)
 
+            # Mirror MSA's _load_ars_pending filter (IS_CLOSED=0, PEND_QTY>0)
+            # so grid and MSA read the same slice of ARS_PEND_ALC.
+            # `__fine_matnr` is the article-grain key carried alongside the
+            # grid's hierarchy columns so the PIVOT preserves per-article
+            # rows; the FineStage CTE then clips STK_TTL at this grain and
+            # the outer SELECT aggregates up to the grid's hier_cols.
             pend_union = f"""
     UNION ALL
     SELECT
         {pend_hier_select},
+        CAST(PA.ARTICLE_NUMBER AS BIGINT) AS __fine_matnr,
         'PEND_ALC' AS SLOC,
-        PA.QTY AS PARTICULARS_VALUE
-    FROM dbo.ARS_pend_alc PA
-    LEFT JOIN dbo.vw_master_product MP2 ON CAST(PA.MATNR AS NVARCHAR(50)) = MP2.ARTICLE_NUMBER
+        PA.PEND_QTY AS PARTICULARS_VALUE
+    FROM dbo.ARS_PEND_ALC PA WITH (NOLOCK)
+    LEFT JOIN dbo.vw_master_product MP2 ON PA.ARTICLE_NUMBER = MP2.ARTICLE_NUMBER
+    WHERE PA.IS_CLOSED = 0
+      AND PA.PEND_QTY  > 0
 """
 
         # ── Staged + chunked INSERT (avoids Azure SQL 9002 log-full) ────
@@ -1014,10 +1241,22 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
         # if the explicit DROP below fails to run for any reason.
         stage_table = "#grid_stage_pivot"
 
+        # The stage SQL is structured in 3 layers:
+        #   Stock_CTE   — raw stock+pend rows, includes __fine_matnr so the
+        #                 PIVOT preserves article granularity regardless of
+        #                 the grid's hier_cols.
+        #   FineStage   — PIVOTed at (hier_cols + __fine_matnr) grain;
+        #                 STK_TTL is clipped to >= 0 HERE (per article) so
+        #                 every grid aggregates the same already-non-negative
+        #                 values → SUM(STK_TTL) parity across grids.
+        #   Outer SELECT — aggregates SLOC columns and STK_TTL up to the
+        #                 grid's own hier_cols grain. SLOC sums stay signed
+        #                 (user instruction: clip only STK_TTL).
         stage_sql = f""";
 WITH Stock_CTE AS (
     SELECT
         {hier_select},
+        STK.MATNR AS __fine_matnr,
         STK.SLOC,
         STK.PARTICULARS_VALUE
     FROM dbo.ET_STORE_STOCK STK WITH (NOLOCK)
@@ -1026,18 +1265,27 @@ WITH Stock_CTE AS (
     WHERE UPPER(S.STATUS) = 'ACTIVE'{kpi_clause}
       AND STK.WERKS IS NOT NULL AND STK.WERKS <> ''
     {pend_union}
+),
+FineStage AS (
+    SELECT
+        {hier_cols_sql},
+        __fine_matnr,
+        {isnull_cols},
+        {sum_expr} AS STK_TTL
+    FROM Stock_CTE
+    PIVOT (
+        SUM(PARTICULARS_VALUE)
+        FOR SLOC IN ({q_slocs})
+    ) AS P
 )
 SELECT
     ROW_NUMBER() OVER (ORDER BY {hier_cols_sql}) AS __rn,
     {hier_cols_sql},
-    {isnull_cols},
-    {sum_expr} AS STK_TTL
+    {sum_isnull_cols},
+    SUM(STK_TTL) AS STK_TTL
 INTO {stage_table}
-FROM Stock_CTE
-PIVOT (
-    SUM(PARTICULARS_VALUE)
-    FOR SLOC IN ({q_slocs})
-) AS P;
+FROM FineStage
+GROUP BY {hier_cols_sql};
 """
 
         t_stage_start = time.time()
@@ -1106,7 +1354,19 @@ PIVOT (
         is_article_grid = any(c in hier_cols for c in ["GEN_ART_NUMBER", "ARTICLE_NUMBER", "GEN_ART", "VAR_ART"])
         lookup_warnings = []
         if grid.get("pivot_only"):
-            logger.info(f"Pivot-only mode: skipping lookups & calculations for {out_table}")
+            # Pivot-only grids (GEN_ART, VAR_ART) skip CONT/MBQ/OPT_CNT
+            # because those calculations aren't meaningful at article grain.
+            # BUT they MUST still apply the LISTING filter — otherwise
+            # unlisted warehouses (rows not in Master_ALC_INPUT_ST_MASTER)
+            # survive here and SUM(STK_TTL) inflates vs the rollup grids
+            # which do filter.
+            logger.info(
+                f"Pivot-only mode for {out_table}: applying filters only "
+                f"(LISTING), skipping CONT/MBQ/OPT_CNT"
+            )
+            lookup_warnings = _apply_post_lookups(
+                conn, out_table, hier_cols, filters_only=True
+            )
         elif is_article_grid:
             logger.info(f"Article-level grid: applying lookups but skipping CONT/MBQ/OPT_CNT for {out_table}")
             lookup_warnings = _apply_post_lookups(conn, out_table, hier_cols, skip_cont=True)
@@ -1192,7 +1452,7 @@ def list_grids(current_user: User = Depends(get_current_user)):
             SELECT id, grid_name, description, hierarchy_columns,
                    kpi_filter, output_table, status, seq,
                    created_at, updated_at,
-                   last_run_at, last_run_status, last_run_rows, last_run_error, duration_sec, pivot_only, weightage, grid_group, use_for_opt_sale
+                   last_run_at, last_run_status, last_run_rows, last_run_error, duration_sec, pivot_only, weightage, grid_group, use_for_opt_sale, sec_cap_applicable, sec_cap_pct
             FROM {GRID_TABLE}
             ORDER BY seq ASC, id ASC
         """)).fetchall()
@@ -1224,6 +1484,8 @@ def create_grid(payload: GridCreate, current_user: User = Depends(get_current_us
     _ensure_grid_table(de)
     hier_json = json.dumps(payload.hierarchy_columns)
     with de.connect() as conn:
+        # Reject MERGE_<X> grids unless an Active parent grid exists
+        _ensure_merge_parent_grid_exists(conn, payload.hierarchy_columns)
         # Validate lookup tables for this hierarchy
         warnings = _validate_lookups(conn, payload.hierarchy_columns)
         warn_msg = ("⚠ " + "; ".join(warnings)) if warnings else None
@@ -1233,13 +1495,25 @@ def create_grid(payload: GridCreate, current_user: User = Depends(get_current_us
         # If this grid is flagged use_for_opt_sale, unset any existing flag first
         if payload.use_for_opt_sale:
             conn.execute(text(f"UPDATE {GRID_TABLE} SET use_for_opt_sale = 0 WHERE ISNULL(use_for_opt_sale,0) = 1"))
+        # Sec-cap applicability — only meaningful for Secondary, non-pivot grids.
+        # Force OFF for Primary, None, or pivot_only grids regardless of what the
+        # client sent.
+        _grp = (payload.grid_group or "Primary").strip()
+        _sec_cap_app = bool(
+            payload.sec_cap_applicable
+            and _grp.lower() == "secondary"
+            and not payload.pivot_only
+        )
+        _sec_cap_pct = payload.sec_cap_pct if _sec_cap_app else None
         conn.execute(text(f"""
             INSERT INTO {GRID_TABLE}
                 (grid_name, description, hierarchy_columns, kpi_filter, output_table, status, seq,
-                 last_run_error, pivot_only, weightage, grid_group, use_for_opt_sale, created_at, updated_at)
+                 last_run_error, pivot_only, weightage, grid_group, use_for_opt_sale,
+                 sec_cap_applicable, sec_cap_pct, created_at, updated_at)
             VALUES
                 (:name, :desc, :hier, :kpi, :out, :status, :seq,
-                 :warn, :ponly, :wt, :grp, :uos, GETDATE(), GETDATE())
+                 :warn, :ponly, :wt, :grp, :uos,
+                 :sca, :scp, GETDATE(), GETDATE())
         """), {
             "name":   payload.grid_name,
             "desc":   payload.description,
@@ -1253,9 +1527,12 @@ def create_grid(payload: GridCreate, current_user: User = Depends(get_current_us
             "wt":    payload.weightage or 1.0,
             "grp":   payload.grid_group or "Primary",
             "uos":   1 if payload.use_for_opt_sale else 0,
+            "sca":   1 if _sec_cap_app else 0,
+            "scp":   _sec_cap_pct,
         })
         conn.commit()
     _ensure_hierarchy_table(de)  # sync hierarchy table after new grid
+    _populate_merge_columns(de)  # re-derive MERGE_<X> columns from parent + ARS_MERGE_RULES
     return APIResponse(success=True, message=f"Grid '{payload.grid_name}' created.",
                        data={"grid_name": payload.grid_name, "warnings": warnings})
 
@@ -1277,6 +1554,8 @@ def update_grid(grid_id: int, payload: GridUpdate, current_user: User = Depends(
     if payload.weightage         is not None: sets.append("weightage=:wt");               params["wt"]                = payload.weightage
     if payload.grid_group        is not None: sets.append("grid_group=:grp");             params["grp"]               = payload.grid_group
     if payload.use_for_opt_sale  is not None: sets.append("use_for_opt_sale=:uos");       params["uos"]               = 1 if payload.use_for_opt_sale else 0
+    if payload.sec_cap_applicable is not None: sets.append("sec_cap_applicable=:sca");    params["sca"]               = 1 if payload.sec_cap_applicable else 0
+    if payload.sec_cap_pct       is not None: sets.append("sec_cap_pct=:scp");            params["scp"]               = payload.sec_cap_pct
     if not sets:
         raise HTTPException(400, "No fields to update")
     sets.append("updated_at=GETDATE()")
@@ -1286,6 +1565,7 @@ def update_grid(grid_id: int, payload: GridUpdate, current_user: User = Depends(
     warnings = []
     if hier_cols:
         with de.connect() as conn:
+            _ensure_merge_parent_grid_exists(conn, hier_cols)
             warnings = _validate_lookups(conn, hier_cols)
             warn_msg = ("⚠ " + "; ".join(warnings)) if warnings else None
             sets.append("last_run_error=:warn")
@@ -1296,8 +1576,21 @@ def update_grid(grid_id: int, payload: GridUpdate, current_user: User = Depends(
         if payload.use_for_opt_sale is True:
             conn.execute(text(f"UPDATE {GRID_TABLE} SET use_for_opt_sale = 0 WHERE id <> :id AND ISNULL(use_for_opt_sale,0) = 1"), {"id": grid_id})
         conn.execute(text(f"UPDATE {GRID_TABLE} SET {', '.join(sets)} WHERE id=:id"), params)
+        # Sec-cap only meaningful for non-pivot Secondary grids — auto-zero
+        # the flag (and clear any leftover pct) whenever the row no longer
+        # qualifies, regardless of which fields the client sent.
+        conn.execute(text(f"""
+            UPDATE {GRID_TABLE}
+               SET sec_cap_applicable = 0,
+                   sec_cap_pct        = NULL
+             WHERE id = :id
+               AND (UPPER(ISNULL(grid_group,'Primary')) <> 'SECONDARY'
+                    OR ISNULL(pivot_only, 0) = 1)
+               AND (ISNULL(sec_cap_applicable, 0) = 1 OR sec_cap_pct IS NOT NULL)
+        """), {"id": grid_id})
         conn.commit()
     _ensure_hierarchy_table(de)  # sync hierarchy table after update
+    _populate_merge_columns(de)  # re-derive MERGE_<X> columns from parent + ARS_MERGE_RULES
     return APIResponse(success=True, message=f"Grid {grid_id} updated.", data={"id": grid_id, "warnings": warnings})
 
 
@@ -1324,6 +1617,7 @@ def delete_grid(grid_id: int, current_user: User = Depends(get_current_user)):
         conn.commit()
 
     _ensure_hierarchy_table(de)  # sync hierarchy table after delete
+    _populate_merge_columns(de)  # re-derive MERGE_<X> columns from parent + ARS_MERGE_RULES
     return APIResponse(success=True,
         message=f"Grid {grid_id} and table [{out_table}] deleted.",
         data={"id": grid_id, "dropped_table": out_table})
@@ -1339,7 +1633,7 @@ def run_grid(grid_id: int, current_user: User = Depends(get_current_user)):
             SELECT id, grid_name, description, hierarchy_columns,
                    kpi_filter, output_table, status, seq,
                    created_at, updated_at,
-                   last_run_at, last_run_status, last_run_rows, last_run_error, duration_sec, pivot_only, weightage, grid_group, use_for_opt_sale
+                   last_run_at, last_run_status, last_run_rows, last_run_error, duration_sec, pivot_only, weightage, grid_group, use_for_opt_sale, sec_cap_applicable, sec_cap_pct
             FROM {GRID_TABLE} WHERE id=:id
         """), {"id": grid_id}).fetchone()
 
@@ -1417,6 +1711,7 @@ def reorder_grids(body: dict, current_user: User = Depends(get_current_user)):
         conn.commit()
     # Rebuild hierarchy table column order to match new seq
     _ensure_hierarchy_table(de)
+    _populate_merge_columns(de)  # re-derive MERGE_<X> columns from parent + ARS_MERGE_RULES
     return APIResponse(success=True, message=f"Sequence updated for {len(seq_list)} grid(s)")
 
 
@@ -1523,7 +1818,7 @@ def run_all_active(
             SELECT id, grid_name, description, hierarchy_columns,
                    kpi_filter, output_table, status, seq,
                    created_at, updated_at,
-                   last_run_at, last_run_status, last_run_rows, last_run_error, duration_sec, pivot_only, weightage, grid_group, use_for_opt_sale
+                   last_run_at, last_run_status, last_run_rows, last_run_error, duration_sec, pivot_only, weightage, grid_group, use_for_opt_sale, sec_cap_applicable, sec_cap_pct
             FROM {GRID_TABLE} WHERE status='Active' ORDER BY seq ASC, id ASC
         """)).fetchall()
 
@@ -1565,12 +1860,30 @@ def run_all_active(
 
     success_count = sum(1 for r in results if r["status"] == "Success")
 
+    # Sync MSA tables to current open ARS_PEND_ALC. Grid TRUNCATE+INSERT
+    # restores PEND_ALC/STK_TTL on grids from the source, but MSA tables
+    # (ARS_MSA_TOTAL/_VAR_ART/_GEN_ART) are written by a separate flow and
+    # can drift if not refreshed. Running bootstrap here means every grid
+    # rebuild keeps MSA's PEND_QTY/FNL_Q consistent with the same source —
+    # the user's mental model: "rebuild = everything matches".
+    msa_sync = {}
+    try:
+        from app.services.pend_alc_service import bootstrap_msa_pend_sync
+        with de.connect() as _conn:
+            msa_sync = bootstrap_msa_pend_sync(_conn)
+        logger.info(
+            f"Post-grid MSA bootstrap: total={msa_sync.get('msa_total',0)} "
+            f"var={msa_sync.get('msa_var_art',0)} gen={msa_sync.get('msa_gen_art',0)}"
+        )
+    except Exception as e:
+        logger.warning(f"Post-grid bootstrap_msa_pend_sync failed (non-fatal): {e}")
+
     # Reclaim space after heavy TRUNCATE + INSERT cycle
     _shrink_db_files(de)
 
     return APIResponse(success=True,
         message=f"Run All complete: {success_count}/{len(results)} grids succeeded.",
-        data={"results": results})
+        data={"results": results, "msa_sync": msa_sync})
 
 
 # ===========================================================================

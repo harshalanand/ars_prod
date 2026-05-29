@@ -1,0 +1,145 @@
+﻿
+================================================================================
+RDC for HB52 in ALLOC_WORKING
+================================================================================
+{'RDC': 'DW01'}
+
+================================================================================
+MSA pool (ARS_MSA_VAR_ART) for HB52 RDC � TBL gen_arts in M_W_BERMUDA
+================================================================================
+row count = 148
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'SZ': '2XL', 'FNL_Q': 395.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'SZ': '3XL', 'FNL_Q': 52.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'SZ': 'L', 'FNL_Q': 585.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'SZ': 'M', 'FNL_Q': 523.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'SZ': 'S', 'FNL_Q': 98.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'SZ': 'XL', 'FNL_Q': 557.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'SZ': '2XL', 'FNL_Q': 496.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'SZ': '3XL', 'FNL_Q': 62.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'SZ': 'L', 'FNL_Q': 728.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'SZ': 'M', 'FNL_Q': 537.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'SZ': 'S', 'FNL_Q': 122.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'SZ': 'XL', 'FNL_Q': 688.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'SZ': '2XL', 'FNL_Q': 288.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'SZ': '3XL', 'FNL_Q': 40.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'SZ': 'L', 'FNL_Q': 540.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'SZ': 'M', 'FNL_Q': 410.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'SZ': 'S', 'FNL_Q': 86.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'SZ': 'XL', 'FNL_Q': 520.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'CRM', 'SZ': '2XL', 'FNL_Q': 79.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'CRM', 'SZ': 'L', 'FNL_Q': 50.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'CRM', 'SZ': 'M', 'FNL_Q': 31.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'CRM', 'SZ': 'XL', 'FNL_Q': 44.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'D_OLV_GRN', 'SZ': '2XL', 'FNL_Q': 141.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'D_OLV_GRN', 'SZ': 'L', 'FNL_Q': 28.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'D_OLV_GRN', 'SZ': 'M', 'FNL_Q': 52.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'D_OLV_GRN', 'SZ': 'S', 'FNL_Q': 0.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'D_OLV_GRN', 'SZ': 'XL', 'FNL_Q': 92.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'M_BEG', 'SZ': '2XL', 'FNL_Q': 152.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'M_BEG', 'SZ': 'L', 'FNL_Q': 70.0}
+{'RDC': 'DW01', 'GEN_ART_NUMBER': '1115095399', 'CLR': 'M_BEG', 'SZ': 'M', 'FNL_Q': 66.0}
+
+================================================================================
+Aggregated FNL_Q per TBL (GEN_ART,CLR) for HB52 RDC
+================================================================================
+{'GEN_ART_NUMBER': '1115095397', 'CLR': 'L_GRY', 'total_fnl_q': 2633.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115109110', 'CLR': 'M_BEG', 'total_fnl_q': 2600.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109113', 'CLR': 'M_KHK', 'total_fnl_q': 2600.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115108429', 'CLR': 'D_OLV_GRN', 'total_fnl_q': 2512.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115109119', 'CLR': 'LT_PST', 'total_fnl_q': 2400.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109210', 'CLR': 'AQUA', 'total_fnl_q': 2395.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115109121', 'CLR': 'LT_PST', 'total_fnl_q': 2300.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115095397', 'CLR': 'D_BL', 'total_fnl_q': 2210.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115109122', 'CLR': 'M_OLV_GRN', 'total_fnl_q': 2200.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109209', 'CLR': 'D_BRW', 'total_fnl_q': 2195.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115109201', 'CLR': 'M_BL', 'total_fnl_q': 2139.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115109216', 'CLR': 'O_WHT', 'total_fnl_q': 1900.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115095397', 'CLR': 'M_GRY', 'total_fnl_q': 1884.0, 'sz_rows': 6}
+{'GEN_ART_NUMBER': '1115109120', 'CLR': 'D_GRY', 'total_fnl_q': 1830.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109107', 'CLR': 'L_GRY', 'total_fnl_q': 1437.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109107', 'CLR': 'L_OLV_GRN', 'total_fnl_q': 1416.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109107', 'CLR': 'M_PST', 'total_fnl_q': 1189.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115108447', 'CLR': 'L_OLV_GRN', 'total_fnl_q': 1000.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115109107', 'CLR': 'S_BL', 'total_fnl_q': 899.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109203', 'CLR': 'O_WHT', 'total_fnl_q': 896.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115109115', 'CLR': 'AQUA', 'total_fnl_q': 808.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109189', 'CLR': 'L_GRY', 'total_fnl_q': 665.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115109204', 'CLR': 'STL_GRY', 'total_fnl_q': 535.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115109206', 'CLR': 'BLK', 'total_fnl_q': 463.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109188', 'CLR': 'L_BL', 'total_fnl_q': 451.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115095399', 'CLR': 'M_BEG', 'total_fnl_q': 445.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109205', 'CLR': 'LT_PST', 'total_fnl_q': 330.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115095399', 'CLR': 'D_OLV_GRN', 'total_fnl_q': 313.0, 'sz_rows': 5}
+{'GEN_ART_NUMBER': '1115108426', 'CLR': 'M_KHK', 'total_fnl_q': 233.0, 'sz_rows': 3}
+{'GEN_ART_NUMBER': '1115108634', 'CLR': 'L_BEG', 'total_fnl_q': 224.0, 'sz_rows': 4}
+{'GEN_ART_NUMBER': '1115109153', 'CLR': 'D_OLV_GRN', 'total_fnl_q': 214.0, 'sz_rows': 3}
+{'GEN_ART_NUMBER': '1115095399', 'CLR': 'CRM', 'total_fnl_q': 204.0, 'sz_rows': 4}
+
+================================================================================
+ALLOC_WORKING FNL_Q for TBL OPTs in HB52/M_W_BERMUDA
+================================================================================
+rows=147
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_BL', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 395.0, 'FNL_Q_REM': 389.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_BL', 'SZ': '3XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 52.0, 'FNL_Q_REM': 50.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_BL', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 585.0, 'FNL_Q_REM': 572.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_BL', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 523.0, 'FNL_Q_REM': 513.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_BL', 'SZ': 'S', 'OPT_TYPE': 'TBL', 'FNL_Q': 98.0, 'FNL_Q_REM': 93.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_BL', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 557.0, 'FNL_Q_REM': 546.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'L_GRY', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 496.0, 'FNL_Q_REM': 488.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'L_GRY', 'SZ': '3XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 62.0, 'FNL_Q_REM': 59.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'L_GRY', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 728.0, 'FNL_Q_REM': 710.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'L_GRY', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 537.0, 'FNL_Q_REM': 523.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'L_GRY', 'SZ': 'S', 'OPT_TYPE': 'TBL', 'FNL_Q': 122.0, 'FNL_Q_REM': 117.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'L_GRY', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 688.0, 'FNL_Q_REM': 675.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'M_GRY', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 288.0, 'FNL_Q_REM': 283.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'M_GRY', 'SZ': '3XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 40.0, 'FNL_Q_REM': 38.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'M_GRY', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 540.0, 'FNL_Q_REM': 531.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'M_GRY', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 410.0, 'FNL_Q_REM': 400.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'M_GRY', 'SZ': 'S', 'OPT_TYPE': 'TBL', 'FNL_Q': 86.0, 'FNL_Q_REM': 81.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'M_GRY', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 520.0, 'FNL_Q_REM': 510.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'CRM', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 79.0, 'FNL_Q_REM': 72.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'CRM', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 50.0, 'FNL_Q_REM': 39.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'CRM', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 31.0, 'FNL_Q_REM': 23.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'CRM', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 44.0, 'FNL_Q_REM': 36.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'D_OLV_GRN', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 141.0, 'FNL_Q_REM': 138.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'D_OLV_GRN', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 28.0, 'FNL_Q_REM': 15.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'D_OLV_GRN', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 52.0, 'FNL_Q_REM': 43.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'D_OLV_GRN', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 92.0, 'FNL_Q_REM': 80.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'M_BEG', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 152.0, 'FNL_Q_REM': 146.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'M_BEG', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 70.0, 'FNL_Q_REM': 58.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'M_BEG', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 66.0, 'FNL_Q_REM': 55.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095399, 'CLR': 'M_BEG', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 157.0, 'FNL_Q_REM': 147.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108426, 'CLR': 'M_KHK', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 14.0, 'FNL_Q_REM': 10.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108426, 'CLR': 'M_KHK', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 62.0, 'FNL_Q_REM': 62.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108426, 'CLR': 'M_KHK', 'SZ': 'S', 'OPT_TYPE': 'TBL', 'FNL_Q': 157.0, 'FNL_Q_REM': 156.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108429, 'CLR': 'D_OLV_GRN', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 448.0, 'FNL_Q_REM': 443.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108429, 'CLR': 'D_OLV_GRN', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 663.0, 'FNL_Q_REM': 647.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108429, 'CLR': 'D_OLV_GRN', 'SZ': 'M', 'OPT_TYPE': 'TBL', 'FNL_Q': 727.0, 'FNL_Q_REM': 713.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108429, 'CLR': 'D_OLV_GRN', 'SZ': 'S', 'OPT_TYPE': 'TBL', 'FNL_Q': 371.0, 'FNL_Q_REM': 367.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108429, 'CLR': 'D_OLV_GRN', 'SZ': 'XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 303.0, 'FNL_Q_REM': 286.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108447, 'CLR': 'L_OLV_GRN', 'SZ': '2XL', 'OPT_TYPE': 'TBL', 'FNL_Q': 114.0, 'FNL_Q_REM': 99.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115108447, 'CLR': 'L_OLV_GRN', 'SZ': 'L', 'OPT_TYPE': 'TBL', 'FNL_Q': 301.0, 'FNL_Q_REM': 266.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+
+================================================================================
+ALLOC_WORKING FNL_Q for TBC OPTs (working, for comparison)
+================================================================================
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_GRY', 'SZ': '2XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 330.0, 'FNL_Q_REM': 312.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_GRY', 'SZ': '3XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 2.0, 'FNL_Q_REM': 0.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'NO_POOL_MSA'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_GRY', 'SZ': 'L', 'OPT_TYPE': 'TBC', 'FNL_Q': 442.0, 'FNL_Q_REM': 419.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'ALREADY_STOCKED'}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_GRY', 'SZ': 'M', 'OPT_TYPE': 'TBC', 'FNL_Q': 327.0, 'FNL_Q_REM': 309.0, 'POOL_CONSUMED': 4.0, 'SHIP_QTY': 4.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_GRY', 'SZ': 'S', 'OPT_TYPE': 'TBC', 'FNL_Q': 55.0, 'FNL_Q_REM': 50.0, 'POOL_CONSUMED': 1.0, 'SHIP_QTY': 1.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115095397, 'CLR': 'D_GRY', 'SZ': 'XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 441.0, 'FNL_Q_REM': 419.0, 'POOL_CONSUMED': 4.0, 'SHIP_QTY': 4.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'BLK', 'SZ': '2XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 137.0, 'FNL_Q_REM': 128.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'ALREADY_STOCKED'}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'BLK', 'SZ': 'L', 'OPT_TYPE': 'TBC', 'FNL_Q': 111.0, 'FNL_Q_REM': 95.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'BLK', 'SZ': 'M', 'OPT_TYPE': 'TBC', 'FNL_Q': 121.0, 'FNL_Q_REM': 105.0, 'POOL_CONSUMED': 5.0, 'SHIP_QTY': 5.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'BLK', 'SZ': 'S', 'OPT_TYPE': 'TBC', 'FNL_Q': 42.0, 'FNL_Q_REM': 36.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'BLK', 'SZ': 'XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 219.0, 'FNL_Q_REM': 211.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_GRY', 'SZ': '2XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 92.0, 'FNL_Q_REM': 87.0, 'POOL_CONSUMED': 0.0, 'SHIP_QTY': 0.0, 'SKIP_REASON': 'ALREADY_STOCKED'}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_GRY', 'SZ': '3XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 8.0, 'FNL_Q_REM': 3.0, 'POOL_CONSUMED': 1.0, 'SHIP_QTY': 1.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_GRY', 'SZ': 'L', 'OPT_TYPE': 'TBC', 'FNL_Q': 80.0, 'FNL_Q_REM': 60.0, 'POOL_CONSUMED': 3.0, 'SHIP_QTY': 3.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_GRY', 'SZ': 'M', 'OPT_TYPE': 'TBC', 'FNL_Q': 108.0, 'FNL_Q_REM': 87.0, 'POOL_CONSUMED': 4.0, 'SHIP_QTY': 4.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_GRY', 'SZ': 'S', 'OPT_TYPE': 'TBC', 'FNL_Q': 32.0, 'FNL_Q_REM': 19.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_GRY', 'SZ': 'XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 112.0, 'FNL_Q_REM': 96.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_OLV_GRN', 'SZ': '2XL', 'OPT_TYPE': 'TBC', 'FNL_Q': 99.0, 'FNL_Q_REM': 91.0, 'POOL_CONSUMED': 2.0, 'SHIP_QTY': 2.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_OLV_GRN', 'SZ': 'L', 'OPT_TYPE': 'TBC', 'FNL_Q': 58.0, 'FNL_Q_REM': 47.0, 'POOL_CONSUMED': 4.0, 'SHIP_QTY': 4.0, 'SKIP_REASON': ''}
+{'GEN_ART_NUMBER': 1115108418, 'CLR': 'D_OLV_GRN', 'SZ': 'M', 'OPT_TYPE': 'TBC', 'FNL_Q': 42.0, 'FNL_Q_REM': 25.0, 'POOL_CONSUMED': 5.0, 'SHIP_QTY': 5.0, 'SKIP_REASON': ''}

@@ -624,6 +624,9 @@ def pend_alc_bdc_generate(
     try:
         # Resolve store list — explicit override > schedule > all
         import datetime
+        import time as _t
+        _t0 = _t.perf_counter()
+
         store_filter: Optional[List[str]] = None
         if st_cd_list:
             store_filter = [s.strip() for s in st_cd_list if s and s.strip()]
@@ -663,8 +666,12 @@ def pend_alc_bdc_generate(
         from app.api.v1.endpoints.bdc import _get_next_allocation_no
         allocation_no = _get_next_allocation_no(_engine())
 
+        # ----- PHASE 1: READ-ONLY aggregation -----
+        # Done OUTSIDE the write transaction with WITH (NOLOCK) so concurrent
+        # /pend-alc/* readers (Reconciliation page, MSA sync, dashboard tiles)
+        # never block on Generate BDC. RCSI + the new covering index
+        # IX_ARS_PEND_ALC_bdc_lookup turn this into a seek.
         with _engine().connect() as conn:
-            ensure_pend_alc_table(conn)
             rows = conn.execute(text(f"""
                 SELECT RDC,
                        ISNULL(ST_CD,'')          AS ST_CD,
@@ -678,33 +685,42 @@ def pend_alc_bdc_generate(
                 ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
             """), params).fetchall()
 
-            if not rows:
-                raise HTTPException(404, "No open pending rows found for BDC")
+        if not rows:
+            raise HTTPException(404, "No open pending rows found for BDC")
+        _t_read = _t.perf_counter()
 
+        # ----- PHASE 2: SHORT write transaction -----
+        # Stamp + insert history + log operation in one quick connection;
+        # release the connection before Excel build to free up the pool and
+        # release any IX/X locks on ARS_PEND_ALC as soon as possible.
+        article_rdc = [
+            {"rdc": r[0], "st_cd": r[1], "article_number": r[2]}
+            for r in rows
+        ]
+        history_rows_input = [
+            {"rdc": r[0], "st_cd": r[1], "article_number": r[2],
+             "maj_cat": r[3], "bdc_qty": float(r[4] or 0)}
+            for r in rows
+        ]
+        total_qty = sum(float(r[4] or 0) for r in rows)
+        username = getattr(current_user, "username", None)
+
+        with _engine().connect() as conn:
             # Stamp BDC_QTY ONLY on the exact (RDC, ST_CD, ARTICLE) rows that
             # went into this BDC file. Scoping by all 3 keys is critical when
             # the user picks a date/store subset — otherwise BDC_QTY would
             # also get stamped on rows for stores that were NOT in the file.
-            article_rdc = [
-                {"rdc": r[0], "st_cd": r[1], "article_number": r[2]}
-                for r in rows
-            ]
             stamped_deltas = stamp_bdc_qty(conn, article_rdc)
 
             # Append one history row per (RDC, ST_CD, ARTICLE) line in this BDC.
             history_ids = insert_bdc_history(
                 conn,
                 allocation_number=allocation_no,
-                rows=[
-                    {"rdc": r[0], "st_cd": r[1], "article_number": r[2],
-                     "maj_cat": r[3], "bdc_qty": float(r[4] or 0)}
-                    for r in rows
-                ],
-                created_by=getattr(current_user, "username", None),
+                rows=history_rows_input,
+                created_by=username,
             )
 
             # Log the operation so it can be reverted later.
-            total_qty = sum(float(r[4] or 0) for r in rows)
             log_operation(
                 conn,
                 op_type="BDC",
@@ -719,29 +735,59 @@ def pend_alc_bdc_generate(
                         f"date={file_date_str}",
                 rows_affected=len(rows),
                 qty_total=total_qty,
-                created_by=getattr(current_user, "username", None),
+                created_by=username,
             )
+        _t_write = _t.perf_counter()
 
-        # Build Excel in BDC Creation 9-column format
-        df = pd.DataFrame([
-            {
-                "Serial No":         i + 1,
-                "Allocation Date":   today_str,
-                "Allocation Number": allocation_no,
-                "VENDOR":            str(r[0] or "").strip(),
-                "MATERIAL NO":       str(r[2] or "").strip().lstrip("0"),
-                "BDC-QTY":           int(r[4] or 0),
-                "RECEIVING STORE":   str(r[1] or "").strip(),
-                "Picking Date":      today_str,
-                "Remark":            "",
-            }
-            for i, r in enumerate(rows)
-        ])
-
+        # ----- PHASE 3: Build the Excel AFTER the DB connection is closed -----
+        # xlsxwriter in constant_memory mode streams rows to disk instead of
+        # holding the whole workbook in RAM (the openpyxl default) — 5-10x
+        # faster for ~100k-row BDC files.
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="BDC")
+        try:
+            import xlsxwriter
+            wb = xlsxwriter.Workbook(buf, {"in_memory": True, "constant_memory": True})
+            ws = wb.add_worksheet("BDC")
+            headers = ["Serial No", "Allocation Date", "Allocation Number",
+                       "VENDOR", "MATERIAL NO", "BDC-QTY", "RECEIVING STORE",
+                       "Picking Date", "Remark"]
+            for c, h in enumerate(headers):
+                ws.write(0, c, h)
+            for i, r in enumerate(rows, start=1):
+                ws.write(i, 0, i)
+                ws.write(i, 1, today_str)
+                ws.write(i, 2, allocation_no)
+                ws.write(i, 3, str(r[0] or "").strip())
+                ws.write(i, 4, str(r[2] or "").strip().lstrip("0"))
+                ws.write(i, 5, int(r[4] or 0))
+                ws.write(i, 6, str(r[1] or "").strip())
+                ws.write(i, 7, today_str)
+                ws.write(i, 8, "")
+            wb.close()
+        except ImportError:
+            # Fallback to openpyxl if xlsxwriter ever goes missing
+            df = pd.DataFrame([
+                {"Serial No": i + 1, "Allocation Date": today_str,
+                 "Allocation Number": allocation_no,
+                 "VENDOR": str(r[0] or "").strip(),
+                 "MATERIAL NO": str(r[2] or "").strip().lstrip("0"),
+                 "BDC-QTY": int(r[4] or 0),
+                 "RECEIVING STORE": str(r[1] or "").strip(),
+                 "Picking Date": today_str, "Remark": ""}
+                for i, r in enumerate(rows)
+            ])
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="BDC")
         buf.seek(0)
+        _t_xls = _t.perf_counter()
+
+        logger.info(
+            f"[bdc-generate] {allocation_no}: rows={len(rows)} "
+            f"read={_t_read - _t0:.2f}s "
+            f"write={_t_write - _t_read:.2f}s "
+            f"xlsx={_t_xls - _t_write:.2f}s "
+            f"total={_t_xls - _t0:.2f}s"
+        )
 
         fname = f"ARS_BDC_{datetime.date.today().strftime('%Y%m%d')}_{allocation_no}.xlsx"
         return StreamingResponse(
