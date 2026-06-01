@@ -27,7 +27,7 @@ from sqlalchemy import text
 from loguru import logger
 
 from app.database.session import get_data_engine
-from app.security.dependencies import get_current_user
+from app.security.dependencies import get_current_user, RequireRoles
 from app.models.rbac import User
 from app.utils.db_helpers import (
     run_sql, table_exists, get_columns, msa_expr, msa_col,
@@ -106,6 +106,14 @@ class GenerateRequest(BaseModel):
     rl_mj_req_cap_pct:  float = 100.0
     tbc_mj_req_cap_pct: float = 100.0
     tbl_mj_req_cap_pct: float = 100.0
+    # Per-OPT_TYPE MBQ caps (Decision 4-B). Anchored to MJ_MBQ_ORIG, NOT the
+    # post-growth MJ_MBQ_REV — so unchecking the "Use Default 100% (MBQ)" box
+    # surfaces independent ceilings for RL / TBC / TBL on the *original* budget.
+    # Defaults 100 = no cap (engine's _stage_c_apply_mbq_cap treats 0 as
+    # disabled and ≥100 as headroom; we use 100 = no over-ship vs original MBQ).
+    rl_mbq_cap_pct:  float = 100.0
+    tbc_mbq_cap_pct: float = 100.0
+    tbl_mbq_cap_pct: float = 100.0
     # MJ_MBQ growth headroom (Allocation Gate).  100 = strict (waterfall stops
     # at the MAJ_CAT target, current default).  >100 scales MJ_MBQ to a
     # SIBLING column MJ_MBQ_REV — the original MJ_MBQ is preserved untouched —
@@ -303,6 +311,9 @@ _SETTING_DEFAULTS = {
     "rl_mj_req_cap_pct": "100.0",
     "tbc_mj_req_cap_pct": "100.0",
     "tbl_mj_req_cap_pct": "100.0",
+    "rl_mbq_cap_pct": "100.0",
+    "tbc_mbq_cap_pct": "100.0",
+    "tbl_mbq_cap_pct": "100.0",
     "mj_req_growth_pct": "100.0",
     "allow_multi_parked": "false",
 }
@@ -355,6 +366,48 @@ def save_listing_settings(body: dict, current_user: User = Depends(get_current_u
     return {"success": True, "data": body}
 
 
+# ── Parking mode (admin-only) ────────────────────────────────────────────────
+# The Single/Multiple parking toggle was moved out of ListingPage into the
+# Settings page (Application tab).  Only SUPER_ADMIN / ADMIN can flip it;
+# regular users see the effective value in /listing/config but can't change
+# it.  Persisted under the same AppSettings key (`listing.allow_multi_parked`)
+# so the existing /generate guard at line ~405 keeps working unchanged — it
+# now reads the persisted setting rather than the request payload field.
+
+@router.get("/parking-mode")
+def get_parking_mode(current_user: User = Depends(get_current_user)):
+    """Return the active parking-mode setting.  Any authenticated user can read.
+    `allow_multi_parked = True` → multi-parked (new runs stack alongside
+    pending parked sessions).  False → single-parked (block new runs while a
+    session is awaiting review)."""
+    de = get_data_engine()
+    with de.connect() as conn:
+        s = _load_listing_settings(conn)
+    val = str(s.get("allow_multi_parked", "false")).lower() in ("true", "1", "yes")
+    return {"success": True, "data": {"allow_multi_parked": val}}
+
+
+@router.put("/parking-mode")
+def set_parking_mode(
+    body: dict,
+    current_user: User = Depends(RequireRoles(["ADMIN", "SUPER_ADMIN"])),
+):
+    """Admin-only: set the parking-mode setting.  Body: `{"allow_multi_parked": bool}`."""
+    raw = body.get("allow_multi_parked")
+    if raw is None:
+        raise HTTPException(status_code=400, detail="allow_multi_parked required")
+    val = bool(raw) if isinstance(raw, bool) else \
+          str(raw).lower() in ("true", "1", "yes", "on")
+    de = get_data_engine()
+    with de.connect() as conn:
+        _save_listing_settings(conn, {"allow_multi_parked": str(val).lower()})
+    logger.info(
+        f"[parking-mode] changed by {current_user.username} → "
+        f"allow_multi_parked={val}"
+    )
+    return {"success": True, "data": {"allow_multi_parked": val}}
+
+
 @router.post("/generate")
 def generate_listing(req: GenerateRequest, current_user: User = Depends(get_current_user)):
     """Build ARS_LISTING = Grid data + MSA missing options.
@@ -391,7 +444,22 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     # snapshot unrecoverable.
     # allow_multi_parked=True opts out of this guard so users can stack
     # several parked snapshots for side-by-side review.
-    if not getattr(req, "allow_multi_parked", False) and parked_history.has_pending_parked():
+    #
+    # Source of truth = AppSettings (`listing.allow_multi_parked`), managed
+    # by admins from Settings → Application.  The request-payload field is
+    # kept for backwards compatibility but ignored here — non-admins can't
+    # smuggle in `allow_multi_parked=true` via a hand-crafted call.
+    try:
+        with de.connect() as _pc:
+            _persisted = _load_listing_settings(_pc).get("allow_multi_parked", "false")
+        _allow_mp = str(_persisted).lower() in ("true", "1", "yes")
+    except Exception:
+        _allow_mp = False
+    # Reflect the persisted value back onto the request so downstream
+    # consumers (audit log, persisted-settings rewrite at line ~585) see
+    # the authoritative value.
+    req.allow_multi_parked = _allow_mp
+    if not _allow_mp and parked_history.has_pending_parked():
         raise HTTPException(
             409,
             "A parked session is awaiting review. Please approve or reject it "
@@ -569,11 +637,89 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "rl_mj_req_cap_pct": str(req.rl_mj_req_cap_pct),
                 "tbc_mj_req_cap_pct": str(req.tbc_mj_req_cap_pct),
                 "tbl_mj_req_cap_pct": str(req.tbl_mj_req_cap_pct),
+                "rl_mbq_cap_pct":  str(req.rl_mbq_cap_pct),
+                "tbc_mbq_cap_pct": str(req.tbc_mbq_cap_pct),
+                "tbl_mbq_cap_pct": str(req.tbl_mbq_cap_pct),
                 "mj_req_growth_pct": str(req.mj_req_growth_pct),
                 "allow_multi_parked": str(req.allow_multi_parked).lower(),
             })
     except Exception as e:
         logger.error(f"[generate] failed to persist listing settings: {e}")
+
+    # ── Audit log: per-run snapshot of every input parameter ───────────
+    # ARS_RUN_PARAMS_AUDIT — one row per param per run.  Lets reviewers
+    # answer "what % / I_ROD / hold-days / cap did we use last week?" in
+    # a single query, and trace param drift across days without grep'ing
+    # logs.  Idempotent: CREATE IF NOT EXISTS + bulk insert.
+    try:
+        _run_uid = session_id or preset_batch_id or f"run-{int(time.time()*1000)}"
+        _audit_rows = [
+            # LISTING params
+            ("LISTING",    "stock_threshold_pct",   str(req.stock_threshold_pct)),
+            ("LISTING",    "excess_multiplier",     str(req.excess_multiplier)),
+            ("LISTING",    "hold_days",             str(req.hold_days)),
+            ("LISTING",    "age_threshold",         str(req.age_threshold)),
+            ("LISTING",    "default_acs_d",         str(req.default_acs_d)),
+            ("LISTING",    "min_size_count",        str(req.min_size_count)),
+            ("LISTING",    "mix_mode",              str(req.mix_mode)),
+            ("LISTING",    "rdc_mode",              str(req.rdc_mode)),
+            ("LISTING",    "run_mode",              str(req.run_mode)),
+            ("LISTING",    "ssn_values",            json.dumps(req.ssn_values)),
+            # RANKING
+            ("RANKING",    "req_weight",            str(req.req_weight)),
+            ("RANKING",    "fill_weight",           str(req.fill_weight)),
+            # ALLOCATION gates
+            ("ALLOCATION", "pri_ct_check_rl",       str(req.pri_ct_check_rl).lower()),
+            ("ALLOCATION", "pri_ct_check_tbc",      str(req.pri_ct_check_tbc).lower()),
+            ("ALLOCATION", "rl_mj_req_cap_pct",     str(req.rl_mj_req_cap_pct)),
+            ("ALLOCATION", "tbc_mj_req_cap_pct",    str(req.tbc_mj_req_cap_pct)),
+            ("ALLOCATION", "tbl_mj_req_cap_pct",    str(req.tbl_mj_req_cap_pct)),
+            ("ALLOCATION", "rl_mbq_cap_pct",        str(req.rl_mbq_cap_pct)),
+            ("ALLOCATION", "tbc_mbq_cap_pct",       str(req.tbc_mbq_cap_pct)),
+            ("ALLOCATION", "tbl_mbq_cap_pct",       str(req.tbl_mbq_cap_pct)),
+            ("ALLOCATION", "mj_req_growth_pct",     str(req.mj_req_growth_pct)),
+            ("ALLOCATION", "opt_types",             json.dumps(req.opt_types)),
+            # SEC_CAP
+            ("SEC_CAP",    "apply_sec_cap_in_normal", str(req.apply_sec_cap_in_normal).lower()),
+            # FLAGS
+            ("FLAGS",      "allocation_mode",       str(req.allocation_mode)),
+            ("FLAGS",      "parallel_workers",      str(req.parallel_workers)),
+            ("FLAGS",      "use_writer_queue",      str(req.use_writer_queue)),
+            ("FLAGS",      "allow_multi_parked",    str(req.allow_multi_parked).lower()),
+        ]
+        with de.connect() as ac:
+            _run(ac, """
+                IF OBJECT_ID('ARS_RUN_PARAMS_AUDIT', 'U') IS NULL
+                CREATE TABLE [ARS_RUN_PARAMS_AUDIT] (
+                    AUDIT_ID     BIGINT IDENTITY(1,1) PRIMARY KEY,
+                    RUN_ID       NVARCHAR(128)  NOT NULL,
+                    SESSION_ID   NVARCHAR(128)  NULL,
+                    USER_ID      NVARCHAR(128)  NULL,
+                    RUN_TS       DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+                    PARAM_GROUP  NVARCHAR(32)   NOT NULL,
+                    PARAM_NAME   NVARCHAR(64)   NOT NULL,
+                    PARAM_VALUE  NVARCHAR(512)  NULL,
+                    SOURCE       NVARCHAR(16)   NOT NULL DEFAULT 'UI',
+                    INDEX IX_RUN_PARAMS_RUN     (RUN_ID),
+                    INDEX IX_RUN_PARAMS_SESSION (SESSION_ID, RUN_TS DESC)
+                )
+            """)
+            ac.execute(text("""
+                INSERT INTO [ARS_RUN_PARAMS_AUDIT]
+                    (RUN_ID, SESSION_ID, USER_ID, PARAM_GROUP, PARAM_NAME,
+                     PARAM_VALUE, SOURCE)
+                VALUES
+                    (:run_id, :session_id, :user_id, :grp, :name, :val, :src)
+            """), [
+                {"run_id": _run_uid, "session_id": session_id,
+                 "user_id": (current_user.username if current_user else None),
+                 "grp": grp, "name": pname, "val": pval, "src": "UI"}
+                for grp, pname, pval in _audit_rows
+            ])
+        logger.info(f"[audit] ARS_RUN_PARAMS_AUDIT: {len(_audit_rows)} rows for run={_run_uid}")
+    except Exception as e:
+        # Audit failure must never abort the run.
+        logger.warning(f"[audit] ARS_RUN_PARAMS_AUDIT insert failed: {e}")
 
     # ── Full pipeline: MSA calc → Grid build → Listing ──────────────
     pipeline_msg = ""
@@ -1985,55 +2131,112 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 working_rows = wc.execute(text(f"SELECT COUNT(*) FROM [{FINAL_TABLE}]")).scalar()
                 logger.info(f"{FINAL_TABLE}: {working_rows} rows (MSA_FNL_Q>0 OR HOLD_QTY>0, OPT_REQ_WH>=1, MJ_DISP_Q>0)")
 
-                # ── Allocation Gate: MJ_MBQ growth headroom ───────────────
-                # Lift the per-(WERKS, MAJ_CAT) target by scaling MJ_MBQ into
-                # a sibling MJ_MBQ_REV column (MJ_MBQ itself is NEVER mutated
-                # — kept as the immutable source-of-truth target).  MJ_REQ_REV
-                # is then re-derived from the scaled MBQ as the unfilled-
-                # portion of the new target.  When growth>100, MJ_REQ is
-                # promoted to MJ_REQ_REV so every downstream engine consumer
-                # (revalidate, OPT_MJ_REQ gate, store-broken pre-band, post-
-                # waterfall recompute) sees the new ceiling with zero code
-                # changes.  MJ_MBQ / MJ_REQ_ORIG remain visible for UI/audit.
+                # ── Allocation Gate: MBQ growth headroom (MJ + all sec-grids) ─
+                # Lift the per-(WERKS, MAJ_CAT[, extras]) target by scaling
+                # each grid's MBQ into a sibling {prefix}_MBQ_REV column.  The
+                # ORIGINAL {prefix}_MBQ value is snapshotted to {prefix}_MBQ_ORIG
+                # (first run wins) and the growth multiplier is ALWAYS applied
+                # against ORIG — so re-runs are idempotent and never compound.
+                # When growth ≠ 100, the lifted REV value is promoted into the
+                # live {prefix}_MBQ and {prefix}_REQ columns so every engine
+                # consumer (waterfall, sec-cap gate, MJ_REQ gate, store-broken
+                # pre-band, post-waterfall recompute) sees the new ceiling
+                # with zero code changes.  ORIG columns remain queryable for
+                # audit and for the MBQ-cap formulas that anchor to original
+                # (rl/tbc/tbl_mbq_cap_pct × MJ_MBQ_ORIG, Decision 4-B).
+                #
+                # Scope: MJ (always) + every active Grid Builder grid where
+                # pivot_only = 0.  Pivot-only grids skip lookups & MBQ math,
+                # so they have no _MBQ column to lift.
                 growth_pct = float(req.mj_req_growth_pct or 100.0)
-                # Always create the revised-target columns so the UI sees them
-                # consistently — at growth=100 they equal MJ_MBQ / MJ_REQ.
-                for _rev_col in ("MJ_MBQ_REV", "MJ_REQ_REV", "MJ_REQ_ORIG"):
-                    try:
-                        _run(wc, f"ALTER TABLE [{FINAL_TABLE}] ADD [{_rev_col}] FLOAT NULL")
-                    except Exception:
-                        pass  # idempotent — column may already exist
-                # Snapshot pre-scaling MJ_REQ exactly once (first run wins).
-                _run(wc, f"""
-                    UPDATE [{FINAL_TABLE}]
-                    SET [MJ_REQ_ORIG] = [MJ_REQ]
-                    WHERE [MJ_REQ_ORIG] IS NULL
-                """)
-                # MJ_MBQ_REV = MJ_MBQ × growth_pct/100 (MJ_MBQ untouched).
-                _run(wc, f"""
-                    UPDATE [{FINAL_TABLE}]
-                    SET [MJ_MBQ_REV] = ROUND(ISNULL([MJ_MBQ], 0) * {growth_pct} / 100.0, 0)
-                """)
-                # MJ_REQ_REV = MAX(0, MJ_MBQ_REV − MJ_STK_TTL).  At growth=100
-                # this equals the original MJ_REQ; above 100 it's the scaled
-                # ceiling the engine should respect.
-                _run(wc, f"""
-                    UPDATE [{FINAL_TABLE}]
-                    SET [MJ_REQ_REV] = CASE
-                        WHEN ISNULL([MJ_MBQ_REV], 0) - ISNULL([MJ_STK_TTL], 0) > 0
-                        THEN ROUND(ISNULL([MJ_MBQ_REV], 0) - ISNULL([MJ_STK_TTL], 0), 0)
-                        ELSE 0 END
-                """)
-                if growth_pct != 100.0:
-                    # Promote MJ_REQ_REV → MJ_REQ so the engine reads the
-                    # scaled ceiling.  MJ_REQ_ORIG retains the original.
+
+                # Discover the set of grid prefixes to lift. Always include MJ.
+                grid_prefixes: List[str] = ["MJ"]
+                try:
+                    grid_rows_lift = wc.execute(text("""
+                        SELECT grid_name, ISNULL(pivot_only, 0) AS po
+                        FROM [ARS_GRID_BUILDER]
+                        WHERE UPPER(status) = 'ACTIVE'
+                    """)).fetchall()
+                    for gn, po in grid_rows_lift:
+                        if int(po or 0) == 1:
+                            continue  # skip pivot-only grids
+                        p = str(gn).upper()
+                        if p.startswith("MJ_"):
+                            p = p[3:]
+                        if p and p not in grid_prefixes:
+                            grid_prefixes.append(p)
+                except Exception as _gx:
+                    logger.warning(f"grid prefix discovery for MBQ lift failed: {_gx}")
+
+                final_cols_upper = {c.upper() for c in _get_columns(wc, FINAL_TABLE)}
+                lifted_log: List[str] = []
+                for prefix in grid_prefixes:
+                    mbq_col      = f"{prefix}_MBQ"
+                    mbq_rev_col  = f"{prefix}_MBQ_REV"
+                    mbq_orig_col = f"{prefix}_MBQ_ORIG"
+                    req_col      = f"{prefix}_REQ"
+                    req_rev_col  = f"{prefix}_REQ_REV"
+                    req_orig_col = f"{prefix}_REQ_ORIG"
+                    stk_col      = f"{prefix}_STK_TTL"
+
+                    if mbq_col.upper() not in final_cols_upper:
+                        continue  # grid's MBQ column not materialised on FINAL_TABLE
+
+                    has_req = req_col.upper() in final_cols_upper
+                    has_stk = stk_col.upper() in final_cols_upper
+
+                    # Always create the audit/revised columns (idempotent).
+                    for _rev_col in (mbq_orig_col, mbq_rev_col,
+                                     req_orig_col if has_req else None,
+                                     req_rev_col  if has_req else None):
+                        if not _rev_col:
+                            continue
+                        try:
+                            _run(wc, f"ALTER TABLE [{FINAL_TABLE}] ADD [{_rev_col}] FLOAT NULL")
+                        except Exception:
+                            pass  # idempotent — column may already exist
+
+                    # Snapshot original MBQ (one-time per session).
                     _run(wc, f"""
-                        UPDATE [{FINAL_TABLE}] SET [MJ_REQ] = [MJ_REQ_REV]
+                        UPDATE [{FINAL_TABLE}]
+                        SET [{mbq_orig_col}] = [{mbq_col}]
+                        WHERE [{mbq_orig_col}] IS NULL
                     """)
+                    if has_req:
+                        _run(wc, f"""
+                            UPDATE [{FINAL_TABLE}]
+                            SET [{req_orig_col}] = [{req_col}]
+                            WHERE [{req_orig_col}] IS NULL
+                        """)
+
+                    # Lift: REV = ORIG × growth_pct/100 (always reads ORIG, never REV → idempotent).
+                    _run(wc, f"""
+                        UPDATE [{FINAL_TABLE}]
+                        SET [{mbq_rev_col}] = ROUND(ISNULL([{mbq_orig_col}], 0) * {growth_pct} / 100.0, 0)
+                    """)
+                    if has_req and has_stk:
+                        _run(wc, f"""
+                            UPDATE [{FINAL_TABLE}]
+                            SET [{req_rev_col}] = CASE
+                                WHEN ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0) > 0
+                                THEN ROUND(ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0), 0)
+                                ELSE 0 END
+                        """)
+
+                    # Promote: lifted MBQ → live column, only when growth ≠ 100.
+                    if growth_pct != 100.0:
+                        _run(wc, f"UPDATE [{FINAL_TABLE}] SET [{mbq_col}] = [{mbq_rev_col}]")
+                        if has_req:
+                            _run(wc, f"UPDATE [{FINAL_TABLE}] SET [{req_col}] = [{req_rev_col}]")
+                        lifted_log.append(prefix)
+
+                if growth_pct != 100.0:
                     logger.info(
-                        f"{FINAL_TABLE}: MJ_MBQ × {growth_pct}% → MJ_MBQ_REV; "
-                        f"MJ_REQ_REV recomputed from scaled MBQ; "
-                        f"MJ_REQ promoted to MJ_REQ_REV (MJ_REQ_ORIG preserved)"
+                        f"{FINAL_TABLE}: MBQ × {growth_pct}% (lifted from ORIG) — "
+                        f"prefixes: {lifted_log or ['(none)']}; "
+                        f"_MBQ_REV / _REQ_REV materialised; "
+                        f"_MBQ_ORIG / _REQ_ORIG preserved for caps & audit"
                     )
                 else:
                     logger.info(
@@ -2247,9 +2450,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
                 pri_ct_check_tbc=req.pri_ct_check_tbc,
-                rl_mbq_cap_pct=_growth,
-                tbc_mbq_cap_pct=_growth,
-                tbl_mbq_cap_pct=_growth,
+                rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+                tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
+                tbl_mbq_cap_pct=req.tbl_mbq_cap_pct,
                 rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
                 tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
                 tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,
@@ -2270,9 +2473,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     min_size_count=req.min_size_count,
                     pri_ct_check_rl=req.pri_ct_check_rl,
                     pri_ct_check_tbc=req.pri_ct_check_tbc,
-                    rl_mbq_cap_pct=_growth,
-                    tbc_mbq_cap_pct=_growth,
-                    tbl_mbq_cap_pct=_growth,
+                    rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+                    tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
+                    tbl_mbq_cap_pct=req.tbl_mbq_cap_pct,
                     rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
                     tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
                     tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,

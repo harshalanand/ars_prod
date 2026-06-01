@@ -108,7 +108,23 @@
       "Bash(./venv/Scripts/python.exe -c ' *)",
       "Bash(node --check frontend/src/services/api.js)",
       "Bash(node --check frontend/src/pages/GapReportPage.jsx)",
-      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(fs.readFileSync\\('src/pages/AlcReviewPage.jsx','utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\('OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")"
+      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(fs.readFileSync\\('src/pages/AlcReviewPage.jsx','utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\('OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")",
+      "Bash(npm install *)",
+      "Bash(npm list *)",
+      "PowerShell(New-Item -ItemType Directory -Force D:\\\\ARS_PROD\\\\ars_prod\\\\frontend\\\\public\\\\docs\\\\process)",
+      "Bash(npm run *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://localhost:3001/docs/process/overview.md)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://localhost:3001/docs/process/variables.md)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://localhost:3001/docs/process/missing.md)",
+      "Bash(curl -s http://localhost:3001/process/overview -o /tmp/spa.html)",
+      "Bash(curl -s -o /dev/null -w \"ProcessPage: %{http_code}\\\\n\" \"http://localhost:3001/src/pages/ProcessPage.jsx\")",
+      "Bash(curl -s -o /dev/null -w \"Sidebar:     %{http_code}\\\\n\" \"http://localhost:3001/src/components/layout/Sidebar.jsx\")",
+      "Bash(curl -s -o /dev/null -w \"App:         %{http_code}\\\\n\" \"http://localhost:3001/src/App.jsx\")",
+      "Bash(curl -s \"http://localhost:3001/src/pages/ProcessPage.jsx\")",
+      "Bash(curl -s -o /dev/null http://localhost:3001/)",
+      "Bash(curl -s -o /dev/null http://localhost:3000/)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(powershell.exe -NoProfile -Command 'Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500; \\(Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Measure-Object\\).Count')"
     ]
   }
 }
