@@ -459,13 +459,28 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     # consumers (audit log, persisted-settings rewrite at line ~585) see
     # the authoritative value.
     req.allow_multi_parked = _allow_mp
+    # Admin bypass: ADMIN / SUPER_ADMIN can already flip Parking Mode in
+    # Settings → Application, so the "ask an admin" 409 message is hostile
+    # when an admin hits the guard themselves.  Skip the guard for them and
+    # log the bypass so the audit trail records who overrode it.
+    _user_roles = set(getattr(current_user, "role_codes", []) or [])
+    _is_admin_bypass = bool(_user_roles.intersection({"ADMIN", "SUPER_ADMIN"}))
     if not _allow_mp and parked_history.has_pending_parked():
-        raise HTTPException(
-            409,
-            "A parked session is awaiting review. Please approve or reject it "
-            "from the Parked Runs page before generating a new one, or enable "
-            "'Allow multiple parked' to stack snapshots."
-        )
+        if _is_admin_bypass:
+            logger.warning(
+                f"[generate] parked-session guard bypassed by admin "
+                f"{getattr(current_user, 'username', None)} "
+                f"(role_codes={sorted(_user_roles)}) — a parked session is "
+                f"awaiting review but the run was admitted anyway."
+            )
+        else:
+            raise HTTPException(
+                409,
+                "A parked session is awaiting review. Please approve or reject it "
+                "from the Parked Runs page before generating a new one. If you "
+                "need to stack multiple parked snapshots, ask an admin to switch "
+                "Parking Mode to 'Multiple' under Settings → Application."
+            )
 
     session_id = make_session_id()
     user_name  = getattr(current_user, "username", None)
