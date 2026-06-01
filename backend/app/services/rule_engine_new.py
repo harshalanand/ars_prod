@@ -199,6 +199,8 @@ def run_listing_and_allocation(
         _apply_sec_grid_cap_pre_gate(
             conn, alloc_table, working_table, _all_grids_main,
             opt_type=None,
+            growth_pct=mj_req_growth_pct,
+            include_primary=True,
         )
 
     # OPT-grain MJ_REQ gate — full-OPT-or-skip semantics replace the old
@@ -1711,11 +1713,18 @@ def _stage_c_apply_mbq_cap(conn, alloc_table: str, working_table: str,
     ALLOC_STATUS='SKIPPED', SKIP_REASON='MBQ_CAP'.
     Only used by sequential mode — pandas mode applies the cap inline in _run_band."""
     _ensure_alloc_remarks_col(conn, alloc_table)
+    # Decision 4-B: MBQ caps anchor to MJ_MBQ_ORIG (the pre-growth budget) so
+    # the slider is independent of the growth lift. COALESCE to MJ_MBQ for
+    # backwards compatibility on deployments where MJ_MBQ_ORIG hasn't been
+    # populated yet (legacy ARS_LISTING_WORKING_FINAL without the snapshot).
+    _wcols_upper = {c.upper() for c in _cols(conn, working_table)}
+    _mbq_orig_sql = ("COALESCE(W.MJ_MBQ_ORIG, W.MJ_MBQ, 0)"
+                     if "MJ_MBQ_ORIG" in _wcols_upper else "ISNULL(W.MJ_MBQ, 0)")
     try:
         _run(conn, f"""
             ;WITH Budget AS (
                 SELECT W.WERKS, W.MAJ_CAT,
-                       ISNULL(MAX(ISNULL(W.MJ_MBQ,0)) * :cap / 100.0
+                       ISNULL(MAX({_mbq_orig_sql}) * :cap / 100.0
                               - MAX(ISNULL(W.MJ_STK_TTL,0)), 0) AS budget
                 FROM [{working_table}] W
                 WHERE W.LISTED_FLAG = 1
@@ -1750,21 +1759,27 @@ def _stage_c_apply_mbq_cap(conn, alloc_table: str, working_table: str,
                    A.SKIP_REASON  = CASE
                        WHEN O.cum_ship - O.SHIP_QTY >= O.budget
                             THEN 'MBQ_CAP_' + :ot_name
-                            + '(cap_pct=' + CAST(:cap_pct_dbg AS NVARCHAR(20)) + ')'
+                            + '(cap=' + CAST(CAST(:cap_pct_dbg AS INT) AS NVARCHAR(8)) + '%)'
                        ELSE A.SKIP_REASON END,
                    A.ALLOC_REMARKS = CASE
                        WHEN O.cum_ship - O.SHIP_QTY >= O.budget
                             THEN ISNULL(A.ALLOC_REMARKS,'')
-                                + ' MBQ_CAP_HIT(opt_type=' + :ot_name
-                                + ', cap_pct=' + CAST(:cap_pct_dbg AS NVARCHAR(20))
-                                + ', cum_ship=' + CAST(O.cum_ship   AS NVARCHAR(20))
-                                + ', budget='   + CAST(O.budget     AS NVARCHAR(20))
-                                + ', trim_row=' + CAST(O.SHIP_QTY   AS NVARCHAR(20))
+                                + ' MBQ_CAP_HIT(why="' + :ot_name
+                                + ' OPT_TYPE total already at the cap_pct%xMJ_MBQ_ORIG ceiling — row trimmed to 0"'
+                                + ', opt_type=' + :ot_name
+                                + ', anchor=MJ_MBQ_ORIG'
+                                + ', cap='     + CAST(CAST(:cap_pct_dbg AS INT) AS NVARCHAR(8)) + '%'
+                                + ', cum_ship='+ CAST(O.cum_ship   AS NVARCHAR(20))
+                                + ', budget='  + CAST(O.budget     AS NVARCHAR(20))
+                                + ', trim='    + CAST(O.SHIP_QTY   AS NVARCHAR(20))
                                 + ');'
                        WHEN O.cum_ship > O.budget
                             THEN ISNULL(A.ALLOC_REMARKS,'')
-                                + ' MBQ_CAP_PARTIAL(opt_type=' + :ot_name
-                                + ', cap_pct=' + CAST(:cap_pct_dbg AS NVARCHAR(20))
+                                + ' MBQ_CAP_PARTIAL(why="row partially trimmed — '
+                                + :ot_name + ' cumulative crossed cap_pct%xMJ_MBQ_ORIG mid-row"'
+                                + ', opt_type=' + :ot_name
+                                + ', anchor=MJ_MBQ_ORIG'
+                                + ', cap='     + CAST(CAST(:cap_pct_dbg AS INT) AS NVARCHAR(8)) + '%'
                                 + ', kept='    + CAST(O.budget - (O.cum_ship - O.SHIP_QTY) AS NVARCHAR(20))
                                 + ', trimmed=' + CAST(O.SHIP_QTY - (O.budget - (O.cum_ship - O.SHIP_QTY)) AS NVARCHAR(20))
                                 + ');'
@@ -1877,21 +1892,23 @@ def _stage_c_apply_opt_mj_req_cap(conn, alloc_table: str, working_table: str,
                    A.SKIP_REASON  = CASE
                        WHEN O.cum_ship - O.SHIP_QTY >= O.budget
                             THEN :ot + '_MJ_REQ_CAP'
-                                + '(cap_pct=' + CAST(:cap_pct_dbg AS NVARCHAR(20)) + ')'
+                                + '(cap=' + CAST(CAST(:cap_pct_dbg AS INT) AS NVARCHAR(8)) + '%)'
                        ELSE A.SKIP_REASON END,
                    A.ALLOC_REMARKS = CASE
                        WHEN O.cum_ship - O.SHIP_QTY >= O.budget
                             THEN ISNULL(A.ALLOC_REMARKS,'')
-                                + ' ' + :ot + '_MJ_REQ_CAP_HIT(cap_pct='
-                                + CAST(:cap_pct_dbg AS NVARCHAR(20))
-                                + ', cum_ship=' + CAST(O.cum_ship AS NVARCHAR(20))
-                                + ', budget='   + CAST(O.budget   AS NVARCHAR(20))
-                                + ', trim_row=' + CAST(O.SHIP_QTY AS NVARCHAR(20))
+                                + ' ' + :ot + '_MJ_REQ_CAP_HIT(why="' + :ot
+                                + ' OPT_TYPE total already at cap_pct%xMJ_REQ ceiling — row trimmed to 0"'
+                                + ', cap='     + CAST(CAST(:cap_pct_dbg AS INT) AS NVARCHAR(8)) + '%'
+                                + ', cum_ship='+ CAST(O.cum_ship AS NVARCHAR(20))
+                                + ', budget='  + CAST(O.budget   AS NVARCHAR(20))
+                                + ', trim='    + CAST(O.SHIP_QTY AS NVARCHAR(20))
                                 + ');'
                        WHEN O.cum_ship > O.budget
                             THEN ISNULL(A.ALLOC_REMARKS,'')
-                                + ' ' + :ot + '_MJ_REQ_CAP_PARTIAL(cap_pct='
-                                + CAST(:cap_pct_dbg AS NVARCHAR(20))
+                                + ' ' + :ot + '_MJ_REQ_CAP_PARTIAL(why="row partially trimmed — '
+                                + :ot + ' cumulative crossed cap_pct%xMJ_REQ mid-row"'
+                                + ', cap='     + CAST(CAST(:cap_pct_dbg AS INT) AS NVARCHAR(8)) + '%'
                                 + ', kept='    + CAST(O.budget - (O.cum_ship - O.SHIP_QTY) AS NVARCHAR(20))
                                 + ', trimmed=' + CAST(O.SHIP_QTY - (O.budget - (O.cum_ship - O.SHIP_QTY)) AS NVARCHAR(20))
                                 + ');'
@@ -3310,6 +3327,8 @@ def _apply_sec_grid_cap_pre_gate(
     working_table: str,
     all_grids: Dict[str, Dict],
     opt_type: Optional[str] = None,
+    growth_pct: float = 100.0,
+    include_primary: bool = False,
 ) -> Dict[str, Any]:
     """
     Secondary-grid PRE-GATE cap (main pass, May-2026 redesign).
@@ -3363,7 +3382,10 @@ def _apply_sec_grid_cap_pre_gate(
     Returns audit dict: {mode, cap_pct, grids_evaluated, opts_blocked,
     units_blocked, blocks_by_grid}.
     """
-    cap_pct = SEC_CAP_DEFAULT_PCT
+    # Decision 2: effective cap = max(SEC_CAP_DEFAULT_PCT, growth_pct).
+    # Growth REPLACES the 130% baseline when it's larger — caps don't stack.
+    # At growth=100 → cap_pct=130 (unchanged); growth=150 → cap_pct=150.
+    cap_pct = max(SEC_CAP_DEFAULT_PCT, float(growth_pct or 0.0))
     cap_factor = cap_pct / 100.0
 
     _ensure_alloc_remarks_col(conn, alloc_table)
@@ -3377,32 +3399,53 @@ def _apply_sec_grid_cap_pre_gate(
     sec_grids: List[tuple] = []
     skipped_not_applicable: List[str] = []
     for g_name, meta in all_grids.items():
-        if str(meta.get("group", "")).strip().lower() != "secondary":
+        grid_group = str(meta.get("group", "")).strip().lower()
+        # When include_primary=True, MJ (Primary) participates alongside the
+        # Secondary grids — the gate enforces the cap on the MAJ_CAT total
+        # too (Decision: cap on all grids when sec-cap toggle is on).  The
+        # MJ grid's hierarchy is just [MAJ_CAT] so it falls through the
+        # "no extras" guard below; we handle it as a special case.
+        is_primary_mj = (g_name.upper() == "MJ")
+        if grid_group != "secondary" and not (include_primary and is_primary_mj):
             continue
         # Per-grid opt-in flag from ARS_GRID_BUILDER.sec_cap_applicable.
         # Grids with the flag OFF are NOT iterated by the cap. Backfill on
         # first deploy sets the flag OFF for every existing row, so this
         # path becomes the default until operators opt in grid-by-grid.
-        if not meta.get("sec_cap_applicable"):
+        # Exception: MJ always participates when include_primary=True
+        # (it is hardcoded sec_cap_applicable=False in _discover_all_active_grids).
+        if not meta.get("sec_cap_applicable") and not (include_primary and is_primary_mj):
             skipped_not_applicable.append(g_name)
             continue
         mbq = meta.get("mbq_col", "") or ""
         extras = list(meta.get("extras") or [])
         gh_col = meta.get("gh_col", "") or ""
-        if not extras or not mbq:
+        if not mbq:
             continue
         if mbq.upper() not in work_cols:
+            continue
+        # MJ has no extras — its grain is just (WERKS, MAJ_CAT).  Other
+        # grids need at least one extra column (FAB, MICRO_MVGR, …) to be
+        # meaningful — without extras the cap collapses to MJ.
+        if not is_primary_mj and not extras:
             continue
         grid_keys = ["WERKS", "MAJ_CAT"] + extras
         if not all(k.upper() in work_cols  for k in grid_keys): continue
         if not all(k.upper() in alloc_cols for k in grid_keys): continue
         # Per-grid cap %: meta["sec_cap_pct"] if set, else fall back to the
-        # global SEC_CAP_DEFAULT_PCT.
+        # global cap_pct (max(SEC_CAP_DEFAULT_PCT, growth_pct)).
         grid_pct = meta.get("sec_cap_pct")
         grid_factor = (float(grid_pct) / 100.0) if grid_pct else cap_factor
+        # Anchor the cap to {prefix}_MBQ_ORIG (pre-growth) when present, so
+        # the gate respects "growth replaces 130%, doesn't stack".  Engine
+        # falls back to live MBQ on legacy deployments without ORIG.
+        mbq_orig = f"{meta.get('prefix','')}_MBQ_ORIG" if meta.get("prefix") else ""
+        anchor_col = mbq_orig if mbq_orig and mbq_orig.upper() in work_cols else mbq
         sec_grids.append((g_name, {
-            "mbq":        mbq,
+            "mbq":        anchor_col,        # budget reads ORIG → post-growth-stable
+            "mbq_live":   mbq,               # kept for diagnostics
             "extras":     extras,
+            "is_primary": is_primary_mj,
             "gh_col":     gh_col if gh_col.upper() in work_cols else None,
             "cap_factor": grid_factor,
             "cap_pct":    float(grid_pct) if grid_pct else cap_pct,
@@ -3639,18 +3682,21 @@ def _apply_sec_grid_cap_pre_gate(
                 intended_val  FLOAT         NULL,
                 budget_val    FLOAT         NULL,
                 opt_req_val   FLOAT         NULL,
-                opt_mbq_val   FLOAT         NULL
+                opt_mbq_val   FLOAT         NULL,
+                cap_pct_val   FLOAT         NULL
         """)
 
         insert_sql = text("""
             INSERT INTO #sec_cap_pre_decisions
                 (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE,
                  decision, blocking_grid, running_val, intended_val, budget_val,
-                 opt_req_val, opt_mbq_val)
+                 opt_req_val, opt_mbq_val, cap_pct_val)
             VALUES (:w, :m, :g, :c, :o, :dec, :grid, :run, :int_v, :bud,
-                    :req, :mbq)
+                    :req, :mbq, :cap)
         """)
         params: List[Dict[str, Any]] = []
+        # Resolve per-grid cap_pct so the REMARKS can say e.g. "cap=130%".
+        cap_pct_by_grid = audit.get("cap_pct_by_grid", {}) or {}
         for (w, mj, gn, cv, ov, grid, rv, iv, bv) in blocked:
             params.append({
                 "w": w, "m": mj, "g": int(gn) if gn is not None else None,
@@ -3658,6 +3704,7 @@ def _apply_sec_grid_cap_pre_gate(
                 "dec": "BLOCK", "grid": grid,
                 "run": float(rv), "int_v": float(iv), "bud": float(bv),
                 "req": 0.0, "mbq": 0.0,
+                "cap": float(cap_pct_by_grid.get(grid, cap_pct)),
             })
         for (w, mj, gn, cv, ov, grid, rv, iv, bv, rq, mq) in overridden:
             params.append({
@@ -3666,11 +3713,15 @@ def _apply_sec_grid_cap_pre_gate(
                 "dec": "OVERRIDE", "grid": grid,
                 "run": float(rv), "int_v": float(iv), "bud": float(bv),
                 "req": float(rq), "mbq": float(mq),
+                "cap": float(cap_pct_by_grid.get(grid, cap_pct)),
             })
         if params:
             conn.execute(insert_sql, params)
 
         # Blocked: zero SHIP/ALLOC, stamp SKIPPED + SEC_CAP_PRE_<grid> reason.
+        # SKIP_REASON: short categorical (grouped for filtering / dashboards).
+        # ALLOC_REMARKS: human-readable narrative — why blocked + every number
+        # the reviewer needs (cap %, running, intended, budget, overflow).
         if blocked:
             _run(conn, f"""
                 UPDATE A SET
@@ -3680,13 +3731,19 @@ def _apply_sec_grid_cap_pre_gate(
                     A.SKIP_REASON = CASE
                         WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
                              THEN 'SEC_CAP_PRE_' + B.blocking_grid
+                                  + '(cap=' + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%)'
                         ELSE A.SKIP_REASON END,
                     A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS, '')
-                        + ' SEC_CAP_PRE_BLOCK(grid=' + B.blocking_grid
-                        + ', running='  + CAST(B.running_val  AS NVARCHAR(20))
-                        + ', intended=' + CAST(B.intended_val AS NVARCHAR(20))
-                        + ', budget='   + CAST(B.budget_val   AS NVARCHAR(20))
-                        + ');'
+                        + ' SEC_CAP_PRE_BLOCK(why="OPT would push grid '
+                        + B.blocking_grid + ' over its sec-cap ceiling"'
+                        + ', grid='        + B.blocking_grid
+                        + ', cap='         + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%'
+                        + ', before_ship=' + CAST(B.running_val  AS NVARCHAR(20))
+                        + ', opt_ship='    + CAST(B.intended_val AS NVARCHAR(20))
+                        + ', would_total=' + CAST(B.running_val + B.intended_val AS NVARCHAR(20))
+                        + ', budget='      + CAST(B.budget_val   AS NVARCHAR(20))
+                        + ', exceeded_by=' + CAST((B.running_val + B.intended_val) - B.budget_val AS NVARCHAR(20))
+                        + ', no_override=true);'
                 FROM [{alloc_table}] A
                 INNER JOIN #sec_cap_pre_decisions B
                     ON  A.WERKS = B.WERKS
@@ -3698,16 +3755,21 @@ def _apply_sec_grid_cap_pre_gate(
             """)
 
         # Overridden: keep SHIP, append diagnostic remark only.
+        # Plain-English "why" explains the high-demand bypass rule.
         if overridden:
             _run(conn, f"""
                 UPDATE A SET
                     A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS, '')
-                        + ' SEC_CAP_PRE_OVERRIDE(grid=' + B.blocking_grid
-                        + ', running='  + CAST(B.running_val  AS NVARCHAR(20))
-                        + ', intended=' + CAST(B.intended_val AS NVARCHAR(20))
-                        + ', budget='   + CAST(B.budget_val   AS NVARCHAR(20))
-                        + ', opt_req='  + CAST(B.opt_req_val  AS NVARCHAR(20))
-                        + ', opt_mbq='  + CAST(B.opt_mbq_val  AS NVARCHAR(20))
+                        + ' SEC_CAP_PRE_OVERRIDE(why="high-demand OPT bypassed sec-cap'
+                        + ' (OPT_REQ >= '
+                        + CAST(CAST({SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT} AS INT) AS NVARCHAR(8))
+                        + '% x OPT_MBQ)"'
+                        + ', grid='        + B.blocking_grid
+                        + ', cap='         + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%'
+                        + ', would_total=' + CAST(B.running_val + B.intended_val AS NVARCHAR(20))
+                        + ', budget='      + CAST(B.budget_val   AS NVARCHAR(20))
+                        + ', opt_req='     + CAST(B.opt_req_val  AS NVARCHAR(20))
+                        + ', opt_mbq='     + CAST(B.opt_mbq_val  AS NVARCHAR(20))
                         + ');'
                 FROM [{alloc_table}] A
                 INNER JOIN #sec_cap_pre_decisions B

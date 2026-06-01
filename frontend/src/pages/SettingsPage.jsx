@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Settings, Database, Mail, Palette, Shield, Server, Check, AlertCircle, AlertTriangle, RefreshCw, Send, Save, HardDrive, Trash2, Download, Play, Users, Cpu, Clock, Table2, Eye, Upload, FileDown, Edit3 } from 'lucide-react'
-import { settingsAPI, tablesAPI, maintenanceAPI } from '@/services/api'
+import { settingsAPI, tablesAPI, maintenanceAPI, listingAPI } from '@/services/api'
+import useAuthStore from '@/store/authStore'
 import toast from 'react-hot-toast'
 
 const tabs = [
@@ -28,6 +29,15 @@ export default function SettingsPage() {
   const [creatingBackup, setCreatingBackup] = useState(false)
   const [backupsLoading, setBackupsLoading] = useState(false)
 
+  // Parking mode (admin-only) — Single / Multiple parked sessions.
+  // Persisted server-side under AppSettings `listing.allow_multi_parked`.
+  // The toggle on the Listing page was removed in favour of this setting,
+  // so only ADMIN / SUPER_ADMIN can flip it.
+  const isAdmin = useAuthStore(s => s.isSuperAdmin?.() || s.hasRole?.('ADMIN'))
+  const [parkingMultiple, setParkingMultiple] = useState(false)
+  const [parkingLoading, setParkingLoading] = useState(false)
+  const [parkingSaving, setParkingSaving] = useState(false)
+
   // Danger Zone — transactional reset
   const [resetIncludeMsa, setResetIncludeMsa] = useState(false)
   const [resetPreview, setResetPreview] = useState(null)
@@ -48,7 +58,42 @@ export default function SettingsPage() {
     if (activeTab === 'danger') {
       loadResetPreview(resetIncludeMsa)
     }
+    if (activeTab === 'application') {
+      loadParkingMode()
+    }
   }, [activeTab])
+
+  const loadParkingMode = async () => {
+    setParkingLoading(true)
+    try {
+      const { data } = await listingAPI.getParkingMode()
+      setParkingMultiple(!!data?.data?.allow_multi_parked)
+    } catch (e) {
+      // Read is open to any user — surface unexpected errors only.
+      console.warn('parking-mode load failed', e)
+    } finally {
+      setParkingLoading(false)
+    }
+  }
+
+  const handleParkingChange = async (next) => {
+    if (!isAdmin) {
+      toast.error('Only admins can change the parking mode.')
+      return
+    }
+    setParkingSaving(true)
+    const prev = parkingMultiple
+    setParkingMultiple(next)  // optimistic
+    try {
+      await listingAPI.setParkingMode(next)
+      toast.success(`Parking mode → ${next ? 'Multiple' : 'Single'}`)
+    } catch (e) {
+      setParkingMultiple(prev)  // revert on failure
+      toast.error(e.response?.data?.detail || 'Failed to update parking mode')
+    } finally {
+      setParkingSaving(false)
+    }
+  }
 
   const loadResetPreview = async (includeMsa = resetIncludeMsa) => {
     setResetPreviewLoading(true)
@@ -605,6 +650,52 @@ export default function SettingsPage() {
                   />
                   <span className="text-sm text-gray-700">Enable Row-Level Security</span>
                 </label>
+              </div>
+
+              {/* Parking mode — admin-only. Moved here from the Listing page. */}
+              <div className="pt-4 border-t">
+                <div className="flex items-center justify-between gap-4 flex-wrap">
+                  <div>
+                    <div className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+                      <Shield size={14} className="text-amber-600"/> Parking Mode
+                      {!isAdmin && (
+                        <span className="text-xs font-normal text-gray-500 italic">
+                          (admin only — read-only for you)
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-gray-500 mt-0.5 max-w-xl">
+                      Controls whether new listing runs are blocked while a parked session is awaiting review.
+                      &nbsp;<b>Single</b> (default) — block until the pending parked session is approved/rejected.
+                      &nbsp;<b>Multiple</b> — allow new runs to stack alongside pending parked sessions.
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {[['single', 'Single', false], ['multi', 'Multiple', true]].map(([v, l, val]) => {
+                      const on = val === !!parkingMultiple
+                      return (
+                        <button
+                          key={v}
+                          type="button"
+                          disabled={!isAdmin || parkingLoading || parkingSaving}
+                          onClick={() => handleParkingChange(val)}
+                          className={
+                            'px-3 py-1.5 text-xs font-semibold rounded border transition ' +
+                            (on
+                              ? 'bg-amber-100 text-amber-800 border-amber-500'
+                              : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50') +
+                            (!isAdmin ? ' opacity-60 cursor-not-allowed' : '')
+                          }
+                        >
+                          {l}
+                        </button>
+                      )
+                    })}
+                    {(parkingLoading || parkingSaving) && (
+                      <span className="text-xs text-gray-400">…</span>
+                    )}
+                  </div>
+                </div>
               </div>
 
               <div className="flex justify-end pt-4 border-t">

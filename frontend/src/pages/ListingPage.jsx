@@ -592,6 +592,11 @@ export default function ListingPage() {
   // MBQ cap — active only when the corresponding PRI gate is OFF (unchecked).
   // Prevents over-allocation: total SHIP_QTY per store ≤ cap% of MJ_MBQ.
   // TBL has no MJ-cap (removed 2026-05-16) — bounded only by SZ_REQ.
+  // Per-OPT_TYPE dispatch caps (Decision 4-B). Anchored to MJ_MBQ_ORIG on
+  // the backend.  Defaults follow Grid MBQ Growth % automatically — these
+  // state values are ONLY consulted when the corresponding PRI ≥ 100%
+  // toggle is ON (the field surfaces inline next to that toggle).  TBL
+  // has no PRI toggle and always inherits growth %.
   const [rlMbqCapPct,  setRlMbqCapPct]  = useState(110)
   const [tbcMbqCapPct, setTbcMbqCapPct] = useState(110)
   // MJ_MBQ growth headroom (Allocation Gate).  Slider value applies only
@@ -1053,6 +1058,20 @@ export default function ListingPage() {
         pri_ct_check_tbc: !!priCheckTBC,
         // Checkbox forces strict 100%; otherwise the slider value applies.
         mj_req_growth_pct: mbqGrowthUseDefault ? 100 : (parseFloat(mjReqGrowthPct) || 100),
+        // Per-OPT_TYPE dispatch caps.  PRI ≥ 100% toggle action:
+        //   • PRI ≥ 100% (RL) ON  → RL cap = Grid MBQ Growth % (default)
+        //   • PRI ≥ 100% (RL) OFF → RL cap = user-set "RL Dispatch Cap %" slider
+        //   • Same for TBC
+        //   • TBL has no PRI toggle and ALWAYS tracks growth (default)
+        // The Dispatch Cap slider is rendered only when the PRI toggle is
+        // OFF — that's the path that actually consumes its value.
+        rl_mbq_cap_pct:  priCheckRL
+          ? (mbqGrowthUseDefault ? 100 : (parseFloat(mjReqGrowthPct) || 100))
+          : (parseFloat(rlMbqCapPct)  || 100),
+        tbc_mbq_cap_pct: priCheckTBC
+          ? (mbqGrowthUseDefault ? 100 : (parseFloat(mjReqGrowthPct) || 100))
+          : (parseFloat(tbcMbqCapPct) || 100),
+        tbl_mbq_cap_pct: mbqGrowthUseDefault ? 100 : (parseFloat(mjReqGrowthPct) || 100),
         allocation_mode: allocationMode,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
         use_writer_queue: useWriterQueue,
@@ -1235,29 +1254,6 @@ export default function ListingPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  // ── Live summary refresh — every 8s while a run is active, else 30s ─
-  // Keeps Total Alloc Qty / Total Hold Qty / KPI tiles ticking forward in
-  // step with allocations as MAJ_CATs complete. Faster cadence while a job
-  // is in flight so the user sees progress; slower cadence when idle.
-  // Both polls run in quiet mode — transient timeouts mid-Generate must
-  // not toast "Failed to load config" at the user every 8 seconds.
-  const summaryPollRef = useRef(null)
-  useEffect(() => {
-    const isLive = generating || !!activeJob
-                || (allocProgress && (allocProgress.pending > 0 || allocProgress.in_progress > 0))
-    const tick = () => {
-      loadSummary({ quiet: true })
-      loadConfig({ quiet: true })
-    }
-    summaryPollRef.current = setInterval(tick, isLive ? 8000 : 30000)
-    return () => {
-      if (summaryPollRef.current) {
-        clearInterval(summaryPollRef.current)
-        summaryPollRef.current = null
-      }
-    }
-  }, [generating, activeJob, allocProgress, loadSummary, loadConfig])
 
   // ── 1s ticker so "updated Xs ago" stays live without extra fetches ─
   useEffect(() => {
@@ -1694,35 +1690,15 @@ export default function ListingPage() {
                   </>
                 )}
               </div>
-              {/* Parking mode — single (block while parked pending) vs multiple (stack). */}
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px',
-                background: '#fff', border: `1px solid ${C.cardBorder}`,
-                borderRadius: 8, height: 38,
-              }} title={allowMultiParked
-                ? 'Multi-parked: new runs stack alongside pending parked sessions.'
-                : 'Single-parked (default): new runs blocked until pending parked session is approved/rejected.'}>
-                <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
-                  textTransform: 'uppercase', letterSpacing: 0.4 }}>Parking</span>
-                {[['single','Single'],['multi','Multiple']].map(([v, l]) => {
-                  const on = (v === 'multi') === !!allowMultiParked
-                  return (
-                    <button key={v} type="button"
-                      onClick={() => setAllowMultiParked(v === 'multi')}
-                      style={{ height: 26, padding: '0 9px', fontSize: 10, fontWeight: 600,
-                        borderRadius: 5, cursor: 'pointer',
-                        border: on ? `1.5px solid ${C.amber || '#d97706'}` : `1px solid ${C.cardBorder}`,
-                        background: on ? '#fef3c7' : '#fff',
-                        color: on ? '#92400e' : C.textSub }}>{l}</button>
-                  )
-                })}
-              </div>
+              {/* Parking mode moved to Settings → Application (admin-only).
+                  `allowMultiParked` is still loaded from /listing/config and
+                  read by the run-block logic below. */}
               {(() => {
                 const parkedBlocks = parkedRuns.length > 0 && !allowMultiParked
                 return (
                   <button onClick={handleGenerate}
                     disabled={parkedBlocks}
-                    title={parkedBlocks ? 'A parked session is awaiting review — approve/reject it or switch Parking to Multiple' : undefined}
+                    title={parkedBlocks ? 'A parked session is awaiting review — approve/reject it, or ask an admin to switch Parking to Multiple in Settings → Application' : undefined}
                     style={{ height: 38, borderRadius: 8, fontSize: 13, fontWeight: 700, color: '#fff', padding: '0 22px',
                       cursor: parkedBlocks ? 'not-allowed' : 'pointer',
                       background: parkedBlocks ? '#94a3b8' : runMode === 'full' ? 'linear-gradient(135deg, #7c3aed, #9333ea)' : 'linear-gradient(135deg, #4f46e5, #7c3aed)',
@@ -2416,19 +2392,33 @@ export default function ListingPage() {
           <ParamGroup title="Allocation Gates" color={C.green}>
             <ToggleRow checked={priCheckRL}  setChecked={setPriCheckRL}
               label="PRI ≥ 100% (RL)"  color="#0891b2"
-              hint="When ON, RL options must have PRI_CT% ≥ 100 to be listed/allocated"/>
+              hint={priCheckRL
+                ? `ON — RL listed only if PRI_CT% ≥ 100; cap = Grid Growth (${mbqGrowthUseDefault ? 100 : mjReqGrowthPct}%)`
+                : `OFF — RL cap = user-set Dispatch Cap (${rlMbqCapPct}%)`}/>
+            {!priCheckRL && (
+              <ParamInput label="RL Dispatch Cap %" value={rlMbqCapPct} setter={setRlMbqCapPct} step={5} min={50} max={200}
+                hint={`Ship up to ${rlMbqCapPct}% × MJ_MBQ_ORIG`}
+                tip="When PRI ≥ 100% (RL) is OFF, this caps the total RL SHIP_QTY at cap% × MJ_MBQ_ORIG per (WERKS, MAJ_CAT). When the toggle is ON, the RL cap follows the Grid MBQ Growth % (default) instead."/>
+            )}
             <ToggleRow checked={priCheckTBC} setChecked={setPriCheckTBC}
               label="PRI ≥ 100% (TBC)" color="#0891b2"
-              hint="When ON, TBC options must have PRI_CT% ≥ 100 to be listed/allocated"/>
+              hint={priCheckTBC
+                ? `ON — TBC listed only if PRI_CT% ≥ 100; cap = Grid Growth (${mbqGrowthUseDefault ? 100 : mjReqGrowthPct}%)`
+                : `OFF — TBC cap = user-set Dispatch Cap (${tbcMbqCapPct}%)`}/>
+            {!priCheckTBC && (
+              <ParamInput label="TBC Dispatch Cap %" value={tbcMbqCapPct} setter={setTbcMbqCapPct} step={5} min={50} max={200}
+                hint={`Ship up to ${tbcMbqCapPct}% × MJ_MBQ_ORIG`}
+                tip="When PRI ≥ 100% (TBC) is OFF, this caps the total TBC SHIP_QTY at cap% × MJ_MBQ_ORIG per (WERKS, MAJ_CAT). When the toggle is ON, the TBC cap follows the Grid MBQ Growth % (default) instead."/>
+            )}
             <ToggleRow checked={mbqGrowthUseDefault} setChecked={setMbqGrowthUseDefault}
               label="Use Default 100% (MBQ)" color={C.green}
               hint={mbqGrowthUseDefault
                 ? "strict cap — MBQ growth disabled"
-                : `MJ_MBQ → MJ_MBQ_REV at ${mjReqGrowthPct}%`}/>
+                : `All non-pivot grid MBQs → *_MBQ_REV at ${mjReqGrowthPct}% (per MAJ_CAT)`}/>
             {!mbqGrowthUseDefault && (
-              <ParamInput label="MJ_MBQ Growth %" value={mjReqGrowthPct} setter={setMjReqGrowthPct} step={5} min={100} max={200}
-                hint={`+${mjReqGrowthPct - 100}% headroom`}
-                tip="Scale MJ_MBQ to MJ_MBQ_REV (the original MJ_MBQ stays untouched). MJ_REQ_REV is re-derived as MAX(0, MJ_MBQ_REV − MJ_STK_TTL). Engine consumes MJ_REQ_REV via MJ_REQ for the allocation ceiling. Original MJ_REQ kept in MJ_REQ_ORIG."/>
+              <ParamInput label="Grid MBQ Growth %" value={mjReqGrowthPct} setter={setMjReqGrowthPct} step={5} min={100} max={200}
+                hint={`+${mjReqGrowthPct - 100}% headroom (all grids); RL/TBC/TBL caps inherit this %`}
+                tip="Scale every non-pivot grid's MBQ to *_MBQ_REV per MAJ_CAT (MJ + FAB + MICRO_MVGR + M_VND_CD + RNG_SEG …). Multiplier reads *_MBQ_ORIG so re-runs never compound. *_REQ_REV is re-derived as MAX(0, MBQ_REV − STK_TTL); engine consumes the lifted columns via *_MBQ / *_REQ. Sec-cap automatically widens to max(130%, growth%). Per-OPT_TYPE dispatch caps follow this %; override per OPT_TYPE only via the PRI ≥ 100% toggles above."/>
             )}
             <ToggleRow checked={enableMinSize} setChecked={setEnableMinSize}
               label="Min sizes for TBL" color="#7c3aed"
