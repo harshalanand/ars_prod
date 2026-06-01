@@ -54,6 +54,7 @@ const PTDashboardPage        = lazy(() => import('@/pages/pt/PTDashboardPage'))
 const PTProjectsPage         = lazy(() => import('@/pages/pt/PTProjectsPage'))
 const PTProjectDetailPage    = lazy(() => import('@/pages/pt/PTProjectDetailPage'))
 const PTMyTasksPage          = lazy(() => import('@/pages/pt/PTMyTasksPage'))
+const ProcessPage            = lazy(() => import('@/pages/ProcessPage'))
 
 function PageLoader() {
   return (
@@ -137,6 +138,9 @@ export default function App() {
         <Route path="data-prep/lookup-art-master" element={<ProtectedRoute permission="LOOKUP_VIEW"><LookupArtMasterPage /></ProtectedRoute>} />
         <Route path="data-prep/listing" element={<ErrorBoundary><ListingPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />
+        {/* Process docs — in-app explanation of Listing + Allocation pipeline */}
+        <Route path="process"             element={<Navigate to="/process/overview" replace />} />
+        <Route path="process/:slug"       element={<ErrorBoundary><ProcessPage /></ErrorBoundary>} />
         {/* Project Tracker */}
         <Route path="pt"                   element={<ErrorBoundary><PTDashboardPage /></ErrorBoundary>} />
         <Route path="pt/projects"          element={<ErrorBoundary><PTProjectsPage /></ErrorBoundary>} />

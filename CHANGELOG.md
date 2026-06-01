@@ -1,5 +1,38 @@
 # ARS Changelog
 
+## 2026-06-01 — Grid-wide MBQ growth, cap pinning, sec-cap on Primary, audit log
+
+### Allocation gate (multi-grid MBQ lift)
+- **`listing.py`** — growth no longer scales only `MJ_MBQ`.  The "Use Default 100% (MBQ)" toggle, when OFF, now lifts every non-pivot grid's `_MBQ` (MJ + FAB + MICRO_MVGR + MACRO_MVGR + M_VND_CD + RNG_SEG + any custom grid where `ARS_GRID_BUILDER.pivot_only = 0`).  Multiplier reads `*_MBQ_ORIG` (snapshot taken first-run-wins) so re-runs never compound.  Lifted values are promoted into the live `*_MBQ` / `*_REQ` columns when growth ≠ 100; ORIG columns remain queryable for audit and for the MBQ-cap formulas.
+- **Per-MAJ_CAT grain is automatic** — each grid's hierarchy already includes `WERKS, MAJ_CAT` (+ extras like FAB/MICRO_MVGR), so the lift partitions naturally by MAJ_CAT.
+
+### MBQ-cap pinning (Decision 4-B)
+- **`rule_engine_new.py :: _stage_c_apply_mbq_cap`** — anchors to `MJ_MBQ_ORIG` (the pre-growth budget) via `COALESCE(W.MJ_MBQ_ORIG, W.MJ_MBQ, 0)`.  Legacy deployments without the snapshot fall back to live `MJ_MBQ`.
+- **`rule_engine_pandas.py :: _build_mbq_budget` / `_live_mbq_budget`** — same anchor, with column-presence fallback.
+- **`listing.py` request schema** — added `rl_mbq_cap_pct`, `tbc_mbq_cap_pct`, `tbl_mbq_cap_pct` (default 100).  The orchestrator no longer hard-codes these to `mj_req_growth_pct` — they flow through from the UI.
+- **`ListingPage.jsx`** — per-OPT_TYPE caps follow the PRI ≥ 100% toggle state.  When PRI is ON (strict listing gate), the cap = `mj_req_growth_pct` (default).  When PRI is OFF, an inline "Dispatch Cap %" slider surfaces next to the toggle and the user-set value becomes the cap.  TBL has no PRI toggle and always tracks growth.  Payload: `rl_mbq_cap_pct = priCheckRL ? mj_req_growth_pct : rlMbqCapPct`; same shape for TBC; TBL inherits growth unconditionally.
+
+### Sec-cap (Decision 2 + Primary inclusion)
+- **`rule_engine_new.py :: _apply_sec_grid_cap_pre_gate`** — accepts `growth_pct` and `include_primary`.  Effective cap = `max(SEC_CAP_DEFAULT_PCT, growth_pct)` — replace, not stack.  Budget reads `{prefix}_MBQ_ORIG` so growth doesn't compound through the cap.  When `include_primary=True` (callers set this when `apply_sec_cap_in_normal=True`), the MJ Primary grid is also gated.
+- **`rule_engine_pandas.py`** — pre-gate call passes the two new arguments.
+
+### Remarks clarity (why + numbers)
+- **`SEC_CAP_PRE_BLOCK`** — `ALLOC_REMARKS` now includes a plain-English `why="..."` field plus `cap=NN%`, `before_ship`, `opt_ship`, `would_total`, `budget`, `exceeded_by`, `no_override=true`.  `SKIP_REASON` carries the cap %: `SEC_CAP_PRE_<grid>(cap=130%)`.
+- **`SEC_CAP_PRE_OVERRIDE`** — the high-demand bypass remark is now self-documenting: `why="high-demand OPT bypassed sec-cap (OPT_REQ >= 100% x OPT_MBQ)"`.
+- **`MBQ_CAP_HIT` / `MBQ_CAP_PARTIAL`** — added `why=...`, `anchor=MJ_MBQ_ORIG`, `cap=NN%`; renamed `cap_pct=` → `cap=NN%` for brevity.
+- **`*_MJ_REQ_CAP_HIT` / `*_MJ_REQ_CAP_PARTIAL`** — same enrichment.
+
+### Run-input audit log
+- **`ARS_RUN_PARAMS_AUDIT`** — new table, created on first use of `/listing/generate`.  ~28 rows per run capturing every input parameter (LISTING, RANKING, ALLOCATION, SEC_CAP, FLAGS) with `RUN_ID`, `USER_ID`, `RUN_TS`.  Sample queries in `frontend/public/docs/process/variables.md §10`.
+
+### Docs
+- `frontend/public/docs/process/sec-cap.md` — replace-not-stack formula, MJ inclusion, worked example rebuilt around the pre-gate (running totals).
+- `frontend/public/docs/process/listing-build.md` — multi-grid lift block (SQL + idempotency note).
+- `frontend/public/docs/process/variables.md` — `MJ_MBQ_ORIG/REV` columns documented; FAQ updated; new §10 for `ARS_RUN_PARAMS_AUDIT`.
+- `frontend/public/docs/process/overview.md` — sec-cap section rewritten with the new effective-cap formula and MJ-inclusion note.
+
+---
+
 ## 2026-05-20 — Corrections
 
 ### Rule engine (allocation)

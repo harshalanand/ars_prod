@@ -297,6 +297,11 @@ export const listingAPI = {
   allocPreview: (params) => api.get('/listing/alloc-preview', { params }),
   finalPreview: (params) => api.get('/listing/final/preview', { params }),
   saveSettings: (data)   => api.post('/listing/settings', data),
+  // Parking-mode (Single / Multiple parked sessions).  Read any user;
+  // write requires ADMIN / SUPER_ADMIN.  Surfaced in Settings → Application.
+  getParkingMode: () => api.get('/listing/parking-mode'),
+  setParkingMode: (allow_multi_parked) =>
+    api.put('/listing/parking-mode', { allow_multi_parked: !!allow_multi_parked }),
   // Parallel allocation: live progress, manual retry, recent batches.
   allocProgress: (batchId) => api.get('/listing/alloc-progress', { params: { batch_id: batchId }, ..._POLL }),
   retryFailed:   (data)    => api.post('/listing/retry-failed', data, { timeout: 600000 }),
