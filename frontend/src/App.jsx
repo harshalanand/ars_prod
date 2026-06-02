@@ -24,6 +24,18 @@ const ContribPresetsPage     = lazy(() => import('@/pages/ContribPresetsPage'))
 const ContribMappingsPage    = lazy(() => import('@/pages/ContribMappingsPage'))
 const ContribExecutePage     = lazy(() => import('@/pages/ContribExecutePage'))
 const ContribReviewPage      = lazy(() => import('@/pages/ContribReviewPage'))
+// Auto Cont % — SQL-direct pipeline (placeholders during rollout, superadmin-only)
+const AutoContPresetsPage    = lazy(() => import('@/pages/AutoContPresetsPage'))
+const AutoContMappingsPage   = lazy(() => import('@/pages/AutoContMappingsPage'))
+const AutoContExecutePage    = lazy(() => import('@/pages/AutoContExecutePage'))
+const AutoContJobsPage       = lazy(() => import('@/pages/AutoContJobsPage'))
+const AutoContReviewPage     = lazy(() => import('@/pages/AutoContReviewPage'))
+// ALC_Fixture — MSA-STK Allocation Engine (blueprint v1.0, superadmin-only during rollout)
+const AlcFixtureTunablesPage  = lazy(() => import('@/pages/AlcFixtureTunablesPage'))
+const AlcFixtureExecutePage   = lazy(() => import('@/pages/AlcFixtureExecutePage'))
+const AlcFixtureReviewPage    = lazy(() => import('@/pages/AlcFixtureReviewPage'))
+const AlcFixtureDashboardPage = lazy(() => import('@/pages/AlcFixtureDashboardPage'))
+const AlcFixtureJobsPage      = lazy(() => import('@/pages/AlcFixtureJobsPage'))
 const JobsDashboardPage      = lazy(() => import('@/pages/JobsDashboardPage'))
 const StoreStockPage         = lazy(() => import('@/pages/StoreStockPage'))
 const GridBuilderPage        = lazy(() => import('@/pages/GridBuilderPage'))
@@ -90,9 +102,12 @@ class ErrorBoundary extends Component {
   }
 }
 
-function ProtectedRoute({ children, permission }) {
-  const { isAuthenticated, hasPermission } = useAuthStore()
+function ProtectedRoute({ children, permission, superadminOnly }) {
+  const { isAuthenticated, hasPermission, isSuperAdmin } = useAuthStore()
   if (!isAuthenticated) return <Navigate to="/login" replace />
+  if (superadminOnly && !isSuperAdmin()) {
+    return <div className="p-10 text-center text-gray-500">Access denied. Superadmin only.</div>
+  }
   if (permission && !hasPermission(permission)) {
     return <div className="p-10 text-center text-gray-500">Access denied. You don't have the required permission.</div>
   }
@@ -130,6 +145,19 @@ export default function App() {
         <Route path="contribution/mappings" element={<ProtectedRoute permission="CONTRIB_MAPPINGS"><ContribMappingsPage /></ProtectedRoute>} />
         <Route path="contribution/execute" element={<ProtectedRoute permission="CONTRIB_EXECUTE"><ContribExecutePage /></ProtectedRoute>} />
         <Route path="contribution/review" element={<ProtectedRoute permission="CONTRIB_REVIEW"><ContribReviewPage /></ProtectedRoute>} />
+        {/* Auto Cont % — SQL-direct pipeline (superadmin-only during rollout) */}
+        <Route path="auto-cont/presets"  element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContPresetsPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="auto-cont/mappings" element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContMappingsPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="auto-cont/execute"  element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContExecutePage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="auto-cont/jobs"     element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContJobsPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="auto-cont/review"   element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContReviewPage /></ErrorBoundary></ProtectedRoute>} />
+        {/* ALC_Fixture — MSA-STK Allocation Engine (superadmin-only during rollout) */}
+        <Route path="alc-fixture"            element={<Navigate to="/alc-fixture/execute" replace />} />
+        <Route path="alc-fixture/tunables"   element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureTunablesPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="alc-fixture/execute"    element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureExecutePage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="alc-fixture/review"     element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureReviewPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="alc-fixture/dashboard"  element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureDashboardPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="alc-fixture/jobs"       element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureJobsPage /></ErrorBoundary></ProtectedRoute>} />
         <Route path="data-validation/store-sloc" element={<ProtectedRoute permission="STORE_SLOC_VIEW"><StoreStockPage /></ProtectedRoute>} />
         <Route path="data-validation/checklist" element={<ProtectedRoute permission="CHECKLIST_VIEW"><ChecklistPage /></ProtectedRoute>} />
         {/* Data Preparation - Grid Builder */}

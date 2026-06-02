@@ -487,6 +487,29 @@ export const contribAPI = {
   deleteExport:     (id)    => api.delete(`/contrib/review/exports/${id}`),
 }
 
+// ============== Auto Cont % (SQL-direct pipeline) ==============
+// Reuses Cont_presets / Cont_mappings via contribAPI above (those tables are
+// shared with the pandas pipeline). Only compute, jobs, and table I/O are
+// net-new here.
+export const autoContAPI = {
+  status:        ()       => api.get('/auto-cont/status'),
+  // execute now creates a background JOB (returns { job_id }) — no longer
+  // blocks the request. Poll /jobs/{id} for status.
+  execute:       (data)   => api.post('/auto-cont/execute', data),
+  // Jobs
+  listJobs:      ()       => api.get('/auto-cont/jobs'),
+  getJob:        (id)     => api.get(`/auto-cont/jobs/${id}`),
+  cancelJob:     (id)     => api.post(`/auto-cont/jobs/${id}/cancel`),
+  deleteJob:     (id)     => api.delete(`/auto-cont/jobs/${id}`),
+  // Tables
+  listTables:    ()       => api.get('/auto-cont/tables'),
+  preview:       (name, limit=200) =>
+    api.get(`/auto-cont/preview/${encodeURIComponent(name)}`, { params: { limit } }),
+  dropTable:     (name)   => api.delete(`/auto-cont/tables/${encodeURIComponent(name)}`),
+  downloadTable: (name)   => api.get(`/auto-cont/download/${encodeURIComponent(name)}`,
+                                      { responseType: 'blob', timeout: 600000 }),
+}
+
 // ============== Data Checklist ==============
 export const checklistAPI = {
   getItems:         ()           => api.get('/checklist/items'),

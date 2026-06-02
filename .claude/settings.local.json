@@ -124,7 +124,11 @@
       "Bash(curl -s -o /dev/null http://localhost:3001/)",
       "Bash(curl -s -o /dev/null http://localhost:3000/)",
       "mcp__Claude_Preview__preview_start",
-      "Bash(powershell.exe -NoProfile -Command 'Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500; \\(Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Measure-Object\\).Count')"
+      "Bash(powershell.exe -NoProfile -Command 'Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500; \\(Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Measure-Object\\).Count')",
+      "Bash(./venv/Scripts/python.exe -c \"from app.api.v1.endpoints.auto_contrib import router; print\\('OK prefix=', router.prefix\\); print\\('routes=', [r.path for r in router.routes]\\)\")",
+      "Bash(./venv/Scripts/python.exe -c \"from app.api.v1.router import api_router; auto = [r for r in api_router.routes if '/auto-cont' in str\\(getattr\\(r,'path',''\\)\\)]; print\\(f'auto-cont routes mounted: {len\\(auto\\)}'\\); [print\\(' ', r.methods, r.path\\) for r in auto]\")",
+      "Bash(./venv/Scripts/python.exe -c \"from app.api.v1.router import api_router; auto = [r for r in api_router.routes if '/auto-cont' in str\\(getattr\\(r,'path',''\\)\\)]; print\\(f'auto-cont routes mounted: {len\\(auto\\)}'\\); [print\\(' ', sorted\\(r.methods\\), r.path\\) for r in auto]\")",
+      "Bash(node -e ' *)"
     ]
   }
 }
