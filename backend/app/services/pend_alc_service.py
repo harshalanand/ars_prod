@@ -2166,6 +2166,13 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
         empty-st_cd input absorbs residual capacity. This matches the
         original input-order behavior in every realistic CSV (templates
         always include st_cd uniformly).
+
+    Does NOT touch ARS_NL_TBL_HOLD_TRACKING. Hold release was decoupled
+    from DO upload by product decision — HOLD_REM stays at its post-listing
+    value regardless of DO shipping. Hold Dashboard, MSA HOLD_QTY (via
+    bootstrap_msa_hold_sync), and listing RL_HOLD_QTY all consume HOLD_REM
+    directly and will over-state held qty until a separate process releases
+    the hold.
     """
     valid = [r for r in rows if float(r.get("do_qty", 0) or 0) > 0]
     if not valid:
@@ -2319,24 +2326,10 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             })
         touched = len(pend_updates)
 
-        # Hold tracking — set-based, same as before. Aggregate by (rdc, art)
-        # so two CSV lines for the same article don't get double-applied to
-        # the same HOLD row.
-        conn.execute(text(f"""
-            ;WITH hold_agg AS (
-                SELECT rdc, art, SUM(qty) AS qty
-                FROM {tmp_in}
-                WHERE qty > 0
-                GROUP BY rdc, art
-            )
-            UPDATE H
-               SET H.HOLD_REM  = CASE WHEN H.HOLD_REM - u.qty < 0 THEN 0
-                                       ELSE H.HOLD_REM - u.qty END,
-                   H.IS_CLOSED = CASE WHEN H.HOLD_REM - u.qty <= 0 THEN 1 ELSE 0 END
-            FROM ARS_NL_TBL_HOLD_TRACKING H
-            JOIN hold_agg u ON H.WERKS = u.rdc AND H.VAR_ART = u.art
-            WHERE H.IS_CLOSED = 0
-        """))
+        # Hold tracking (ARS_NL_TBL_HOLD_TRACKING) is intentionally NOT
+        # touched here. DO upload only updates PEND_ALC + BDC_HISTORY now.
+        # Holds are released by a different lifecycle event (or never, per
+        # current product decision) — see the team's notes on hold release.
     except Exception:
         # Drop temp tables, re-raise to bubble up to endpoint
         try:
