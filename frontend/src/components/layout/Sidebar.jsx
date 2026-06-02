@@ -47,6 +47,24 @@ const contributionItems = [
   { label: 'Review', path: '/contribution/review', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
 ]
 
+// Auto Cont % — SQL-direct pipeline (superadmin-only during rollout)
+const autoContItems = [
+  { label: 'Presets',  path: '/auto-cont/presets',  icon: Settings,       superadminOnly: true },
+  { label: 'Mappings', path: '/auto-cont/mappings', icon: Columns,        superadminOnly: true },
+  { label: 'Execute',  path: '/auto-cont/execute',  icon: Cpu,            superadminOnly: true },
+  { label: 'Jobs',     path: '/auto-cont/jobs',     icon: Activity,       superadminOnly: true },
+  { label: 'Review',   path: '/auto-cont/review',   icon: ClipboardCheck, superadminOnly: true },
+]
+
+// ALC_Fixture — MSA-STK Allocation Engine (blueprint v1.0, superadmin-only during rollout)
+const alcFixtureItems = [
+  { label: 'Tunables',  path: '/alc-fixture/tunables',  icon: Sliders,         superadminOnly: true },
+  { label: 'Execute',   path: '/alc-fixture/execute',   icon: Cpu,             superadminOnly: true },
+  { label: 'Review',    path: '/alc-fixture/review',    icon: ClipboardCheck,  superadminOnly: true },
+  { label: 'Dashboard', path: '/alc-fixture/dashboard', icon: LayoutDashboard, superadminOnly: true },
+  { label: 'Jobs',      path: '/alc-fixture/jobs',      icon: Activity,        superadminOnly: true },
+]
+
 // Reports submenu
 const reportsItems = [
   { label: 'Hold Dashboard', path: '/reports/hold', icon: Lock },
@@ -296,6 +314,30 @@ export default function Sidebar({ collapsed, onToggle }) {
           items={contributionItems}
           collapsed={collapsed}
           hasPermission={hasPermission}
+        />
+
+        {/* Auto Cont % — SQL-direct pipeline (superadmin-only during rollout).
+            Presents results only after the SQL job completes — no streaming pandas. */}
+        <SubMenu
+          title="Auto Cont %"
+          icon={Cpu}
+          items={autoContItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+          isSuperAdmin={superadmin}
+        />
+
+        {/* ALC_Fixture — MSA-STK Allocation Engine (superadmin-only during rollout).
+            Computes final fixture count per Store × Floor × Major-Cat via the
+            8-stage blueprint pipeline (BGT/AUTO refs → C-ART carve-out →
+            stock-based fix → BGT reconciliation → MSA-backed redistribution). */}
+        <SubMenu
+          title="ALC_Fixture"
+          icon={Boxes}
+          items={alcFixtureItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+          isSuperAdmin={superadmin}
         />
 
         {/* Trends submenu */}

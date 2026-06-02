@@ -9,11 +9,12 @@ SESSION_ID. The user reviews those rows in the UI; on Approve they are
 promoted to matching `*_HISTORY` tables (the permanent record); on Reject
 they stay in `*_PARKED` with PARK_STATUS='REJECTED' for audit.
 
-Five source tables are parked in lock-step:
+Six source tables are parked in lock-step:
 
     ARS_ALLOC_WORKING    →  ARS_ALLOC_PARKED            →  ARS_ALLOC_HISTORY
     ARS_LISTING_WORKING  →  ARS_LISTING_WORKING_PARKED  →  ARS_LISTING_WORKING_HISTORY
     ARS_LISTING          →  ARS_LISTING_PARKED          →  ARS_LISTING_HISTORY
+    ARS_MSA_TOTAL        →  ARS_MSA_TOTAL_PARKED        →  ARS_MSA_TOTAL_HISTORY
     ARS_MSA_GEN_ART      →  ARS_MSA_GEN_ART_PARKED      →  ARS_MSA_GEN_ART_HISTORY
     ARS_MSA_VAR_ART      →  ARS_MSA_VAR_ART_PARKED      →  ARS_MSA_VAR_ART_HISTORY
 
@@ -72,6 +73,12 @@ _SNAPSHOT_TARGETS: List[Dict[str, str]] = [
         "source":  "ARS_LISTING",
         "parked":  "ARS_LISTING_PARKED",
         "history": "ARS_LISTING_HISTORY",
+    },
+    {
+        "label":   "msa_total",
+        "source":  "ARS_MSA_TOTAL",
+        "parked":  "ARS_MSA_TOTAL_PARKED",
+        "history": "ARS_MSA_TOTAL_HISTORY",
     },
     {
         "label":   "msa_gen_art",

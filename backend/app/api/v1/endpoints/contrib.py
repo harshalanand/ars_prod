@@ -263,7 +263,7 @@ def get_grouping_columns(current_user: User = Depends(get_current_user)):
             rows = c.execute(text("""
                 SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_NAME='VW_MASTER_PRODUCT' AND TABLE_SCHEMA='dbo'
-                AND COLUMN_NAME IN ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02')
+                AND COLUMN_NAME IN ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02','BODY','FIT')
                 ORDER BY ORDINAL_POSITION
             """)).fetchall()
         cols = [r[0] for r in rows] or ['MACRO_MVGR']
@@ -533,7 +533,7 @@ def _compute_kpis(df, avg_days, grouping_column):
     gr = 2 if grouping_column == 'M_VND_CD' else 1
     algo_raw = df['SALE_CONT%'] * np.where(df['SALE_CONT%']<0.05, 5.0, 3.0)
     algo_adj = df['SALE_CONT%'] * (1 + (df['GM_PSF_ACH%']-1)*gr)
-    df['ALGO'] = np.minimum(algo_raw, np.maximum(algo_adj, 0))
+    df['ALGO'] = np.minimum(algo_raw, np.maximum(np.maximum(algo_adj, df['SALE_CONT%']*0.5), 0))
     algo_sum = grp['ALGO'].transform('sum')
     df['INITIAL AUTO CONT%'] = np.where(algo_sum==0, 0, df['ALGO']/algo_sum)
 
