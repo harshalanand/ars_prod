@@ -456,6 +456,14 @@ class DoUpdateRow(BaseModel):
 
 class DoUpdateRequest(BaseModel):
     rows: List[DoUpdateRow]
+    # Multi-chunk upload coordination — mirror of manual-upload's pattern.
+    # The frontend generates ONE session_id for the whole upload and sends
+    # it with every chunk so all chunks roll up to a SINGLE operations_log
+    # entry (revert covers the whole upload, not just chunk 1).
+    # All three fields are optional; legacy single-shot clients still work.
+    session_id:     Optional[str] = None
+    is_first_chunk: bool          = True
+    is_last_chunk:  bool          = True
 
 
 @router.post("/do-update")
@@ -473,12 +481,21 @@ def pend_alc_do_update(
 
     If st_cd is provided, deduction is scoped to that destination store —
     critical when the same RDC ships the same article to multiple stores.
-    If omitted, falls back to legacy behavior (deduct from any matching row)."""
+    If omitted, falls back to legacy behavior (deduct from any matching row).
+
+    Multi-chunk uploads: the frontend slices large uploads into chunks and
+    sends each chunk with the same session_id. Chunk 1 (is_first_chunk=True)
+    creates the operations_log row; chunks 2..N append their pend_updates /
+    history_updates into the same row's payload so revert can undo every
+    chunk's effect from a single click."""
     if not body.rows:
         raise HTTPException(400, "No rows provided")
     try:
         import uuid as _uuid
-        do_batch_id = _uuid.uuid4().hex[:12]  # one batch UUID per upload
+        from app.services.pend_alc_service import log_operation_upsert
+        # session_id doubles as the OP_KEY for chunked uploads. Legacy
+        # single-shot callers get a fresh UUID — same behavior as before.
+        session_id = body.session_id or _uuid.uuid4().hex[:12]
         rows = [
             {"rdc": r.rdc, "article_number": r.article_number,
              "do_qty": r.do_qty, "do_number": r.do_number,
@@ -490,35 +507,43 @@ def pend_alc_do_update(
             do_result   = apply_do_deductions(conn, rows)
             hist_result = update_bdc_history_with_do(conn, rows)
 
-            # Log the operation for revert support
             total_qty = sum(float(r.get("do_qty") or 0) for r in rows)
-            log_operation(
+            # Chunk 1 INSERTs the audit row; chunks 2..N MERGE pend_updates /
+            # history_updates into the existing row so the entire upload
+            # remains revertable as one unit.
+            log_operation_upsert(
                 conn,
                 op_type="DO",
-                op_key=do_batch_id,
+                op_key=session_id,
                 payload={
-                    "input_rows":      rows,
+                    "session_id":      session_id,
                     "pend_updates":    do_result["pend_updates"],
                     "history_updates": hist_result["history_updates"],
                 },
-                summary=f"DO upload {do_batch_id}: {len(rows)} input lines, "
+                summary=f"DO upload {session_id}: {len(rows)} input lines, "
                         f"{int(total_qty)} units, "
                         f"{do_result['touched']} pend_alc rows updated",
                 rows_affected=do_result["touched"],
                 qty_total=total_qty,
                 created_by=getattr(current_user, "username", None),
+                is_first=body.is_first_chunk,
+                merge_payload_lists=["pend_updates", "history_updates"],
             )
         logger.info(
             f"[pend_alc] do-update by {getattr(current_user,'username','?')}: "
             f"{len(rows)} input → {do_result['touched']} pend_alc rows updated, "
             f"{hist_result['touched']} bdc_history rows updated, "
-            f"batch={do_batch_id}"
+            f"session_id={session_id}, "
+            f"chunk(first={body.is_first_chunk}, last={body.is_last_chunk})"
         )
         return {
             "success":              True,
             "updated_rows":         do_result["touched"],
             "bdc_history_updated":  hist_result["touched"],
-            "do_batch_id":          do_batch_id,
+            "session_id":           session_id,
+            # Keep do_batch_id for backwards compatibility with any caller
+            # that reads it (frontend currently ignores the value).
+            "do_batch_id":          session_id,
         }
     except Exception as e:
         raise HTTPException(500, str(e))

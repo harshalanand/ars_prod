@@ -605,7 +605,14 @@ export const pendAlcAPI = {
   sessions:    ()               => api.get('/pend-alc/sessions'),
   detail:      (params = {})    => api.get('/pend-alc/detail', { params }),
   doHistory:   (limit = 100)    => api.get('/pend-alc/do-history', { params: { limit } }),
-  doUpdate:    (rows)           => api.post('/pend-alc/do-update', { rows }),
+  doUpdate:    (payload)        => api.post('/pend-alc/do-update',
+    // Accept either a raw rows array (legacy callers) or the full request
+    // body { rows, session_id, is_first_chunk, is_last_chunk } (new callers).
+    Array.isArray(payload) ? { rows: payload } : payload,
+    // Per-chunk SQL is now sub-second after the set-based rewrite, but a
+    // 10-min ceiling protects against cold Azure SQL connections and
+    // unexpected lock waits on huge uploads.
+    { timeout: 10 * 60 * 1000 }),
   bdcPreview:  (params = {})    => api.get('/pend-alc/bdc-preview', { params }),
   bdcGenerate: (params = {})    => api.post('/pend-alc/bdc-generate', null,
                                     { params, responseType: 'blob', timeout: 300000,
@@ -636,7 +643,13 @@ export const pendAlcAPI = {
   operationsPreview:   (op_id)               => api.post(`/pend-alc/operations/${op_id}/preview-revert`),
   operationsRevert:    (op_id, note)         => api.post(`/pend-alc/operations/${op_id}/revert`,
                                                   { note: note || null },
-                                                  { params: { confirm: true } }),
+                                                  // 15-min cap — set-based revert is sub-second, but the
+                                                  // post-revert grid + MSA resync passes can take a minute
+                                                  // on huge ops, and the default 5-min axios timeout was
+                                                  // killing the request mid-flight (backend finished, but
+                                                  // the UI never saw the response so the success toast
+                                                  // never fired).
+                                                  { params: { confirm: true }, timeout: 15 * 60 * 1000 }),
   operationsBackfillBdc: (confirm = false)   => api.post('/pend-alc/operations/backfill-bdc',
                                                   null, { params: { confirm } }),
 }
