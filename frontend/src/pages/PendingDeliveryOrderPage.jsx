@@ -13,8 +13,17 @@ import {
 
 // Above this row count, switch to bulk mode (no editable table render).
 const BULK_THRESHOLD = 100
-// Submit in chunks so the user sees progress and the request body stays small.
-const SUBMIT_CHUNK = 5000
+// Submit in chunks so the user sees progress and the request body stays
+// small. 2,000 sized chunks comfortably finish well under the 10-min axios
+// ceiling on a cold connection, leaving plenty of headroom over the
+// sub-second set-based backend SQL.
+const SUBMIT_CHUNK = 2000
+
+// Generate a per-upload session id so chunks roll up to ONE ops_log row
+// (revert covers the whole upload, not just chunk 1).
+const newSessionId = () =>
+  `DO-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-` +
+  Math.random().toString(16).slice(2, 8)
 
 const C = {
   primary: '#4f46e5', blue: '#0891b2', green: '#16a34a',
@@ -144,26 +153,53 @@ export default function PendingDeliveryOrderPage() {
     setSubmitting(true)
     setResult(null)
     setProgress({ sent: 0, total: valid.length })
-    try {
-      let totalUpdated = 0
-      for (let i = 0; i < valid.length; i += SUBMIT_CHUNK) {
-        const slice = valid.slice(i, i + SUBMIT_CHUNK)
-        const payload = slice.map(buildPayload)
+
+    const sessionId  = newSessionId()
+    const totalRows  = valid.length
+    const numChunks  = Math.ceil(totalRows / SUBMIT_CHUNK)
+    let totalUpdated = 0
+    const failures   = []  // {chunkIdx, rows, message}
+
+    // Per-chunk try/catch: one failure no longer abandons the whole upload.
+    // Every chunk gets a fair attempt; the user sees a summary at the end.
+    for (let i = 0, idx = 0; i < totalRows; i += SUBMIT_CHUNK, idx += 1) {
+      const slice   = valid.slice(i, i + SUBMIT_CHUNK)
+      const payload = {
+        rows:           slice.map(buildPayload),
+        session_id:     sessionId,
+        is_first_chunk: idx === 0,
+        is_last_chunk:  idx === numChunks - 1,
+      }
+      try {
         const { data } = await pendAlcAPI.doUpdate(payload)
         totalUpdated += (data.updated_rows || 0)
-        setProgress({ sent: Math.min(i + slice.length, valid.length), total: valid.length })
+      } catch (e) {
+        failures.push({
+          chunkIdx: idx + 1,
+          rows:     slice.length,
+          message:  e.response?.data?.detail || e.message || 'request failed',
+        })
       }
-      setResult({ submitted: valid.length, updated: totalUpdated })
+      setProgress({ sent: Math.min(i + slice.length, totalRows), total: totalRows })
+    }
+
+    setResult({ submitted: totalRows, updated: totalUpdated, failures: failures.length })
+    if (failures.length === 0) {
       toast.success(`DO update applied — ${totalUpdated.toLocaleString()} ARS_PEND_ALC rows updated`)
       if (bulkMode) exitBulkMode()
       else setRows([{ ...EMPTY_ROW }])
-      loadHistory()
-    } catch (e) {
-      toast.error(e.response?.data?.detail || 'DO update failed')
-    } finally {
-      setSubmitting(false)
-      setProgress(null)
+    } else {
+      const failedRows = failures.reduce((s, f) => s + f.rows, 0)
+      toast.error(
+        `Partial: ${totalUpdated.toLocaleString()} pend_alc rows updated, ` +
+        `${failures.length}/${numChunks} chunk(s) failed (${failedRows.toLocaleString()} rows). ` +
+        `First error: ${failures[0].message}`,
+        { duration: 8000 }
+      )
     }
+    loadHistory()
+    setSubmitting(false)
+    setProgress(null)
   }
 
   const submittable = useMemo(() => {
@@ -419,13 +455,21 @@ export default function PendingDeliveryOrderPage() {
 
       {/* Result banner */}
       {result && (
-        <div style={{ background: '#f0fdf4', border: `1px solid #bbf7d0`, borderRadius: 8,
-                      padding: '10px 14px', marginBottom: 12,
-                      display: 'flex', alignItems: 'center', gap: 8 }}>
-          <CheckCircle size={14} color={C.green}/>
-          <span style={{ fontSize: 10, fontWeight: 600, color: C.green }}>
-            DO update applied — {result.submitted.toLocaleString()} rows submitted,&nbsp;
+        <div style={{
+            background: result.failures ? '#fef2f2' : '#f0fdf4',
+            border: `1px solid ${result.failures ? '#fecaca' : '#bbf7d0'}`,
+            borderRadius: 8,
+            padding: '10px 14px', marginBottom: 12,
+            display: 'flex', alignItems: 'center', gap: 8 }}>
+          <CheckCircle size={14} color={result.failures ? C.red : C.green}/>
+          <span style={{ fontSize: 10, fontWeight: 600,
+                         color: result.failures ? C.red : C.green }}>
+            DO update {result.failures ? 'partially applied' : 'applied'} —
+            &nbsp;{result.submitted.toLocaleString()} rows submitted,&nbsp;
             {result.updated.toLocaleString()} ARS_PEND_ALC rows updated
+            {result.failures
+              ? ` (${result.failures} chunk${result.failures > 1 ? 's' : ''} failed — see toast)`
+              : ''}
           </span>
         </div>
       )}
