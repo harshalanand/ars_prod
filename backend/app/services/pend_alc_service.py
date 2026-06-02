@@ -1998,7 +1998,7 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
                 FROM {BDC_HISTORY_TABLE} H
                 WHERE H.STATUS <> 'CONFIRMED' AND (H.BDC_QTY - H.DO_RECEIVED) > 0
             ),
-            plan AS (
+            alloc_plan AS (
                 SELECT o.ID,
                        CASE
                            WHEN agg.qty <= o.cum_before THEN 0
@@ -2010,8 +2010,8 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
                 JOIN agg ON {join_pred}
             )
             UPDATE H
-               SET H.DO_RECEIVED = H.DO_RECEIVED + plan.apply_qty,
-                   H.STATUS      = CASE WHEN H.DO_RECEIVED + plan.apply_qty >= H.BDC_QTY
+               SET H.DO_RECEIVED = H.DO_RECEIVED + alloc_plan.apply_qty,
+                   H.STATUS      = CASE WHEN H.DO_RECEIVED + alloc_plan.apply_qty >= H.BDC_QTY
                                         THEN 'CONFIRMED' ELSE 'PARTIAL' END,
                    H.LAST_DO_AT  = GETDATE()
             OUTPUT INSERTED.ID,
@@ -2025,8 +2025,8 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
                               new_do_received, old_status, new_status,
                               old_last_do_at)
             FROM {BDC_HISTORY_TABLE} H
-            JOIN plan ON H.ID = plan.ID
-            WHERE plan.apply_qty > 0
+            JOIN alloc_plan ON H.ID = alloc_plan.ID
+            WHERE alloc_plan.apply_qty > 0
             """
             conn.execute(text(sql), {"bucket": bucket})
 
@@ -2235,7 +2235,7 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
         for scope in ("scoped", "global"):
             if scope == "scoped":
                 scope_pred = "agg.st_cd <> ''"
-                join_pred  = "agg.st_cd = ISNULL(P.ST_CD,'')"
+                join_pred  = "agg.st_cd = ISNULL(o.ST_CD,'')"
             else:
                 scope_pred = "agg.st_cd = ''"
                 join_pred  = "1 = 1"
@@ -2270,7 +2270,7 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
                 FROM {PEND_ALC_TABLE} P
                 WHERE P.IS_CLOSED = 0 AND (P.ALLOC_QTY - P.DO_QTY) > 0
             ),
-            plan AS (
+            alloc_plan AS (
                 SELECT o.ID,
                        agg.do_numbers,
                        CASE
@@ -2286,14 +2286,14 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
                 WHERE {scope_pred}
             )
             UPDATE P
-               SET P.DO_QTY         = P.DO_QTY + plan.apply_qty,
-                   P.IS_CLOSED      = CASE WHEN P.DO_QTY + plan.apply_qty >= P.ALLOC_QTY THEN 1 ELSE 0 END,
+               SET P.DO_QTY         = P.DO_QTY + alloc_plan.apply_qty,
+                   P.IS_CLOSED      = CASE WHEN P.DO_QTY + alloc_plan.apply_qty >= P.ALLOC_QTY THEN 1 ELSE 0 END,
                    P.LAST_DO_AT     = GETDATE(),
                    P.DO_UPLOADED_AT = GETDATE(),
                    P.DO_NUMBER      = CASE
-                       WHEN plan.do_numbers IS NULL OR plan.do_numbers = '' THEN P.DO_NUMBER
-                       WHEN P.DO_NUMBER IS NULL OR P.DO_NUMBER = ''         THEN plan.do_numbers
-                       ELSE P.DO_NUMBER + ', ' + plan.do_numbers
+                       WHEN alloc_plan.do_numbers IS NULL OR alloc_plan.do_numbers = '' THEN P.DO_NUMBER
+                       WHEN P.DO_NUMBER IS NULL OR P.DO_NUMBER = ''         THEN alloc_plan.do_numbers
+                       ELSE P.DO_NUMBER + ', ' + alloc_plan.do_numbers
                    END
             OUTPUT INSERTED.ID,
                    INSERTED.DO_QTY - DELETED.DO_QTY AS qty_added,
@@ -2301,8 +2301,8 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
                    DELETED.LAST_DO_AT AS prev_last_do_at
               INTO {tmp_out} (pend_alc_id, qty_added, was_just_closed, prev_last_do_at)
             FROM {PEND_ALC_TABLE} P
-            JOIN plan ON P.ID = plan.ID
-            WHERE plan.apply_qty > 0
+            JOIN alloc_plan ON P.ID = alloc_plan.ID
+            WHERE alloc_plan.apply_qty > 0
             """
             conn.execute(text(sql))
 
