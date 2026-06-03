@@ -46,6 +46,7 @@ from app.services.pend_alc_service import (
     adjust_msa_after_pend_insert,
     apply_pend_alc_delta_by_session,
     bootstrap_msa_hold_sync,
+    log_operation,
 )
 
 
@@ -658,6 +659,38 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
         )
         # Merge for the by_table response so the caller always sees both.
         merged: Dict[str, int] = {**already_in_history, **approved_by_table}
+
+        # Log an APPROVE op row so this session shows up in the Operations /
+        # Undo UI alongside BDC / DO / MANUAL. Revert dispatches to
+        # _revert_approve which deletes the inserted PEND_ALC rows, applies
+        # the -1 MSA/Grid delta, and restores ARS_NL_TBL_HOLD_TRACKING from
+        # the snapshot taken above. Best-effort — a logging failure must not
+        # roll back a successful approve.
+        try:
+            pend_rows_int = (
+                approved_by_table.get("pend_alc_rows")
+                if isinstance(approved_by_table.get("pend_alc_rows"), int)
+                else 0
+            )
+            with engine.connect() as conn2:
+                log_operation(
+                    conn2,
+                    op_type="APPROVE",
+                    op_key=session_id,
+                    payload={
+                        "session_id":  session_id,
+                        "by_table":    {k: v for k, v in merged.items()
+                                        if isinstance(v, (int, float))},
+                    },
+                    summary=(f"Approve {session_id}: {pend_rows_int} pend rows, "
+                             f"by {user}")[:500],
+                    rows_affected=int(pend_rows_int or 0),
+                    qty_total=0,
+                    created_by=user,
+                )
+        except Exception as le:
+            logger.warning(f"[approve] log_operation(APPROVE) skipped: {le}")
+
         return {
             "approved_rows":    total,
             "by_table":         merged,

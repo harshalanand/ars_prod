@@ -617,6 +617,19 @@ export const pendAlcAPI = {
   bdcGenerate: (params = {})    => api.post('/pend-alc/bdc-generate', null,
                                     { params, responseType: 'blob', timeout: 300000,
                                       paramsSerializer: { indexes: null } }),
+  // Async BDC generate — returns { job_id } immediately. Caller polls
+  // asyncJobStatus(job_id) and downloads via asyncJobDownload(job_id) when
+  // status === 'completed'. Used by the Generate-BDC modal to escape the
+  // 100s Cloudflare edge timeout on large batches.
+  bdcGenerateAsync: (params = {}) => api.post('/pend-alc/bdc-generate-async', null,
+                                      { params, paramsSerializer: { indexes: null } }),
+  asyncJobStatus:   (job_id)      => api.get(`/pend-alc/async-jobs/${job_id}`),
+  asyncJobDownload: (job_id)      => api.get(`/pend-alc/async-jobs/${job_id}/download`,
+                                      { responseType: 'blob', timeout: 10 * 60 * 1000 }),
+  // Async DO upload — same body as doUpdate(), returns { job_id, session_id }.
+  doUpdateAsync: (payload)        => api.post('/pend-alc/do-update-async',
+                                      Array.isArray(payload) ? { rows: payload } : payload,
+                                      { timeout: 60 * 1000 }),
   bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
   manualUpload:(payload)        => api.post('/pend-alc/manual-upload',
     // Accept either a raw rows array (legacy callers) or the full request
@@ -650,6 +663,10 @@ export const pendAlcAPI = {
                                                   // the UI never saw the response so the success toast
                                                   // never fired).
                                                   { params: { confirm: true }, timeout: 15 * 60 * 1000 }),
+  // Async revert — returns { job_id } immediately, frontend polls asyncJobStatus.
+  operationsRevertAsync: (op_id, note)       => api.post(`/pend-alc/operations/${op_id}/revert-async`,
+                                                  { note: note || null },
+                                                  { params: { confirm: true }, timeout: 60 * 1000 }),
   operationsBackfillBdc: (confirm = false)   => api.post('/pend-alc/operations/backfill-bdc',
                                                   null, { params: { confirm } }),
 }

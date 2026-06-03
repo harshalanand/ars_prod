@@ -827,6 +827,470 @@ def pend_alc_bdc_generate(
 
 
 # ---------------------------------------------------------------------------
+# Generic background-job registry — used by every long-running endpoint
+# (BDC generate, DO upload, operation revert). Each job runs in a daemon
+# thread so Cloudflare's 100s edge timeout never kills it; the UI polls
+# /pend-alc/async-jobs/{job_id} and shows a completion modal when done.
+#
+# Job dict shape:
+#   id, type ('bdc'|'do'|'revert'), status, progress, created_at,
+#   started_at, finished_at, duration, error,
+#   result (dict, type-specific),
+#   zip_path (BDC only — path to the streamable ZIP)
+# ---------------------------------------------------------------------------
+import os as _os
+import csv as _csv
+import io as _io
+import zipfile as _zipfile
+import tempfile as _tempfile
+import threading as _threading
+import uuid as _uuid
+from datetime import datetime as _dt
+
+_jobs: dict = {}
+_jobs_lock = _threading.Lock()
+
+
+def _new_job(job_type: str, label: str = "") -> str:
+    job_id = _uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "id":         job_id,
+            "type":       job_type,
+            "label":      label,
+            "status":     "pending",
+            "progress":   "queued",
+            "created_at": _dt.now().isoformat(),
+            "started_at": None,
+            "finished_at": None,
+            "duration":   None,
+            "error":      None,
+            "result":     None,
+            "zip_path":   None,
+        }
+    return job_id
+
+
+def _job_update(job_id: str, **kwargs):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j:
+            j.update(kwargs)
+
+
+# Backwards-compat shim — older block referenced _bdc_job_update.
+_bdc_job_update = _job_update
+
+
+def _bdc_run_job(job_id: str, params: dict, store_filter, file_date_str: str,
+                 today_str: str, username):
+    """Worker: read rows → stamp → log → build ZIP-of-CSVs → mark complete."""
+    import time as _t
+    t0 = _t.perf_counter()
+    try:
+        _job_update(job_id, status="running", started_at=_dt.now().isoformat(),
+                    progress="reading rows")
+
+        filters = ["IS_CLOSED = 0", "PEND_QTY > 0"]
+        if params.get("rdc"):
+            filters.append("RDC = :rdc")
+        if params.get("maj_cat"):
+            filters.append("MAJ_CAT = :mc")
+        if store_filter:
+            placeholders = ",".join(f":st{i}" for i in range(len(store_filter)))
+            filters.append(f"ISNULL(ST_CD,'') IN ({placeholders})")
+        where = "WHERE " + " AND ".join(filters)
+
+        sql_params = {}
+        if params.get("rdc"):     sql_params["rdc"] = params["rdc"]
+        if params.get("maj_cat"): sql_params["mc"]  = params["maj_cat"]
+        if store_filter:
+            for i, v in enumerate(store_filter):
+                sql_params[f"st{i}"] = v
+
+        from app.api.v1.endpoints.bdc import _get_next_allocation_no
+        allocation_no = _get_next_allocation_no(_engine())
+
+        with _engine().connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT RDC,
+                       ISNULL(ST_CD,'')          AS ST_CD,
+                       ARTICLE_NUMBER,
+                       MAJ_CAT,
+                       SUM(PEND_QTY)             AS PEND_QTY
+                FROM {PEND_ALC_TABLE} WITH (NOLOCK)
+                {where}
+                GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
+                HAVING SUM(PEND_QTY) > 0
+                ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
+            """), sql_params).fetchall()
+
+        if not rows:
+            _job_update(job_id, status="failed", error="No open pending rows found for BDC",
+                        finished_at=_dt.now().isoformat())
+            return
+
+        t_read = _t.perf_counter()
+        _job_update(job_id, progress=f"stamping {len(rows):,} rows")
+
+        article_rdc = [{"rdc": r[0], "st_cd": r[1], "article_number": r[2]} for r in rows]
+        history_rows_input = [
+            {"rdc": r[0], "st_cd": r[1], "article_number": r[2],
+             "maj_cat": r[3], "bdc_qty": float(r[4] or 0)}
+            for r in rows
+        ]
+        total_qty = sum(float(r[4] or 0) for r in rows)
+
+        with _engine().connect() as conn:
+            stamped_deltas = stamp_bdc_qty(conn, article_rdc)
+            history_ids = insert_bdc_history(
+                conn, allocation_number=allocation_no,
+                rows=history_rows_input, created_by=username,
+            )
+            log_operation(
+                conn,
+                op_type="BDC",
+                op_key=allocation_no,
+                payload={
+                    "allocation_number": allocation_no,
+                    "history_ids":       history_ids,
+                    "stamped_rows":      stamped_deltas,
+                },
+                summary=f"BDC {allocation_no}: {len(rows)} lines, "
+                        f"{int(total_qty)} units, date={file_date_str}",
+                rows_affected=len(rows),
+                qty_total=total_qty,
+                created_by=username,
+            )
+
+        t_write = _t.perf_counter()
+        _job_update(job_id, progress="building per-RDC CSVs")
+
+        # Group by RDC → one CSV each, bundled into a ZIP.
+        per_rdc: dict = {}
+        for r in rows:
+            per_rdc.setdefault(str(r[0] or "").strip() or "UNKNOWN", []).append(r)
+
+        headers = ["Serial No", "Allocation Date", "Allocation Number",
+                   "VENDOR", "MATERIAL NO", "BDC-QTY", "RECEIVING STORE",
+                   "Picking Date", "Remark"]
+        tmp_dir = _os.path.join(_tempfile.gettempdir(), "bdc_jobs")
+        _os.makedirs(tmp_dir, exist_ok=True)
+        zip_path = _os.path.join(tmp_dir, f"{job_id}.zip")
+
+        with _zipfile.ZipFile(zip_path, "w", _zipfile.ZIP_DEFLATED) as zf:
+            for rdc_name in sorted(per_rdc.keys()):
+                rdc_rows = per_rdc[rdc_name]
+                buf = _io.StringIO()
+                w = _csv.writer(buf, lineterminator="\n")
+                w.writerow(headers)
+                for i, r in enumerate(rdc_rows, start=1):
+                    w.writerow([
+                        i, today_str, allocation_no,
+                        str(r[0] or "").strip(),
+                        str(r[2] or "").strip().lstrip("0"),
+                        int(r[4] or 0),
+                        str(r[1] or "").strip(),
+                        today_str, "",
+                    ])
+                safe_rdc = "".join(c if c.isalnum() or c in "_-" else "_" for c in rdc_name)
+                csv_name = f"ARS_BDC_{safe_rdc}_{today_str.replace('-','')}_{allocation_no}.csv"
+                zf.writestr(csv_name, buf.getvalue())
+
+        t_zip = _t.perf_counter()
+        logger.info(
+            f"[bdc-generate-async] {allocation_no}: rows={len(rows):,} "
+            f"rdcs={len(per_rdc)} "
+            f"read={t_read-t0:.2f}s write={t_write-t_read:.2f}s "
+            f"zip={t_zip-t_write:.2f}s total={t_zip-t0:.2f}s"
+        )
+
+        _job_update(
+            job_id,
+            status="completed",
+            progress="done",
+            finished_at=_dt.now().isoformat(),
+            duration=round(t_zip - t0, 2),
+            zip_path=zip_path,
+            result={
+                "allocation_no": allocation_no,
+                "rdc_count":     len(per_rdc),
+                "rdc_list":      sorted(per_rdc.keys()),
+                "row_count":     len(rows),
+                "total_qty":     int(total_qty),
+                "file_date":     file_date_str,
+                "download_url":  f"/api/v1/pend-alc/async-jobs/{job_id}/download",
+            },
+        )
+    except Exception as e:
+        logger.exception(f"[bdc-generate-async] job {job_id} failed: {e}")
+        _job_update(job_id, status="failed", error=str(e)[:1000],
+                    finished_at=_dt.now().isoformat())
+
+
+@router.post("/bdc-generate-async")
+def pend_alc_bdc_generate_async(
+    rdc:         Optional[str]       = Query(None),
+    maj_cat:     Optional[str]       = Query(None),
+    target_date: Optional[str]       = Query(None),
+    st_cd_list:  Optional[List[str]] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
+    """Async variant of /bdc-generate. Returns {job_id} immediately; the
+    background worker stamps + builds a ZIP of per-RDC CSVs. Poll
+    /async-jobs/{job_id} and GET /async-jobs/{job_id}/download when
+    status='completed'.
+    """
+    import datetime as _datetime
+
+    store_filter = None
+    if st_cd_list:
+        store_filter = [s.strip() for s in st_cd_list if s and s.strip()]
+    elif target_date:
+        with _engine().connect() as _sc:
+            store_filter = get_stores_for_date(_sc, target_date)
+        if not store_filter:
+            raise HTTPException(
+                400,
+                f"No stores scheduled for {target_date}. "
+                f"Either Sunday or no schedule rows match."
+            )
+
+    if target_date:
+        try:
+            file_date_str = _datetime.date.fromisoformat(target_date).strftime("%Y-%m-%d")
+        except Exception:
+            file_date_str = _datetime.date.today().strftime("%Y-%m-%d")
+    else:
+        file_date_str = _datetime.date.today().strftime("%Y-%m-%d")
+
+    username = getattr(current_user, "username", None)
+    label = f"BDC {file_date_str}" + (f" — {len(store_filter)} stores" if store_filter else "")
+    job_id = _new_job("bdc", label=label)
+
+    params = {"rdc": rdc, "maj_cat": maj_cat}
+    _threading.Thread(
+        target=_bdc_run_job,
+        args=(job_id, params, store_filter, file_date_str, file_date_str, username),
+        daemon=True,
+    ).start()
+    return {"success": True, "job_id": job_id}
+
+
+# ---------------------------------------------------------------------------
+# DO upload — async wrapper
+# ---------------------------------------------------------------------------
+def _do_run_job(job_id: str, rows: list, session_id: str, is_first: bool,
+                username):
+    """Worker: apply_do_deductions + history update + log_operation_upsert."""
+    import time as _t
+    t0 = _t.perf_counter()
+    try:
+        _job_update(job_id, status="running", started_at=_dt.now().isoformat(),
+                    progress=f"applying {len(rows):,} input lines")
+        from app.services.pend_alc_service import log_operation_upsert
+        with _engine().connect() as conn:
+            do_result   = apply_do_deductions(conn, rows)
+            hist_result = update_bdc_history_with_do(conn, rows)
+            total_qty = sum(float(r.get("do_qty") or 0) for r in rows)
+            log_operation_upsert(
+                conn,
+                op_type="DO",
+                op_key=session_id,
+                payload={
+                    "session_id":      session_id,
+                    "pend_updates":    do_result["pend_updates"],
+                    "history_updates": hist_result["history_updates"],
+                },
+                summary=f"DO upload {session_id}: {len(rows)} input lines, "
+                        f"{int(total_qty)} units, "
+                        f"{do_result['touched']} pend_alc rows updated",
+                rows_affected=do_result["touched"],
+                qty_total=total_qty,
+                created_by=username,
+                is_first=is_first,
+                merge_payload_lists=["pend_updates", "history_updates"],
+            )
+        logger.info(
+            f"[do-update-async] {session_id}: input={len(rows)} "
+            f"touched={do_result['touched']} hist={hist_result['touched']} "
+            f"first={is_first} total={_t.perf_counter()-t0:.2f}s"
+        )
+        _job_update(
+            job_id,
+            status="completed",
+            progress="done",
+            finished_at=_dt.now().isoformat(),
+            duration=round(_t.perf_counter() - t0, 2),
+            result={
+                "session_id":          session_id,
+                "do_batch_id":         session_id,
+                "updated_rows":        do_result["touched"],
+                "bdc_history_updated": hist_result["touched"],
+                "input_lines":         len(rows),
+                "total_qty":           int(total_qty),
+            },
+        )
+    except Exception as e:
+        logger.exception(f"[do-update-async] job {job_id} failed: {e}")
+        _job_update(job_id, status="failed", error=str(e)[:1000],
+                    finished_at=_dt.now().isoformat())
+
+
+@router.post("/do-update-async")
+def pend_alc_do_update_async(
+    body: DoUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Async variant of /do-update. Same body, returns {job_id} immediately.
+    Poll /async-jobs/{job_id}; result carries session_id + counts."""
+    if not body.rows:
+        raise HTTPException(400, "No rows provided")
+    import uuid as _uu
+    session_id = body.session_id or _uu.uuid4().hex[:12]
+    rows = [
+        {"rdc": r.rdc, "article_number": r.article_number,
+         "do_qty": r.do_qty, "do_number": r.do_number,
+         "st_cd": r.st_cd, "allocation_number": r.allocation_number}
+        for r in body.rows
+    ]
+    label = f"DO upload {session_id} ({len(rows)} lines)"
+    job_id = _new_job("do", label=label)
+    username = getattr(current_user, "username", None)
+    _threading.Thread(
+        target=_do_run_job,
+        args=(job_id, rows, session_id, bool(body.is_first_chunk), username),
+        daemon=True,
+    ).start()
+    # Return session_id eagerly so multi-chunk callers can reuse it on
+    # subsequent chunks without waiting for the first chunk's job to finish.
+    return {"success": True, "job_id": job_id, "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# Revert operation — async wrapper
+# ---------------------------------------------------------------------------
+def _revert_run_job(job_id: str, op_id: int, note: Optional[str], username):
+    import time as _t
+    t0 = _t.perf_counter()
+    try:
+        _job_update(job_id, status="running", started_at=_dt.now().isoformat(),
+                    progress=f"reverting op #{op_id}")
+        with _engine().connect() as conn:
+            res = revert_operation(conn, op_id, reverted_by=username, note=note)
+        if not res.get("success"):
+            _job_update(job_id, status="failed",
+                        error=res.get("error") or "Revert failed",
+                        finished_at=_dt.now().isoformat())
+            return
+        logger.info(
+            f"[revert-async] op_id={op_id} by {username}: {res} "
+            f"total={_t.perf_counter()-t0:.2f}s"
+        )
+        _job_update(
+            job_id,
+            status="completed",
+            progress="done",
+            finished_at=_dt.now().isoformat(),
+            duration=round(_t.perf_counter() - t0, 2),
+            result={"op_id": op_id, **{k: v for k, v in res.items() if k != "success"}},
+        )
+    except Exception as e:
+        logger.exception(f"[revert-async] job {job_id} failed: {e}")
+        _job_update(job_id, status="failed", error=str(e)[:1000],
+                    finished_at=_dt.now().isoformat())
+
+
+class _RevertAsyncBody(BaseModel):
+    note: Optional[str] = None
+
+
+@router.post("/operations/{op_id}/revert-async")
+def pend_alc_operations_revert_async(
+    op_id: int,
+    body:    Optional[_RevertAsyncBody] = None,
+    confirm: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+):
+    """Async variant of /operations/{op_id}/revert. Returns {job_id} immediately."""
+    if not confirm:
+        raise HTTPException(400, "confirm=true is required to revert")
+    note = (body.note if body else None)
+    label = f"Revert op #{op_id}"
+    job_id = _new_job("revert", label=label)
+    username = getattr(current_user, "username", None)
+    _threading.Thread(
+        target=_revert_run_job,
+        args=(job_id, op_id, note, username),
+        daemon=True,
+    ).start()
+    return {"success": True, "job_id": job_id}
+
+
+# ---------------------------------------------------------------------------
+# Generic poll + download endpoints used by every async job above.
+# ---------------------------------------------------------------------------
+@router.get("/async-jobs/{job_id}")
+def pend_alc_async_job_status(job_id: str,
+                              current_user: User = Depends(get_current_user)):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if not j:
+            raise HTTPException(404, f"Job {job_id} not found")
+        out = {k: v for k, v in j.items() if k != "zip_path"}
+    return {"success": True, "data": out}
+
+
+@router.get("/async-jobs/{job_id}/download")
+def pend_alc_async_job_download(job_id: str,
+                                current_user: User = Depends(get_current_user)):
+    """Stream the BDC ZIP (only valid for type='bdc' jobs once complete)."""
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if not j:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if j.get("status") != "completed":
+            raise HTTPException(409, f"Job {job_id} status={j.get('status')}")
+        zip_path = j.get("zip_path")
+        res = j.get("result") or {}
+        allocation_no = res.get("allocation_no") or "BDC"
+        file_date     = res.get("file_date") or _dt.now().strftime("%Y-%m-%d")
+    if not zip_path or not _os.path.exists(zip_path):
+        raise HTTPException(410, "Download no longer available (server restart or cleanup)")
+
+    fname = f"ARS_BDC_{file_date.replace('-','')}_{allocation_no}.zip"
+
+    def _stream():
+        with open(zip_path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+# Back-compat — keep the old /bdc-jobs/* paths working in case any caller
+# (or earlier UI build) is still polling them.  Both forward to the generic
+# handlers above.
+@router.get("/bdc-jobs/{job_id}")
+def pend_alc_bdc_job_status_legacy(job_id: str,
+                                   current_user: User = Depends(get_current_user)):
+    return pend_alc_async_job_status(job_id, current_user)
+
+
+@router.get("/bdc-jobs/{job_id}/download")
+def pend_alc_bdc_job_download_legacy(job_id: str,
+                                     current_user: User = Depends(get_current_user)):
+    return pend_alc_async_job_download(job_id, current_user)
+
+
+# ---------------------------------------------------------------------------
 # Store BDC schedule — Mon-Sat schedule per store
 # ---------------------------------------------------------------------------
 @router.get("/schedule")
@@ -1095,16 +1559,16 @@ def pend_alc_bdc_recover_orphans(
 
 
 # ---------------------------------------------------------------------------
-# Operations log + revert (BDC / DO / MANUAL)
+# Operations log + revert (BDC / DO / MANUAL / APPROVE)
 # ---------------------------------------------------------------------------
 @router.get("/operations")
 def pend_alc_operations_list(
-    op_type:           Optional[str] = Query(None, description="BDC / DO / MANUAL"),
+    op_type:           Optional[str] = Query(None, description="BDC / DO / MANUAL / APPROVE"),
     include_reverted:  bool          = Query(True),
     limit:             int           = Query(200, ge=1, le=2000),
     current_user: User = Depends(get_current_user),
 ):
-    """List recent BDC / DO / MANUAL operations for the audit + undo UI."""
+    """List recent BDC / DO / MANUAL / APPROVE operations for the audit + undo UI."""
     try:
         with _engine().connect() as conn:
             data = list_operations(conn, op_type=op_type,

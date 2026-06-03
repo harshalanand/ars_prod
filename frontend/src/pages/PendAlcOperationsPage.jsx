@@ -1,5 +1,5 @@
 /**
- * PendAlcOperationsPage — soft-revert audit log for BDC / DO / Manual ops.
+ * PendAlcOperationsPage — soft-revert audit log for BDC / DO / Manual / Approve ops.
  *
  * Each row in ARS_PEND_ALC_OPERATIONS is one write event with a JSON payload
  * describing the deltas. "Revert" replays the deltas in reverse and stamps
@@ -19,7 +19,7 @@ const C = {
   border: '#e2e8f0', bg: '#f8fafc', card: '#ffffff',
 }
 
-const OP_TYPE_COLOR = { BDC: C.primary, DO: C.amber, MANUAL: '#0891b2' }
+const OP_TYPE_COLOR = { BDC: C.primary, DO: C.amber, MANUAL: '#0891b2', APPROVE: C.green }
 
 const fmt = (n) => Number.isFinite(+n) ? Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'
 const fmtDt = (s) => s ? new Date(s).toLocaleString() : '—'
@@ -27,7 +27,7 @@ const fmtDt = (s) => s ? new Date(s).toLocaleString() : '—'
 export default function PendAlcOperationsPage() {
   const [rows, setRows]       = useState([])
   const [loading, setLoading] = useState(false)
-  const [filterType, setFilterType] = useState('')   // '' | 'BDC' | 'DO' | 'MANUAL'
+  const [filterType, setFilterType] = useState('')   // '' | 'BDC' | 'DO' | 'MANUAL' | 'APPROVE'
   const [showReverted, setShowReverted] = useState(true)
   const [search, setSearch]   = useState('')
 
@@ -37,6 +37,9 @@ export default function PendAlcOperationsPage() {
   const [previewLoading, setPreviewLoading] = useState(false)
   const [reverting, setReverting] = useState(false)
   const [revertNote, setRevertNote] = useState('')
+  // Async revert tracking — surfaces progress + a completion banner.
+  const [revertJobStatus, setRevertJobStatus] = useState(null)
+  const [revertJobResult, setRevertJobResult] = useState(null)
 
   // Backfill state — for old BDCs generated before logging existed
   const [backfilling, setBackfilling] = useState(false)
@@ -79,13 +82,34 @@ export default function PendAlcOperationsPage() {
   const confirmRevert = async () => {
     if (!modalOp) return
     setReverting(true)
+    setRevertJobStatus(null); setRevertJobResult(null)
     try {
-      const { data } = await pendAlcAPI.operationsRevert(modalOp.op_id, revertNote)
+      const startResp = await pendAlcAPI.operationsRevertAsync(modalOp.op_id, revertNote)
+      const jobId = startResp.data?.job_id
+      if (!jobId) throw new Error('No job_id from server')
+      setRevertJobStatus({ status: 'pending', progress: 'queued' })
+
+      const finalJob = await new Promise((resolve, reject) => {
+        const timer = setInterval(async () => {
+          try {
+            const s = await pendAlcAPI.asyncJobStatus(jobId)
+            const j = s.data?.data
+            if (!j) return
+            setRevertJobStatus(j)
+            if (j.status === 'completed') { clearInterval(timer); resolve(j) }
+            else if (j.status === 'failed') {
+              clearInterval(timer); reject(new Error(j.error || 'job failed'))
+            }
+          } catch (err) { clearInterval(timer); reject(err) }
+        }, 2000)
+      })
+
+      setRevertJobResult(finalJob.result || {})
       toast.success(`Reverted op #${modalOp.op_id}`)
-      setModalOp(null)
       load()
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'Revert failed')
+      toast.error(e.response?.data?.detail || e.message || 'Revert failed')
+      setRevertJobStatus(null)
     } finally { setReverting(false) }
   }
 
@@ -122,7 +146,7 @@ export default function PendAlcOperationsPage() {
         <div>
           <div style={{ fontSize: 13, fontWeight: 800 }}>Operations Log + Undo</div>
           <div style={{ fontSize: 10, color: C.textMuted }}>
-            BDC generation, DO upload, Manual upload — each can be reverted (soft-revert preserves audit)
+            BDC, DO, Manual upload, Approve — each can be reverted (soft-revert preserves audit)
           </div>
         </div>
         <div style={{ flex: 1 }}/>
@@ -144,7 +168,7 @@ export default function PendAlcOperationsPage() {
                     flexWrap: 'wrap' }}>
         <Filter size={12} color={C.textMuted}/>
         <span style={{ fontSize: 10, fontWeight: 600, color: C.textSub }}>Type:</span>
-        {['', 'BDC', 'DO', 'MANUAL'].map(t => (
+        {['', 'BDC', 'DO', 'MANUAL', 'APPROVE'].map(t => (
           <button key={t || 'all'} onClick={() => setFilterType(t)}
             style={{
               fontSize: 10, padding: '4px 10px', borderRadius: 4, cursor: 'pointer',
@@ -334,18 +358,49 @@ export default function PendAlcOperationsPage() {
                              outline: 'none', boxSizing: 'border-box' }}/>
                 </div>
               )}
+
+              {/* Live status of the async revert job */}
+              {reverting && revertJobStatus && revertJobStatus.status !== 'completed' && (
+                <div style={{ marginTop: 12, padding: '8px 10px', borderRadius: 4,
+                              background: '#FFF7ED', border: `1px solid ${C.amber}`,
+                              fontSize: 11, color: C.text }}>
+                  <div style={{ fontWeight: 700 }}>Revert running — {revertJobStatus.status}</div>
+                  <div style={{ color: C.textSub, fontSize: 10 }}>{revertJobStatus.progress || '…'}</div>
+                </div>
+              )}
+
+              {/* Completion banner */}
+              {revertJobResult && (
+                <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 4,
+                              background: '#ECFDF5', border: '1px solid #10b981',
+                              fontSize: 11, color: C.text }}>
+                  <div style={{ fontWeight: 800, color: '#047857', marginBottom: 4 }}>
+                    ✓ Revert complete
+                  </div>
+                  {Object.entries(revertJobResult).map(([k, v]) => (
+                    <div key={k} style={{ fontSize: 10 }}>
+                      {k}: <b>{typeof v === 'number' ? v.toLocaleString() : String(v)}</b>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div style={{ padding: '10px 16px', borderTop: `1px solid ${C.border}`,
                           display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button onClick={() => setModalOp(null)} disabled={reverting}
-                style={btn(C.border, '#fff', C.textSub)}>Cancel</button>
+              <button onClick={() => { setModalOp(null); setRevertJobResult(null); setRevertJobStatus(null) }}
+                disabled={reverting}
+                style={btn(C.border, '#fff', C.textSub)}>
+                {revertJobResult ? 'Close' : 'Cancel'}
+              </button>
               <button onClick={confirmRevert}
-                disabled={reverting || !preview?.can_revert}
+                disabled={reverting || !preview?.can_revert || !!revertJobResult}
                 style={btn(C.amber, C.amber, '#fff')}>
                 <Undo2 size={11}
                   style={{ animation: reverting ? 'spin 1s linear infinite' : 'none' }}/>
-                {reverting ? 'Reverting…' : 'Confirm Revert'}
+                {reverting
+                  ? (revertJobStatus?.progress ? `${revertJobStatus.progress}…` : 'Reverting…')
+                  : (revertJobResult ? 'Done' : 'Confirm Revert')}
               </button>
             </div>
           </div>

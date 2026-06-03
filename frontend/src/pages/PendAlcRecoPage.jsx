@@ -133,6 +133,10 @@ export default function PendAlcRecoPage() {
   const [bdcSelectedStores, setBdcSelectedStores] = useState(new Set())
   const [bdcWeekday, setBdcWeekday] = useState('')
   const [bdcDateLoading, setBdcDateLoading] = useState(false)
+  // Async job tracking — populated while the BDC backend job runs/finishes
+  // so the modal can show progress + a "Job complete" confirmation banner.
+  const [bdcJobStatus, setBdcJobStatus] = useState(null)
+  const [bdcJobResult, setBdcJobResult] = useState(null)
 
   const loadSummary = useCallback(async () => {
     setSummaryLoading(true)
@@ -201,14 +205,17 @@ export default function PendAlcRecoPage() {
     })
   }
 
+  // Async BDC generate: kick off background job, poll status, download ZIP,
+  // show completion summary. Survives Cloudflare's 100s edge timeout on
+  // large batches (the old sync call would hang the browser then fail).
   const handleBdcGenerate = async () => {
     setBdcLoading(true)
+    setBdcJobStatus(null); setBdcJobResult(null)
     try {
       const params = {}
       if (fRdc)    params.rdc     = fRdc
       if (fMajCat) params.maj_cat = fMajCat
       if (bdcDate) params.target_date = bdcDate
-      // Send only the user-selected subset (lets users de-select stores)
       if (bdcScheduleStores.length > 0) {
         params.st_cd_list = [...bdcSelectedStores]
         if (params.st_cd_list.length === 0) {
@@ -216,19 +223,51 @@ export default function PendAlcRecoPage() {
           setBdcLoading(false); return
         }
       }
-      const resp = await pendAlcAPI.bdcGenerate(params)
-      const url = URL.createObjectURL(new Blob([resp.data],
-        { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
+
+      const startResp = await pendAlcAPI.bdcGenerateAsync(params)
+      const jobId = startResp.data?.job_id
+      if (!jobId) throw new Error('No job_id in response')
+      setBdcJobStatus({ status: 'pending', progress: 'queued' })
+
+      // Poll every 2s until completed / failed.
+      const poll = () => new Promise((resolve, reject) => {
+        const timer = setInterval(async () => {
+          try {
+            const s = await pendAlcAPI.asyncJobStatus(jobId)
+            const j = s.data?.data
+            if (!j) return
+            setBdcJobStatus(j)
+            if (j.status === 'completed') { clearInterval(timer); resolve(j) }
+            else if (j.status === 'failed') {
+              clearInterval(timer)
+              reject(new Error(j.error || 'Job failed'))
+            }
+          } catch (err) {
+            clearInterval(timer); reject(err)
+          }
+        }, 2000)
+      })
+
+      const finalJob = await poll()
+
+      // Job complete — fetch the ZIP and trigger browser download.
+      const dl = await pendAlcAPI.asyncJobDownload(jobId)
+      const url = URL.createObjectURL(new Blob([dl.data], { type: 'application/zip' }))
       const a = document.createElement('a')
       const stamp = (bdcDate || new Date().toISOString().slice(0, 10)).replace(/-/g, '')
-      a.href = url; a.download = `ARS_BDC_${stamp}.xlsx`
+      const alloc = finalJob.result?.allocation_no || ''
+      a.href = url
+      a.download = `ARS_BDC_${stamp}${alloc ? '_' + alloc : ''}.zip`
       document.body.appendChild(a); a.click()
       document.body.removeChild(a); URL.revokeObjectURL(url)
-      toast.success(`BDC downloaded — ${[...bdcSelectedStores].length || 'all'} store(s)`)
-      setBdcModalOpen(false)
+
+      setBdcJobResult(finalJob.result || null)
+      toast.success(`BDC ready — ${finalJob.result?.rdc_count || 0} RDC file(s), `
+        + `${(finalJob.result?.row_count || 0).toLocaleString()} rows`)
       loadSummary(); setGridBumpKey(k => k + 1)
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'BDC generate failed')
+      toast.error(e.response?.data?.detail || e.message || 'BDC generate failed')
+      setBdcJobStatus(null)
     } finally {
       setBdcLoading(false)
     }
@@ -384,17 +423,50 @@ export default function PendAlcRecoPage() {
                     {bdcSelectedStores.size} of {bdcScheduleStores.length} selected
                   </div>
                 )}
+
+                {/* Live progress while async BDC job is running. */}
+                {bdcLoading && bdcJobStatus && bdcJobStatus.status !== 'completed' && (
+                  <div style={{ marginTop: 12, padding: '8px 10px', borderRadius: 4,
+                                background: '#FFF7ED', border: `1px solid ${C.amber}`,
+                                fontSize: 10, color: C.text }}>
+                    <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                      Job running — status: {bdcJobStatus.status}
+                    </div>
+                    <div style={{ color: C.textSub }}>{bdcJobStatus.progress || '…'}</div>
+                  </div>
+                )}
+
+                {/* Completion confirmation — stays in modal so user sees the
+                    summary and can close manually after download fired. */}
+                {bdcJobResult && (
+                  <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 4,
+                                background: '#ECFDF5', border: '1px solid #10b981',
+                                fontSize: 10, color: C.text }}>
+                    <div style={{ fontWeight: 800, color: '#047857', marginBottom: 4 }}>
+                      ✓ Job complete — ZIP downloaded
+                    </div>
+                    <div>Allocation: <b>{bdcJobResult.allocation_no}</b></div>
+                    <div>RDCs: <b>{bdcJobResult.rdc_count}</b> file(s)</div>
+                    <div>Rows: <b>{(bdcJobResult.row_count || 0).toLocaleString()}</b></div>
+                    <div>Units: <b>{(bdcJobResult.total_qty || 0).toLocaleString()}</b></div>
+                  </div>
+                )}
               </div>
             </div>
 
             <div style={{ padding: '10px 16px', borderTop: `1px solid ${C.border}`,
                           display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button onClick={() => setBdcModalOpen(false)} disabled={bdcLoading}
-                style={{ ..._btn(), border: `1px solid ${C.border}` }}>Cancel</button>
+              <button onClick={() => { setBdcModalOpen(false); setBdcJobResult(null); setBdcJobStatus(null) }}
+                disabled={bdcLoading}
+                style={{ ..._btn(), border: `1px solid ${C.border}` }}>
+                {bdcJobResult ? 'Close' : 'Cancel'}
+              </button>
               <button onClick={handleBdcGenerate} disabled={bdcLoading || bdcDateLoading}
                 style={_btn('primary')}>
                 <Download size={11} style={{ animation: bdcLoading ? 'spin 1s linear infinite' : 'none' }}/>
-                {bdcLoading ? 'Generating…' : 'Generate BDC'}
+                {bdcLoading
+                  ? (bdcJobStatus?.progress ? `${bdcJobStatus.progress}…` : 'Generating…')
+                  : (bdcJobResult ? 'Generate again' : 'Generate BDC')}
               </button>
             </div>
           </div>

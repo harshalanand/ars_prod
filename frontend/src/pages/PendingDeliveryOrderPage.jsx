@@ -14,10 +14,11 @@ import {
 // Above this row count, switch to bulk mode (no editable table render).
 const BULK_THRESHOLD = 100
 // Submit in chunks so the user sees progress and the request body stays
-// small. 2,000 sized chunks comfortably finish well under the 10-min axios
-// ceiling on a cold connection, leaving plenty of headroom over the
-// sub-second set-based backend SQL.
-const SUBMIT_CHUNK = 2000
+// small. 10,000-row chunks match the Manual upload page so DO entry runs
+// at the same speed — fast_executemany on the backend keeps each chunk
+// sub-second, and the request body stays under axios's 10-min ceiling on
+// a cold connection.
+const SUBMIT_CHUNK = 10000
 
 // Generate a per-upload session id so chunks roll up to ONE ops_log row
 // (revert covers the whole upload, not just chunk 1).
@@ -162,6 +163,23 @@ export default function PendingDeliveryOrderPage() {
 
     // Per-chunk try/catch: one failure no longer abandons the whole upload.
     // Every chunk gets a fair attempt; the user sees a summary at the end.
+    // Async path: kick off background job per chunk, poll until complete,
+    // then move to the next chunk. Survives the 100s Cloudflare timeout.
+    const waitForJob = (jobId) => new Promise((resolve, reject) => {
+      const timer = setInterval(async () => {
+        try {
+          const s = await pendAlcAPI.asyncJobStatus(jobId)
+          const j = s.data?.data
+          if (!j) return
+          if (j.status === 'completed') { clearInterval(timer); resolve(j) }
+          else if (j.status === 'failed') {
+            clearInterval(timer)
+            reject(new Error(j.error || 'job failed'))
+          }
+        } catch (err) { clearInterval(timer); reject(err) }
+      }, 2000)
+    })
+
     for (let i = 0, idx = 0; i < totalRows; i += SUBMIT_CHUNK, idx += 1) {
       const slice   = valid.slice(i, i + SUBMIT_CHUNK)
       const payload = {
@@ -171,8 +189,11 @@ export default function PendingDeliveryOrderPage() {
         is_last_chunk:  idx === numChunks - 1,
       }
       try {
-        const { data } = await pendAlcAPI.doUpdate(payload)
-        totalUpdated += (data.updated_rows || 0)
+        const startResp = await pendAlcAPI.doUpdateAsync(payload)
+        const jobId = startResp.data?.job_id
+        if (!jobId) throw new Error('No job_id from server')
+        const finalJob = await waitForJob(jobId)
+        totalUpdated += (finalJob.result?.updated_rows || 0)
       } catch (e) {
         failures.push({
           chunkIdx: idx + 1,

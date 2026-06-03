@@ -178,7 +178,7 @@ _OPERATIONS_DDL = f"""
 IF OBJECT_ID('dbo.{OPERATIONS_TABLE}','U') IS NULL
 CREATE TABLE dbo.{OPERATIONS_TABLE} (
     OP_ID         BIGINT IDENTITY(1,1),
-    OP_TYPE       NVARCHAR(20)   NOT NULL,   -- 'BDC' / 'DO' / 'MANUAL'
+    OP_TYPE       NVARCHAR(20)   NOT NULL,   -- 'BDC' / 'DO' / 'MANUAL' / 'APPROVE'
     OP_KEY        NVARCHAR(100)  NOT NULL,   -- ALLOCATION_NUMBER / SESSION_ID / DO batch UUID
     OP_DATE       DATETIME       NOT NULL DEFAULT GETDATE(),
     CREATED_BY    NVARCHAR(100)  NULL,
@@ -541,42 +541,103 @@ def backfill_bdc_operations(conn, dry_run: bool = True) -> Dict:
     return {"found": found, "ops_created": ops_created, "applied": True}
 
 
+def _bulk_load_ids(conn, ids) -> str:
+    # Bulk-load ids into a fresh #tmp table and return its name. Caller
+    # must DROP it in a finally block. Replaces literal `WHERE ID IN (lit,
+    # lit, ...)` which trips SQL Server error 8623 past ~few-thousand items.
+    tmp = f"#ids_{uuid.uuid4().hex[:8]}"
+    conn.execute(text(f"CREATE TABLE {tmp} (id BIGINT NOT NULL)"))
+    cur = conn.connection.cursor()
+    try:
+        try:
+            cur.fast_executemany = True
+        except Exception:
+            pass
+        cur.executemany(
+            f"INSERT INTO {tmp} (id) VALUES (?)",
+            [(int(x),) for x in ids],
+        )
+    finally:
+        cur.close()
+    return tmp
+
+
+def _drop_tmp(conn, tmp: str) -> None:
+    try:
+        conn.execute(text(
+            f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
+        ))
+    except Exception:
+        pass
+
+
 def _check_bdc_revert(conn, op: Dict) -> List[str]:
     """Block BDC revert if any history row has DO_RECEIVED > 0."""
     errors = []
     history_ids = op["payload"].get("history_ids") or []
-    if history_ids:
+    if not history_ids:
+        return errors
+    tmp = _bulk_load_ids(conn, history_ids)
+    try:
         rows = conn.execute(text(f"""
-            SELECT ID, ALLOCATION_NUMBER, DO_RECEIVED, STATUS
-            FROM {BDC_HISTORY_TABLE}
-            WHERE ID IN ({','.join(str(int(x)) for x in history_ids)})
-              AND DO_RECEIVED > 0
+            SELECT H.ID, H.ALLOCATION_NUMBER, H.DO_RECEIVED, H.STATUS
+            FROM {BDC_HISTORY_TABLE} H
+            JOIN {tmp} t ON t.id = H.ID
+            WHERE H.DO_RECEIVED > 0
         """)).fetchall()
-        for r in rows:
-            errors.append(
-                f"BDC history #{r[0]} (alloc {r[1]}) already has DO={r[2]:.0f} — "
-                f"cannot revert without first reversing the DO upload"
-            )
+    finally:
+        _drop_tmp(conn, tmp)
+    for r in rows:
+        errors.append(
+            f"BDC history #{r[0]} (alloc {r[1]}) already has DO={r[2]:.0f} — "
+            f"cannot revert without first reversing the DO upload"
+        )
     return errors
 
 
 def _check_do_revert(conn, op: Dict) -> List[str]:
-    """Block DO revert if any affected PEND row has been touched by a later DO."""
+    """Block DO revert only if a STRICTLY LATER non-reverted DO upload has
+    touched any of the affected pend rows.
+
+    Why not compare LAST_DO_AT > op_date directly?  OP_DATE is stamped at
+    log_operation INSERT time, but the apply later sets LAST_DO_AT =
+    GETDATE() inside the same op — so this op's own writes always satisfy
+    LAST_DO_AT > OP_DATE and get flagged as a "newer DO event" against
+    themselves.  Threshold must be the next op's OP_DATE, not this one's.
+    """
     errors = []
-    op_date = op["op_date"]
     pend_updates = op["payload"].get("pend_updates") or []
-    pend_ids = [u["pend_alc_id"] for u in pend_updates]
+    # Dedup — multi-chunk uploads can repeat the same pend_alc_id across
+    # chunks when several input lines hit the same row.
+    pend_ids = {int(u["pend_alc_id"]) for u in pend_updates if u.get("pend_alc_id") is not None}
     if not pend_ids:
         return errors
-    placeholders = ",".join(str(int(x)) for x in pend_ids)
-    rows = conn.execute(text(f"""
-        SELECT ID, LAST_DO_AT
-        FROM {PEND_ALC_TABLE}
-        WHERE ID IN ({placeholders}) AND LAST_DO_AT > :d
-    """), {"d": op_date}).fetchall()
-    if rows:
+
+    next_op_date = conn.execute(text(f"""
+        SELECT MIN(OP_DATE) FROM {OPERATIONS_TABLE}
+        WHERE OP_TYPE = 'DO'
+          AND REVERTED_AT IS NULL
+          AND OP_ID <> :this_id
+          AND OP_DATE > :this_date
+    """), {"this_id": op["op_id"], "this_date": op["op_date"]}).scalar()
+
+    if next_op_date is None:
+        return errors  # no later DO → nothing could have touched these rows
+
+    tmp = _bulk_load_ids(conn, pend_ids)
+    try:
+        cnt = conn.execute(text(f"""
+            SELECT COUNT(DISTINCT P.ID)
+            FROM {PEND_ALC_TABLE} P
+            JOIN {tmp} t ON t.id = P.ID
+            WHERE P.LAST_DO_AT > :d
+        """), {"d": next_op_date}).scalar() or 0
+    finally:
+        _drop_tmp(conn, tmp)
+
+    if cnt > 0:
         errors.append(
-            f"{len(rows)} row(s) have a newer DO event after this upload — "
+            f"{cnt} row(s) have a newer DO event after this upload — "
             f"revert the newer DO upload first to keep FIFO integrity"
         )
     return errors
@@ -588,17 +649,56 @@ def _check_manual_revert(conn, op: Dict) -> List[str]:
     inserted_ids = op["payload"].get("inserted_ids") or []
     if not inserted_ids:
         return errors
-    placeholders = ",".join(str(int(x)) for x in inserted_ids)
-    rows = conn.execute(text(f"""
-        SELECT ID, BDC_QTY, DO_QTY
-        FROM {PEND_ALC_TABLE}
-        WHERE ID IN ({placeholders})
-          AND (BDC_QTY > 0 OR DO_QTY > 0)
-    """)).fetchall()
+    tmp = _bulk_load_ids(conn, inserted_ids)
+    try:
+        rows = conn.execute(text(f"""
+            SELECT P.ID, P.BDC_QTY, P.DO_QTY
+            FROM {PEND_ALC_TABLE} P
+            JOIN {tmp} t ON t.id = P.ID
+            WHERE P.BDC_QTY > 0 OR P.DO_QTY > 0
+        """)).fetchall()
+    finally:
+        _drop_tmp(conn, tmp)
     for r in rows:
         errors.append(
             f"Row #{r[0]} has BDC_QTY={r[1]:.0f} DO_QTY={r[2]:.0f} — "
             f"this manual upload was already actioned, revert BDC/DO first"
+        )
+    return errors
+
+
+def _check_approve_revert(conn, op: Dict) -> List[str]:
+    """Block APPROVE revert if any PEND row from this session has already
+    been actioned (BDC stamped or DO received). Same rationale as MANUAL —
+    silently nuking a row that's already downstream would orphan the BDC /
+    DO history. The user must revert those downstream ops first.
+
+    APPROVE rows are identified by SESSION_ID (write_pend_alc keys every
+    inserted row to the approved session_id). Returns a small set of
+    representative offending rows — not the full list — to keep the
+    response readable when thousands are affected.
+    """
+    errors: List[str] = []
+    session_id = op["payload"].get("session_id") or op.get("op_key")
+    if not session_id:
+        return errors
+    cnt_row = conn.execute(text(f"""
+        SELECT COUNT(*),
+               SUM(CASE WHEN BDC_QTY > 0 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN DO_QTY  > 0 THEN 1 ELSE 0 END)
+        FROM {PEND_ALC_TABLE}
+        WHERE SESSION_ID = :sid
+          AND (BDC_QTY > 0 OR DO_QTY > 0)
+    """), {"sid": session_id}).fetchone()
+    bad = int((cnt_row and cnt_row[0]) or 0)
+    bdc = int((cnt_row and cnt_row[1]) or 0)
+    do  = int((cnt_row and cnt_row[2]) or 0)
+    if bad > 0:
+        errors.append(
+            f"Cannot revert this approve — {bad} row(s) already actioned "
+            f"(BDC_QTY > 0: {bdc}, DO_QTY > 0: {do}). "
+            f"Revert the downstream DO upload(s) first, then the BDC "
+            f"generation(s), then come back and revert this approve."
         )
     return errors
 
@@ -618,6 +718,8 @@ def preview_revert(conn, op_id: int) -> Dict:
         errors = _check_do_revert(conn, op)
     elif op["op_type"] == "MANUAL":
         errors = _check_manual_revert(conn, op)
+    elif op["op_type"] == "APPROVE":
+        errors = _check_approve_revert(conn, op)
     else:
         errors = [f"Unknown op_type: {op['op_type']}"]
 
@@ -653,6 +755,8 @@ def revert_operation(
         errors = _check_do_revert(conn, op)
     elif op["op_type"] == "MANUAL":
         errors = _check_manual_revert(conn, op)
+    elif op["op_type"] == "APPROVE":
+        errors = _check_approve_revert(conn, op)
     else:
         return {"success": False, "error": f"Unknown op_type: {op['op_type']}"}
     if errors:
@@ -666,6 +770,8 @@ def revert_operation(
         result = _revert_do(conn, payload)
     elif op["op_type"] == "MANUAL":
         result = _revert_manual(conn, payload)
+    elif op["op_type"] == "APPROVE":
+        result = _revert_approve(conn, payload)
 
     # Stamp the audit fields on the op row
     conn.execute(text(f"""
@@ -725,11 +831,16 @@ def _revert_bdc(conn, payload: Dict) -> Dict:
 
     history_deleted = 0
     if history_ids:
-        placeholders = ",".join(str(int(x)) for x in history_ids)
-        res = conn.execute(text(
-            f"DELETE FROM {BDC_HISTORY_TABLE} WHERE ID IN ({placeholders})"
-        ))
-        history_deleted = int(res.rowcount or 0)
+        tmp = _bulk_load_ids(conn, history_ids)
+        try:
+            res = conn.execute(text(f"""
+                DELETE H
+                FROM {BDC_HISTORY_TABLE} H
+                JOIN {tmp} t ON t.id = H.ID
+            """))
+            history_deleted = int(res.rowcount or 0)
+        finally:
+            _drop_tmp(conn, tmp)
 
     return {"pend_alc_rows_restored": rows_restored,
             "bdc_history_rows_deleted": history_deleted}
@@ -869,18 +980,86 @@ def _revert_manual(conn, payload: Dict) -> Dict:
 
     # Build the WHERE clause: prefer session_id (covers all chunks), fall
     # back to inserted_ids for older log entries that didn't carry session_id.
+    # inserted_ids uses a #tmp JOIN — literal IN(...) trips SQL Server 8623
+    # past a few-thousand entries (same fix as the _check_* helpers above).
+    tmp_ids = None
     if session_id:
         where_sql = "SESSION_ID = :sid"
         where_params = {"sid": session_id}
     elif inserted_ids:
-        placeholders = ",".join(str(int(x)) for x in inserted_ids)
-        where_sql = f"ID IN ({placeholders})"
+        tmp_ids = _bulk_load_ids(conn, inserted_ids)
+        where_sql = f"ID IN (SELECT id FROM {tmp_ids})"
         where_params = {}
     else:
         return {"pend_alc_rows_deleted": 0}
 
-    # Read the rows BEFORE deleting so we can apply the -1 delta against
-    # the same grain (RDC, ST_CD, ARTICLE, MAJ_CAT, GEN_ART, CLR, qty).
+    try:
+        # Read the rows BEFORE deleting so we can apply the -1 delta against
+        # the same grain (RDC, ST_CD, ARTICLE, MAJ_CAT, GEN_ART, CLR, qty).
+        rows_to_revert = [
+            {
+                "rdc":            r[0],
+                "st_cd":          r[1],
+                "article_number": r[2],
+                "maj_cat":        r[3],
+                "gen_art_number": r[4],
+                "clr":            r[5],
+                "alloc_qty":      float(r[6] or 0),
+                "do_qty":         float(r[7] or 0),
+            }
+            for r in conn.execute(text(f"""
+                SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                       ALLOC_QTY, ISNULL(DO_QTY, 0)
+                FROM {PEND_ALC_TABLE}
+                WHERE {where_sql}
+            """), where_params).fetchall()
+        ]
+
+        res = conn.execute(text(
+            f"DELETE FROM {PEND_ALC_TABLE} WHERE {where_sql}"
+        ), where_params)
+        deleted = int(res.rowcount or 0)
+    finally:
+        if tmp_ids:
+            _drop_tmp(conn, tmp_ids)
+
+    if rows_to_revert:
+        try:
+            apply_pend_alc_delta(conn, rows_to_revert, sign=-1)
+        except Exception as e:
+            logger.warning(f"[revert] -1 delta skipped: {e}")
+
+    logger.info(
+        f"[revert] manual: deleted {deleted} rows "
+        f"(by {'session_id=' + session_id if session_id else 'inserted_ids'})"
+    )
+    return {"pend_alc_rows_deleted": deleted}
+
+
+def _revert_approve(conn, payload: Dict) -> Dict:
+    """Reverse an approved listing's downstream effects on PEND_ALC + MSA +
+    HOLD_TRACKING. Symmetric inverse of `parked_history.approve_parked`'s
+    post-promotion work (pend_alc INSERTs, MSA +1 delta, hold-tracking
+    apply).
+
+    Does NOT touch ARS_ALLOC_HISTORY / ARS_LISTING_*_HISTORY — history is
+    the permanent audit record of "this was approved by this user at this
+    time", and clearing it would break the alloc-history report. To
+    re-allocate after revert, run a fresh listing.
+
+    Steps (every step best-effort; one failure shouldn't strand the rest):
+      1. Snapshot the rows we're about to delete so we can pass them to
+         apply_pend_alc_delta with sign=-1 (delta needs grain + qty).
+      2. DELETE FROM ARS_PEND_ALC WHERE SESSION_ID = :sid.
+      3. Apply -1 MSA/Grid delta against the snapshotted rows.
+      4. Call parked_history._revert_hold_tracking to restore
+         ARS_NL_TBL_HOLD_TRACKING from its pre-approve snapshot.
+    """
+    session_id = payload.get("session_id")
+    if not session_id:
+        return {"pend_alc_rows_deleted": 0,
+                "error": "missing session_id in payload"}
+
     rows_to_revert = [
         {
             "rdc":            r[0],
@@ -896,26 +1075,39 @@ def _revert_manual(conn, payload: Dict) -> Dict:
             SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
                    ALLOC_QTY, ISNULL(DO_QTY, 0)
             FROM {PEND_ALC_TABLE}
-            WHERE {where_sql}
-        """), where_params).fetchall()
+            WHERE SESSION_ID = :sid
+        """), {"sid": session_id}).fetchall()
     ]
 
     res = conn.execute(text(
-        f"DELETE FROM {PEND_ALC_TABLE} WHERE {where_sql}"
-    ), where_params)
+        f"DELETE FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid"
+    ), {"sid": session_id})
     deleted = int(res.rowcount or 0)
+    conn.commit()
+
+    result: Dict = {"pend_alc_rows_deleted": deleted}
 
     if rows_to_revert:
         try:
-            apply_pend_alc_delta(conn, rows_to_revert, sign=-1)
+            result["msa_delta"] = apply_pend_alc_delta(
+                conn, rows_to_revert, sign=-1
+            )
         except Exception as e:
-            logger.warning(f"[revert] -1 delta skipped: {e}")
+            logger.warning(f"[revert] APPROVE -1 delta skipped: {e}")
+            result["msa_delta_error"] = str(e)
+
+    try:
+        from app.services.parked_history import _revert_hold_tracking
+        result["hold_revert"] = _revert_hold_tracking(conn, session_id)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[revert] APPROVE hold-tracking revert skipped: {e}")
+        result["hold_revert_error"] = str(e)
 
     logger.info(
-        f"[revert] manual: deleted {deleted} rows "
-        f"(by {'session_id=' + session_id if session_id else 'inserted_ids'})"
+        f"[revert] APPROVE session={session_id}: deleted {deleted} pend rows"
     )
-    return {"pend_alc_rows_deleted": deleted}
+    return result
 
 
 # ---------------------------------------------------------------------------
