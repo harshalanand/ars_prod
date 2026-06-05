@@ -589,10 +589,93 @@ def _compute_kpis(df, avg_days, grouping_column):
     return df
 
 
+def _load_base_kpi_data(engine, grouping_column, majcats, selected_presets, all_presets):
+    """Pull the inner-aggregated stock data ONCE for all selected presets.
+
+    The previous design ran one full scan of COUNT_STOCK_DATA_18M per preset.
+    Now we union all required (KPI, STOCK_DATE) slices into a single query and
+    keep KPI + STOCK_DATE as columns. Each preset later filters this df and
+    runs only the OUTER AVG-over-STOCK_DATE step in pandas, which preserves
+    the existing math (AVG of NULLIF / CASE-WHEN-SALE_Q semantics).
+
+    Returns a df indexed by (KPI, STOCK_DATE, ST_CD, MAJ_CAT, grouping) with
+    the SUM(qty)/1000 + SUM(val)/100000 columns. Empty df if no presets
+    selected or no matching rows.
+    """
+    if not selected_presets:
+        return pd.DataFrame()
+
+    need_l7d = False
+    need_l30d = False
+    l18m_months: set = set()
+    for pname in selected_presets:
+        cfg = all_presets.get(pname, {})
+        kt = cfg.get("kpi_type", "L30D")
+        if kt == "L7D" or pname == "L7D":
+            need_l7d = True
+        elif kt == "L30D" or pname == "L30D":
+            need_l30d = True
+        else:
+            for m in cfg.get("months", []):
+                if m:
+                    l18m_months.add(m)
+
+    or_parts = []
+    if need_l7d:
+        or_parts.append("sal_stk.KPI = 'L7D'")
+    if need_l30d:
+        or_parts.append("sal_stk.KPI = 'L30D'")
+    if l18m_months:
+        ms = "','".join(sorted(l18m_months))
+        or_parts.append(f"(sal_stk.KPI = 'L18M' AND sal_stk.STOCK_DATE IN ('{ms}'))")
+    if not or_parts:
+        return pd.DataFrame()
+    combined_kpi_filter = "(" + " OR ".join(or_parts) + ")"
+
+    where_parts = []
+    if majcats:
+        safe = "','".join(m.replace("'", "''") for m in majcats)
+        where_parts.append(f"prod.MAJ_CAT IN ('{safe}')")
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+
+    grouping_expr, _ = _get_grouping_expr(engine, grouping_column)
+
+    # Inner-aggregation only — KPI + STOCK_DATE are kept as columns so each
+    # preset can pick its slice in pandas. SUM divisors and SEG filter match
+    # the original per-preset query exactly.
+    base_query = f"""
+        SELECT sal_stk.KPI, sal_stk.STOCK_DATE,
+               sal_stk.WERKS AS ST_CD,
+               prod.MAJ_CAT, prod.{grouping_column},
+               COALESCE(SUM(sal_stk.OP_STK_QTY)/1000,0)   AS OP_STK_Q,
+               COALESCE(SUM(sal_stk.OP_STK_VAL)/100000,0) AS OP_STK_V,
+               COALESCE(SUM(sal_stk.CL_STK_QTY)/1000,0)   AS CL_STK_Q,
+               COALESCE(SUM(sal_stk.CL_STK_VAL)/100000,0) AS CL_STK_V,
+               COALESCE(SUM(sal_stk.SALE_QTY)/1000,0)     AS SALE_Q,
+               COALESCE(SUM(sal_stk.SALE_VAL)/100000,0)   AS SALE_V,
+               COALESCE(SUM(sal_stk.GM_VAL)/100000,0)     AS GM_V
+        FROM dbo.COUNT_STOCK_DATA_18M sal_stk WITH (NOLOCK)
+        LEFT JOIN (
+            SELECT ARTICLE_NUMBER AS MATNR, MAJ_CAT,
+                   {grouping_expr} AS {grouping_column}, SEG
+            FROM dbo.VW_MASTER_PRODUCT WITH (NOLOCK)
+        ) prod ON sal_stk.MATNR = prod.MATNR
+        WHERE {where_clause} AND prod.SEG IN ('APP','GM') AND {combined_kpi_filter}
+        GROUP BY sal_stk.KPI, sal_stk.STOCK_DATE, sal_stk.WERKS,
+                 prod.MAJ_CAT, prod.{grouping_column}
+    """
+    return _read_sql_nolock(base_query, engine)
+
+
 def _process_single_preset(engine, preset_name, preset_cfg, majcats, grouping_column,
-                           avg_density, apf, df_master_cache=None):
-    """Process one preset: query → merge → KPI → return (detail_df, agg_df, timing, df_master).
-    df_master_cache: reuse master query result across presets (big optimization)."""
+                           avg_density, apf, df_master_cache=None, base_data=None):
+    """Process one preset: slice base data → merge → KPI → return (detail_df, agg_df, timing, df_master).
+
+    df_master_cache: reuse master query result across presets (big optimization).
+    base_data: pre-loaded inner-aggregated stock data shared across presets.
+               Each preset filters this in pandas and does the OUTER AVG step,
+               replacing N full scans of COUNT_STOCK_DATA_18M with one shared pull.
+    """
     timing = {}
     where_parts = []
     if majcats:
@@ -604,54 +687,56 @@ def _process_single_preset(engine, preset_name, preset_cfg, majcats, grouping_co
     kpi_type = preset_cfg.get("kpi_type", "L30D")
     avg_days = preset_cfg.get("avg_days", 30)
 
-    if kpi_type == "L7D" or preset_name == "L7D":
-        date_filter = "sal_stk.KPI = 'L7D'"
-    elif kpi_type == "L30D" or preset_name == "L30D":
-        date_filter = "sal_stk.KPI = 'L30D'"
-    else:
-        ms = "','".join(months)
-        date_filter = f"sal_stk.STOCK_DATE IN ('{ms}') AND sal_stk.KPI = 'L18M'"
-
     grouping_expr, grouping_dtype = _get_grouping_expr(engine, grouping_column)
 
-    # Step 1: Data query (stock + product join)
+    # Step 1: Pull this preset's slice from the shared base data (computed once
+    # at the job level in _load_base_kpi_data). Replaces the per-preset SQL.
+    # The OUTER AVG step happens here in pandas using the same NULLIF /
+    # CASE-WHEN-SALE_Q rules the SQL had — see the masking block below.
+    #
+    # IMPORTANT: do NOT round the per-row inputs — values are in lakhs and
+    # often < 0.005, which would round to 0.00 and hide real contribution at
+    # the company level. Final 2-dp rounding happens at the end of _compute_kpis.
     t = time.time()
-    # NOTE: do NOT ROUND() these averages in SQL — per-store, per-active-month
-    # values for GM_V/SALE_V are in lakhs and often < 0.005 (e.g. 0.0007 lakhs),
-    # which would round to 0.00 and then SUM across stores stays 0, hiding real
-    # contribution at the company level. Final 2-dp rounding happens once at
-    # the end of _compute_kpis().
-    data_query = f"""
-        SELECT ST_CD, MAJ_CAT, {grouping_column},
-               AVG(NULLIF(OP_STK_Q, 0)) AS OP_STK_Q,
-               AVG(NULLIF(OP_STK_V, 0)) AS OP_STK_V,
-               AVG(NULLIF(CL_STK_Q, 0)) AS CL_STK_Q,
-               AVG(NULLIF(CL_STK_V, 0)) AS CL_STK_V,
-               AVG(CASE WHEN SALE_Q <> 0 THEN SALE_Q END) AS SALE_Q,
-               AVG(CASE WHEN SALE_Q <> 0 THEN SALE_V END) AS SALE_V,
-               AVG(CASE WHEN SALE_Q <> 0 THEN GM_V   END) AS GM_V
-        FROM (
-            SELECT sal_stk.STOCK_DATE, sal_stk.WERKS AS ST_CD,
-                   prod.MAJ_CAT, prod.{grouping_column},
-                   COALESCE(SUM(sal_stk.OP_STK_QTY)/1000,0) AS OP_STK_Q,
-                   COALESCE(SUM(sal_stk.OP_STK_VAL)/100000,0) AS OP_STK_V,
-                   COALESCE(SUM(sal_stk.CL_STK_QTY)/1000,0) AS CL_STK_Q,
-                   COALESCE(SUM(sal_stk.CL_STK_VAL)/100000,0) AS CL_STK_V,
-                   COALESCE(SUM(sal_stk.SALE_QTY)/1000,0) AS SALE_Q,
-                   COALESCE(SUM(sal_stk.SALE_VAL)/100000,0) AS SALE_V,
-                   COALESCE(SUM(sal_stk.GM_VAL)/100000,0) AS GM_V
-            FROM dbo.COUNT_STOCK_DATA_18M sal_stk WITH (NOLOCK)
-            LEFT JOIN (
-                SELECT ARTICLE_NUMBER AS MATNR, MAJ_CAT,
-                       {grouping_expr} AS {grouping_column}, SEG
-                FROM dbo.VW_MASTER_PRODUCT WITH (NOLOCK)
-            ) prod ON sal_stk.MATNR = prod.MATNR
-            WHERE {where_clause} AND prod.SEG IN ('APP','GM') AND {date_filter}
-            GROUP BY sal_stk.WERKS, sal_stk.STOCK_DATE, prod.MAJ_CAT, prod.{grouping_column}
-        ) t
-        GROUP BY ST_CD, MAJ_CAT, {grouping_column}
-    """
-    df_data = _read_sql_nolock(data_query, engine)
+    gcols = ['ST_CD', 'MAJ_CAT', grouping_column]
+    avg_cols_zero  = ['OP_STK_Q', 'OP_STK_V', 'CL_STK_Q', 'CL_STK_V']
+    avg_cols_sale  = ['SALE_Q', 'SALE_V', 'GM_V']
+    all_avg_cols   = avg_cols_zero + avg_cols_sale
+
+    if base_data is None or base_data.empty:
+        df_data = pd.DataFrame(columns=gcols + all_avg_cols)
+    else:
+        # Filter to this preset's KPI / STOCK_DATE rows.
+        if kpi_type == "L7D" or preset_name == "L7D":
+            slice_df = base_data[base_data['KPI'] == 'L7D']
+        elif kpi_type == "L30D" or preset_name == "L30D":
+            slice_df = base_data[base_data['KPI'] == 'L30D']
+        else:
+            slice_df = base_data[
+                (base_data['KPI'] == 'L18M')
+                & (base_data['STOCK_DATE'].astype(str).isin([str(m) for m in months]))
+            ]
+
+        if slice_df.empty:
+            df_data = pd.DataFrame(columns=gcols + all_avg_cols)
+        else:
+            # Apply masks that reproduce SQL's NULLIF / CASE-WHEN semantics.
+            #   AVG(NULLIF(col, 0))                       → mean ignoring zero rows of that col
+            #   AVG(CASE WHEN SALE_Q <> 0 THEN col END)   → mean over rows where SALE_Q != 0
+            masked = slice_df.copy()
+            sale_zero_mask = (masked['SALE_Q'] == 0)
+            for c in avg_cols_zero:
+                if c in masked.columns:
+                    masked.loc[masked[c] == 0, c] = np.nan
+            for c in avg_cols_sale:
+                if c in masked.columns:
+                    masked.loc[sale_zero_mask, c] = np.nan
+
+            df_data = (
+                masked.groupby(gcols, dropna=False)[all_avg_cols]
+                      .mean()      # pandas .mean() skips NaN, matching SQL AVG ignoring NULLs
+                      .reset_index()
+            )
     timing["sql_data"] = round(time.time()-t, 2)
 
     if df_data.empty:
@@ -936,17 +1021,25 @@ def _inherit_company_bgt_final(df_store, df_company_mem, engine, gc_col):
         company_bgt = df_company_mem[needed].copy()
         source = "in-memory company df"
     else:
-        month_tag = datetime.now().strftime('%Y_%m')
+        # Q1b: tables are now timestamped per execution (YYYY_MM_DD_HHMM), so
+        # there's no single "this month's" CO table. Find the LATEST one for
+        # this gc by lexicographic name DESC — the suffix is zero-padded so
+        # name sort = chronological. Falls back to legacy YYYY_MM tables too.
         safe_gc = gc_col.upper().replace(' ', '_').replace('-', '_')
-        co_table = f"{TABLE_PREFIX}_{safe_gc}_CO_{month_tag}"
+        co_table = None
         try:
             with engine.connect() as c:
-                exists = c.execute(text(
-                    "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME=:t"
-                ), {"t": co_table}).fetchone()
-            if not exists:
-                logger.info(f"[contrib] No company table '{co_table}' — store BGT CONT% (FINAL) keeps local value.")
+                row = c.execute(text(
+                    "SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_NAME LIKE :pat ORDER BY TABLE_NAME DESC"
+                ), {"pat": f"{TABLE_PREFIX}_{safe_gc}_CO_%"}).fetchone()
+            if not row:
+                logger.info(
+                    f"[contrib] No company table matching '{TABLE_PREFIX}_{safe_gc}_CO_*' — "
+                    "store BGT CONT% (FINAL) keeps local value."
+                )
                 return df_store, False
+            co_table = row[0]
             company_bgt = _read_sql_nolock(
                 f"SELECT [MAJ_CAT], [{gc_col}], [BGT CONT% (FINAL)] FROM [{co_table}] WITH (NOLOCK)",
                 engine,
@@ -1356,9 +1449,14 @@ def _save_to_db(engine, df, table_name, retries=3, progress_cb=None):
                 cursor = raw_conn.cursor()
                 cursor.fast_executemany = True
 
-                # Drop + Create
-                cursor.execute(f"IF OBJECT_ID('{table_name}','U') IS NOT NULL DROP TABLE [{table_name}]")
-                cursor.execute(f"CREATE TABLE [{table_name}] ({', '.join(col_defs)})")
+                # Create-if-not-exists (Q1b): per-execution timestamped table
+                # names mean we shouldn't ever clobber a prior run. On the rare
+                # collision (two runs in the same minute for the same gc), this
+                # falls through to an append on the existing table.
+                cursor.execute(
+                    f"IF OBJECT_ID('{table_name}','U') IS NULL "
+                    f"CREATE TABLE [{table_name}] ({', '.join(col_defs)})"
+                )
                 raw_conn.commit()
 
                 # Insert in batches
@@ -1438,6 +1536,24 @@ def _run_job(job_id):
         log = [{"step": "master_load", "duration": master_load_time}]
         df_master_cache = None  # Cache CROSS JOIN result across presets
 
+        # Single base SQL pull — replaces N per-preset scans of COUNT_STOCK_DATA_18M.
+        # Returns inner-aggregated rows keyed by (KPI, STOCK_DATE, ST_CD, MAJ_CAT,
+        # grouping); each preset later filters this df in pandas and runs only
+        # the OUTER AVG step.
+        logger.info(f"[Job {job_id}] Loading shared base KPI data...")
+        t_base = time.time()
+        try:
+            base_data = _load_base_kpi_data(engine, gc_col, majcats, selected, all_presets)
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Base data load failed: {e}")
+            base_data = pd.DataFrame()
+        base_load_dur = round(time.time() - t_base, 2)
+        logger.info(
+            f"[Job {job_id}] Base data loaded in {base_load_dur}s "
+            f"({len(base_data):,} inner-aggregated rows)"
+        )
+        log.append({"step": "base_kpi_data", "duration": base_load_dur, "rows": int(len(base_data))})
+
         cancelled = False
         for idx, pname in enumerate(selected, 1):
             while True:
@@ -1463,7 +1579,8 @@ def _run_job(job_id):
                 logger.info(f"[Job {job_id}] Processing preset {idx}/{len(selected)}: {pname}")
                 t1 = time.time()
                 df_det, df_agg, step_timing, df_master_cache = _process_single_preset(
-                    engine, pname, all_presets[pname], majcats, gc_col, avg_density, apf, df_master_cache)
+                    engine, pname, all_presets[pname], majcats, gc_col,
+                    avg_density, apf, df_master_cache, base_data=base_data)
                 dur = round(time.time()-t1, 2)
                 if df_det.empty:
                     logger.warning(f"[Job {job_id}] Preset {pname} returned empty in {dur}s")
@@ -1576,7 +1693,11 @@ def _run_job(job_id):
         # ── Save to DB AFTER marking complete (with retry) ──
         if payload.get("save_to_db"):
             _update_job(job_id, progress="saving to database...")
-            month_tag = datetime.now().strftime('%Y_%m')
+            # Per-execution timestamped suffix so each run produces its own
+            # snapshot (Q1b — was YYYY_MM, overwrote same-month runs). Both
+            # Store and Company tables of this job share the same ts_tag so
+            # they pair up cleanly for downstream inheritance.
+            ts_tag = datetime.now().strftime('%Y_%m_%d_%H%M')
             safe_gc = gc_col.upper().replace(' ','_').replace('-','_')
 
             def _make_progress_cb(label):
@@ -1587,7 +1708,7 @@ def _run_job(job_id):
             try:
                 if not df_store.empty:
                     t = time.time()
-                    tbl = f"{TABLE_PREFIX}_{safe_gc}_{month_tag}"
+                    tbl = f"{TABLE_PREFIX}_{safe_gc}_{ts_tag}"
                     logger.info(f"[Job {job_id}] Saving store to DB: {tbl} ({len(df_store):,} rows)")
                     _save_to_db(engine, df_store, tbl, retries=3, progress_cb=_make_progress_cb("store"))
                     dur_s = round(time.time()-t, 2)
@@ -1596,7 +1717,7 @@ def _run_job(job_id):
                                  "duration": dur_s})
                 if not df_company.empty:
                     t = time.time()
-                    tbl = f"{TABLE_PREFIX}_{safe_gc}_CO_{month_tag}"
+                    tbl = f"{TABLE_PREFIX}_{safe_gc}_CO_{ts_tag}"
                     logger.info(f"[Job {job_id}] Saving company to DB: {tbl} ({len(df_company):,} rows)")
                     _save_to_db(engine, df_company, tbl, retries=3, progress_cb=_make_progress_cb("company"))
                     dur_c = round(time.time()-t, 2)
@@ -2037,6 +2158,21 @@ def delete_result_table(table_name: str, current_user: User = Depends(get_curren
 _export_jobs: OrderedDict = OrderedDict()   # export_id → job dict
 _export_lock = threading.Lock()
 
+
+class ExportCancelled(Exception):
+    """Raised inside _run_export_job when the user cancels the export.
+    Bubbles up to the worker's outer except so we can mark status='cancelled'
+    and clean up the partial file."""
+
+
+def _check_export_cancel(export_id: str) -> None:
+    """Soft-cancel checkpoint — call between chunk iterations. Raises
+    ExportCancelled if the user requested cancellation via the cancel endpoint."""
+    with _export_lock:
+        job = _export_jobs.get(export_id)
+        if job and job.get("cancel_requested"):
+            raise ExportCancelled()
+
 def _build_where_clause(filters, table_cols=None):
     """Build SQL WHERE clause from filter dict. Only includes columns that exist in the table."""
     clauses = []
@@ -2097,6 +2233,7 @@ def _run_export_job(export_id):
             with open(out_path, 'w', newline='', encoding='utf-8') as f:
                 first = True
                 for chunk in pd.read_sql(base_query, engine, chunksize=100000):
+                    _check_export_cancel(export_id)
                     f.write(chunk.to_csv(index=False, header=first))
                     first = False
                     written += len(chunk)
@@ -2118,11 +2255,13 @@ def _run_export_job(export_id):
                     seg_query = f"SELECT DISTINCT SEG FROM [{safe}] WITH (NOLOCK){where_sql}"
                     segs = pd.read_sql(seg_query, engine)['SEG'].tolist()
                     for seg_val in segs:
+                        _check_export_cancel(export_id)
                         s_seg = re.sub(r'[^A-Za-z0-9_-]', '_', str(seg_val))[:30]
                         seg_where = f"{where} AND " if where else ""
                         if str(seg_val).upper() == 'GM':
                             parts = []
                             for chunk in pd.read_sql(f"SELECT * FROM [{safe}] WITH (NOLOCK) WHERE {seg_where}SEG='{seg_val}'", engine, chunksize=100000):
+                                _check_export_cancel(export_id)
                                 parts.append(chunk.to_csv(index=False, header=len(parts)==0))
                                 written += len(chunk)
                                 with _export_lock:
@@ -2131,9 +2270,11 @@ def _run_export_job(export_id):
                         else:
                             divs = pd.read_sql(f"SELECT DISTINCT DIV FROM [{safe}] WITH (NOLOCK) WHERE {seg_where}SEG='{seg_val}'", engine)['DIV'].tolist()
                             for div_val in divs:
+                                _check_export_cancel(export_id)
                                 s_div = re.sub(r'[^A-Za-z0-9_-]', '_', str(div_val))[:30]
                                 parts = []
                                 for chunk in pd.read_sql(f"SELECT * FROM [{safe}] WITH (NOLOCK) WHERE {seg_where}SEG='{seg_val}' AND DIV='{div_val}'", engine, chunksize=100000):
+                                    _check_export_cancel(export_id)
                                     parts.append(chunk.to_csv(index=False, header=len(parts)==0))
                                     written += len(chunk)
                                     with _export_lock:
@@ -2143,10 +2284,12 @@ def _run_export_job(export_id):
                     div_query = f"SELECT DISTINCT DIV FROM [{safe}] WITH (NOLOCK){where_sql}"
                     divs = pd.read_sql(div_query, engine)['DIV'].tolist()
                     for div_val in divs:
+                        _check_export_cancel(export_id)
                         s_div = re.sub(r'[^A-Za-z0-9_-]', '_', str(div_val))[:30]
                         div_where = f"{where} AND " if where else ""
                         parts = []
                         for chunk in pd.read_sql(f"SELECT * FROM [{safe}] WITH (NOLOCK) WHERE {div_where}DIV='{div_val}'", engine, chunksize=100000):
+                            _check_export_cancel(export_id)
                             parts.append(chunk.to_csv(index=False, header=len(parts)==0))
                             written += len(chunk)
                             with _export_lock:
@@ -2155,6 +2298,7 @@ def _run_export_job(export_id):
                 else:
                     parts = []
                     for chunk in pd.read_sql(base_query, engine, chunksize=100000):
+                        _check_export_cancel(export_id)
                         parts.append(chunk.to_csv(index=False, header=len(parts)==0))
                         written += len(chunk)
                         with _export_lock:
@@ -2174,6 +2318,21 @@ def _run_export_job(export_id):
             job["duration"] = round(time.time() - job["_start_time"], 2)
         logger.info(f"[Export {export_id}] Completed: {out_path} ({file_size:,} bytes, {job['duration']}s)")
 
+    except ExportCancelled:
+        # User clicked Cancel — exit cleanly, remove the partial file, and
+        # mark status='cancelled' (distinct from 'failed' so the UI can tell
+        # the difference).
+        logger.info(f"[Export {export_id}] Cancelled by user")
+        try:
+            if 'out_path' in locals() and out_path and os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        with _export_lock:
+            job["status"] = "cancelled"
+            job["finished_at"] = datetime.now().isoformat()
+            job["duration"] = round(time.time() - job["_start_time"], 2)
+            job["file_path"] = None
     except Exception as e:
         logger.error(f"[Export {export_id}] Failed: {e}")
         with _export_lock:
@@ -2210,6 +2369,7 @@ def start_export_job(table_name: str, body: ExportPayload = ExportPayload(),
         "started_at": None,
         "finished_at": None,
         "duration": None,
+        "cancel_requested": False,
         "_start_time": time.time(),
     }
     with _export_lock:
@@ -2278,6 +2438,24 @@ def download_export_job(export_id: str, current_user: User = Depends(get_current
 
     return StreamingResponse(file_stream(), media_type=job.get("content_type", "application/octet-stream"),
         headers={"Content-Disposition": f"attachment; filename={job['file_name']}"})
+
+
+@router.post("/review/exports/{export_id}/cancel", response_model=APIResponse)
+def cancel_export_job(export_id: str, current_user: User = Depends(get_current_user)):
+    """Request cancellation of a running export. The worker checks the flag at
+    each chunk boundary and exits cleanly. Returns immediately — actual status
+    transitions to 'cancelled' on the next checkpoint."""
+    with _export_lock:
+        job = _export_jobs.get(export_id)
+        if not job:
+            raise HTTPException(404, "Export job not found")
+        if job["status"] not in ("pending", "running"):
+            return APIResponse(success=True,
+                message=f"Export {export_id} already {job['status']}; nothing to cancel")
+        job["cancel_requested"] = True
+    logger.info(f"[Export {export_id}] Cancel requested")
+    return APIResponse(success=True,
+        message="Cancel signal sent; export will stop at the next chunk boundary")
 
 
 @router.delete("/review/exports/{export_id}", response_model=APIResponse)
@@ -2659,6 +2837,8 @@ def report_page(table: str = Query(...),
                 seg: Optional[str] = Query(None),
                 status: Optional[str] = Query(None),
                 q: Optional[str] = Query(None),
+                col_filters: Optional[str] = Query(None, description="JSON object {col: [v1,v2,...]} for generic in-header filters"),
+                cols: Optional[str] = Query(None, description="Comma-separated explicit column list. When provided, overrides show_all/curated logic."),
                 show_all: bool = Query(False),
                 current_user: User = Depends(get_current_user)):
     """Paginated report view for a Cont_Percentage_* table.
@@ -2683,39 +2863,101 @@ def report_page(table: str = Query(...),
     vendor_col = _detect_vendor_col(all_cols)
     vendor_name_col = _vendor_label_col(vendor_col) if _vendor_label_col(vendor_col) in all_cols else None
 
-    selected = all_cols if show_all else _select_curated_columns(all_cols, is_store, vendor_col, vendor_name_col)
+    # Column selection priority:
+    #   1. Explicit `cols` list (from the column picker on the frontend)
+    #   2. `show_all=true` → every column in the table
+    #   3. Curated default from _select_curated_columns
+    if cols:
+        # Preserve user's order; filter to columns that actually exist.
+        wanted = [c.strip() for c in cols.split(",") if c.strip()]
+        all_cols_lower = {c.lower(): c for c in all_cols}
+        selected = []
+        for c in wanted:
+            actual = all_cols_lower.get(c.lower())
+            if actual and actual not in selected:
+                selected.append(actual)
+        # If user accidentally sent an entirely-invalid list, fall back to curated
+        if not selected:
+            selected = _select_curated_columns(all_cols, is_store, vendor_col, vendor_name_col)
+    else:
+        selected = all_cols if show_all else _select_curated_columns(all_cols, is_store, vendor_col, vendor_name_col)
     selected = [c for c in selected if c in all_cols]  # safety filter
+    # Dedupe while preserving order. Some curated-column branches don't check
+    # membership before appending (vendor name/code, period KPIs), so the same
+    # column could otherwise appear twice — which would propagate into the SQL
+    # SELECT and break df.to_json(orient='records') with "columns must be unique".
+    selected = list(dict.fromkeys(selected))
 
-    # Build WHERE
+    # Build WHERE — majcat/seg/status accept comma-separated lists so the
+    # in-table filter dropdowns (multi-select) translate to `IN (...)`.
+    def _in_clause(raw: str, col: str) -> Optional[str]:
+        if not raw:
+            return None
+        vals = [v.strip() for v in raw.split(",") if v.strip()]
+        if not vals:
+            return None
+        quoted = ",".join("'" + v.replace("'", "''") + "'" for v in vals)
+        return f"[{col}] IN ({quoted})"
+
     where_parts = []
     if majcat and 'MAJ_CAT' in all_cols:
-        safe_v = majcat.replace("'", "''")
-        where_parts.append(f"[MAJ_CAT] = '{safe_v}'")
+        c = _in_clause(majcat, 'MAJ_CAT')
+        if c: where_parts.append(c)
     if seg and 'SEG' in all_cols:
-        safe_v = seg.replace("'", "''")
-        where_parts.append(f"[SEG] = '{safe_v}'")
+        c = _in_clause(seg, 'SEG')
+        if c: where_parts.append(c)
     if status and 'STATUS' in all_cols:
-        safe_v = status.replace("'", "''")
-        where_parts.append(f"[STATUS] = '{safe_v}'")
+        c = _in_clause(status, 'STATUS')
+        if c: where_parts.append(c)
     if q and vendor_name_col:
         safe_v = q.replace("'", "''").replace("%", "")
         where_parts.append(f"[{vendor_name_col}] LIKE '%{safe_v}%'")
+    # Generic per-column filters (in-header multi-select). Accepts a JSON map
+    # {col: [v1, v2, ...]}. Each entry becomes an IN-clause if the col exists
+    # in the table. Silently ignored if JSON is malformed.
+    if col_filters:
+        try:
+            cf = json.loads(col_filters)
+            if isinstance(cf, dict):
+                for col, vals in cf.items():
+                    if not isinstance(vals, list) or not vals:
+                        continue
+                    if col not in all_cols:
+                        continue
+                    clause = _in_clause(",".join(str(v) for v in vals), col)
+                    if clause:
+                        where_parts.append(clause)
+        except (json.JSONDecodeError, ValueError):
+            pass
     where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     with engine.connect() as c:
         total = c.execute(text(f"SELECT COUNT(*) FROM [{safe}] WITH (NOLOCK){where_sql}")).scalar() or 0
 
-    # Distinct filter options (for dropdowns) — only on first page request, cheap
+    # Distinct filter options (for in-header multi-select) — computed on first
+    # page request only. We cover low-cardinality identity-style columns plus
+    # the table's grouping column (vendor_col) so the user can filter on
+    # MAJ_CAT / SEG / STATUS / SSN / ACT_INACT / DIV / SUB_DIV / RNG_SEG /
+    # RDC_CD / <grouping column> when they exist in the table.
     filter_options = {}
     if page == 1:
+        filterable_cols = ['SEG', 'MAJ_CAT', 'STATUS', 'SSN', 'ACT_INACT',
+                           'DIV', 'SUB_DIV', 'RNG_SEG', 'RDC_CD']
+        if vendor_col and vendor_col not in filterable_cols:
+            filterable_cols.append(vendor_col)
         with engine.connect() as c:
-            for fc in ('SEG', 'MAJ_CAT', 'STATUS'):
+            for fc in filterable_cols:
                 if fc not in all_cols:
                     continue
                 try:
                     vals = [r[0] for r in c.execute(text(
                         f"SELECT DISTINCT [{fc}] FROM [{safe}] WITH (NOLOCK) WHERE [{fc}] IS NOT NULL ORDER BY [{fc}]"
                     )).fetchall()]
+                    # Skip very-high-cardinality columns — multi-select on 1000+
+                    # values is unusable; keep them out of the response so the
+                    # frontend won't render a filter icon there.
+                    if len(vals) > 500:
+                        continue
                     filter_options[fc] = [str(v) for v in vals if v is not None]
                 except Exception:
                     pass

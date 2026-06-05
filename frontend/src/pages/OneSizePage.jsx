@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { oneSizeAPI } from '@/services/api'
 import toast from 'react-hot-toast'
-import { Play, Download, Filter, RefreshCw, CheckCircle2, AlertCircle, Database, Layers, Store, X } from 'lucide-react'
+import { Play, Download, RefreshCw, CheckCircle2, AlertCircle, Database, Layers, Store, X, Square, Trash2 } from 'lucide-react'
 import { C } from '@/theme/colors'
 
 const STAGE_LABELS = {
@@ -47,34 +47,78 @@ const STAGE_LABELS = {
   drop_alloc_zero:      'Dropping ALLOC=0 rows (POOL_EMPTY) — final output has only rows that received stock',
 }
 
-function StageProgress({ stages, running }) {
-  if (!stages?.length && !running) return null
+function ProgressBar({ stages, running }) {
+  const orderedKeys = Object.keys(STAGE_LABELS)
+  const total = orderedKeys.length
+  const completedKeys = new Set((stages || []).map((s) => s.stage))
+  const completedCount = orderedKeys.filter((k) => completedKeys.has(k)).length
+
+  // Pick the label to display: when running, show the next pending stage;
+  // when finished, show "Complete"; when idle with no stages, hide.
+  const allDone = completedCount >= total
+  const nextKey = orderedKeys.find((k) => !completedKeys.has(k))
+  const activeKey = running
+    ? (nextKey || orderedKeys[orderedKeys.length - 1])
+    : (allDone ? null : (stages?.length ? orderedKeys[completedCount - 1] : null))
+
+  if (!running && !stages?.length) return null
+
+  const pct = Math.round((completedCount / total) * 100)
+  const stepNum = Math.min(completedCount + (running ? 1 : 0), total)
+  const label = allDone && !running
+    ? 'Complete'
+    : (activeKey ? STAGE_LABELS[activeKey] : 'Starting…')
+
+  const stopped = !running && !allDone
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {Object.keys(STAGE_LABELS).map((key) => {
-        const done = stages?.find((s) => s.stage === key)
-        const label = STAGE_LABELS[key]
-        const detail = done
-          ? Object.entries(done)
-              .filter(([k]) => k !== 'stage')
-              .map(([k, v]) => `${k}=${v}`)
-              .join(', ')
-          : ''
-        return (
-          <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-            {done ? (
-              <CheckCircle2 size={14} color={C.green} />
-            ) : running ? (
-              <RefreshCw size={14} color={C.primary} className="spin" />
-            ) : (
-              <div style={{ width: 14, height: 14, borderRadius: 7, border: `2px solid ${C.cardBorder}` }} />
-            )}
-            <span style={{ color: done ? C.text : C.textMuted }}>{label}</span>
-            {detail && <span style={{ color: C.textMuted, fontSize: 11 }}>— {detail}</span>}
-          </div>
-        )
-      })}
-      <style>{`.spin { animation: spin 0.9s linear infinite } @keyframes spin { to { transform: rotate(360deg) } }`}</style>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13 }}>
+        {allDone && !running ? (
+          <CheckCircle2 size={16} color={C.green} />
+        ) : stopped ? (
+          <AlertCircle size={16} color={C.amber} />
+        ) : (
+          <RefreshCw size={16} color={C.primary} className="spin" />
+        )}
+        <span style={{ color: C.textMuted, fontWeight: 600, minWidth: 92 }}>
+          Step {stepNum} of {total}
+        </span>
+        <span
+          key={activeKey || 'done'}
+          style={{
+            color: C.text,
+            flex: 1,
+            animation: 'stepFade 280ms ease-out',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          }}
+        >
+          {label}
+        </span>
+        <span style={{ color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{pct}%</span>
+      </div>
+      <div style={{
+        position: 'relative', height: 8, borderRadius: 6,
+        background: C.grayBg, overflow: 'hidden',
+      }}>
+        <div style={{
+          position: 'absolute', inset: 0,
+          width: `${pct}%`,
+          background: allDone && !running ? C.green : stopped ? C.amber : C.primary,
+          borderRadius: 6,
+          transition: 'width 320ms ease-out, background 200ms linear',
+        }} />
+      </div>
+      <style>{`
+        .spin { animation: spin 0.9s linear infinite }
+        @keyframes spin { to { transform: rotate(360deg) } }
+        @keyframes stepFade {
+          from { opacity: 0; transform: translateY(4px) }
+          to   { opacity: 1; transform: translateY(0) }
+        }
+      `}</style>
     </div>
   )
 }
@@ -102,11 +146,11 @@ function MultiSelect({ options, value, onChange, disabled, allLabel = 'All', emp
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        disabled={disabled || options.length === 0}
+        disabled={disabled}
         style={{
           minWidth: 200, padding: '8px 10px', border: `1px solid ${C.inputBorder}`,
           borderRadius: 8, fontSize: 13, background: C.inputBg, color: C.text,
-          textAlign: 'left', cursor: disabled || options.length === 0 ? 'not-allowed' : 'pointer',
+          textAlign: 'left', cursor: disabled ? 'not-allowed' : 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
         }}
       >
@@ -120,7 +164,7 @@ function MultiSelect({ options, value, onChange, disabled, allLabel = 'All', emp
           />
         )}
       </button>
-      {open && options.length > 0 && (
+      {open && (
         <>
           <div
             onClick={() => setOpen(false)}
@@ -137,8 +181,15 @@ function MultiSelect({ options, value, onChange, disabled, allLabel = 'All', emp
               fontSize: 11, color: C.textMuted, padding: '4px 8px 6px',
               borderBottom: `1px solid ${C.cardBorder}`, marginBottom: 4,
             }}>
-              {emptyHint} ({options.length} available)
+              {options.length === 0
+                ? 'No options loaded — backend lookup failed. Use Retry above.'
+                : `${emptyHint} (${options.length} available)`}
             </div>
+            {options.length === 0 && (
+              <div style={{ padding: '12px 8px', fontSize: 12, color: C.textMuted, textAlign: 'center' }}>
+                Nothing to pick yet.
+              </div>
+            )}
             {options.map((item) => (
               <label
                 key={item}
@@ -186,61 +237,187 @@ function StatCard({ icon: Icon, label, value, color }) {
   )
 }
 
+const POLL_INTERVAL_MS = 800
+const JOB_STORAGE_KEY = 'ars.onesize.jobId'
+
 export default function OneSizePage() {
-  const [running, setRunning]           = useState(false)
-  const [exporting, setExporting] = useState(false)
-  const [result, setResult]       = useState(null)
-  const [error, setError]         = useState('')
+  // Lazy initializer — restore jobId from localStorage so jobs survive navigation.
+  // The backend keeps the job alive in its in-memory registry until it finishes
+  // or the user deletes it; we just need to remember which id to poll.
+  const [job, setJob]                   = useState(null)
+  const [jobId, setJobId]               = useState(() => {
+    try { return localStorage.getItem(JOB_STORAGE_KEY) || null }
+    catch { return null }
+  })
+  const [starting, setStarting]         = useState(false)  // brief: POST /jobs in flight
+  const [cancelling, setCancelling]     = useState(false)
+  const [deleting, setDeleting]         = useState(false)
+  const [exporting, setExporting]       = useState(false)
+  const [error, setError]               = useState('')
   const [rdcOptions, setRdcOptions]     = useState([])
   const [selectedRdcs, setSelectedRdcs] = useState([])
   const [ssnOptions, setSsnOptions]     = useState([])
   const [selectedSsns, setSelectedSsns] = useState(['A', 'OC', 'S'])
+  const [optionsError, setOptionsError] = useState('')
+  const [optionsLoading, setOptionsLoading] = useState(false)
+  const [optionsRetryToken, setOptionsRetryToken] = useState(0)
 
+  // Load RDC + SSN dropdown options. Retry by bumping optionsRetryToken.
+  // Silent catches used to leave the dropdowns disabled with no feedback —
+  // now any failure surfaces as a chip with a Retry button.
   useEffect(() => {
-    let cancelled = false
-    oneSizeAPI.listRdcs()
-      .then((res) => {
-        if (cancelled) return
+    let stopped = false
+    const run = async () => {
+      setOptionsLoading(true)
+      setOptionsError('')
+      let firstErr = ''
+      try {
+        const res = await oneSizeAPI.listRdcs()
+        if (stopped) return
         setRdcOptions(res?.data?.data?.rdcs || [])
-      })
-      .catch(() => { /* silent — empty list disables the picker */ })
-    oneSizeAPI.listSsns()
-      .then((res) => {
-        if (cancelled) return
+      } catch (e) {
+        firstErr = e?.response?.data?.detail || e.message || 'Failed to load RDCs'
+      }
+      try {
+        const res = await oneSizeAPI.listSsns()
+        if (stopped) return
         const list = res?.data?.data?.ssns || []
         const defaults = res?.data?.data?.defaults || ['A', 'OC', 'S']
         setSsnOptions(list)
         // Re-align the default selection to whatever is actually present —
         // if e.g. 'OC' doesn't exist for this sequence, drop it from the pick.
         setSelectedSsns(defaults.filter((d) => list.includes(d)))
-      })
-      .catch(() => { /* silent */ })
-    return () => { cancelled = true }
-  }, [])
+      } catch (e) {
+        if (!firstErr) firstErr = e?.response?.data?.detail || e.message || 'Failed to load SSNs'
+      }
+      if (stopped) return
+      if (firstErr) setOptionsError(firstErr)
+      setOptionsLoading(false)
+    }
+    run()
+    return () => { stopped = true }
+  }, [optionsRetryToken])
 
+  const handleRetryOptions = () => setOptionsRetryToken((t) => t + 1)
+
+  // Persist jobId across navigation. Cleared on null (delete / 404 / fresh slate).
+  useEffect(() => {
+    try {
+      if (jobId) localStorage.setItem(JOB_STORAGE_KEY, jobId)
+      else       localStorage.removeItem(JOB_STORAGE_KEY)
+    } catch { /* private mode etc. — nothing we can do */ }
+  }, [jobId])
+
+  // Poll the job until it reaches a terminal state.
+  useEffect(() => {
+    if (!jobId) return
+    if (job && job.status && job.status !== 'running') return
+    let stopped = false
+    let timer
+
+    const tick = async () => {
+      try {
+        const { data } = await oneSizeAPI.getJob(jobId, true)
+        if (stopped) return
+        const snap = data?.data || null
+        setJob(snap)
+        if (snap && snap.status === 'running') {
+          timer = setTimeout(tick, POLL_INTERVAL_MS)
+        } else if (snap?.status === 'failed') {
+          toast.error(snap.error || 'OneSize job failed')
+        } else if (snap?.status === 'cancelled') {
+          toast('OneSize job cancelled', { icon: '⏹' })
+        } else if (snap?.status === 'completed') {
+          if (snap.persist_error) {
+            toast.error(`Compute OK (${snap.total_rows} rows) but DB save failed`)
+          } else if (snap.persisted_rows != null) {
+            toast.success(`OneSize: ${snap.total_rows} rows · saved ${snap.persisted_rows} to DB`)
+          } else {
+            toast.success(`OneSize: ${snap.total_rows} rows`)
+          }
+        }
+      } catch (e) {
+        if (stopped) return
+        // Backend forgot this job (process restart, LRU eviction, manual delete
+        // from another tab). Treat as "gone" — clear state silently so the UI
+        // returns to the idle Execute state instead of showing an error.
+        if (e?.response?.status === 404) {
+          setJob(null)
+          setJobId(null)
+          return
+        }
+        const msg = e?.response?.data?.detail || e.message || 'Polling failed'
+        setError(msg)
+      }
+    }
+    tick()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [jobId, job?.status])
+
+  // Derived view-model — keep older variable names so the rest of the JSX is unchanged.
+  const result       = job && job.status === 'completed' ? job : null
+  const stages       = job?.stages || []
   const columns      = result?.columns || []
   const previewRows  = result?.preview_rows || []
-  const stages       = result?.stages || []
   const totalRows    = result?.total_rows || 0
   const stores       = result?.stores || 0
-  const sequenceId   = result?.sequence_id
+  const sequenceId   = result?.sequence_id ?? job?.sequence_id
   const previewLimit = result?.preview_limit ?? 0
+  const running      = !!job && job.status === 'running'
+  const terminal     = !!job && job.status && job.status !== 'running'
 
   const fmt = useMemo(() => new Intl.NumberFormat('en-IN'), [])
 
   const handleRun = async () => {
-    setRunning(true)
+    setStarting(true)
     setError('')
-    setResult(null)
+    setJob(null)
+    setJobId(null)
     try {
-      const { data } = await oneSizeAPI.run(1000, selectedRdcs, selectedSsns)
-      setResult(data?.data || null)
-      toast.success(data?.message || 'OneSize calculation complete')
+      const { data } = await oneSizeAPI.startJob(1000, selectedRdcs, selectedSsns)
+      const snap = data?.data
+      if (snap?.job_id) {
+        setJob(snap)
+        setJobId(snap.job_id)
+      } else {
+        setError('Backend did not return a job_id')
+      }
     } catch (e) {
-      const msg = e?.response?.data?.detail || e.message || 'Failed to run OneSize'
+      const msg = e?.response?.data?.detail || e.message || 'Failed to start OneSize job'
       setError(msg)
     } finally {
-      setRunning(false)
+      setStarting(false)
+    }
+  }
+
+  const handleCancel = async () => {
+    if (!jobId || !running) return
+    setCancelling(true)
+    try {
+      await oneSizeAPI.cancelJob(jobId)
+      toast('Cancelling — will stop at the next stage boundary', { icon: '⏳' })
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || e.message || 'Cancel failed')
+    } finally {
+      setCancelling(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!jobId) return
+    setDeleting(true)
+    try {
+      await oneSizeAPI.deleteJob(jobId)
+      setJob(null)
+      setJobId(null)
+      setError('')
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || e.message || 'Delete failed')
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -278,37 +455,34 @@ export default function OneSizePage() {
         </div>
       </div>
 
-      {/* Filter logic panel */}
-      <div style={{
-        background: C.cardBg, border: `1px solid ${C.cardBorder}`, borderRadius: 12,
-        padding: 14,
-      }}>
-        <div style={{ fontSize: 11, color: C.textMuted, textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 8 }}>
-          Filter logic — final_msa
+      {/* Options-load error chip */}
+      {(optionsError || (!optionsLoading && rdcOptions.length === 0 && ssnOptions.length === 0)) && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
+          background: '#fef3c7', border: '1px solid #fcd34d', color: '#92400e',
+          borderRadius: 10, fontSize: 12,
+        }}>
+          <AlertCircle size={14} />
+          <span style={{ flex: 1 }}>
+            {optionsError
+              ? `Couldn't load filter options: ${optionsError}`
+              : 'Filter options haven\'t loaded yet — backend lookup may be unavailable.'}
+          </span>
+          <button
+            onClick={handleRetryOptions}
+            disabled={optionsLoading}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px',
+              background: '#fff', border: '1px solid #fcd34d', color: '#92400e',
+              borderRadius: 6, fontSize: 12, fontWeight: 600,
+              cursor: optionsLoading ? 'wait' : 'pointer',
+            }}
+          >
+            <RefreshCw size={12} className={optionsLoading ? 'spin' : ''} />
+            {optionsLoading ? 'Retrying…' : 'Retry'}
+          </button>
         </div>
-        <pre style={{
-          margin: 0, padding: 10, background: C.inputBg, border: `1px solid ${C.inputBorder}`,
-          borderRadius: 8, fontSize: 12, color: C.text, fontFamily: 'Consolas, monospace',
-          overflow: 'auto', whiteSpace: 'pre-wrap', lineHeight: 1.55,
-        }}>{`Step 1  — BEFORE cross-join: drop applicable_sz='N' rows
-          (these fail the gate; can never pass)
-
-Step 1a — BEFORE cross-join: compute row_or per MSA row
-          row_or = (count        ≤ 2)   (≤2 sizes in this MAJ_CAT × GEN_ART × CLR)
-                OR (maj_gen_cl_q ≤ 50)  (sum FNL_Q per MAJ_CAT × GEN_ART × CLR)
-                OR (maj_cat_q    ≤ 400) (sum FNL_Q per MAJ_CAT)
-
-Step 1b — BEFORE cross-join: drop row_or=FALSE rows
-          (final filter — no ST_STATUS clause, so we can filter early)
-
-Step 2  — Load stores from Master_ALC_INPUT_ST_MASTER (ST_STATUS for display only)
-          Cross-join surviving MSA rows × stores on RDC.
-          Every cross row is final_msa='Y' by construction — no post-join filter.
-
-Step 3  — Continue to the downstream allocation pipeline.
-
-Blank numeric cells are treated as 0 before ≤ comparisons (matches Excel).`}</pre>
-      </div>
+      )}
 
       {/* Controls */}
       <div style={{
@@ -345,17 +519,52 @@ Blank numeric cells are treated as 0 before ≤ comparisons (matches Excel).`}</
 
         <button
           onClick={handleRun}
-          disabled={running}
+          disabled={running || starting}
           style={{
             display: 'inline-flex', alignItems: 'center', gap: 8, padding: '9px 16px',
-            background: running ? C.gray : C.primary, color: '#fff', border: 'none',
-            borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: running ? 'wait' : 'pointer',
+            background: (running || starting) ? C.gray : C.primary, color: '#fff', border: 'none',
+            borderRadius: 8, fontSize: 13, fontWeight: 600,
+            cursor: (running || starting) ? 'wait' : 'pointer',
             boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
           }}
         >
-          {running ? <RefreshCw size={14} className="spin" /> : <Play size={14} />}
-          {running ? 'Running…' : 'Execute'}
+          {(running || starting) ? <RefreshCw size={14} className="spin" /> : <Play size={14} />}
+          {starting ? 'Starting…' : running ? 'Running…' : 'Execute'}
         </button>
+
+        {running && (
+          <button
+            onClick={handleCancel}
+            disabled={cancelling}
+            title="Stop the running job at the next stage boundary"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8, padding: '9px 16px',
+              background: cancelling ? C.grayBg : C.amber, color: '#fff', border: 'none',
+              borderRadius: 8, fontSize: 13, fontWeight: 600,
+              cursor: cancelling ? 'wait' : 'pointer',
+            }}
+          >
+            {cancelling ? <RefreshCw size={14} className="spin" /> : <Square size={14} />}
+            {cancelling ? 'Cancelling…' : 'Cancel'}
+          </button>
+        )}
+
+        {terminal && jobId && (
+          <button
+            onClick={handleDelete}
+            disabled={deleting}
+            title="Remove this job and its cached result"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8, padding: '9px 16px',
+              background: deleting ? C.grayBg : C.red, color: '#fff', border: 'none',
+              borderRadius: 8, fontSize: 13, fontWeight: 600,
+              cursor: deleting ? 'wait' : 'pointer',
+            }}
+          >
+            {deleting ? <RefreshCw size={14} className="spin" /> : <Trash2 size={14} />}
+            {deleting ? 'Deleting…' : 'Delete job'}
+          </button>
+        )}
 
         <button
           onClick={handleExport}
@@ -374,9 +583,28 @@ Blank numeric cells are treated as 0 before ≤ comparisons (matches Excel).`}</
         </button>
 
         <div style={{ flex: 1 }} />
-        {sequenceId != null && (
+        {(sequenceId != null || jobId) && (
           <div style={{ fontSize: 12, color: C.textMuted, display: 'flex', gap: 10, alignItems: 'center' }}>
-            <span>sequence_id: <span style={{ color: C.text, fontWeight: 600 }}>{sequenceId}</span></span>
+            {jobId && (
+              <span title={jobId}>
+                job: <span style={{ color: C.text, fontWeight: 600 }}>{jobId.slice(0, 8)}</span>
+              </span>
+            )}
+            {sequenceId != null && (
+              <span>sequence_id: <span style={{ color: C.text, fontWeight: 600 }}>{sequenceId}</span></span>
+            )}
+            {job?.status && job.status !== 'completed' && (
+              <span style={{
+                padding: '2px 8px', borderRadius: 12,
+                background: job.status === 'failed' ? '#fee2e2'
+                          : job.status === 'cancelled' ? '#fef3c7' : '#dbeafe',
+                color: job.status === 'failed' ? '#991b1b'
+                     : job.status === 'cancelled' ? '#92400e' : '#1e40af',
+                fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.4,
+              }}>
+                {job.status}
+              </span>
+            )}
             {result?.cache_key && (
               <span style={{
                 padding: '2px 8px', borderRadius: 12, background: '#dcfce7',
@@ -392,21 +620,27 @@ Blank numeric cells are treated as 0 before ≤ comparisons (matches Excel).`}</
       {/* Progress */}
       {(running || stages.length > 0) && (
         <div style={{ background: C.cardBg, border: `1px solid ${C.cardBorder}`, borderRadius: 12, padding: 14 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-            <Filter size={14} color={C.primary} />
-            <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Pipeline progress</span>
-          </div>
-          <StageProgress stages={stages} running={running} />
+          <ProgressBar stages={stages} running={running} />
         </div>
       )}
 
-      {error && (
+      {(error || job?.error) && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
           background: C.redBg, border: `1px solid ${C.redBd}`, color: C.red,
           borderRadius: 10, fontSize: 13,
         }}>
-          <AlertCircle size={16} /> {error}
+          <AlertCircle size={16} /> {error || job?.error}
+        </div>
+      )}
+
+      {job?.persist_error && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
+          background: '#fef3c7', border: '1px solid #fcd34d', color: '#92400e',
+          borderRadius: 10, fontSize: 13,
+        }}>
+          <AlertCircle size={16} /> {job.persist_error} — result is still available for CSV export.
         </div>
       )}
 

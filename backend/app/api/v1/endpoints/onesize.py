@@ -48,6 +48,253 @@ _CACHE_TTL_SECONDS = 1800   # 30 minutes — drops after this regardless of acce
 _CACHE_MAX_ENTRIES = 3       # keep at most this many runs in memory
 
 
+# ---------------------------------------------------------------------------
+# Job registry — one entry per OneSize run kicked off via POST /jobs.
+# Soft-cancel: cancel_event is checked at each stage boundary via _StagesList
+# below. We can't kill a mid-stage SQL query, but the worker exits at the
+# next .append() call.
+# ---------------------------------------------------------------------------
+class OneSizeCancelled(Exception):
+    """Raised inside the worker thread when the job's cancel_event fires."""
+
+
+class _StagesList(list):
+    """Drop-in replacement for the stages list used by _compute_onesize.
+
+    Every .append() first checks the bound cancel_event; if it's set, we
+    raise OneSizeCancelled so the pipeline aborts at the next stage boundary
+    without scattering checks through 2500 lines of code.
+    """
+    def __init__(self, cancel_event: Optional[threading.Event] = None) -> None:
+        super().__init__()
+        self._cancel = cancel_event
+
+    def append(self, item: Any) -> None:
+        if self._cancel is not None and self._cancel.is_set():
+            raise OneSizeCancelled()
+        super().append(item)
+
+
+_JOBS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_JOBS_LOCK = threading.Lock()
+_JOBS_MAX_ENTRIES = 10  # oldest evicted past this; user can explicitly delete
+
+
+def _job_snapshot(job: Dict[str, Any], include_preview: bool = False) -> Dict[str, Any]:
+    """Build a JSON-safe snapshot of a job (no df, no Event, no Thread)."""
+    snap = {
+        "job_id":       job["id"],
+        "status":       job["status"],
+        "stages":       list(job["stages"]),
+        "total_rows":   job.get("total_rows", 0),
+        "stores":       job.get("stores", 0),
+        "sequence_id":  job.get("sequence_id"),
+        "columns":      job.get("columns", []),
+        "cache_key":    job.get("cache_key", ""),
+        "error":        job.get("error"),
+        "persist_error": job.get("persist_error"),
+        "persisted_rows": job.get("persisted_rows"),
+        "started_at":   job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "params":       job.get("params", {}),
+        "preview_limit": job.get("preview_limit", 0),
+    }
+    if include_preview:
+        snap["preview_rows"] = job.get("preview_rows", []) or []
+    return snap
+
+
+# ---------------------------------------------------------------------------
+# Persistence — ARS_ONESIZE_ALLOCATION
+# ---------------------------------------------------------------------------
+# Auto-created on first successful run. Replace-per-sequence_id: prior rows
+# for the same sequence_id are DELETEd before the new set is INSERTed. Both
+# happen inside a single transaction so a half-failed insert can't leave the
+# table empty.
+# ---------------------------------------------------------------------------
+ALLOCATION_TABLE = "ARS_ONESIZE_ALLOCATION"
+
+_ALLOCATION_DDL = f"""
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_NAME = '{ALLOCATION_TABLE}'
+)
+BEGIN
+    CREATE TABLE [{ALLOCATION_TABLE}] (
+        id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+        sequence_id     BIGINT       NOT NULL,
+        job_id          NVARCHAR(64) NOT NULL,
+        run_at          DATETIME2    NOT NULL CONSTRAINT DF_OneSizeAlloc_RunAt DEFAULT SYSUTCDATETIME(),
+        run_by          NVARCHAR(100) NULL,
+
+        -- Article identity
+        DIV             NVARCHAR(50)  NULL,
+        SUB_DIV         NVARCHAR(50)  NULL,
+        MAJCAT          NVARCHAR(50)  NULL,
+        SSN             NVARCHAR(50)  NULL,
+        SZ              NVARCHAR(50)  NULL,
+        MACRO_MVGR      NVARCHAR(100) NULL,
+        MICRO_MVGR      NVARCHAR(100) NULL,
+        CLR             NVARCHAR(100) NULL,
+        GEN_ART         NVARCHAR(50)  NULL,
+        GEN_ART_NUMBER  NVARCHAR(50)  NULL,
+        GEN_ART_DESC    NVARCHAR(255) NULL,
+        ARTICLE_NUMBER  NVARCHAR(50)  NULL,
+        ARTICLE_DESC    NVARCHAR(255) NULL,
+        M_VND_CD        NVARCHAR(50)  NULL,
+        M_VND_NM        NVARCHAR(100) NULL,
+        MC_DESC         NVARCHAR(255) NULL,
+        FAB             NVARCHAR(50)  NULL,
+        RNG_SEG         NVARCHAR(50)  NULL,
+        SEG             NVARCHAR(50)  NULL,
+        MRP             FLOAT         NULL,
+        [DATE]          NVARCHAR(50)  NULL,
+        V02_FRESH       NVARCHAR(20)  NULL,
+
+        -- MSA opening qty
+        FNL_Q           FLOAT NULL,
+        STK_QTY         FLOAT NULL,
+        PEND_QTY        FLOAT NULL,
+        HOLD_QTY        FLOAT NULL,
+        ARS_PEND        FLOAT NULL,
+        [list]          NVARCHAR(50) NULL,
+
+        -- Store
+        ST_CD           NVARCHAR(50)  NULL,
+        ST_NM           NVARCHAR(255) NULL,
+        RDC             NVARCHAR(50)  NULL,
+        ST_STATUS       NVARCHAR(20)  NULL,
+        ST_RANK         FLOAT NULL,
+        ST_RANK_STORE   FLOAT NULL,
+        days            FLOAT NULL,
+        PAK_SZ          FLOAT NULL,
+        [status]        NVARCHAR(20) NULL,
+
+        -- Counts / density / contribution
+        applicable_sz   NVARCHAR(2) NULL,
+        [count]         FLOAT NULL,
+        fnl_q_sum       FLOAT NULL,
+        maj_cat_q       FLOAT NULL,
+        final_msa       NVARCHAR(2) NULL,
+        AVG_DENSITY     FLOAT NULL,
+        cont            FLOAT NULL,
+
+        -- MAJ-SZ block
+        DISP_Q          FLOAT NULL,
+        SAL_PD_SZ       FLOAT NULL,
+        SAL_PD          FLOAT NULL,
+        ACS_D           FLOAT NULL,
+        ALC_D           FLOAT NULL,
+        MBQ_SZ          FLOAT NULL,
+        STK_TTL_SZ      FLOAT NULL,
+        REQ             FLOAT NULL,
+
+        -- Var-art block
+        OPT_GRID_MBQ      FLOAT NULL,
+        OPT_GRID_DISP_Q   FLOAT NULL,
+        var_art_disp      FLOAT NULL,
+        L7_DAILY          FLOAT NULL,
+        AUTO_GEN_ART_SALE FLOAT NULL,
+        PER_OPT_SALE      FLOAT NULL,
+        AGE               FLOAT NULL,
+        MAX_DAILY_SALE    FLOAT NULL,
+        SALE_VAR_ART      FLOAT NULL,
+        MBQ_VAR           FLOAT NULL,
+        STK_TTL           FLOAT NULL,
+        VAR_REQ           FLOAT NULL,
+
+        -- Allocation outputs
+        MSA_REMAIN       FLOAT NULL,
+        POOL_POS         BIGINT NULL,
+        ALLOC            FLOAT NULL,
+        FINAL_ALLOCATION FLOAT NULL,
+        REMAIN_AFTER     FLOAT NULL,
+        DEMAND_SRC       NVARCHAR(20) NULL,
+
+        INDEX IX_OneSizeAlloc_Seq NONCLUSTERED (sequence_id),
+        INDEX IX_OneSizeAlloc_Job NONCLUSTERED (job_id)
+    )
+END
+"""
+
+
+def _ensure_allocation_table(engine) -> None:
+    """Create ARS_ONESIZE_ALLOCATION if missing. Idempotent."""
+    with engine.begin() as conn:
+        conn.execute(text(_ALLOCATION_DDL))
+
+
+def _persist_onesize_result(
+    engine,
+    df: pd.DataFrame,
+    sequence_id: int,
+    job_id: str,
+    run_by: Optional[str],
+) -> int:
+    """Replace-per-sequence_id write of `df` into ARS_ONESIZE_ALLOCATION.
+
+    Atomic: DELETE for this sequence_id and INSERTs of the new rows happen
+    inside one transaction so a partial chunk-insert failure rolls back the
+    DELETE and leaves the prior data intact.
+
+    Returns the number of rows inserted.
+    """
+    if df is None or df.empty:
+        return 0
+    if sequence_id is None:
+        raise ValueError("sequence_id is required for persistence")
+
+    _ensure_allocation_table(engine)
+
+    # Discover the table's actual column names so we can align df → table.
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = :t ORDER BY ORDINAL_POSITION"
+            ),
+            {"t": ALLOCATION_TABLE},
+        ).fetchall()
+    table_cols = [r[0] for r in rows]
+    # Audit cols + identity are written separately or by default — drop from match set.
+    excluded = {"id", "run_at"}
+    table_col_lower = {c.lower(): c for c in table_cols if c.lower() not in excluded}
+
+    # Build the insert frame.
+    insert_df = df.copy()
+    insert_df["sequence_id"] = int(sequence_id)
+    insert_df["job_id"]      = str(job_id)
+    insert_df["run_by"]      = run_by
+
+    # Keep only columns the table knows about (case-insensitive). Rename to
+    # the table's exact casing so pandas writes match the columns.
+    keep_lower = [c for c in insert_df.columns if c.lower() in table_col_lower]
+    insert_df = insert_df[keep_lower]
+    insert_df.columns = [table_col_lower[c.lower()] for c in insert_df.columns]
+
+    # NaN / pd.NA → None so SQL Server gets proper NULLs.
+    insert_df = insert_df.astype(object).where(pd.notnull(insert_df), None)
+
+    # Both engines are created with fast_executemany=True (pyodbc), so a plain
+    # executemany (no method='multi') sends each chunk as one bulk parameter
+    # array — not subject to SQL Server's 2100-parameter-per-statement cap.
+    # method='multi' would build a single giant INSERT VALUES(...) statement,
+    # bypassing fast_executemany and forcing ~28-row chunks. Don't use it.
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"DELETE FROM [{ALLOCATION_TABLE}] WHERE sequence_id = :sid"),
+            {"sid": int(sequence_id)},
+        )
+        insert_df.to_sql(
+            ALLOCATION_TABLE,
+            conn,
+            if_exists="append",
+            index=False,
+            chunksize=20_000,
+        )
+    return len(insert_df)
+
+
 def _cache_store(df: "pd.DataFrame", meta: Dict[str, Any]) -> str:
     """Stash df+meta in the cache, return a fresh UUID handle."""
     key = uuid.uuid4().hex
@@ -204,9 +451,15 @@ def _compute_onesize(
     placeholder_value: str = "A",
     rdcs: Optional[List[str]] = None,
     ssns: Optional[List[str]] = None,
+    job: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run the full OneSize calculation. Pure read; no writes."""
-    stages: List[Dict[str, Any]] = []
+    """Run the full OneSize calculation. Pure read; no writes.
+
+    When `job` is supplied, stages are appended to `job['stages']` so the
+    poll endpoint reflects live progress, and any append() will raise
+    OneSizeCancelled if the job's cancel_event fired.
+    """
+    stages: List[Dict[str, Any]] = job["stages"] if job is not None else []
 
     # ---- Stage 1: latest sequence_id ------------------------------------
     seq_row = db.execute(
@@ -2308,57 +2561,257 @@ def _compute_onesize(
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Job runner
 # ---------------------------------------------------------------------------
-@router.post(
-    "/run",
-    response_model=APIResponse,
-    summary="Run OneSize calculation (read-only)",
-)
-def run_onesize(
-    preview_limit: int = Query(1000, ge=0, le=50000, description="How many rows to return in-line for preview"),
-    rdc: List[str] = Query(default=[], description="Restrict to these RDCs (empty = all)"),
-    ssn: List[str] = Query(default=DEFAULT_SSNS, description="Restrict to these SSNs (empty = all)"),
-    db: Session = Depends(get_data_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Run the OneSize calculation and return a preview slice."""
+def _run_job(
+    job_id: str,
+    rdcs: List[str],
+    ssns: List[str],
+    preview_limit: int,
+    username: Optional[str],
+) -> None:
+    """Worker thread body. Owns its own DB session (FastAPI's request-scoped
+    session can't safely cross threads). Writes status/result back into the
+    job dict; never raises out of the thread."""
+    from app.database.session import DataSessionLocal
+
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if job is None:
+        return  # deleted before we even started
+
+    db: Optional[Session] = None
     try:
-        result = _compute_onesize(
-            db, rdcs=rdc, ssns=ssn,
-        )
+        db = DataSessionLocal()
+        result = _compute_onesize(db, rdcs=rdcs, ssns=ssns, job=job)
         df = result.pop("_df", None)
+
+        # Preview slice + full df cache for CSV export
         preview_rows: List[Dict[str, Any]] = []
         if df is not None and not df.empty and preview_limit > 0:
-            preview_rows = df.head(preview_limit).where(pd.notnull(df.head(preview_limit)), None).to_dict("records")
-        result["preview_rows"] = preview_rows
-        result["preview_limit"] = preview_limit
+            head = df.head(preview_limit)
+            preview_rows = head.where(pd.notnull(head), None).to_dict("records")
 
-        # Stash the full df for /export.csv so the user doesn't pay to recompute.
         cache_key = ""
         if df is not None and not df.empty:
             cache_key = _cache_store(
                 df,
                 {
                     "sequence_id": result.get("sequence_id"),
-                    "rdcs": list(rdc),
-                    "ssns": list(ssn),
-                    "user": getattr(current_user, "username", None),
+                    "rdcs": list(rdcs),
+                    "ssns": list(ssns),
+                    "user": username,
+                    "job_id": job_id,
                 },
             )
-        result["cache_key"] = cache_key
 
-        msg = (
-            f"OneSize: {result['total_rows']} rows "
-            f"(final_msa='Y' rows, "
-            f"{result['stores']} stores, sequence {result['sequence_id']})"
-        )
-        return APIResponse(data=result, message=msg)
-    except HTTPException:
-        raise
+        # ---- Persist to ARS_ONESIZE_ALLOCATION (replace-per-sequence_id) ----
+        # Errors here don't fail the job — the compute already succeeded and
+        # the df is cached for CSV export. We record persist_error on the job
+        # so the UI can surface a warning.
+        persist_error: Optional[str] = None
+        persisted_rows: Optional[int] = None
+        seq_id_for_persist = result.get("sequence_id")
+        if df is not None and not df.empty and seq_id_for_persist is not None:
+            # Visible to pollers so the UI shows the job is in the save phase
+            # (a cancel here raises OneSizeCancelled before we touch the table).
+            job["stages"].append({
+                "stage": "persist_to_db",
+                "table": ALLOCATION_TABLE,
+                "rows": int(len(df)),
+            })
+            try:
+                persisted_rows = _persist_onesize_result(
+                    db.bind, df,
+                    sequence_id=seq_id_for_persist,
+                    job_id=job_id,
+                    run_by=username,
+                )
+                logger.info(
+                    f"[onesize][job {job_id}] persisted {persisted_rows} rows to "
+                    f"{ALLOCATION_TABLE} (sequence_id={seq_id_for_persist})"
+                )
+            except Exception as e:
+                persist_error = f"DB save failed: {str(e)[:400]}"
+                logger.exception(f"[onesize][job {job_id}] persistence failed: {e}")
+
+        with _JOBS_LOCK:
+            j = _JOBS.get(job_id)
+            if j is None:
+                return  # deleted while running
+            j["status"]         = "completed"
+            j["total_rows"]     = result.get("total_rows", 0)
+            j["stores"]         = result.get("stores", 0)
+            j["sequence_id"]    = result.get("sequence_id")
+            j["columns"]        = result.get("columns", [])
+            j["preview_rows"]   = preview_rows
+            j["preview_limit"]  = preview_limit
+            j["cache_key"]      = cache_key
+            j["persist_error"]  = persist_error
+            j["persisted_rows"] = persisted_rows
+            j["finished_at"]    = time.time()
+        logger.info(f"[onesize][job {job_id}] completed — rows={result.get('total_rows', 0)}")
+    except OneSizeCancelled:
+        with _JOBS_LOCK:
+            j = _JOBS.get(job_id)
+            if j is not None:
+                j["status"]      = "cancelled"
+                j["finished_at"] = time.time()
+        logger.info(f"[onesize][job {job_id}] cancelled by user")
     except Exception as e:
-        logger.error(f"[onesize] run failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"[onesize][job {job_id}] failed: {e}")
+        with _JOBS_LOCK:
+            j = _JOBS.get(job_id)
+            if j is not None:
+                j["status"]      = "failed"
+                j["error"]       = str(e)[:1000]
+                j["finished_at"] = time.time()
+    finally:
+        if db is not None:
+            try: db.close()
+            except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# Routes — Job lifecycle
+# ---------------------------------------------------------------------------
+@router.post(
+    "/jobs",
+    response_model=APIResponse,
+    summary="Start a OneSize calculation job",
+)
+def start_onesize_job(
+    preview_limit: int = Query(1000, ge=0, le=50000, description="Rows to include in preview when job finishes"),
+    rdc: List[str] = Query(default=[], description="Restrict to these RDCs (empty = all)"),
+    ssn: List[str] = Query(default=DEFAULT_SSNS, description="Restrict to these SSNs (empty = all)"),
+    current_user: User = Depends(get_current_user),
+):
+    """Kick off the OneSize pipeline in a background thread. Returns a job_id
+    that the client polls via GET /jobs/{job_id}."""
+    job_id = uuid.uuid4().hex
+    cancel_event = threading.Event()
+    job: Dict[str, Any] = {
+        "id":            job_id,
+        "status":        "running",
+        "stages":        _StagesList(cancel_event),
+        "cancel_event":  cancel_event,
+        "started_at":    time.time(),
+        "finished_at":   None,
+        "total_rows":    0,
+        "stores":        0,
+        "sequence_id":   None,
+        "columns":       [],
+        "preview_rows":  [],
+        "preview_limit": preview_limit,
+        "cache_key":     "",
+        "error":         None,
+        "params":        {"rdcs": list(rdc), "ssns": list(ssn)},
+        "user":          getattr(current_user, "username", None),
+    }
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+        while len(_JOBS) > _JOBS_MAX_ENTRIES:
+            evict_id, evicted = _JOBS.popitem(last=False)
+            # Best-effort: if the evicted job is still running, cancel it.
+            ev = evicted.get("cancel_event")
+            if ev is not None and evicted.get("status") == "running":
+                ev.set()
+            logger.info(f"[onesize][jobs] LRU-evicted {evict_id} (status={evicted.get('status')})")
+
+    t = threading.Thread(
+        target=_run_job,
+        name=f"onesize-job-{job_id[:8]}",
+        args=(job_id, list(rdc), list(ssn), preview_limit, job["user"]),
+        daemon=True,
+    )
+    job["thread"] = t
+    t.start()
+    logger.info(f"[onesize][job {job_id}] started (rdcs={list(rdc)}, ssns={list(ssn)})")
+    return APIResponse(data=_job_snapshot(job), message=f"OneSize job {job_id} started")
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=APIResponse,
+    summary="Poll a OneSize job's status / progress / result",
+)
+def get_onesize_job(
+    job_id: str,
+    include_preview: bool = Query(True, description="Include preview_rows in the response (only when status=completed)"),
+    current_user: User = Depends(get_current_user),
+):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        snap = _job_snapshot(job, include_preview=include_preview and job["status"] == "completed")
+    return APIResponse(data=snap, message=f"Job {job_id} status={snap['status']}")
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=APIResponse,
+    summary="Request cancellation of a running OneSize job",
+)
+def cancel_onesize_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        if job["status"] != "running":
+            return APIResponse(
+                data=_job_snapshot(job),
+                message=f"Job already in terminal state ({job['status']}); nothing to cancel",
+            )
+        ev = job.get("cancel_event")
+        if ev is not None:
+            ev.set()
+        snap = _job_snapshot(job)
+    logger.info(f"[onesize][job {job_id}] cancel requested")
+    return APIResponse(data=snap, message="Cancel signal sent; job will stop at next stage boundary")
+
+
+@router.delete(
+    "/jobs/{job_id}",
+    response_model=APIResponse,
+    summary="Delete a OneSize job (cancels first if still running)",
+)
+def delete_onesize_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    with _JOBS_LOCK:
+        job = _JOBS.pop(job_id, None)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    # If it was still running, set the cancel event so the worker exits cleanly.
+    if job.get("status") == "running":
+        ev = job.get("cancel_event")
+        if ev is not None:
+            ev.set()
+    # Free the cache entry too — the df is bound to this job's cache_key.
+    ck = job.get("cache_key")
+    if ck:
+        with _CACHE_LOCK:
+            _RESULT_CACHE.pop(ck, None)
+    logger.info(f"[onesize][job {job_id}] deleted (was {job.get('status')})")
+    return APIResponse(data={"job_id": job_id}, message=f"Job {job_id} deleted")
+
+
+@router.get(
+    "/jobs",
+    response_model=APIResponse,
+    summary="List recent OneSize jobs",
+)
+def list_onesize_jobs(
+    current_user: User = Depends(get_current_user),
+):
+    with _JOBS_LOCK:
+        snaps = [_job_snapshot(j) for j in _JOBS.values()]
+    return APIResponse(data={"jobs": snaps}, message=f"{len(snaps)} jobs")
 
 
 @router.get(

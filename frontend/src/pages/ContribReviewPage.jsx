@@ -7,7 +7,7 @@ import { contribAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
   ClipboardCheck, Download, Trash2, RefreshCw, Table2, Eye, Search,
-  ChevronDown, CheckCircle2, XCircle, Loader, Clock, FileDown, Filter, X
+  ChevronDown, CheckCircle2, XCircle, Loader, Clock, FileDown, Filter, X, StopCircle
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 
@@ -90,6 +90,10 @@ export default function ContribReviewPage() {
   // Export jobs — only track active (pending/running) ones
   const [activeExports, setActiveExports] = useState([])  // [{id, table_name, status, processed_rows, total_rows}]
   const downloadedRef = useRef(new Set())  // track already auto-downloaded export IDs
+  // Persists across the 2s poll cycle. Without this, the next listExports
+  // overwrites our optimistic `cancel_requested` flag and the cancelled row
+  // briefly reappears until the worker flips status to 'cancelled'.
+  const cancelledRef = useRef(new Set())
   const pollRef = useRef(null)
   const [exporting, setExporting] = useState(false)
 
@@ -108,7 +112,17 @@ export default function ContribReviewPage() {
     try {
       const { data } = await contribAPI.listExports()
       const all = data.data?.exports || []
-      setActiveExports(all)
+      // Re-apply the optimistic cancel flag on every merge so a row the user
+      // has cancelled stays hidden until the server confirms with status='cancelled'.
+      // Prune the ref for IDs that no longer appear in the list.
+      const liveIds = new Set(all.map(e => e.id))
+      for (const id of Array.from(cancelledRef.current)) {
+        if (!liveIds.has(id)) cancelledRef.current.delete(id)
+      }
+      const annotated = all.map(e =>
+        cancelledRef.current.has(e.id) ? { ...e, cancel_requested: true } : e
+      )
+      setActiveExports(annotated)
 
       // Auto-download completed jobs, then delete them
       for (const exp of all) {
@@ -148,8 +162,13 @@ export default function ContribReviewPage() {
     return () => clearInterval(pollRef.current)
   }, [refreshExports])
 
-  // Only show pending/running exports
-  const visibleExports = activeExports.filter(e => e.status === 'pending' || e.status === 'running')
+  // Only show pending/running exports that haven't been cancelled locally.
+  // Hiding on cancel_requested is optimistic — the worker may take 1-3s to
+  // hit the next chunk boundary and flip status='cancelled', but the user
+  // shouldn't have to wait for that round-trip to see the row disappear.
+  const visibleExports = activeExports.filter(e =>
+    (e.status === 'pending' || e.status === 'running') && !e.cancel_requested
+  )
 
   // Fetch preview from server with current filters
   const fetchPreview = useCallback(async (name, currentFilters) => {
@@ -198,6 +217,24 @@ export default function ContribReviewPage() {
     } finally { setExporting(false) }
   }
 
+  // Cancel an in-progress export. Worker checks the flag at the next chunk
+  // boundary (usually < 1s) and transitions status to 'cancelled'. We track
+  // the ID in cancelledRef so the optimistic `cancel_requested=true` flag
+  // survives the next poll's wholesale state replace.
+  const handleCancelExport = async (exportId) => {
+    try {
+      await contribAPI.cancelExport(exportId)
+      toast.success('Cancel requested — export will stop shortly')
+      cancelledRef.current.add(exportId)
+      setActiveExports(prev => prev.map(e =>
+        e.id === exportId ? { ...e, cancel_requested: true } : e,
+      ))
+      refreshExports()
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Cancel failed')
+    }
+  }
+
   const handleDelete = async (name) => {
     if (!confirm(`Delete table "${name}"? This cannot be undone.`)) return
     try {
@@ -235,6 +272,22 @@ export default function ContribReviewPage() {
                   </div>
                 )}
                 <span style={{ fontSize: 10, color: C.textMuted }}>Auto-downloads when ready</span>
+                <button
+                  onClick={() => handleCancelExport(exp.id)}
+                  disabled={exp.cancel_requested}
+                  title={exp.cancel_requested ? 'Cancelling...' : 'Cancel this export'}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 700,
+                    border: `1px solid ${exp.cancel_requested ? C.cardBorder : C.red}`,
+                    background: exp.cancel_requested ? '#fff' : '#fef2f2',
+                    color: exp.cancel_requested ? C.textMuted : C.red,
+                    cursor: exp.cancel_requested ? 'wait' : 'pointer',
+                  }}
+                >
+                  <StopCircle size={11} />
+                  {exp.cancel_requested ? 'Cancelling…' : 'Cancel'}
+                </button>
               </div>
             )
           })}

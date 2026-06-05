@@ -228,8 +228,8 @@ const repeatedArrayParams = (params) => {
 export const oneSizeAPI = {
   listRdcs: () => api.get('/onesize/rdcs'),
   listSsns: () => api.get('/onesize/ssns'),
-  run: (previewLimit = 1000, rdcs = [], ssns = []) =>
-    api.post('/onesize/run', null, {
+  startJob: (previewLimit = 1000, rdcs = [], ssns = []) =>
+    api.post('/onesize/jobs', null, {
       params: {
         preview_limit: previewLimit,
         rdc: rdcs,
@@ -237,6 +237,13 @@ export const oneSizeAPI = {
       },
       paramsSerializer: repeatedArrayParams,
     }),
+  getJob: (jobId, includePreview = true) =>
+    api.get(`/onesize/jobs/${jobId}`, {
+      params: { include_preview: includePreview },
+    }),
+  cancelJob: (jobId) => api.post(`/onesize/jobs/${jobId}/cancel`),
+  deleteJob: (jobId) => api.delete(`/onesize/jobs/${jobId}`),
+  listJobs:  () => api.get('/onesize/jobs'),
   exportCsvBlob: (cacheKey = '', rdcs = [], ssns = []) =>
     api.get('/onesize/export.csv', {
       params: {
@@ -519,6 +526,7 @@ export const contribAPI = {
   listExports:      ()      => api.get('/contrib/review/exports'),
   getExport:        (id)    => api.get(`/contrib/review/exports/${id}`),
   downloadExport:   (id)    => api.get(`/contrib/review/exports/${id}/download`, { responseType: 'blob', timeout: 600000 }),
+  cancelExport:     (id)    => api.post(`/contrib/review/exports/${id}/cancel`),
   deleteExport:     (id)    => api.delete(`/contrib/review/exports/${id}`),
   // Contribution Report — paginated full-table view
   reportTables: () => api.get('/contrib/report/tables'),
