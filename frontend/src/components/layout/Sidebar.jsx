@@ -5,7 +5,7 @@ import {
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
   Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
   HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
-  AlertTriangle
+  AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -49,6 +49,24 @@ const contributionItems = [
   { label: 'Report', path: '/contribution/report', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
 ]
 
+// Auto Cont % — SQL-direct pipeline (superadmin-only during rollout)
+const autoContItems = [
+  { label: 'Presets',  path: '/auto-cont/presets',  icon: Settings,       superadminOnly: true },
+  { label: 'Mappings', path: '/auto-cont/mappings', icon: Columns,        superadminOnly: true },
+  { label: 'Execute',  path: '/auto-cont/execute',  icon: Cpu,            superadminOnly: true },
+  { label: 'Jobs',     path: '/auto-cont/jobs',     icon: Activity,       superadminOnly: true },
+  { label: 'Review',   path: '/auto-cont/review',   icon: ClipboardCheck, superadminOnly: true },
+]
+
+// ALC_Fixture — MSA-STK Allocation Engine (blueprint v1.0, superadmin-only during rollout)
+const alcFixtureItems = [
+  { label: 'Tunables',  path: '/alc-fixture/tunables',  icon: Sliders,         superadminOnly: true },
+  { label: 'Execute',   path: '/alc-fixture/execute',   icon: Cpu,             superadminOnly: true },
+  { label: 'Review',    path: '/alc-fixture/review',    icon: ClipboardCheck,  superadminOnly: true },
+  { label: 'Dashboard', path: '/alc-fixture/dashboard', icon: LayoutDashboard, superadminOnly: true },
+  { label: 'Jobs',      path: '/alc-fixture/jobs',      icon: Activity,        superadminOnly: true },
+]
+
 // Reports submenu
 const reportsItems = [
   { label: 'Hold Dashboard', path: '/reports/hold', icon: Lock },
@@ -78,6 +96,24 @@ const projectTrackerItems = [
   { label: 'Dashboard',     path: '/pt',          icon: LayoutDashboard, end: true },
   { label: 'All Projects',  path: '/pt/projects', icon: FolderKanban },
   { label: 'My Tasks',      path: '/pt/my-tasks', icon: ListTodo },
+]
+
+// Process documentation submenu — explains every step of Listing + Allocation.
+// Deep engine pages (listing-build → Stage A-D) are code-level step-by-step walkthroughs.
+const processItems = [
+  { label: 'Overview',            path: '/process/overview',         icon: BookOpen },
+  { label: 'Workflow Chart',      path: '/process/workflow',         icon: GitBranch },
+  { label: 'Listing (intro)',     path: '/process/listing',          icon: ListOrdered },
+  { label: 'Listing Build 1-5',   path: '/process/listing-build',    icon: ListOrdered },
+  { label: 'Stage A · Rank',      path: '/process/stage-a-rank',     icon: ListOrdered },
+  { label: 'Stage B · Explode',   path: '/process/stage-b-explode',  icon: Layers },
+  { label: 'Stage C · Waterfall', path: '/process/stage-c-waterfall',icon: Boxes },
+  { label: 'Stage D · Finalize',  path: '/process/stage-d-finalize', icon: Boxes },
+  { label: 'Primary & Sec-Cap',   path: '/process/sec-cap',          icon: Layers },
+  { label: 'Allocation',          path: '/process/allocation',       icon: Boxes },
+  { label: 'Pending Allocation',  path: '/process/pending-alc',      icon: Truck },
+  { label: 'Fallback (archived)', path: '/process/fallback',         icon: AlertTriangle },
+  { label: 'Variables Glossary',  path: '/process/variables',        icon: Sliders },
 ]
 
 // Settings submenu (admin features)
@@ -282,6 +318,30 @@ export default function Sidebar({ collapsed, onToggle }) {
           hasPermission={hasPermission}
         />
 
+        {/* Auto Cont % — SQL-direct pipeline (superadmin-only during rollout).
+            Presents results only after the SQL job completes — no streaming pandas. */}
+        <SubMenu
+          title="Auto Cont %"
+          icon={Cpu}
+          items={autoContItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+          isSuperAdmin={superadmin}
+        />
+
+        {/* ALC_Fixture — MSA-STK Allocation Engine (superadmin-only during rollout).
+            Computes final fixture count per Store × Floor × Major-Cat via the
+            8-stage blueprint pipeline (BGT/AUTO refs → C-ART carve-out →
+            stock-based fix → BGT reconciliation → MSA-backed redistribution). */}
+        <SubMenu
+          title="ALC_Fixture"
+          icon={Boxes}
+          items={alcFixtureItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+          isSuperAdmin={superadmin}
+        />
+
         {/* Trends submenu */}
         <SubMenu
           title="Trends"
@@ -329,6 +389,16 @@ export default function Sidebar({ collapsed, onToggle }) {
           items={projectTrackerItems}
           collapsed={collapsed}
           hasPermission={hasPermission}
+        />
+
+        {/* Process — in-app documentation for Listing + Allocation pipeline */}
+        <SubMenu
+          title="Process"
+          icon={BookOpen}
+          items={processItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+          defaultOpen={false}
         />
 
         {/* Settings submenu */}

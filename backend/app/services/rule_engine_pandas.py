@@ -967,6 +967,8 @@ def run_listing_and_allocation_pandas(
             rne._apply_sec_grid_cap_pre_gate(
                 conn, alloc_table, working_table, _all_grids_main,
                 opt_type=None,
+                growth_pct=mj_req_growth_pct,
+                include_primary=True,
             )
 
             # Drop the parent-side pool now — Stage D doesn't need it, and the
@@ -1213,22 +1215,25 @@ def _select_working_cols(conn, working_table, grids) -> List[str]:
 # Per-MAJ_CAT waterfall (pandas)
 # ---------------------------------------------------------------------------
 def _build_mbq_budget(working_df: pd.DataFrame, cap_pct: float) -> Dict[str, float]:
-    """Per-WERKS allocation budget: max(0, cap_pct/100 * MJ_MBQ - MJ_STK_TTL).
-    MJ_REQ = MJ_MBQ * factor then stock (including excess) is deducted.
-    Returns empty dict (disables cap) when the required columns are absent."""
+    """Per-WERKS allocation budget: max(0, cap_pct/100 * MJ_MBQ_ORIG - MJ_STK_TTL).
+    Decision 4-B: caps anchor to the ORIGINAL pre-growth MJ_MBQ so the slider
+    operates independently of the growth lift. Falls back to MJ_MBQ on legacy
+    deployments where MJ_MBQ_ORIG isn't populated yet."""
     if 'MJ_MBQ' not in working_df.columns or 'MJ_STK_TTL' not in working_df.columns:
         return {}
+    # Anchor column: prefer ORIG (pre-growth), fall back to live MJ_MBQ.
+    mbq_anchor = 'MJ_MBQ_ORIG' if 'MJ_MBQ_ORIG' in working_df.columns else 'MJ_MBQ'
     # Deterministic: sort by WERKS first so drop_duplicates always keeps the
     # same row across runs even if upstream input order varies.
     store_data = (
-        working_df[['WERKS', 'MJ_MBQ', 'MJ_STK_TTL']]
-        .sort_values(['WERKS', 'MJ_MBQ', 'MJ_STK_TTL'], kind='mergesort')
+        working_df[['WERKS', mbq_anchor, 'MJ_STK_TTL']]
+        .sort_values(['WERKS', mbq_anchor, 'MJ_STK_TTL'], kind='mergesort')
         .drop_duplicates(subset=['WERKS'])
     )
     budget: Dict[str, float] = {}
     factor = cap_pct / 100.0
     for _, row in store_data.iterrows():
-        cap = float(row['MJ_MBQ'] or 0) * factor - float(row['MJ_STK_TTL'] or 0)
+        cap = float(row[mbq_anchor] or 0) * factor - float(row['MJ_STK_TTL'] or 0)
         budget[str(row['WERKS'])] = max(0.0, cap)
     return budget
 
@@ -1239,25 +1244,29 @@ def _live_mbq_budget(working_df: pd.DataFrame, cap_pct: float) -> Dict[str, floa
     has already shipped — across all OPT_TYPEs and rounds — without having
     to re-derive from MJ_MBQ - MJ_STK_TTL - cum_ships.
 
-    Math:  budget = max(0, MJ_REQ_REM + ((cap_pct - 100) / 100) × MJ_MBQ)
+    Math:  budget = max(0, MJ_REQ_REM + ((cap_pct - 100) / 100) × MJ_MBQ_ORIG)
       • cap_pct = 100 (PRI strict) → budget = MJ_REQ_REM
-      • cap_pct = 130            → budget = MJ_REQ_REM + 30% × MJ_MBQ
-    Empty dict (cap disabled) when cap_pct ≤ 0 or required columns missing."""
+      • cap_pct = 130            → budget = MJ_REQ_REM + 30% × MJ_MBQ_ORIG
+    Decision 4-B: headroom is computed off ORIG so the cap is anchored to the
+    pre-growth budget. Empty dict (cap disabled) when cap_pct ≤ 0 or required
+    columns missing."""
     if cap_pct <= 0:
         return {}
     needed = {'WERKS', 'MJ_REQ_REM', 'MJ_MBQ'}
     if not needed.issubset(working_df.columns):
         return {}
+    # Anchor column: prefer ORIG (pre-growth), fall back to live MJ_MBQ.
+    mbq_anchor = 'MJ_MBQ_ORIG' if 'MJ_MBQ_ORIG' in working_df.columns else 'MJ_MBQ'
     headroom = (cap_pct - 100.0) / 100.0
     store_data = (
-        working_df[['WERKS', 'MJ_REQ_REM', 'MJ_MBQ']]
-        .sort_values(['WERKS', 'MJ_REQ_REM', 'MJ_MBQ'], kind='mergesort')
+        working_df[['WERKS', 'MJ_REQ_REM', mbq_anchor]]
+        .sort_values(['WERKS', 'MJ_REQ_REM', mbq_anchor], kind='mergesort')
         .drop_duplicates(subset=['WERKS'])
     )
     budget: Dict[str, float] = {}
     for _, row in store_data.iterrows():
         rem = float(row['MJ_REQ_REM'] or 0)
-        mbq = float(row['MJ_MBQ'] or 0)
+        mbq = float(row[mbq_anchor] or 0)
         budget[str(row['WERKS'])] = max(0.0, rem + headroom * mbq)
     return budget
 

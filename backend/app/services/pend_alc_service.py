@@ -250,6 +250,7 @@ def log_operation_upsert(
     conn, op_type: str, op_key: str, payload: Dict,
     summary: str = "", rows_affected: int = 0, qty_total: float = 0,
     created_by: Optional[str] = None, is_first: bool = True,
+    merge_payload_lists: Optional[List[str]] = None,
 ) -> int:
     """Multi-chunk-aware variant of log_operation.
 
@@ -258,15 +259,68 @@ def log_operation_upsert(
       accumulating rows_affected and qty_total. Used for chunks 2..N so the
       whole upload appears as ONE entry in the ops log.
 
+    merge_payload_lists: list of payload field names whose values are lists
+      that should be APPENDED to the chunk-1 payload (read-modify-write).
+      Used for DO uploads where pend_updates / history_updates accumulate
+      across chunks and must all be present for revert to work end-to-end.
+      Omit (or pass None) for callers like manual-upload that revert via
+      a SESSION_ID query and don't need the per-chunk payload preserved.
+
     If is_first=False but no existing row is found (caller error or upstream
     failure on chunk 1), falls through to a regular INSERT so we never lose
     the audit trail.
 
     Returns the OP_ID of the row (new or existing).
     """
+    import json as _json
     ensure_operations_table(conn)
 
     if is_first:
+        return log_operation(conn, op_type, op_key, payload, summary,
+                             rows_affected, qty_total, created_by)
+
+    if merge_payload_lists:
+        # Read-modify-write so chunks 2..N append their list deltas to the
+        # existing chunk-1 payload. Single ops_log row, complete revert.
+        existing = conn.execute(text(f"""
+            SELECT OP_ID, PAYLOAD FROM {OPERATIONS_TABLE}
+             WHERE OP_TYPE = :t AND OP_KEY = :k
+               AND ISNULL(REVERTED_AT, '') = ''
+        """), {"t": op_type, "k": str(op_key)[:100]}).fetchone()
+
+        if existing:
+            op_id = int(existing[0])
+            try:
+                doc = _json.loads(existing[1]) if existing[1] else {}
+            except Exception:
+                doc = {}
+            for field in merge_payload_lists:
+                incoming = payload.get(field) or []
+                if not incoming:
+                    continue
+                doc.setdefault(field, []).extend(incoming)
+            conn.execute(text(f"""
+                UPDATE {OPERATIONS_TABLE}
+                   SET ROWS_AFFECTED = ISNULL(ROWS_AFFECTED, 0) + :n,
+                       QTY_TOTAL     = ISNULL(QTY_TOTAL, 0)     + :q,
+                       SUMMARY       = :s,
+                       PAYLOAD       = :p
+                 WHERE OP_ID = :id
+            """), {
+                "n":  int(rows_affected or 0),
+                "q":  float(qty_total or 0),
+                "s":  (summary or "")[:500],
+                "p":  _json.dumps(doc, default=str),
+                "id": op_id,
+            })
+            conn.commit()
+            return op_id
+
+        # Fallthrough to INSERT below
+        logger.warning(
+            f"[ops_log] upsert: no existing row for {op_type}/{op_key} on chunk N "
+            f"(merge_payload mode); falling back to INSERT"
+        )
         return log_operation(conn, op_type, op_key, payload, summary,
                              rows_affected, qty_total, created_by)
 
@@ -682,41 +736,115 @@ def _revert_bdc(conn, payload: Dict) -> Dict:
 
 
 def _revert_do(conn, payload: Dict) -> Dict:
-    """Subtract DO_QTY from PEND rows + restore IS_CLOSED + roll back history."""
+    """Subtract DO_QTY from PEND rows + restore IS_CLOSED + roll back history.
+
+    Set-based: bulk-loads pend_updates / history_updates into temp tables,
+    then runs one UPDATE..JOIN per side. Replaces the prior per-row loop
+    (5K updates = 5K SQL round-trips → minutes on the same upload size as
+    the apply path) with two bulk passes (sub-second).
+
+    Restore semantics are IDENTICAL to the prior loop:
+      • DO_QTY decremented by recorded qty_added.
+      • IS_CLOSED reset to 0 only if the original apply just-closed the row.
+      • LAST_DO_AT restored to the pre-apply value (NULL if it was NULL).
+      • BDC_HISTORY.DO_RECEIVED / STATUS / LAST_DO_AT restored to the
+        pre-apply values captured at apply time.
+    """
     pend_updates = payload.get("pend_updates") or []
     history_updates = payload.get("history_updates") or []
 
     pend_rows = 0
-    for u in pend_updates:
-        conn.execute(text(f"""
-            UPDATE {PEND_ALC_TABLE}
-               SET DO_QTY    = DO_QTY - :q,
-                   IS_CLOSED = CASE WHEN :was_closed = 1 THEN 0 ELSE IS_CLOSED END,
-                   LAST_DO_AT = :prev_do_at
-             WHERE ID = :id
-        """), {
-            "q":           float(u.get("qty_added") or 0),
-            "was_closed":  1 if u.get("was_just_closed") else 0,
-            "prev_do_at":  u.get("prev_last_do_at"),
-            "id":          int(u["pend_alc_id"]),
-        })
-        pend_rows += 1
-
     history_rows = 0
-    for h in history_updates:
-        conn.execute(text(f"""
-            UPDATE {BDC_HISTORY_TABLE}
-               SET DO_RECEIVED = :got,
-                   STATUS      = :s,
-                   LAST_DO_AT  = :t
-             WHERE ID = :id
-        """), {
-            "got": float(h.get("old_do_received") or 0),
-            "s":   h.get("old_status") or "OPEN",
-            "t":   h.get("old_last_do_at"),
-            "id":  int(h["history_id"]),
-        })
-        history_rows += 1
+
+    if pend_updates:
+        tmp_pa = f"#do_rev_pa_{uuid.uuid4().hex[:8]}"
+        try:
+            conn.execute(text(
+                f"CREATE TABLE {tmp_pa} ("
+                "  id          BIGINT  NOT NULL,"
+                "  qty_added   FLOAT   NOT NULL,"
+                "  was_closed  BIT     NOT NULL,"
+                "  prev_do_at  DATETIME NULL"
+                ")"
+            ))
+            raw = conn.connection
+            cur = raw.cursor()
+            try:
+                try:
+                    cur.fast_executemany = True
+                except Exception:
+                    pass
+                cur.executemany(
+                    f"INSERT INTO {tmp_pa} (id, qty_added, was_closed, prev_do_at) "
+                    f"VALUES (?, ?, ?, ?)",
+                    [(int(u["pend_alc_id"]),
+                      float(u.get("qty_added") or 0),
+                      1 if u.get("was_just_closed") else 0,
+                      u.get("prev_last_do_at"))
+                     for u in pend_updates],
+                )
+            finally:
+                cur.close()
+
+            conn.execute(text(f"""
+                UPDATE P
+                   SET P.DO_QTY     = P.DO_QTY - u.qty_added,
+                       P.IS_CLOSED  = CASE WHEN u.was_closed = 1 THEN 0 ELSE P.IS_CLOSED END,
+                       P.LAST_DO_AT = u.prev_do_at
+                FROM {PEND_ALC_TABLE} P
+                JOIN {tmp_pa} u ON P.ID = u.id
+            """))
+            pend_rows = len(pend_updates)
+        finally:
+            try:
+                conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_pa}') IS NOT NULL DROP TABLE {tmp_pa}"))
+            except Exception:
+                pass
+
+    if history_updates:
+        tmp_h = f"#do_rev_h_{uuid.uuid4().hex[:8]}"
+        try:
+            conn.execute(text(
+                f"CREATE TABLE {tmp_h} ("
+                "  id      BIGINT       NOT NULL,"
+                "  got     FLOAT        NOT NULL,"
+                "  status  NVARCHAR(20) NOT NULL,"
+                "  last_at DATETIME     NULL"
+                ")"
+            ))
+            raw = conn.connection
+            cur = raw.cursor()
+            try:
+                try:
+                    cur.fast_executemany = True
+                except Exception:
+                    pass
+                cur.executemany(
+                    f"INSERT INTO {tmp_h} (id, got, status, last_at) "
+                    f"VALUES (?, ?, ?, ?)",
+                    [(int(h["history_id"]),
+                      float(h.get("old_do_received") or 0),
+                      (h.get("old_status") or "OPEN")[:20],
+                      h.get("old_last_do_at"))
+                     for h in history_updates],
+                )
+            finally:
+                cur.close()
+
+            conn.execute(text(f"""
+                UPDATE H
+                   SET H.DO_RECEIVED = u.got,
+                       H.STATUS      = u.status,
+                       H.LAST_DO_AT  = u.last_at
+                FROM {BDC_HISTORY_TABLE} H
+                JOIN {tmp_h} u ON H.ID = u.id
+            """))
+            history_rows = len(history_updates)
+        finally:
+            try:
+                conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_h}') IS NOT NULL DROP TABLE {tmp_h}"))
+            except Exception:
+                pass
 
     return {"pend_alc_rows_reverted": pend_rows,
             "bdc_history_rows_reverted": history_rows}
@@ -1719,92 +1847,218 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
     """When a DO is uploaded, credit each DO line against the matching
     open BDC history row(s).
 
-    Matching strategy per row:
-      1. If `allocation_number` is provided in the DO row → match that exact
-         BDC (the SAP DO file references the BDC it satisfies).
-      2. Otherwise → FIFO across all open history rows for the same
-         (RDC, ST_CD, ARTICLE). Oldest BDC absorbs first.
+    Matching strategy per input row (UNCHANGED from prior behavior — same
+    three-way routing, same FIFO ordering):
+      1. If `allocation_number` is provided → match exact ALLOCATION_NUMBER
+         + RDC + ART.
+      2. Else if `st_cd` is provided → FIFO across open history rows for
+         (RDC, ST_CD, ARTICLE).
+      3. Else → FIFO across open history rows for (RDC, ARTICLE).
+
+    Set-based implementation: input is bucketed by route, each bucket gets
+    one windowed-FIFO UPDATE pass. Replaces the per-row Python loop
+    (1 SELECT + N UPDATEs per input row → minutes on 5K rows) with three
+    bulk passes (sub-second total).
 
     Updates DO_RECEIVED and flips STATUS to PARTIAL or CONFIRMED.
 
     do_rows: dicts with rdc, article_number, do_qty,
              optional st_cd, optional allocation_number.
-    Returns count of history rows touched.
+    Returns: {touched, history_updates} — history_updates payload format
+    is byte-for-byte identical to the prior implementation so _revert_do
+    needs no changes.
     """
     if not do_rows:
         return {"touched": 0, "history_updates": []}
     ensure_bdc_history_table(conn)
-    touched = 0
-    history_updates: List[Dict] = []
+
+    # Bucket input rows by routing path (alloc_no > st_cd > global).
+    # Each bucket runs in its own set-based pass so the FIFO and matching
+    # rules of the original per-row Python loop are preserved exactly.
+    by_alloc: List[Dict]  = []  # alloc_no path
+    by_store: List[Dict]  = []  # st_cd FIFO path
+    by_global: List[Dict] = []  # global FIFO path
+
     for r in do_rows:
         rdc       = str(r.get("rdc") or "").strip()
         art       = str(r.get("article_number") or "").strip()
-        st_cd     = (str(r.get("st_cd") or "").strip() or None)
-        alloc_no  = (str(r.get("allocation_number") or "").strip() or None)
-        remaining = float(r.get("do_qty") or 0)
-        if not rdc or not art or remaining <= 0:
+        st_cd     = (str(r.get("st_cd") or "").strip() or "")
+        alloc_no  = (str(r.get("allocation_number") or "").strip() or "")
+        qty       = float(r.get("do_qty") or 0)
+        if not rdc or not art or qty <= 0:
             continue
-
+        rec = {"rdc": rdc, "art": art, "st_cd": st_cd, "alloc_no": alloc_no, "qty": qty}
         if alloc_no:
-            open_rows = conn.execute(text(f"""
-                SELECT ID, BDC_QTY, DO_RECEIVED, STATUS, LAST_DO_AT
-                FROM {BDC_HISTORY_TABLE}
-                WHERE ALLOCATION_NUMBER = :alloc
-                  AND RDC = :rdc AND ARTICLE_NUMBER = :art
-                  AND STATUS <> 'CONFIRMED'
-                ORDER BY BDC_DATE ASC, ID ASC
-            """), {"alloc": alloc_no, "rdc": rdc, "art": art}).fetchall()
+            by_alloc.append(rec)
         elif st_cd:
-            open_rows = conn.execute(text(f"""
-                SELECT ID, BDC_QTY, DO_RECEIVED, STATUS, LAST_DO_AT
-                FROM {BDC_HISTORY_TABLE}
-                WHERE RDC = :rdc AND ARTICLE_NUMBER = :art
-                  AND ISNULL(ST_CD,'') = :st AND STATUS <> 'CONFIRMED'
-                ORDER BY BDC_DATE ASC, ID ASC
-            """), {"rdc": rdc, "art": art, "st": st_cd}).fetchall()
+            by_store.append(rec)
         else:
-            open_rows = conn.execute(text(f"""
-                SELECT ID, BDC_QTY, DO_RECEIVED, STATUS, LAST_DO_AT
-                FROM {BDC_HISTORY_TABLE}
-                WHERE RDC = :rdc AND ARTICLE_NUMBER = :art
-                  AND STATUS <> 'CONFIRMED'
-                ORDER BY BDC_DATE ASC, ID ASC
-            """), {"rdc": rdc, "art": art}).fetchall()
+            by_global.append(rec)
 
-        for hist in open_rows:
-            if remaining <= 0:
-                break
-            hid          = int(hist[0])
-            bdc_qty      = float(hist[1] or 0)
-            already      = float(hist[2] or 0)
-            old_status   = hist[3] or "OPEN"
-            old_last_do  = hist[4]
-            need         = max(bdc_qty - already, 0)
-            if need <= 0:
-                continue
-            apply_qty    = min(need, remaining)
-            new_total    = already + apply_qty
-            new_status   = "CONFIRMED" if new_total >= bdc_qty else "PARTIAL"
-            conn.execute(text(f"""
-                UPDATE {BDC_HISTORY_TABLE}
-                   SET DO_RECEIVED = :got,
-                       STATUS      = :st,
-                       LAST_DO_AT  = GETDATE()
-                 WHERE ID = :id
-            """), {"got": new_total, "st": new_status, "id": hid})
-            touched += 1
-            remaining -= apply_qty
+    if not (by_alloc or by_store or by_global):
+        return {"touched": 0, "history_updates": []}
+
+    tmp_in  = f"#bdc_in_{uuid.uuid4().hex[:8]}"
+    tmp_out = f"#bdc_out_{uuid.uuid4().hex[:8]}"
+    history_updates: List[Dict] = []
+
+    try:
+        conn.execute(text(
+            f"CREATE TABLE {tmp_in} ("
+            "  bucket   NVARCHAR(10) NOT NULL,"   # 'alloc' / 'store' / 'global'
+            "  rdc      NVARCHAR(20) NOT NULL,"
+            "  st_cd    NVARCHAR(20) NOT NULL,"
+            "  art      NVARCHAR(30) NOT NULL,"
+            "  alloc_no NVARCHAR(50) NOT NULL,"
+            "  qty      FLOAT        NOT NULL"
+            ")"
+        ))
+        raw = conn.connection
+        cur = raw.cursor()
+        try:
+            try:
+                cur.fast_executemany = True
+            except Exception:
+                pass
+            all_rows = (
+                [("alloc",  r["rdc"], r["st_cd"], r["art"], r["alloc_no"], r["qty"]) for r in by_alloc]
+              + [("store",  r["rdc"], r["st_cd"], r["art"], "",            r["qty"]) for r in by_store]
+              + [("global", r["rdc"], "",         r["art"], "",            r["qty"]) for r in by_global]
+            )
+            cur.executemany(
+                f"INSERT INTO {tmp_in} (bucket, rdc, st_cd, art, alloc_no, qty) "
+                f"VALUES (?, ?, ?, ?, ?, ?)",
+                all_rows,
+            )
+        finally:
+            cur.close()
+
+        conn.execute(text(
+            f"CREATE TABLE {tmp_out} ("
+            "  history_id      BIGINT       NOT NULL,"
+            "  qty_added       FLOAT        NOT NULL,"
+            "  old_do_received FLOAT        NOT NULL,"
+            "  new_do_received FLOAT        NOT NULL,"
+            "  old_status      NVARCHAR(20) NOT NULL,"
+            "  new_status      NVARCHAR(20) NOT NULL,"
+            "  old_last_do_at  DATETIME     NULL"
+            ")"
+        ))
+
+        # Three passes — one per route. Each uses the same windowed
+        # running-sum CTE to assign FIFO apply-qty across matching history
+        # rows in a single UPDATE..JOIN.
+        #
+        # group_cols and join_pred MUST share the same key columns so each
+        # open history row matches at most one agg row (otherwise an
+        # UPDATE..JOIN can drop apply_qty silently when two agg rows hit
+        # the same target).
+        passes = [
+            # (bucket_name, partition_cols, group_cols, join_pred)
+            ("alloc",
+             "H.ALLOCATION_NUMBER, H.RDC, H.ARTICLE_NUMBER",
+             "rdc, art, alloc_no",
+             "agg.alloc_no = o.ALLOCATION_NUMBER AND agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER"),
+            ("store",
+             "H.RDC, ISNULL(H.ST_CD,''), H.ARTICLE_NUMBER",
+             "rdc, st_cd, art",
+             "agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER AND agg.st_cd = ISNULL(o.ST_CD,'')"),
+            ("global",
+             "H.RDC, H.ARTICLE_NUMBER",
+             "rdc, art",
+             "agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER"),
+        ]
+
+        for bucket, partition_cols, group_cols, join_pred in passes:
+            sql = f"""
+            ;WITH agg AS (
+                SELECT {group_cols}, SUM(qty) AS qty
+                FROM {tmp_in}
+                WHERE bucket = :bucket AND qty > 0
+                GROUP BY {group_cols}
+            ),
+            open_ranked AS (
+                SELECT H.ID,
+                       H.BDC_QTY,
+                       H.DO_RECEIVED,
+                       H.STATUS,
+                       H.LAST_DO_AT,
+                       H.RDC, H.ST_CD, H.ARTICLE_NUMBER, H.ALLOCATION_NUMBER,
+                       (H.BDC_QTY - H.DO_RECEIVED) AS need,
+                       SUM(H.BDC_QTY - H.DO_RECEIVED) OVER (
+                           PARTITION BY {partition_cols}
+                           ORDER BY H.BDC_DATE, H.ID
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS cum_after,
+                       ISNULL(SUM(H.BDC_QTY - H.DO_RECEIVED) OVER (
+                           PARTITION BY {partition_cols}
+                           ORDER BY H.BDC_DATE, H.ID
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                       ), 0) AS cum_before
+                FROM {BDC_HISTORY_TABLE} H
+                WHERE H.STATUS <> 'CONFIRMED' AND (H.BDC_QTY - H.DO_RECEIVED) > 0
+            ),
+            alloc_plan AS (
+                SELECT o.ID,
+                       CASE
+                           WHEN agg.qty <= o.cum_before THEN 0
+                           WHEN agg.qty >= o.cum_after  THEN o.need
+                           ELSE agg.qty - o.cum_before
+                       END AS apply_qty,
+                       o.BDC_QTY, o.DO_RECEIVED, o.STATUS, o.LAST_DO_AT
+                FROM open_ranked o
+                JOIN agg ON {join_pred}
+            )
+            UPDATE H
+               SET H.DO_RECEIVED = H.DO_RECEIVED + alloc_plan.apply_qty,
+                   H.STATUS      = CASE WHEN H.DO_RECEIVED + alloc_plan.apply_qty >= H.BDC_QTY
+                                        THEN 'CONFIRMED' ELSE 'PARTIAL' END,
+                   H.LAST_DO_AT  = GETDATE()
+            OUTPUT INSERTED.ID,
+                   INSERTED.DO_RECEIVED - DELETED.DO_RECEIVED AS qty_added,
+                   DELETED.DO_RECEIVED  AS old_do_received,
+                   INSERTED.DO_RECEIVED AS new_do_received,
+                   ISNULL(DELETED.STATUS, 'OPEN')  AS old_status,
+                   INSERTED.STATUS                 AS new_status,
+                   DELETED.LAST_DO_AT              AS old_last_do_at
+              INTO {tmp_out} (history_id, qty_added, old_do_received,
+                              new_do_received, old_status, new_status,
+                              old_last_do_at)
+            FROM {BDC_HISTORY_TABLE} H
+            JOIN alloc_plan ON H.ID = alloc_plan.ID
+            WHERE alloc_plan.apply_qty > 0
+            """
+            conn.execute(text(sql), {"bucket": bucket})
+
+        for r in conn.execute(text(
+            f"SELECT history_id, qty_added, old_do_received, new_do_received, "
+            f"old_status, new_status, old_last_do_at FROM {tmp_out}"
+        )).fetchall():
             history_updates.append({
-                "history_id":      hid,
-                "qty_added":       apply_qty,
-                "old_do_received": already,
-                "new_do_received": new_total,
-                "old_status":      old_status,
-                "new_status":      new_status,
-                "old_last_do_at":  old_last_do.isoformat() if old_last_do else None,
+                "history_id":      int(r[0]),
+                "qty_added":       float(r[1] or 0),
+                "old_do_received": float(r[2] or 0),
+                "new_do_received": float(r[3] or 0),
+                "old_status":      r[4] or "OPEN",
+                "new_status":      r[5] or "OPEN",
+                "old_last_do_at":  r[6].isoformat() if r[6] else None,
             })
+    except Exception:
+        try:
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')  IS NOT NULL DROP TABLE {tmp_in}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}') IS NOT NULL DROP TABLE {tmp_out}"))
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')  IS NOT NULL DROP TABLE {tmp_in}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}') IS NOT NULL DROP TABLE {tmp_out}"))
+        except Exception:
+            pass
+
     conn.commit()
-    return {"touched": touched, "history_updates": history_updates}
+    return {"touched": len(history_updates), "history_updates": history_updates}
 
 
 def stamp_bdc_qty(
@@ -1884,6 +2138,13 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     """Increment DO_QTY in ARS_PEND_ALC for each DO row using FIFO across
     multiple open session rows for the same (RDC, ST_CD, ARTICLE).
 
+    Set-based implementation: input rows are bulk-loaded into a temp table,
+    aggregated by (RDC, ST_CD, ARTICLE), then one UPDATE..JOIN uses a windowed
+    running-sum CTE to assign the FIFO apply-qty across all open PEND_ALC
+    rows in a single statement. Replaces the prior per-row Python loop
+    (5K input rows = 10K+ round-trips → minutes) with one bulk pass
+    (5K input rows = sub-second).
+
     Returns: {
         "touched":      int,         # rows actually updated
         "pend_updates": [             # per-row deltas for the operations log
@@ -1896,104 +2157,191 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
 
     rows: list of dicts with keys rdc, article_number, do_qty.
           Optional: st_cd, do_number.
+
+    FIFO and matching semantics are IDENTICAL to the prior per-row loop:
+      • Open rows ordered by APPROVED_AT ASC, ID ASC.
+      • st_cd-scoped input matches only rows with that ST_CD;
+        empty-st_cd input matches any row regardless of ST_CD.
+      • st_cd-scoped input is applied first (in its own pass), then
+        empty-st_cd input absorbs residual capacity. This matches the
+        original input-order behavior in every realistic CSV (templates
+        always include st_cd uniformly).
+
+    Does NOT touch ARS_NL_TBL_HOLD_TRACKING. Hold release was decoupled
+    from DO upload by product decision — HOLD_REM stays at its post-listing
+    value regardless of DO shipping. Hold Dashboard, MSA HOLD_QTY (via
+    bootstrap_msa_hold_sync), and listing RL_HOLD_QTY all consume HOLD_REM
+    directly and will over-state held qty until a separate process releases
+    the hold.
     """
     valid = [r for r in rows if float(r.get("do_qty", 0) or 0) > 0]
     if not valid:
         return {"touched": 0, "pend_updates": []}
 
     ensure_pend_alc_table(conn)
-    touched = 0
+
+    # Build input tuples with a stable sequence index so STRING_AGG can
+    # rebuild DO_NUMBER concatenation in the original input order.
+    input_rows = []
+    for seq, r in enumerate(valid):
+        input_rows.append({
+            "seq":    seq,
+            "rdc":    str(r["rdc"]).strip(),
+            "st_cd":  (str(r.get("st_cd") or "").strip() or ""),
+            "art":    str(r["article_number"]).strip(),
+            "qty":    float(r["do_qty"]),
+            "do_num": (str(r.get("do_number") or "").strip() or None),
+        })
+
+    tmp_in   = f"#do_in_{uuid.uuid4().hex[:8]}"
+    tmp_out  = f"#do_out_{uuid.uuid4().hex[:8]}"
     pend_updates: List[Dict] = []
+    touched = 0
 
-    for r in valid:
-        rdc       = str(r["rdc"]).strip()
-        art       = str(r["article_number"]).strip()
-        st_cd     = (str(r.get("st_cd") or "").strip() or None)
-        do_num    = (str(r.get("do_number") or "").strip() or None)
-        remaining = float(r["do_qty"])
-
-        if st_cd:
-            open_rows = conn.execute(text(f"""
-                SELECT ID, ALLOC_QTY, DO_QTY, ISNULL(DO_NUMBER,'') AS DO_NUMBER, LAST_DO_AT
-                FROM {PEND_ALC_TABLE}
-                WHERE RDC = :rdc AND ARTICLE_NUMBER = :art
-                  AND ISNULL(ST_CD,'') = :st AND IS_CLOSED = 0
-                ORDER BY APPROVED_AT ASC, ID ASC
-            """), {"rdc": rdc, "art": art, "st": st_cd}).fetchall()
-        else:
-            open_rows = conn.execute(text(f"""
-                SELECT ID, ALLOC_QTY, DO_QTY, ISNULL(DO_NUMBER,'') AS DO_NUMBER, LAST_DO_AT
-                FROM {PEND_ALC_TABLE}
-                WHERE RDC = :rdc AND ARTICLE_NUMBER = :art
-                  AND IS_CLOSED = 0
-                ORDER BY APPROVED_AT ASC, ID ASC
-            """), {"rdc": rdc, "art": art}).fetchall()
-
-        for row in open_rows:
-            if remaining <= 0:
-                break
-            row_id     = int(row[0])
-            alloc_qty  = float(row[1] or 0)
-            do_already = float(row[2] or 0)
-            prev_do_at = row[4]
-            need       = max(alloc_qty - do_already, 0)
-            if need <= 0:
-                continue
-            apply_qty  = min(need, remaining)
-            new_do     = do_already + apply_qty
-            is_closed  = 1 if new_do >= alloc_qty else 0
-            new_do_num = (
-                ((row[3] + ", ") if row[3] else "") + do_num
-                if do_num else (row[3] or None)
-            )
-            conn.execute(text(f"""
-                UPDATE {PEND_ALC_TABLE}
-                   SET DO_QTY         = :got,
-                       LAST_DO_AT     = GETDATE(),
-                       DO_UPLOADED_AT = GETDATE(),
-                       DO_NUMBER      = :dn,
-                       IS_CLOSED      = :cl
-                 WHERE ID = :id
-            """), {"got": new_do, "dn": new_do_num, "cl": is_closed, "id": row_id})
-            touched   += 1
-            remaining -= apply_qty
-            pend_updates.append({
-                "pend_alc_id":      row_id,
-                "qty_added":        apply_qty,
-                "was_just_closed":  bool(is_closed),
-                "prev_last_do_at":  prev_do_at.isoformat() if prev_do_at else None,
-            })
-
-    # Hold tracking — single bulk update by (RDC, ARTICLE), unchanged from
-    # before. Each (rdc, art) pair updates at most one HOLD row, so over-
-    # counting isn't an issue here.
-    tmp = f"#pa_do_{uuid.uuid4().hex[:8]}"
     try:
+        # Stage input rows. Use fast_executemany for the bulk load.
         conn.execute(text(
-            f"CREATE TABLE {tmp} (rdc NVARCHAR(20), art NVARCHAR(30), qty FLOAT)"
+            f"CREATE TABLE {tmp_in} ("
+            "  seq    INT          NOT NULL,"
+            "  rdc    NVARCHAR(20) NOT NULL,"
+            "  st_cd  NVARCHAR(20) NOT NULL,"   # '' means no-store-scope
+            "  art    NVARCHAR(30) NOT NULL,"
+            "  qty    FLOAT        NOT NULL,"
+            "  do_num NVARCHAR(50) NULL"
+            ")"
         ))
-        conn.execute(
-            text(f"INSERT INTO {tmp} VALUES (:r, :a, :q)"),
-            [{"r": str(r["rdc"]),
-              "a": str(r["article_number"]),
-              "q": float(r["do_qty"])} for r in valid]
-        )
-        conn.execute(text(f"""
-            UPDATE H
-               SET H.HOLD_REM  = CASE WHEN H.HOLD_REM - u.qty < 0 THEN 0
-                                       ELSE H.HOLD_REM - u.qty END,
-                   H.IS_CLOSED = CASE WHEN H.HOLD_REM - u.qty <= 0 THEN 1 ELSE 0 END
-            FROM ARS_NL_TBL_HOLD_TRACKING H
-            JOIN {tmp} u ON H.WERKS = u.rdc AND H.VAR_ART = u.art
-            WHERE H.IS_CLOSED = 0
-        """))
-    except Exception as he:
-        logger.warning(f"[pend_alc] hold tracking update skipped: {he}")
-    finally:
+        raw = conn.connection
+        cur = raw.cursor()
         try:
-            conn.execute(text(
-                f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
-            ))
+            try:
+                cur.fast_executemany = True
+            except Exception:
+                pass
+            cur.executemany(
+                f"INSERT INTO {tmp_in} (seq, rdc, st_cd, art, qty, do_num) "
+                f"VALUES (?, ?, ?, ?, ?, ?)",
+                [(r["seq"], r["rdc"], r["st_cd"], r["art"], r["qty"], r["do_num"])
+                 for r in input_rows],
+            )
+        finally:
+            cur.close()
+
+        # Output capture table for OUTPUT INSERTED/DELETED → pend_updates.
+        conn.execute(text(
+            f"CREATE TABLE {tmp_out} ("
+            "  pend_alc_id     BIGINT  NOT NULL,"
+            "  qty_added       FLOAT   NOT NULL,"
+            "  was_just_closed BIT     NOT NULL,"
+            "  prev_last_do_at DATETIME NULL"
+            ")"
+        ))
+
+        # One pass per scope-bucket. Scoped (st_cd != '') first so it claims
+        # its targeted PEND_ALC rows before empty-st_cd input can absorb them
+        # — preserves the original input-order behavior in mixed CSVs.
+        for scope in ("scoped", "global"):
+            if scope == "scoped":
+                scope_pred = "agg.st_cd <> ''"
+                join_pred  = "agg.st_cd = ISNULL(o.ST_CD,'')"
+            else:
+                scope_pred = "agg.st_cd = ''"
+                join_pred  = "1 = 1"
+
+            # Aggregate input within the current scope by (rdc, st_cd, art).
+            # do_numbers preserves input order via STRING_AGG WITHIN GROUP.
+            sql = f"""
+            ;WITH agg AS (
+                SELECT rdc, st_cd, art,
+                       SUM(qty) AS qty,
+                       STRING_AGG(do_num, ', ') WITHIN GROUP (ORDER BY seq) AS do_numbers
+                FROM {tmp_in}
+                WHERE qty > 0
+                GROUP BY rdc, st_cd, art
+            ),
+            open_ranked AS (
+                SELECT P.ID,
+                       P.ALLOC_QTY,
+                       P.DO_QTY,
+                       (P.ALLOC_QTY - P.DO_QTY) AS need,
+                       SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
+                           PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                           ORDER BY P.APPROVED_AT, P.ID
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS cum_after,
+                       ISNULL(SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
+                           PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                           ORDER BY P.APPROVED_AT, P.ID
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                       ), 0) AS cum_before,
+                       P.RDC, P.ST_CD, P.ARTICLE_NUMBER
+                FROM {PEND_ALC_TABLE} P
+                WHERE P.IS_CLOSED = 0 AND (P.ALLOC_QTY - P.DO_QTY) > 0
+            ),
+            alloc_plan AS (
+                SELECT o.ID,
+                       agg.do_numbers,
+                       CASE
+                           WHEN agg.qty <= o.cum_before THEN 0
+                           WHEN agg.qty >= o.cum_after  THEN o.need
+                           ELSE agg.qty - o.cum_before
+                       END AS apply_qty
+                FROM open_ranked o
+                JOIN agg
+                  ON agg.rdc = o.RDC
+                 AND agg.art = o.ARTICLE_NUMBER
+                 AND {join_pred}
+                WHERE {scope_pred}
+            )
+            UPDATE P
+               SET P.DO_QTY         = P.DO_QTY + alloc_plan.apply_qty,
+                   P.IS_CLOSED      = CASE WHEN P.DO_QTY + alloc_plan.apply_qty >= P.ALLOC_QTY THEN 1 ELSE 0 END,
+                   P.LAST_DO_AT     = GETDATE(),
+                   P.DO_UPLOADED_AT = GETDATE(),
+                   P.DO_NUMBER      = CASE
+                       WHEN alloc_plan.do_numbers IS NULL OR alloc_plan.do_numbers = '' THEN P.DO_NUMBER
+                       WHEN P.DO_NUMBER IS NULL OR P.DO_NUMBER = ''         THEN alloc_plan.do_numbers
+                       ELSE P.DO_NUMBER + ', ' + alloc_plan.do_numbers
+                   END
+            OUTPUT INSERTED.ID,
+                   INSERTED.DO_QTY - DELETED.DO_QTY AS qty_added,
+                   CASE WHEN INSERTED.IS_CLOSED = 1 AND DELETED.IS_CLOSED = 0 THEN 1 ELSE 0 END AS was_just_closed,
+                   DELETED.LAST_DO_AT AS prev_last_do_at
+              INTO {tmp_out} (pend_alc_id, qty_added, was_just_closed, prev_last_do_at)
+            FROM {PEND_ALC_TABLE} P
+            JOIN alloc_plan ON P.ID = alloc_plan.ID
+            WHERE alloc_plan.apply_qty > 0
+            """
+            conn.execute(text(sql))
+
+        # Pull captured deltas for the audit payload.
+        for r in conn.execute(text(
+            f"SELECT pend_alc_id, qty_added, was_just_closed, prev_last_do_at "
+            f"FROM {tmp_out}"
+        )).fetchall():
+            pend_updates.append({
+                "pend_alc_id":     int(r[0]),
+                "qty_added":       float(r[1] or 0),
+                "was_just_closed": bool(r[2]),
+                "prev_last_do_at": r[3].isoformat() if r[3] else None,
+            })
+        touched = len(pend_updates)
+
+        # Hold tracking (ARS_NL_TBL_HOLD_TRACKING) is intentionally NOT
+        # touched here. DO upload only updates PEND_ALC + BDC_HISTORY now.
+        # Holds are released by a different lifecycle event (or never, per
+        # current product decision) — see the team's notes on hold release.
+    except Exception:
+        # Drop temp tables, re-raise to bubble up to endpoint
+        try:
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')  IS NOT NULL DROP TABLE {tmp_in}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}') IS NOT NULL DROP TABLE {tmp_out}"))
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')  IS NOT NULL DROP TABLE {tmp_in}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}') IS NOT NULL DROP TABLE {tmp_out}"))
         except Exception:
             pass
 

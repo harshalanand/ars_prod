@@ -487,6 +487,19 @@ def reload_db_engines() -> dict:
         logger.error(f"Post-reload probe FAILED for data engine: {e}")
         raise
 
+    # 7) Re-run the pend_alc / bdc_history / operations prewarm against the
+    #    new data DB. Without this, the module-level _TABLES_PREWARMED latch
+    #    stays True from the original startup, ensure_*_table() short-circuits
+    #    on every request, and any table missing from the new DB surfaces as
+    #    "Invalid object name 'ARS_BDC_HISTORY'" (42S02) on the hot path.
+    try:
+        import app.services.pend_alc_service as _ps
+        _ps._TABLES_PREWARMED = False
+        _ps.prewarm_pend_alc_tables(data_engine)
+        logger.info("Post-reload prewarm completed against new data engine")
+    except Exception as e:
+        logger.warning(f"Post-reload prewarm failed: {e}")
+
     db_cfg = new_settings._db()
     logger.info(
         f"DB engines reloaded → server={db_cfg['server']} "

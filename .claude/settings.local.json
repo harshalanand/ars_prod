@@ -108,7 +108,28 @@
       "Bash(./venv/Scripts/python.exe -c ' *)",
       "Bash(node --check frontend/src/services/api.js)",
       "Bash(node --check frontend/src/pages/GapReportPage.jsx)",
-      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(fs.readFileSync\\('src/pages/AlcReviewPage.jsx','utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\('OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")"
+      "Bash(node -e \"const fs=require\\('fs'\\);const babel=require\\('@babel/parser'\\);try{babel.parse\\(fs.readFileSync\\('src/pages/AlcReviewPage.jsx','utf8'\\),{sourceType:'module',plugins:['jsx']}\\);console.log\\('OK'\\)}catch\\(e\\){console.error\\('PARSE ERROR line:',e.loc&&e.loc.line,'-',e.message\\)}\")",
+      "Bash(npm install *)",
+      "Bash(npm list *)",
+      "PowerShell(New-Item -ItemType Directory -Force D:\\\\ARS_PROD\\\\ars_prod\\\\frontend\\\\public\\\\docs\\\\process)",
+      "Bash(npm run *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://localhost:3001/docs/process/overview.md)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://localhost:3001/docs/process/variables.md)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://localhost:3001/docs/process/missing.md)",
+      "Bash(curl -s http://localhost:3001/process/overview -o /tmp/spa.html)",
+      "Bash(curl -s -o /dev/null -w \"ProcessPage: %{http_code}\\\\n\" \"http://localhost:3001/src/pages/ProcessPage.jsx\")",
+      "Bash(curl -s -o /dev/null -w \"Sidebar:     %{http_code}\\\\n\" \"http://localhost:3001/src/components/layout/Sidebar.jsx\")",
+      "Bash(curl -s -o /dev/null -w \"App:         %{http_code}\\\\n\" \"http://localhost:3001/src/App.jsx\")",
+      "Bash(curl -s \"http://localhost:3001/src/pages/ProcessPage.jsx\")",
+      "Bash(curl -s -o /dev/null http://localhost:3001/)",
+      "Bash(curl -s -o /dev/null http://localhost:3000/)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(powershell.exe -NoProfile -Command 'Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500; \\(Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Measure-Object\\).Count')",
+      "Bash(./venv/Scripts/python.exe -c \"from app.api.v1.endpoints.auto_contrib import router; print\\('OK prefix=', router.prefix\\); print\\('routes=', [r.path for r in router.routes]\\)\")",
+      "Bash(./venv/Scripts/python.exe -c \"from app.api.v1.router import api_router; auto = [r for r in api_router.routes if '/auto-cont' in str\\(getattr\\(r,'path',''\\)\\)]; print\\(f'auto-cont routes mounted: {len\\(auto\\)}'\\); [print\\(' ', r.methods, r.path\\) for r in auto]\")",
+      "Bash(./venv/Scripts/python.exe -c \"from app.api.v1.router import api_router; auto = [r for r in api_router.routes if '/auto-cont' in str\\(getattr\\(r,'path',''\\)\\)]; print\\(f'auto-cont routes mounted: {len\\(auto\\)}'\\); [print\\(' ', sorted\\(r.methods\\), r.path\\) for r in auto]\")",
+      "Bash(node -e ' *)",
+      "PowerShell($files = 'AutoContExecutePage','AutoContJobsPage','AutoContReviewPage','AutoContPresetsPage','AutoContMappingsPage'; $ok=0; $fail=0; foreach \\($f in $files\\) { $path = \"D:\\\\ARS_PROD\\\\ars_prod\\\\frontend\\\\src\\\\pages\\\\$f.jsx\"; try { & \"D:\\\\ARS_PROD\\\\ars_prod\\\\frontend\\\\node_modules\\\\.bin\\\\esbuild.cmd\" --loader=jsx --log-level=error --bundle=false $path 2>&1 | Out-Null; if \\($LASTEXITCODE -eq 0\\) { Write-Host \"OK   $f.jsx\"; $ok++ } else { Write-Host \"FAIL $f.jsx\"; $fail++ } } catch { Write-Host \"FAIL $f.jsx -- $_\"; $fail++ } }; Write-Host \"Summary: $ok ok, $fail fail\")"
     ]
   }
 }

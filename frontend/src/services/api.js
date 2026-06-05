@@ -342,6 +342,11 @@ export const listingAPI = {
   allocPreview: (params) => api.get('/listing/alloc-preview', { params }),
   finalPreview: (params) => api.get('/listing/final/preview', { params }),
   saveSettings: (data)   => api.post('/listing/settings', data),
+  // Parking-mode (Single / Multiple parked sessions).  Read any user;
+  // write requires ADMIN / SUPER_ADMIN.  Surfaced in Settings → Application.
+  getParkingMode: () => api.get('/listing/parking-mode'),
+  setParkingMode: (allow_multi_parked) =>
+    api.put('/listing/parking-mode', { allow_multi_parked: !!allow_multi_parked }),
   // Parallel allocation: live progress, manual retry, recent batches.
   allocProgress: (batchId) => api.get('/listing/alloc-progress', { params: { batch_id: batchId }, ..._POLL }),
   retryFailed:   (data)    => api.post('/listing/retry-failed', data, { timeout: 600000 }),
@@ -533,6 +538,29 @@ export const contribAPI = {
   reportPage:   (params) => api.get('/contrib/report/page', { params }),
 }
 
+// ============== Auto Cont % (SQL-direct pipeline) ==============
+// Reuses Cont_presets / Cont_mappings via contribAPI above (those tables are
+// shared with the pandas pipeline). Only compute, jobs, and table I/O are
+// net-new here.
+export const autoContAPI = {
+  status:        ()       => api.get('/auto-cont/status'),
+  // execute now creates a background JOB (returns { job_id }) — no longer
+  // blocks the request. Poll /jobs/{id} for status.
+  execute:       (data)   => api.post('/auto-cont/execute', data),
+  // Jobs
+  listJobs:      ()       => api.get('/auto-cont/jobs'),
+  getJob:        (id)     => api.get(`/auto-cont/jobs/${id}`),
+  cancelJob:     (id)     => api.post(`/auto-cont/jobs/${id}/cancel`),
+  deleteJob:     (id)     => api.delete(`/auto-cont/jobs/${id}`),
+  // Tables
+  listTables:    ()       => api.get('/auto-cont/tables'),
+  preview:       (name, limit=200) =>
+    api.get(`/auto-cont/preview/${encodeURIComponent(name)}`, { params: { limit } }),
+  dropTable:     (name)   => api.delete(`/auto-cont/tables/${encodeURIComponent(name)}`),
+  downloadTable: (name)   => api.get(`/auto-cont/download/${encodeURIComponent(name)}`,
+                                      { responseType: 'blob', timeout: 600000 }),
+}
+
 // ============== Data Checklist ==============
 export const checklistAPI = {
   getItems:         ()           => api.get('/checklist/items'),
@@ -628,7 +656,14 @@ export const pendAlcAPI = {
   sessions:    ()               => api.get('/pend-alc/sessions'),
   detail:      (params = {})    => api.get('/pend-alc/detail', { params }),
   doHistory:   (limit = 100)    => api.get('/pend-alc/do-history', { params: { limit } }),
-  doUpdate:    (rows)           => api.post('/pend-alc/do-update', { rows }),
+  doUpdate:    (payload)        => api.post('/pend-alc/do-update',
+    // Accept either a raw rows array (legacy callers) or the full request
+    // body { rows, session_id, is_first_chunk, is_last_chunk } (new callers).
+    Array.isArray(payload) ? { rows: payload } : payload,
+    // Per-chunk SQL is now sub-second after the set-based rewrite, but a
+    // 10-min ceiling protects against cold Azure SQL connections and
+    // unexpected lock waits on huge uploads.
+    { timeout: 10 * 60 * 1000 }),
   bdcPreview:  (params = {})    => api.get('/pend-alc/bdc-preview', { params }),
   bdcGenerate: (params = {})    => api.post('/pend-alc/bdc-generate', null,
                                     { params, responseType: 'blob', timeout: 300000,
@@ -659,7 +694,13 @@ export const pendAlcAPI = {
   operationsPreview:   (op_id)               => api.post(`/pend-alc/operations/${op_id}/preview-revert`),
   operationsRevert:    (op_id, note)         => api.post(`/pend-alc/operations/${op_id}/revert`,
                                                   { note: note || null },
-                                                  { params: { confirm: true } }),
+                                                  // 15-min cap — set-based revert is sub-second, but the
+                                                  // post-revert grid + MSA resync passes can take a minute
+                                                  // on huge ops, and the default 5-min axios timeout was
+                                                  // killing the request mid-flight (backend finished, but
+                                                  // the UI never saw the response so the success toast
+                                                  // never fired).
+                                                  { params: { confirm: true }, timeout: 15 * 60 * 1000 }),
   operationsBackfillBdc: (confirm = false)   => api.post('/pend-alc/operations/backfill-bdc',
                                                   null, { params: { confirm } }),
 }
