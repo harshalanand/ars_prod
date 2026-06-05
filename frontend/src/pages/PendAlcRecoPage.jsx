@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { pendAlcAPI } from '@/services/api'
 import toast from 'react-hot-toast'
-import { RefreshCw, BarChart2, Download, AlertTriangle } from 'lucide-react'
+import { RefreshCw, BarChart2, Download, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 import DataGrid from '@/components/DataGrid'
 
 const C = {
@@ -22,31 +22,48 @@ function fmt(n) {
   return typeof n === 'number' ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'
 }
 
-function AgingTile({ band, rows, pend_qty, alloc_qty }) {
+function AgingTile({ band, rows, pend_qty, alloc_qty, active, onClick, onExport, exporting }) {
   const accent = AGING_ACCENT[band] || C.textSub
   const pct = alloc_qty > 0 ? (100 * pend_qty / alloc_qty).toFixed(0) : '—'
   return (
-    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
-                  padding: '12px 14px', borderLeft: `3px solid ${accent}` }}>
+    <div onClick={onClick}
+      style={{ background: C.card, border: `1px solid ${active ? accent : C.border}`,
+               borderRadius: 8, padding: '12px 14px',
+               borderLeft: `3px solid ${accent}`,
+               cursor: onClick ? 'pointer' : 'default',
+               boxShadow: active ? `0 0 0 1px ${accent} inset` : 'none',
+               position: 'relative' }}>
       <div style={{ fontSize: 9, fontWeight: 700, color: accent, letterSpacing: '.06em',
-                    marginBottom: 4 }}>{band}</div>
+                    marginBottom: 4 }}>{band}{active && ' ●'}</div>
       <div style={{ fontSize: 20, fontWeight: 800, color: C.text, lineHeight: 1 }}>
         {fmt(pend_qty)}
       </div>
       <div style={{ fontSize: 9, color: C.textMuted, marginTop: 3 }}>
         {rows} rows · {pct}% of alloc
       </div>
+      {onExport && (
+        <button onClick={(e) => { e.stopPropagation(); onExport() }}
+          disabled={exporting}
+          title={`Export ${band} rows to Excel`}
+          style={tileExportBtn(accent, exporting)}>
+          <Download size={10}/>
+        </button>
+      )}
     </div>
   )
 }
 
-function StatusTile({ color, label, rows, qty, hint }) {
+function StatusTile({ color, label, rows, qty, hint, active, onClick, onExport, exporting }) {
   return (
-    <div title={hint || ''}
-      style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
-               padding: '10px 12px', borderTop: `3px solid ${color}` }}>
+    <div onClick={onClick} title={hint || ''}
+      style={{ background: C.card, border: `1px solid ${active ? color : C.border}`,
+               borderRadius: 8, padding: '10px 12px',
+               borderTop: `3px solid ${color}`,
+               cursor: onClick ? 'pointer' : 'default',
+               boxShadow: active ? `0 0 0 1px ${color} inset` : 'none',
+               position: 'relative' }}>
       <div style={{ fontSize: 9, fontWeight: 700, color, letterSpacing: '.06em',
-                    marginBottom: 3 }}>{label}</div>
+                    marginBottom: 3 }}>{label}{active && ' ●'}</div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
         <div style={{ fontSize: 18, fontWeight: 800, color: C.text, lineHeight: 1 }}>{fmt(rows)}</div>
         <div style={{ fontSize: 9, color: C.textMuted }}>rows</div>
@@ -54,9 +71,26 @@ function StatusTile({ color, label, rows, qty, hint }) {
       <div style={{ fontSize: 9, color: C.textMuted, marginTop: 3 }}>
         {fmt(qty)} units
       </div>
+      {onExport && (
+        <button onClick={(e) => { e.stopPropagation(); onExport() }}
+          disabled={exporting}
+          title={`Export ${label} rows to Excel`}
+          style={tileExportBtn(color, exporting)}>
+          <Download size={10}/>
+        </button>
+      )}
     </div>
   )
 }
+
+const tileExportBtn = (color, exporting) => ({
+  position: 'absolute', top: 6, right: 6,
+  background: '#fff', border: `1px solid ${color}40`,
+  color, borderRadius: 3, padding: '2px 4px',
+  cursor: exporting ? 'wait' : 'pointer',
+  display: 'flex', alignItems: 'center',
+  opacity: exporting ? 0.5 : 1,
+})
 
 function ModeBadge({ value }) {
   const color = value === 'MANUAL' ? C.amber : C.primary
@@ -81,10 +115,12 @@ function StatusBadge({ closed }) {
 function BdcStatusBadge({ value }) {
   if (!value) return <span style={{color:C.textMuted}}>—</span>
   const map = {
-    NEVER_SENT: { bg:'#f1f5f9',  fg:C.textMuted, label:'NEVER SENT' },
-    OPEN:       { bg:'#fef3c7',  fg:C.amber,     label:'OPEN'       },
-    PARTIAL:    { bg:'#dbeafe',  fg:C.blue,      label:'PARTIAL'    },
-    CONFIRMED:  { bg:'#dcfce7',  fg:C.green,     label:'CONFIRMED'  },
+    NEVER_SENT:     { bg:'#f1f5f9',  fg:C.textMuted, label:'NEVER SENT'    },
+    OPEN:           { bg:'#fef3c7',  fg:C.amber,     label:'OPEN'          },
+    PARTIAL:        { bg:'#dbeafe',  fg:C.blue,      label:'PARTIAL'       },
+    CLOSED_PARTIAL: { bg:'#fde68a',  fg:'#b45309',   label:'CLOSED PARTIAL'},
+    CONFIRMED:      { bg:'#dcfce7',  fg:C.green,     label:'CONFIRMED'     },
+    CANCELLED:      { bg:'#fee2e2',  fg:C.red,       label:'CANCELLED'     },
   }
   const s = map[value] || { bg:'#f1f5f9', fg:C.textSub, label:value }
   return (
@@ -106,6 +142,11 @@ const TH = ({ children, right }) => (
 export default function PendAlcRecoPage() {
   const [recoSummary, setRecoSummary] = useState(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
+  const [sessions, setSessions] = useState([])
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+  // Collapsed by default — long session lists were pushing the detail grid
+  // below the fold on smaller screens.
+  const [sessionsCollapsed, setSessionsCollapsed] = useState(true)
 
   // The grid manages its own data + loading internally; we only bump
   // `gridBumpKey` to force a refresh.
@@ -119,6 +160,13 @@ export default function PendAlcRecoPage() {
   const [fMode,     setFMode]     = useState('')
   const [fClosed,   setFClosed]   = useState('open') // 'open' | 'closed' | 'all'
   const [fSession,  setFSession]  = useState('')
+  // Tile-driven filters — set by clicking a status / aging tile. Empty
+  // strings mean "no tile filter active". The status filter accepts CSV
+  // of BDC_HISTORY.STATUS values (incl. 'NEVER_SENT' for rows that never
+  // had a BDC sent); aging accepts CSV of '0-7d' / '8-30d' / '31-60d' / '60d+'.
+  const [fBdcStatus,  setFBdcStatus]  = useState('')
+  const [fAgingBand,  setFAgingBand]  = useState('')
+  const [exporting,   setExporting]   = useState('')   // tile id currently exporting
 
   // BDC
   const [bdcLoading, setBdcLoading] = useState(false)
@@ -150,6 +198,19 @@ export default function PendAlcRecoPage() {
     }
   }, [])
 
+  const loadSessions = useCallback(async () => {
+    setSessionsLoading(true)
+    try {
+      const { data } = await pendAlcAPI.sessions()
+      setSessions(data?.data || [])
+    } catch {
+      // Silent — sessions panel is supplementary; the rest of the page
+      // works fine without it.
+    } finally {
+      setSessionsLoading(false)
+    }
+  }, [])
+
   // The DataGrid component drives its own pagination/sort/per-column filter
   // and calls this fetcher whenever any of those change. The top-bar filters
   // (date range, RDC, etc.) are merged in here and changes bump `refreshKey`
@@ -164,16 +225,137 @@ export default function PendAlcRecoPage() {
     if (fSession)  params.session_id = fSession
     if (fClosed === 'open')   params.closed = false
     if (fClosed === 'closed') params.closed = true
+    if (fBdcStatus) params.f_bdc_status = fBdcStatus
+    if (fAgingBand) params.f_aging_band = fAgingBand
     return pendAlcAPI.reco(params)
-  }, [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession])
+  }, [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession,
+      fBdcStatus, fAgingBand])
 
   // Bump this to make the grid re-fetch from page 1.
   const recoRefreshKey = useMemo(
-    () => `${fDateFrom}|${fDateTo}|${fRdc}|${fMajCat}|${fMode}|${fClosed}|${fSession}`,
-    [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession]
+    () => `${fDateFrom}|${fDateTo}|${fRdc}|${fMajCat}|${fMode}|${fClosed}|${fSession}|${fBdcStatus}|${fAgingBand}`,
+    [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession,
+     fBdcStatus, fAgingBand]
   )
 
-  useEffect(() => { loadSummary() }, [loadSummary])
+  useEffect(() => { loadSummary(); loadSessions() }, [loadSummary, loadSessions])
+
+  // Tile → filter mapping. Each tile sets `closed`, `f_bdc_status`,
+  // `f_aging_band` to scope the detail grid + Excel export. Click the same
+  // tile again to clear. Aging tiles + status tiles are independent — you
+  // can stack one of each.
+  //
+  // Mapping rationale:
+  //   pending_bdc  → closed=false AND latest BDC history STATUS is null /
+  //                   terminal (NEVER_SENT/CLOSED_PARTIAL/CONFIRMED/CANCELLED).
+  //                   Same set that the next /bdc-generate would pick up.
+  //   pending_do   → closed=false AND latest BDC history STATUS = 'OPEN'.
+  //   partial      → closed=false AND latest BDC history STATUS = 'CLOSED_PARTIAL'.
+  //                   (Legacy 'PARTIAL' rows pre-cutover keep the same chip.)
+  //   closed       → IS_CLOSED = 1.
+  //   aging:<band> → aging band CSV filter + closed=false.
+  const STATUS_TILE_MAP = {
+    pending_bdc: { closed: 'open', bdc_status: 'NEVER_SENT,CLOSED_PARTIAL,CONFIRMED,CANCELLED' },
+    pending_do:  { closed: 'open', bdc_status: 'OPEN' },
+    partial:     { closed: 'open', bdc_status: 'CLOSED_PARTIAL,PARTIAL' },
+    closed:      { closed: 'closed', bdc_status: '' },
+  }
+
+  const tileActive = useMemo(() => {
+    const out = { pending_bdc: false, pending_do: false, partial: false, closed: false, aging: '' }
+    for (const [k, v] of Object.entries(STATUS_TILE_MAP)) {
+      if (fClosed === v.closed && fBdcStatus === v.bdc_status) out[k] = true
+    }
+    // If a status tile isn't matching but the user has *some* status
+    // filter active, mark none — keeps the UI honest when filters drift.
+    out.aging = fAgingBand || ''
+    return out
+  }, [fClosed, fBdcStatus, fAgingBand])
+
+  const applyTileFilter = (tileId) => {
+    const m = STATUS_TILE_MAP[tileId]
+    if (!m) return
+    // Toggle off if already active
+    if (tileActive[tileId]) {
+      setFClosed('open'); setFBdcStatus('')
+      return
+    }
+    setFClosed(m.closed); setFBdcStatus(m.bdc_status)
+    setGridBumpKey(k => k + 1)
+  }
+
+  const applyAgingFilter = (band) => {
+    if (fAgingBand === band) { setFAgingBand(''); return }   // toggle off
+    setFAgingBand(band)
+    setGridBumpKey(k => k + 1)
+  }
+
+  // Export current filtered detail view to CSV (no tile scope — uses
+  // exactly what the grid is showing). Honours every active filter:
+  // top-bar fields + any tile filter active.
+  const exportFiltered = async () => {
+    setExporting('filtered')
+    try {
+      const params = {}
+      if (fDateFrom) params.date_from  = fDateFrom
+      if (fDateTo)   params.date_to    = fDateTo
+      if (fRdc)      params.rdc        = fRdc
+      if (fMajCat)   params.maj_cat    = fMajCat
+      if (fMode)     params.alloc_mode = fMode
+      if (fSession)  params.session_id = fSession
+      if (fClosed === 'open')   params.closed = false
+      if (fClosed === 'closed') params.closed = true
+      if (fBdcStatus) params.f_bdc_status = fBdcStatus
+      if (fAgingBand) params.f_aging_band = fAgingBand
+      const { data: blob } = await pendAlcAPI.recoExport(params)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a'); a.href = url
+      const today = new Date().toISOString().slice(0,10).replace(/-/g,'')
+      a.download = `PEND_ALC_RECO_FILTERED_${today}.csv`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      toast.success('CSV downloaded')
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Export failed')
+    } finally {
+      setExporting('')
+    }
+  }
+
+  // Per-tile CSV export — hits /reco-export with that tile's scope.
+  const exportTile = async (tileId) => {
+    const isAging = tileId.startsWith('aging:')
+    const m = isAging
+      ? { closed: 'open', bdc_status: '' }
+      : STATUS_TILE_MAP[tileId]
+    if (!m) return
+    setExporting(tileId)
+    try {
+      const params = {}
+      if (fDateFrom) params.date_from  = fDateFrom
+      if (fDateTo)   params.date_to    = fDateTo
+      if (fRdc)      params.rdc        = fRdc
+      if (fMajCat)   params.maj_cat    = fMajCat
+      if (fMode)     params.alloc_mode = fMode
+      if (fSession)  params.session_id = fSession
+      if (m.closed === 'open')   params.closed = false
+      if (m.closed === 'closed') params.closed = true
+      if (m.bdc_status) params.f_bdc_status = m.bdc_status
+      if (isAging) params.f_aging_band = tileId.slice('aging:'.length)
+      const { data: blob } = await pendAlcAPI.recoExport(params)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a'); a.href = url
+      const today = new Date().toISOString().slice(0,10).replace(/-/g,'')
+      a.download = `PEND_ALC_RECO_${tileId.replace(':','_').toUpperCase()}_${today}.csv`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      toast.success('CSV downloaded')
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Export failed')
+    } finally {
+      setExporting('')
+    }
+  }
 
   // Load stores scheduled for the picked date (Mon-Sat schedule lookup)
   const loadScheduleForDate = useCallback(async (dateStr) => {
@@ -264,7 +446,7 @@ export default function PendAlcRecoPage() {
       setBdcJobResult(finalJob.result || null)
       toast.success(`BDC ready — ${finalJob.result?.rdc_count || 0} RDC file(s), `
         + `${(finalJob.result?.row_count || 0).toLocaleString()} rows`)
-      loadSummary(); setGridBumpKey(k => k + 1)
+      loadSummary(); loadSessions(); setGridBumpKey(k => k + 1)
     } catch (e) {
       toast.error(e.response?.data?.detail || e.message || 'BDC generate failed')
       setBdcJobStatus(null)
@@ -311,7 +493,7 @@ export default function PendAlcRecoPage() {
         </div>
         <div style={{ flex: 1 }}/>
         <button style={_btn()}
-          onClick={() => { loadSummary(); setGridBumpKey(k => k + 1) }}
+          onClick={() => { loadSummary(); loadSessions(); setGridBumpKey(k => k + 1) }}
           disabled={summaryLoading}>
           <RefreshCw size={11}
             style={{ animation: summaryLoading ? 'spin 1s linear infinite' : 'none' }}/>
@@ -473,30 +655,50 @@ export default function PendAlcRecoPage() {
         </div>
       )}
 
-      {/* Status tiles — Awaiting BDC / Awaiting DO / Partial / Closed */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 8 }}>
+      {/* Status tiles — sit along the user's mental workflow:
+            Approved, not in BDC     → ready for next /bdc-generate
+            In flight (BDC awaiting DO) → BDC sent, DO not yet received
+            Closed (shipped)          → DO ≥ ALLOC
+          Both "open" tiles are anchored on PEND_ALC (not BDC_HISTORY) so
+          aging total = Approved-not-in-BDC + In flight is an invariant.
+          Each tile is clickable to filter the detail grid + has a small
+          Download icon for per-tile CSV export. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8, marginBottom: 8 }}>
         {summaryLoading ? (
           <div style={{ gridColumn: '1/-1', padding: 16, textAlign: 'center',
                         color: C.textMuted, fontSize: 11 }}>Loading…</div>
         ) : (
           <>
-            <StatusTile color={C.red}    label="Awaiting BDC"
-              hint="No BDC sent yet — generate to request from SAP"
-              {...(s?.by_status?.awaiting_bdc || { rows: 0, qty: 0 })}/>
-            <StatusTile color={C.amber}  label="Awaiting DO"
-              hint="BDC sent — waiting for SAP to confirm"
-              {...(s?.by_status?.awaiting_do  || { rows: 0, qty: 0 })}/>
-            <StatusTile color={C.primary} label="Partial / Re-BDC needed"
-              hint="DO short — needs another BDC for the gap"
-              {...(s?.by_status?.partial      || { rows: 0, qty: 0 })}/>
-            <StatusTile color={C.green}  label="Closed"
-              hint="DO ≥ ALLOC — fully covered"
-              {...(s?.by_status?.closed       || { rows: 0, qty: 0 })}/>
+            <StatusTile color={C.red}    label="Approved, not in BDC"
+              hint="Click to filter · approved units with no open BDC yet — what the next Generate BDC will stamp"
+              {...(s?.by_status?.pending_bdc_generate
+                  || s?.by_status?.awaiting_bdc
+                  || { rows: 0, qty: 0 })}
+              active={tileActive.pending_bdc}
+              onClick={() => applyTileFilter('pending_bdc')}
+              exporting={exporting === 'pending_bdc'}
+              onExport={() => exportTile('pending_bdc')}/>
+            <StatusTile color={C.amber}  label="In flight (BDC awaiting DO)"
+              hint="Click to filter · BDC sent to SAP, DO not yet received in full"
+              {...(s?.by_status?.pending_do_against_bdc
+                  || s?.by_status?.awaiting_do
+                  || { rows: 0, qty: 0 })}
+              active={tileActive.pending_do}
+              onClick={() => applyTileFilter('pending_do')}
+              exporting={exporting === 'pending_do'}
+              onExport={() => exportTile('pending_do')}/>
+            <StatusTile color={C.green}  label="Closed (shipped)"
+              hint="Click to filter · DO ≥ ALLOC — fully covered"
+              {...(s?.by_status?.closed       || { rows: 0, qty: 0 })}
+              active={tileActive.closed}
+              onClick={() => applyTileFilter('closed')}
+              exporting={exporting === 'closed'}
+              onExport={() => exportTile('closed')}/>
           </>
         )}
       </div>
 
-      {/* Aging tiles */}
+      {/* Aging tiles — clickable filters + per-tile export */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 14 }}>
         {summaryLoading ? (
           <div style={{ gridColumn: '1/-1', padding: 20, textAlign: 'center', color: C.textMuted }}>
@@ -505,7 +707,11 @@ export default function PendAlcRecoPage() {
         ) : (s?.by_aging || []).length ? (
           ['0-7d','8-30d','31-60d','60d+'].map(band => {
             const b = s.by_aging.find(x => x.aging_band === band) || { rows: 0, pend_qty: 0, alloc_qty: 0 }
-            return <AgingTile key={band} band={band} {...b}/>
+            return <AgingTile key={band} band={band} {...b}
+              active={tileActive.aging === band}
+              onClick={() => applyAgingFilter(band)}
+              exporting={exporting === 'aging:' + band}
+              onExport={() => exportTile('aging:' + band)}/>
           })
         ) : (
           <div style={{ gridColumn: '1/-1', padding: 20, textAlign: 'center', color: C.textMuted }}>
@@ -529,7 +735,9 @@ export default function PendAlcRecoPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead><tr style={{ background: C.bg }}>
                 <TH>MODE</TH><TH right>ALLOC</TH><TH right>BDC</TH>
-                <TH right>DO</TH><TH right>PEND</TH><TH right>ROWS</TH>
+                <TH right>DO</TH><TH right>PEND</TH>
+                <TH right>PEND BDC</TH>
+                <TH right>ROWS</TH>
               </tr></thead>
               <tbody>
                 {(s?.by_mode || []).map((r, i) => (
@@ -541,6 +749,12 @@ export default function PendAlcRecoPage() {
                     <td style={{ padding: '6px 10px', textAlign: 'right', color: C.green }}>{fmt(r.do_qty)}</td>
                     <td style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700,
                                  color: r.pend_qty > 0 ? C.amber : C.green }}>{fmt(r.pend_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right',
+                                 color: r.pending_bdc_qty > 0 ? C.red : C.textMuted,
+                                 fontWeight: r.pending_bdc_qty > 0 ? 600 : 400 }}
+                        title="Qty waiting to be sent to SAP — what the next Generate BDC will pick up">
+                      {fmt(r.pending_bdc_qty)}
+                    </td>
                     <td style={{ padding: '6px 10px', textAlign: 'right', color: C.textMuted }}>{r.rows}</td>
                   </tr>
                 ))}
@@ -561,7 +775,9 @@ export default function PendAlcRecoPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead><tr style={{ background: C.bg }}>
                 <TH>RDC</TH><TH right>ALLOC</TH><TH right>BDC</TH>
-                <TH right>DO</TH><TH right>PEND</TH><TH right>ROWS</TH>
+                <TH right>DO</TH><TH right>PEND</TH>
+                <TH right>PEND BDC</TH>
+                <TH right>ROWS</TH>
               </tr></thead>
               <tbody>
                 {(s?.by_rdc || []).map((r, i) => (
@@ -573,6 +789,12 @@ export default function PendAlcRecoPage() {
                     <td style={{ padding: '6px 10px', textAlign: 'right', color: C.green }}>{fmt(r.do_qty)}</td>
                     <td style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700,
                                  color: r.pend_qty > 0 ? C.amber : C.green }}>{fmt(r.pend_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right',
+                                 color: r.pending_bdc_qty > 0 ? C.red : C.textMuted,
+                                 fontWeight: r.pending_bdc_qty > 0 ? 600 : 400 }}
+                        title="Qty waiting to be sent to SAP — what the next Generate BDC will pick up">
+                      {fmt(r.pending_bdc_qty)}
+                    </td>
                     <td style={{ padding: '6px 10px', textAlign: 'right', color: C.textMuted }}>{r.rows}</td>
                   </tr>
                 ))}
@@ -580,6 +802,103 @@ export default function PendAlcRecoPage() {
             </table>
           )}
         </div>
+      </div>
+
+      {/* BY SESSION — open allocation sessions with BDC / DO / pending split.
+          Lets ops see "how much pending from which session" at a glance and
+          click through to filter the detail grid. Collapsible — click the
+          header (or the chevron) to expand. */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`,
+                    borderRadius: 8, overflow: 'hidden', marginBottom: 14 }}>
+        <div onClick={() => setSessionsCollapsed(v => !v)}
+             role="button" tabIndex={0}
+             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') setSessionsCollapsed(v => !v) }}
+             style={{ padding: '8px 12px',
+                      borderBottom: sessionsCollapsed ? 'none' : `1px solid ${C.border}`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      cursor: 'pointer', userSelect: 'none' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {sessionsCollapsed
+              ? <ChevronRight size={12} color={C.textSub}/>
+              : <ChevronDown  size={12} color={C.textSub}/>}
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
+              BY SESSION (open rows)
+            </div>
+          </div>
+          <div style={{ fontSize: 9, color: C.textMuted }}>
+            {sessionsLoading ? 'loading…' : `${sessions.length} session${sessions.length === 1 ? '' : 's'}`}
+          </div>
+        </div>
+        {sessionsCollapsed ? null : sessionsLoading ? (
+          <div style={{ padding: 20, textAlign: 'center', color: C.textMuted }}>Loading…</div>
+        ) : sessions.length === 0 ? (
+          <div style={{ padding: 20, textAlign: 'center', color: C.textMuted, fontSize: 10 }}>
+            No open sessions.
+          </div>
+        ) : (
+          <div style={{ maxHeight: 280, overflow: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead><tr style={{ background: C.bg, position: 'sticky', top: 0 }}>
+                <TH>SESSION_ID</TH>
+                <TH>APPROVED</TH>
+                <TH>SOURCE</TH>
+                <TH right>ARTICLES</TH>
+                <TH right>ALLOC</TH>
+                <TH right>BDC (last)</TH>
+                <TH right>BDC IN FLIGHT</TH>
+                <TH right>DO</TH>
+                <TH right>PEND</TH>
+                <TH></TH>
+              </tr></thead>
+              <tbody>
+                {sessions.map((r, i) => (
+                  <tr key={`${r.session_id}|${r.source}`}
+                      style={{ borderBottom: `1px solid ${C.border}`,
+                               background: i % 2 === 0 ? '#fff' : C.bg }}>
+                    <td style={{ padding: '6px 10px', fontFamily: 'monospace', fontSize: 9 }}>
+                      {r.session_id}
+                    </td>
+                    <td style={{ padding: '6px 10px', color: C.textMuted, fontSize: 9 }}>
+                      {r.approved_at ? r.approved_at.slice(0, 16).replace('T', ' ') : '—'}
+                    </td>
+                    <td style={{ padding: '6px 10px' }}>
+                      <ModeBadge value={r.source}/>
+                    </td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.textMuted }}>
+                      {fmt(r.article_count)}
+                    </td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right' }}>{fmt(r.alloc_qty)}</td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.blue }}>
+                      {fmt(r.bdc_qty)}
+                    </td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right',
+                                 color: r.bdc_in_flight_qty > 0 ? C.amber : C.textMuted,
+                                 fontWeight: r.bdc_in_flight_qty > 0 ? 600 : 400 }}
+                        title="Open BDC qty attributed to this session — split evenly when same (RDC, ST_CD, ARTICLE) is in multiple open sessions">
+                      {fmt(r.bdc_in_flight_qty)}
+                    </td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', color: C.green }}>
+                      {fmt(r.do_qty)}
+                    </td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700,
+                                 color: r.pend_qty > 0 ? C.amber : C.green }}>
+                      {fmt(r.pend_qty)}
+                    </td>
+                    <td style={{ padding: '6px 10px', textAlign: 'right' }}>
+                      <button
+                        onClick={() => { setFSession(r.session_id); setGridBumpKey(k => k + 1) }}
+                        style={{ fontSize: 8, padding: '2px 6px', border: `1px solid ${C.border}`,
+                                 background: '#fff', color: C.primary, borderRadius: 3,
+                                 cursor: 'pointer' }}>
+                        Filter ↓
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Filters */}
@@ -617,6 +936,14 @@ export default function PendAlcRecoPage() {
           <button style={_btn()}
             onClick={() => setGridBumpKey(k => k + 1)}>
             <RefreshCw size={10}/> Apply
+          </button>
+          {/* Export current filtered view to CSV — same filters the grid
+              is using right now, but uncapped (no page limit). */}
+          <button onClick={exportFiltered} disabled={exporting === 'filtered'}
+            title="Export the current filtered detail rows to CSV"
+            style={_btn('primary')}>
+            <Download size={10}/>
+            {exporting === 'filtered' ? 'Exporting…' : 'Export CSV'}
           </button>
         </div>
       </div>
@@ -665,7 +992,7 @@ export default function PendAlcRecoPage() {
               ? <span style={{fontFamily:'monospace', fontSize:9, color:C.primary}}>{r.bdc_alloc_no}</span>
               : <span style={{color:C.textMuted}}>—</span> },
           { key:'bdc_status', label:'BDC STATUS', sortable:true, filterType:'multi',
-            filterOptions:['NEVER_SENT','OPEN','PARTIAL','CONFIRMED'],
+            filterOptions:['NEVER_SENT','OPEN','PARTIAL','CLOSED_PARTIAL','CONFIRMED','CANCELLED'],
             render:r => <BdcStatusBadge value={r.bdc_status}/> },
           { key:'do_received', label:'DO RECVD', sortable:true, align:'right',
             render:r => r.do_received != null

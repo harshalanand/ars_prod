@@ -11,7 +11,7 @@ export default defineConfig({
     port: 3000,
     host: true,
     proxy: {
-      '/api': { target: 'http://localhost:8080', changeOrigin: true }
+      '/api': { target: 'http://localhost:8080', changeOrigin: true, proxyTimeout:600000 }
     },
     allowedHosts: ['ars.v2retail.net']
   },

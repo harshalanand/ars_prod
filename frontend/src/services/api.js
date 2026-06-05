@@ -631,6 +631,18 @@ export const pendAlcAPI = {
                                       Array.isArray(payload) ? { rows: payload } : payload,
                                       { timeout: 60 * 1000 }),
   bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
+  // Re-download an old BDC's SAP-ready 9-column Excel from history.
+  bdcHistoryRedownload: (allocation_number) => api.get('/pend-alc/bdc-history-redownload',
+                                        { params: { allocation_number },
+                                          responseType: 'blob', timeout: 5 * 60 * 1000 }),
+  // Bulk export ARS_BDC_HISTORY rows (CSV) — default Open BDC Report view.
+  bdcHistoryExport: (params = {}) => api.get('/pend-alc/bdc-history-export',
+                                        { params, responseType: 'blob',
+                                          timeout: 5 * 60 * 1000 }),
+  // Distinct allocations summary — drives the "Re-download original SAP file"
+  // chips on the Open BDC Report regardless of the row-cap on the table.
+  bdcHistoryAllocations: (params = {}) => api.get('/pend-alc/bdc-history-allocations',
+                                        { params }),
   manualUpload:(payload)        => api.post('/pend-alc/manual-upload',
     // Accept either a raw rows array (legacy callers) or the full request
     // body { rows, session_id, is_first_chunk, is_last_chunk } (new callers).
@@ -641,6 +653,11 @@ export const pendAlcAPI = {
     { timeout: 5 * 60 * 1000, quiet: true }),
   reco:        (params = {})    => api.get('/pend-alc/reco', { params }),
   recoSummary: ()               => api.get('/pend-alc/reco-summary'),
+  // Excel export — same filter params as /reco. Used by the per-tile export
+  // buttons on the Reconciliation page.
+  recoExport:  (params = {})    => api.get('/pend-alc/reco-export',
+                                    { params, responseType: 'blob',
+                                      timeout: 10 * 60 * 1000 }),
 
   // Store BDC schedule (Mon-Sat per store)
   scheduleList:        ()                    => api.get('/pend-alc/schedule'),
@@ -669,6 +686,26 @@ export const pendAlcAPI = {
                                                   { params: { confirm: true }, timeout: 60 * 1000 }),
   operationsBackfillBdc: (confirm = false)   => api.post('/pend-alc/operations/backfill-bdc',
                                                   null, { params: { confirm } }),
+  // One-shot cleanup of orphan OPEN BDC_HISTORY rows (those whose
+  // PEND_ALC has already closed). confirm=false previews, confirm=true
+  // applies. See close_orphan_open_bdc_history in pend_alc_service.py.
+  operationsCloseOrphanBdc: (confirm = false) => api.post('/pend-alc/operations/close-orphan-bdc-history',
+                                                  null, { params: { confirm },
+                                                          timeout: 10 * 60 * 1000 }),
+
+  // Adhoc Close — flip IS_CLOSED on PEND_ALC rows + CANCEL their open BDC
+  // history. Revertable via the same operations log (OP_TYPE='ADHOC_CLOSE').
+  closeRows:     (payload)         => api.post('/pend-alc/close-rows', payload,
+                                        { timeout: 10 * 60 * 1000 }),
+  closeRowsFile: (file, reason)    => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const params = reason ? { reason } : {}
+    return api.post('/pend-alc/close-rows-file', fd, {
+      params, headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 10 * 60 * 1000,
+    })
+  },
 }
 
 // ============== Project Tracker ==============

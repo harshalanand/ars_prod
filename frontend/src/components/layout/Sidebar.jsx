@@ -5,7 +5,8 @@ import {
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
   Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
   HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
-  AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered
+  AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered,
+  XCircle,
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -67,8 +68,8 @@ const alcFixtureItems = [
 
 // Reports submenu
 const reportsItems = [
-  { label: 'Hold Dashboard', path: '/reports/hold', icon: Lock },
-  { label: 'GAP Report',     path: '/reports/gap',  icon: AlertTriangle, permission: 'ALLOC_READ' },
+  { label: 'Hold Dashboard',  path: '/reports/hold',     icon: Lock },
+  { label: 'GAP Report',      path: '/reports/gap',      icon: AlertTriangle, permission: 'ALLOC_READ' },
 ]
 
 // Pending Allocation lifecycle submenu
@@ -76,8 +77,10 @@ const pendAlcItems = [
   { label: 'Overview',         path: '/pend-alc/overview',     icon: PackageCheck },
   { label: 'Report',           path: '/reports/pend-alc',      icon: ClipboardCheck, permission: 'REPORTS_PEND_ALC' },
   { label: 'Manual Entry',     path: '/pend-alc/manual-entry', icon: ClipboardList },
+  { label: 'Adhoc Close',      path: '/pend-alc/adhoc-close',  icon: XCircle },
   { label: 'Daily DO Entry',   path: '/pend-alc/do-entry',     icon: Truck },
   { label: 'Reconciliation',   path: '/pend-alc/reco',         icon: BarChart3 },
+  { label: 'Open BDC Report',  path: '/pend-alc/open-bdc',     icon: AlertTriangle },
   { label: 'BDC Schedule',     path: '/pend-alc/schedule',     icon: CalendarDays },
   { label: 'Schedule Audit',   path: '/pend-alc/schedule-audit', icon: History },
   { label: 'Operations Log',   path: '/pend-alc/operations',   icon: History },

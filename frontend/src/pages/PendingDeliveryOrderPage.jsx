@@ -14,11 +14,18 @@ import {
 // Above this row count, switch to bulk mode (no editable table render).
 const BULK_THRESHOLD = 100
 // Submit in chunks so the user sees progress and the request body stays
-// small. 10,000-row chunks match the Manual upload page so DO entry runs
-// at the same speed — fast_executemany on the backend keeps each chunk
-// sub-second, and the request body stays under axios's 10-min ceiling on
-// a cold connection.
-const SUBMIT_CHUNK = 10000
+// small. The set-based apply_do_deductions handles 25K rows in well under
+// Cloudflare's 100s edge timeout, so larger chunks = fewer round trips
+// and fewer polling waits.
+const SUBMIT_CHUNK = 25000
+// Uploads at or below this size skip the async/polling path entirely and
+// hit /do-update synchronously — saves the full polling overhead for the
+// common single-file daily DO entry.
+const SYNC_FAST_LANE_MAX = 25000
+// How often to poll an async job for completion. Was 2000ms; dropped to
+// 500ms because typical DO chunks finish in ~1s on the backend and the
+// old interval added 0–2s of pure waiting per chunk.
+const POLL_INTERVAL_MS = 500
 
 // Generate a per-upload session id so chunks roll up to ONE ops_log row
 // (revert covers the whole upload, not just chunk 1).
@@ -161,6 +168,29 @@ export default function PendingDeliveryOrderPage() {
     let totalUpdated = 0
     const failures   = []  // {chunkIdx, rows, message}
 
+    // Fast lane: uploads small enough to fit one chunk go straight through
+    // the synchronous /do-update — no job, no polling, no detection latency.
+    // Cloudflare's 100s edge timeout is well past the ~2s the set-based
+    // apply_do_deductions needs for 25K rows.
+    if (totalRows <= SYNC_FAST_LANE_MAX && numChunks === 1) {
+      try {
+        const payload = {
+          rows:           valid.map(buildPayload),
+          session_id:     sessionId,
+          is_first_chunk: true,
+          is_last_chunk:  true,
+        }
+        const resp = await pendAlcAPI.doUpdate(payload)
+        totalUpdated = resp.data?.updated_rows || 0
+        setProgress({ sent: totalRows, total: totalRows })
+      } catch (e) {
+        failures.push({
+          chunkIdx: 1,
+          rows:     totalRows,
+          message:  e.response?.data?.detail || e.message || 'request failed',
+        })
+      }
+    } else {
     // Per-chunk try/catch: one failure no longer abandons the whole upload.
     // Every chunk gets a fair attempt; the user sees a summary at the end.
     // Async path: kick off background job per chunk, poll until complete,
@@ -177,7 +207,7 @@ export default function PendingDeliveryOrderPage() {
             reject(new Error(j.error || 'job failed'))
           }
         } catch (err) { clearInterval(timer); reject(err) }
-      }, 2000)
+      }, POLL_INTERVAL_MS)
     })
 
     for (let i = 0, idx = 0; i < totalRows; i += SUBMIT_CHUNK, idx += 1) {
@@ -202,6 +232,7 @@ export default function PendingDeliveryOrderPage() {
         })
       }
       setProgress({ sent: Math.min(i + slice.length, totalRows), total: totalRows })
+    }
     }
 
     setResult({ submitted: totalRows, updated: totalUpdated, failures: failures.length })

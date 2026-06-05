@@ -6,7 +6,7 @@ BDC Creation API Endpoints
 - Status upload: update ARS_ALLOCATION_MASTER with DO_QTY column
 """
 import io
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
@@ -36,7 +36,8 @@ def _read_file_to_df(content: bytes, filename: str, sheet_name: Optional[str] = 
     return df
 
 
-def _process_bdc(df: pd.DataFrame, engine, allocation_no="", alloc_batch: str = "") -> dict:
+def _process_bdc(df: pd.DataFrame, engine, allocation_no="", alloc_batch: str = "",
+                 alloc_by_rdc: Optional[dict] = None) -> dict:
     """
     BDC Processing Pipeline:
     1. Aggregate PEND/NEW status rows: sum qty by VAR-ART + ST-CD + RDC, track pending qty
@@ -209,8 +210,16 @@ def _process_bdc(df: pd.DataFrame, engine, allocation_no="", alloc_batch: str = 
     combined = combined.reset_index(drop=True)
     combined["Serial No"] = range(1, len(combined) + 1)
     combined["Allocation Date"] = pd.to_datetime(combined["ALLOC-DATE"]).dt.strftime("%Y-%m-%d")
-    combined["Allocation Number"] = allocation_no
     combined["VENDOR"] = combined["RDC"].astype(str).str.strip()
+    # Per-RDC alloc# when provided (one allocation_number per warehouse); fall
+    # back to the single `allocation_no` for legacy callers (e.g. /bdc/download
+    # where the user supplies a number directly).
+    if alloc_by_rdc:
+        combined["Allocation Number"] = (
+            combined["VENDOR"].map(alloc_by_rdc).fillna(allocation_no or "")
+        )
+    else:
+        combined["Allocation Number"] = allocation_no
     combined["MATERIAL NO"] = combined["MATNR"].astype(str).str.strip().str.lstrip("0")
     combined["BDC-QTY"] = combined["ALLOC-QTY"].astype(int)
     combined["RECEIVING STORE"] = combined["ST-CD"].astype(str).str.strip()
@@ -288,29 +297,66 @@ def _get_fy_tag():
     return f"{fy_start % 100:02d}{fy_end % 100:02d}"
 
 
-def _get_next_allocation_no(engine) -> str:
-    """Generate single unique allocation number per upload: {FY}-{3-digit serial}. e.g., 2526-001."""
+def _get_next_allocation_no(engine, rdc: Optional[str] = None) -> str:
+    """Generate next allocation number.
+
+    rdc=None  →  legacy `FY-NNN`   (e.g. `2526-001`).  Kept for callers
+                 that issue one number for an entire multi-RDC upload.
+    rdc='X'   →  per-RDC `FY-X-NNN` (e.g. `2526-DH24-001`).  Serial is
+                 scoped per (FY, RDC) so each warehouse has its own
+                 sequence — required for /bdc-generate splitting BDC files
+                 by RDC + date.
+
+    Both forms can coexist in `ARS_ALLOCATION_MASTER`. The pattern uses
+    SQL Server LIKE without a trailing `%`, so `'2526-[0-9][0-9][0-9]'`
+    matches exactly `2526-` + 3 digits and ignores any `2526-DH24-001`
+    rows — and vice-versa.
+    """
     table_name = "ARS_ALLOCATION_MASTER"
     fy = _get_fy_tag()
-    prefix = f"{fy}-"
+    if rdc:
+        rdc_clean = "".join(c for c in str(rdc).strip().upper()
+                            if c.isalnum())  # strip stray chars; keep ASCII
+        if not rdc_clean:
+            rdc_clean = "X"
+        prefix = f"{fy}-{rdc_clean}-"
+    else:
+        prefix = f"{fy}-"
+
+    # The counter must advance even if ARS_ALLOCATION_MASTER hasn't been
+    # populated (it's only written by _save_to_db, which doesn't run for
+    # every BDC code path). Without a fallback the function used to return
+    # `{prefix}001` forever, and that collision broke insert_bdc_history's
+    # readback (it queried by ALLOCATION_NUMBER, picking up prior ops'
+    # history_ids). Now we take MAX across every place a BDC alloc-no can
+    # be recorded: ARS_ALLOCATION_MASTER, ARS_BDC_HISTORY, and the
+    # operations log. Whichever source has the highest serial wins.
+    pat = prefix + "[0-9][0-9][0-9]"
+    candidates: List[str] = []
 
     with engine.connect() as conn:
-        tbl_exists = conn.execute(text(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME=:t"
-        ), {"t": table_name}).scalar()
+        for src_sql in (
+            "SELECT MAX([Allocation Number]) FROM dbo.ARS_ALLOCATION_MASTER WITH (NOLOCK) "
+            "WHERE [Allocation Number] LIKE :pat",
+            "SELECT MAX(ALLOCATION_NUMBER) FROM dbo.ARS_BDC_HISTORY WITH (NOLOCK) "
+            "WHERE ALLOCATION_NUMBER LIKE :pat",
+            "SELECT MAX(OP_KEY) FROM dbo.ARS_PEND_ALC_OPERATIONS WITH (NOLOCK) "
+            "WHERE OP_TYPE = 'BDC' AND OP_KEY LIKE :pat",
+        ):
+            try:
+                row = conn.execute(text(src_sql), {"pat": pat}).scalar()
+                if row:
+                    candidates.append(str(row).strip())
+            except Exception:
+                # Missing table is fine — we union across whatever exists.
+                pass
 
-        if tbl_exists:
-            row = conn.execute(text(f"""
-                SELECT MAX([Allocation Number])
-                FROM dbo.{table_name} WITH (NOLOCK)
-                WHERE [Allocation Number] LIKE :prefix
-            """), {"prefix": prefix + "%"}).scalar()
-            if row:
-                try:
-                    last_serial = int(str(row).split("-")[-1])
-                    return f"{prefix}{last_serial + 1:03d}"
-                except (ValueError, IndexError):
-                    pass
+    if candidates:
+        try:
+            last_serial = max(int(c[-3:]) for c in candidates if c[-3:].isdigit())
+            return f"{prefix}{last_serial + 1:03d}"
+        except (ValueError, IndexError):
+            pass
 
     return f"{prefix}001"
 
@@ -533,13 +579,25 @@ async def upload_and_process_bdc(
         engine = get_data_engine()
         is_auto_save = auto_save.lower() == "true"
 
+        alloc_by_rdc: dict = {}
         if is_auto_save:
-            allocation_no = _get_next_allocation_no(engine)
+            # One allocation# per (FY, RDC). The output rows are stamped with
+            # the alloc# matching their VENDOR (= RDC).
+            distinct_rdcs = sorted({
+                str(v).strip() for v in df["RDC"].dropna().astype(str)
+                if str(v).strip()
+            })
+            alloc_by_rdc = {
+                rdc: _get_next_allocation_no(engine, rdc=rdc)
+                for rdc in distinct_rdcs
+            }
+            allocation_no = ",".join(alloc_by_rdc[k] for k in distinct_rdcs)
             batch_no = _get_next_batch_no(engine)
         else:
             allocation_no = ""
             batch_no = ""
-        result = _process_bdc(df, engine, allocation_no=allocation_no, alloc_batch=batch_no)
+        result = _process_bdc(df, engine, allocation_no=allocation_no,
+                              alloc_batch=batch_no, alloc_by_rdc=alloc_by_rdc)
 
         saved = False
         if is_auto_save and result["total_rows"] > 0:
@@ -592,9 +650,18 @@ async def save_bdc_to_db(
             raise HTTPException(status_code=400, detail=f"Missing required columns: {', '.join(missing)}")
 
         engine = get_data_engine()
-        allocation_no = _get_next_allocation_no(engine)
+        distinct_rdcs = sorted({
+            str(v).strip() for v in df["RDC"].dropna().astype(str)
+            if str(v).strip()
+        })
+        alloc_by_rdc = {
+            rdc: _get_next_allocation_no(engine, rdc=rdc)
+            for rdc in distinct_rdcs
+        }
+        allocation_no = ",".join(alloc_by_rdc[k] for k in distinct_rdcs)
         batch_no = _get_next_batch_no(engine)
-        result = _process_bdc(df, engine, allocation_no=allocation_no, alloc_batch=batch_no)
+        result = _process_bdc(df, engine, allocation_no=allocation_no,
+                              alloc_batch=batch_no, alloc_by_rdc=alloc_by_rdc)
 
         if result["total_rows"] == 0:
             raise HTTPException(status_code=400, detail="No rows to save after processing")

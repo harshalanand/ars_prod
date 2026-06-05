@@ -131,7 +131,14 @@
       "Bash(node -e ' *)",
       "PowerShell($files = 'AutoContExecutePage','AutoContJobsPage','AutoContReviewPage','AutoContPresetsPage','AutoContMappingsPage'; $ok=0; $fail=0; foreach \\($f in $files\\) { $path = \"D:\\\\ARS_PROD\\\\ars_prod\\\\frontend\\\\src\\\\pages\\\\$f.jsx\"; try { & \"D:\\\\ARS_PROD\\\\ars_prod\\\\frontend\\\\node_modules\\\\.bin\\\\esbuild.cmd\" --loader=jsx --log-level=error --bundle=false $path 2>&1 | Out-Null; if \\($LASTEXITCODE -eq 0\\) { Write-Host \"OK   $f.jsx\"; $ok++ } else { Write-Host \"FAIL $f.jsx\"; $fail++ } } catch { Write-Host \"FAIL $f.jsx -- $_\"; $fail++ } }; Write-Host \"Summary: $ok ok, $fail fail\")",
       "Bash(node --check src/services/api.js)",
-      "Bash(node -e \"const fs = require\\('fs'\\); fs.readFileSync\\('src/pages/PendAlcRecoPage.jsx', 'utf8'\\); fs.readFileSync\\('src/pages/PendingDeliveryOrderPage.jsx', 'utf8'\\); fs.readFileSync\\('src/pages/PendAlcOperationsPage.jsx', 'utf8'\\); console.log\\('jsx files readable'\\)\")"
+      "Bash(node -e \"const fs = require\\('fs'\\); fs.readFileSync\\('src/pages/PendAlcRecoPage.jsx', 'utf8'\\); fs.readFileSync\\('src/pages/PendingDeliveryOrderPage.jsx', 'utf8'\\); fs.readFileSync\\('src/pages/PendAlcOperationsPage.jsx', 'utf8'\\); console.log\\('jsx files readable'\\)\")",
+      "Bash(ls -la \"C:/Users/Administrator/.claude/projects/d--projects-ars-prod/memory/\" 2>&1)",
+      "Read(//c/Users/Administrator/.claude/projects/d--projects-ars-prod/memory/**)",
+      "Bash(ls d:/projects/ars_prod/backend/venv/Scripts/python.exe 2>&1; ls d:/projects/ars_prod/venv/Scripts/python.exe 2>&1; ls d:/ARS_PROD/ars_prod/backend/venv/Scripts/python.exe 2>&1)",
+      "Read(//d/ARS_PROD/ars_prod/backend/venv/Scripts/**)",
+      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe d:/projects/ars_prod/diag_bdc_open.py)",
+      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe d:/projects/ars_prod/diag_scope.py)",
+      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe d:/projects/ars_prod/diag_real.py)"
     ]
   }
 }

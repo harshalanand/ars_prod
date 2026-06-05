@@ -51,6 +51,8 @@ const StoreBdcSchedulePage       = lazy(() => import('@/pages/StoreBdcSchedulePa
 const ScheduleAuditPage          = lazy(() => import('@/pages/ScheduleAuditPage'))
 const PendAlcOperationsPage      = lazy(() => import('@/pages/PendAlcOperationsPage'))
 const ManualPendAlcPage          = lazy(() => import('@/pages/ManualPendAlcPage'))
+const AdhocClosePage             = lazy(() => import('@/pages/AdhocClosePage'))
+const OpenBdcReportPage          = lazy(() => import('@/pages/OpenBdcReportPage'))
 const HoldDashboardPage      = lazy(() => import('@/pages/HoldDashboardPage'))
 const ArsDashboardPage       = lazy(() => import('@/pages/ArsDashboardPage'))
 const AlcReviewPage          = lazy(() => import('@/pages/AlcReviewPage'))
@@ -186,6 +188,10 @@ export default function App() {
         {/* Pending Allocation Lifecycle */}
         <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />
+        <Route path="pend-alc/adhoc-close"   element={<ErrorBoundary><AdhocClosePage /></ErrorBoundary>} />
+        <Route path="pend-alc/open-bdc"      element={<ErrorBoundary><OpenBdcReportPage /></ErrorBoundary>} />
+        {/* Legacy route — keep working for any bookmarked links. */}
+        <Route path="reports/open-bdc"       element={<ErrorBoundary><OpenBdcReportPage /></ErrorBoundary>} />
         <Route path="pend-alc/do-entry"      element={<ErrorBoundary><PendingDeliveryOrderPage /></ErrorBoundary>} />
         <Route path="pend-alc/reco"          element={<ErrorBoundary><PendAlcRecoPage /></ErrorBoundary>} />
         <Route path="pend-alc/schedule"        element={<ErrorBoundary><StoreBdcSchedulePage /></ErrorBoundary>} />

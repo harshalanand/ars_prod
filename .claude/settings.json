@@ -28,7 +28,20 @@
       "Bash(node --experimental-vm-modules -e ' *)",
       "Bash(/e/ARS/backend/venv/Scripts/python.exe -c \"import docx; print\\('python-docx', docx.__version__\\)\")",
       "Bash(/e/ARS/backend/venv/Scripts/python.exe /e/ARS/docs/generate_project_tracker_brd.py)",
-      "Bash(e:/ARS/backend/venv/Scripts/python.exe e:/ARS/scripts/load_review_findings.py)"
+      "Bash(e:/ARS/backend/venv/Scripts/python.exe e:/ARS/scripts/load_review_findings.py)",
+      "Bash(./venv/Scripts/python.exe _recover_apply.py)",
+      "Bash(./venv/Scripts/python.exe _verify_only.py)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(./venv/Scripts/python.exe -c ' *)",
+      "Bash(cd /d/projects/ars_prod/backend && grep -n \"close_orphan_open_bdc_history\\\\|get_data_engine\" app/services/pend_alc_service.py | head -20)",
+      "Read(//d/d/projects/ars_prod/backend/app/services/**)",
+      "Bash(./venv/Scripts/python.exe _run_orphan_check.py before)",
+      "Bash(./venv/Scripts/python.exe _run_orphan_check.py apply)",
+      "Bash(./venv/Scripts/python.exe _run_orphan_check.py after)",
+      "Bash(./venv/Scripts/python.exe _run_orphan_check.py invariant)",
+      "Bash(where python.exe)",
+      "Bash(./venv/Scripts/python.exe _check_pend_alc.py)",
+      "Bash(./venv/Scripts/python.exe _check_pend_alc2.py)"
     ]
   }
 }

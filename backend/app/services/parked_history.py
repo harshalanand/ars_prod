@@ -282,36 +282,49 @@ def _reconcile_parked_columns(conn, tgt: Dict[str, str],
 
 
 def _reconcile_history_columns(conn, tgt: Dict[str, str],
-                               parked_col_names: List[str]) -> List[str]:
-    """Mirror parked-table columns into <tgt.history>. Returns the list of
-    column names to copy on Approve (excluding control cols that the SELECT
-    supplies explicitly)."""
-    parked  = tgt["parked"]
-    history = tgt["history"]
-    parked_types = {c["name"].upper(): c
-                    for c in _get_columns_with_types(conn, parked)}
-    history_existing = {c["name"].upper(): c["name"]
-                        for c in _get_columns_with_types(conn, history)}
+                               source_col_names: List[str],
+                               direction: str = "to_history") -> List[str]:
+    """Mirror columns between PARKED and HISTORY in either direction.
+
+    direction='to_history' (default): add to HISTORY any column that's on
+        PARKED but not yet on HISTORY. Used by Approve (parked → history).
+    direction='to_parked': add to PARKED any column that's on HISTORY but
+        not yet on PARKED. Used by Revert-Approve (history → parked).
+
+    Returns the list of column names to copy (excluding control cols that
+    the SELECT supplies explicitly).
+    """
+    if direction == "to_parked":
+        src_tbl  = tgt["history"]
+        dest_tbl = tgt["parked"]
+    else:
+        src_tbl  = tgt["parked"]
+        dest_tbl = tgt["history"]
+
+    src_types = {c["name"].upper(): c
+                 for c in _get_columns_with_types(conn, src_tbl)}
+    dest_existing = {c["name"].upper(): c["name"]
+                     for c in _get_columns_with_types(conn, dest_tbl)}
     control_upper = {x.upper() for x in _HISTORY_CONTROL_COLS}
     payload_cols: List[str] = []
-    for name in parked_col_names:
+    for name in source_col_names:
         if name.upper() in control_upper:
             continue
         payload_cols.append(name)
-        if name.upper() not in history_existing:
-            src = parked_types.get(name.upper())
+        if name.upper() not in dest_existing:
+            src = src_types.get(name.upper())
             if not src:
                 continue
             try:
                 conn.execute(text(
-                    f"ALTER TABLE [{history}] "
+                    f"ALTER TABLE [{dest_tbl}] "
                     f"ADD [{name}] {src['dtype_sql']} NULL"
                 ))
                 conn.commit()
             except Exception as e:
                 logger.debug(
-                    f"[parked_history] history reconcile skipped for "
-                    f"{name} on {history}: {e}"
+                    f"[parked_history] {direction} reconcile skipped for "
+                    f"{name} on {dest_tbl}: {e}"
                 )
     return payload_cols
 
@@ -475,6 +488,76 @@ def _promote_one_within_conn(conn, tgt: Dict[str, str],
         f"session {session_id}"
     )
     return inserted
+
+
+def _demote_one_within_conn(conn, tgt: Dict[str, str],
+                            session_id: str) -> int:
+    """Inverse of _promote_one_within_conn: move a session's rows out of
+    HISTORY and back into PARKED with PARK_STATUS='PARKED' so the parked
+    runs UI resurfaces it for re-review.
+
+    Used by `_revert_approve` to put the session back in front of the user
+    after an "approved by mistake" revert. Caller commits.
+
+    Returns the row count demoted.
+    """
+    parked  = tgt["parked"]
+    history = tgt["history"]
+    label   = tgt["label"]
+
+    history_count = conn.execute(text(
+        f"SELECT COUNT(*) FROM [{history}] WHERE SESSION_ID = :sid"
+    ), {"sid": session_id}).scalar() or 0
+    if history_count == 0:
+        return 0
+
+    history_cols = [
+        c["name"]
+        for c in _get_columns_with_types(conn, history)
+        if c["name"].upper() not in
+            {x.upper() for x in _HISTORY_CONTROL_COLS}
+    ]
+    # Reconcile in the OTHER direction (history → parked) — adds any
+    # column to PARKED that's on HISTORY but not yet on PARKED.
+    _reconcile_history_columns(conn, tgt, history_cols, direction="to_parked")
+    cols_sql = ", ".join(f"[{c}]" for c in history_cols)
+
+    # NOT EXISTS guard so we never double-insert if the user clicks revert
+    # twice (idempotent).
+    res = conn.execute(text(
+        f"INSERT INTO [{parked}] "
+        f"({cols_sql}, [SESSION_ID], [PARKED_AT], [PARK_STATUS]) "
+        f"SELECT {cols_sql}, [SESSION_ID], [PARKED_AT], 'PARKED' "
+        f"FROM [{history}] H "
+        f"WHERE H.[SESSION_ID] = :sid "
+        f"  AND NOT EXISTS ("
+        f"    SELECT 1 FROM [{parked}] P "
+        f"    WHERE P.[SESSION_ID] = :sid AND P.[PARK_STATUS] = 'PARKED'"
+        f"  )"
+    ), {"sid": session_id})
+    restored = int(res.rowcount or 0)
+
+    conn.execute(text(
+        f"DELETE FROM [{history}] WHERE SESSION_ID = :sid"
+    ), {"sid": session_id})
+
+    logger.info(
+        f"[parked_history:{label}] demoted {restored} rows back to parked "
+        f"for session {session_id}"
+    )
+    return restored
+
+
+def revert_approved_to_parked(conn, session_id: str) -> Dict[str, int]:
+    """Demote every configured target's rows from HISTORY back to PARKED
+    for `session_id`. Atomic across targets — caller commits once.
+
+    Counterpart to `approve_parked`'s six `_promote_one_within_conn` calls.
+    """
+    out: Dict[str, int] = {}
+    for tgt in _SNAPSHOT_TARGETS:
+        out[tgt["label"]] = _demote_one_within_conn(conn, tgt, session_id)
+    return out
 
 
 def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
@@ -673,6 +756,15 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 else 0
             )
             with engine.connect() as conn2:
+                # Sum the actual ALLOC_QTY this approve wrote into PEND_ALC
+                # so the Operations Log shows the right total (was hardcoded
+                # to 0 and rendered as "0" in the QTY column).
+                qty_total = float(conn2.execute(text("""
+                    SELECT ISNULL(SUM(ALLOC_QTY), 0)
+                    FROM ARS_PEND_ALC
+                    WHERE SESSION_ID = :sid
+                """), {"sid": session_id}).scalar() or 0)
+
                 log_operation(
                     conn2,
                     op_type="APPROVE",
@@ -683,9 +775,9 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                                         if isinstance(v, (int, float))},
                     },
                     summary=(f"Approve {session_id}: {pend_rows_int} pend rows, "
-                             f"by {user}")[:500],
+                             f"{int(qty_total)} units, by {user}")[:500],
                     rows_affected=int(pend_rows_int or 0),
-                    qty_total=0,
+                    qty_total=qty_total,
                     created_by=user,
                 )
         except Exception as le:

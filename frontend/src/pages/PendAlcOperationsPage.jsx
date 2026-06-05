@@ -19,7 +19,7 @@ const C = {
   border: '#e2e8f0', bg: '#f8fafc', card: '#ffffff',
 }
 
-const OP_TYPE_COLOR = { BDC: C.primary, DO: C.amber, MANUAL: '#0891b2', APPROVE: C.green }
+const OP_TYPE_COLOR = { BDC: C.primary, DO: C.amber, MANUAL: '#0891b2', APPROVE: C.green, ADHOC_CLOSE: C.red }
 
 const fmt = (n) => Number.isFinite(+n) ? Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'
 const fmtDt = (s) => s ? new Date(s).toLocaleString() : '—'
@@ -27,7 +27,7 @@ const fmtDt = (s) => s ? new Date(s).toLocaleString() : '—'
 export default function PendAlcOperationsPage() {
   const [rows, setRows]       = useState([])
   const [loading, setLoading] = useState(false)
-  const [filterType, setFilterType] = useState('')   // '' | 'BDC' | 'DO' | 'MANUAL' | 'APPROVE'
+  const [filterType, setFilterType] = useState('')   // '' | 'BDC' | 'DO' | 'MANUAL' | 'APPROVE' | 'ADHOC_CLOSE'
   const [showReverted, setShowReverted] = useState(true)
   const [search, setSearch]   = useState('')
 
@@ -146,7 +146,7 @@ export default function PendAlcOperationsPage() {
         <div>
           <div style={{ fontSize: 13, fontWeight: 800 }}>Operations Log + Undo</div>
           <div style={{ fontSize: 10, color: C.textMuted }}>
-            BDC, DO, Manual upload, Approve — each can be reverted (soft-revert preserves audit)
+            BDC, DO, Manual upload, Approve, Adhoc Close — each can be reverted (soft-revert preserves audit)
           </div>
         </div>
         <div style={{ flex: 1 }}/>
@@ -168,7 +168,14 @@ export default function PendAlcOperationsPage() {
                     flexWrap: 'wrap' }}>
         <Filter size={12} color={C.textMuted}/>
         <span style={{ fontSize: 10, fontWeight: 600, color: C.textSub }}>Type:</span>
-        {['', 'BDC', 'DO', 'MANUAL', 'APPROVE'].map(t => (
+        {[
+          { value: '',             label: 'All' },
+          { value: 'BDC',          label: 'BDC' },
+          { value: 'DO',           label: 'DO' },
+          { value: 'MANUAL',       label: 'MANUAL' },
+          { value: 'APPROVE',      label: 'APPROVE' },
+          { value: 'ADHOC_CLOSE',  label: 'ADHOC CLOSE' },
+        ].map(({ value: t, label }) => (
           <button key={t || 'all'} onClick={() => setFilterType(t)}
             style={{
               fontSize: 10, padding: '4px 10px', borderRadius: 4, cursor: 'pointer',
@@ -176,7 +183,7 @@ export default function PendAlcOperationsPage() {
               background: filterType === t ? C.primary : '#fff',
               color: filterType === t ? '#fff' : C.textSub, fontWeight: 600,
             }}>
-            {t || 'All'}
+            {label}
           </button>
         ))}
         <div style={{ width: 1, height: 18, background: C.border, margin: '0 4px' }}/>
@@ -230,11 +237,12 @@ export default function PendAlcOperationsPage() {
                              opacity: isReverted ? 0.7 : 1 }}>
                     <td style={td()}><code>#{r.op_id}</code></td>
                     <td style={td()}>
-                      <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 7px',
-                                     borderRadius: 3,
+                      <span title={r.op_type}
+                            style={{ fontSize: 9, fontWeight: 700, padding: '2px 7px',
+                                     borderRadius: 3, whiteSpace: 'nowrap',
                                      background: (OP_TYPE_COLOR[r.op_type] || C.textSub) + '22',
                                      color: OP_TYPE_COLOR[r.op_type] || C.textSub }}>
-                        {r.op_type}
+                        {r.op_type === 'ADHOC_CLOSE' ? 'ADHOC' : r.op_type}
                       </span>
                     </td>
                     <td style={{ ...td(), fontFamily: 'monospace' }}>{r.op_key}</td>

@@ -23,6 +23,7 @@ BDC_QTY  = cumulative qty included in BDC files sent to SAP (audit only, not use
 """
 from __future__ import annotations
 
+import datetime
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -541,6 +542,383 @@ def backfill_bdc_operations(conn, dry_run: bool = True) -> Dict:
     return {"found": found, "ops_created": ops_created, "applied": True}
 
 
+def recover_bdc_history_from_active_ops(conn, dry_run: bool = True) -> Dict:
+    """Rebuild ARS_BDC_HISTORY rows for active BDC ops whose history was
+    wiped by a colliding-alloc revert (see insert_bdc_history's prev-MAX
+    fix). Without this, PEND_ALC.BDC_QTY stays stamped but
+    _NO_OPEN_BDC_PREDICATE has nothing to match against, and the next
+    /bdc-generate re-stamps everything.
+
+    For each ACTIVE BDC op:
+      1. Skip if its `history_ids` all exist in ARS_BDC_HISTORY (healthy).
+      2. Otherwise, for every (rdc, st_cd, article) in the op's
+         `stamped_rows`, read the LIVE PEND_ALC.BDC_QTY (= residual
+         unconfirmed) and INSERT one ARS_BDC_HISTORY row with that qty,
+         STATUS='OPEN', DO_RECEIVED = max(BDC_QTY - PEND_ALC.DO_QTY -
+         residual, 0). Skip rows where BDC_QTY=0 (already shipped /
+         orphan-cleaned).
+      3. UPDATE the op's payload.history_ids to point at the new IDs so a
+         future revert undoes the correct rows.
+
+    dry_run=True → reports what would change without writing.
+    """
+    import json as _json
+    ensure_operations_table(conn)
+    ensure_bdc_history_table(conn)
+
+    ops = conn.execute(text(f"""
+        SELECT OP_ID, OP_KEY, CREATED_BY, PAYLOAD
+        FROM {OPERATIONS_TABLE}
+        WHERE OP_TYPE = 'BDC' AND REVERTED_AT IS NULL
+        ORDER BY OP_DATE
+    """)).fetchall()
+
+    found = 0
+    rebuilt = 0
+    history_rows_inserted = 0
+
+    for op_id, op_key, created_by, payload_json in ops:
+        try:
+            payload = _json.loads(payload_json) if payload_json else {}
+        except Exception:
+            continue
+        history_ids = payload.get("history_ids") or []
+        stamped_rows = payload.get("stamped_rows") or []
+        if not stamped_rows:
+            continue
+
+        # Healthy? all history_ids still exist. Bulk-load via #tmp + JOIN
+        # — STRING_SPLIT rejects the >4000-char NVARCHAR cast to ntext on
+        # large payloads (op #6 has 221,547 ids → ~1.5 MB string).
+        if history_ids:
+            tmp_h = _bulk_load_ids(conn, [int(i) for i in history_ids])
+            try:
+                existing = conn.execute(text(f"""
+                    SELECT COUNT(*) FROM {BDC_HISTORY_TABLE} H
+                    JOIN {tmp_h} t ON t.id = H.ID
+                """)).scalar() or 0
+            finally:
+                _drop_tmp(conn, tmp_h)
+            if int(existing) >= len(history_ids):
+                continue  # nothing missing
+
+        found += 1
+        if dry_run:
+            continue
+
+        # Pull live PEND state for the stamped pend_alc_ids and rebuild
+        # one BDC_HISTORY row per (rdc, st_cd, article) with the CURRENT
+        # BDC_QTY (= residual). MAJ_CAT comes from PEND_ALC.
+        pend_ids = [int(s["pend_alc_id"]) for s in stamped_rows
+                    if s.get("pend_alc_id") is not None]
+        if not pend_ids:
+            continue
+        tmp = _bulk_load_ids(conn, pend_ids)
+        try:
+            live = conn.execute(text(f"""
+                SELECT P.RDC, ISNULL(P.ST_CD,'') AS ST_CD, P.ARTICLE_NUMBER,
+                       P.MAJ_CAT, P.BDC_QTY
+                FROM {PEND_ALC_TABLE} P
+                JOIN {tmp} t ON t.id = P.ID
+                WHERE P.BDC_QTY > 0
+            """)).fetchall()
+        finally:
+            _drop_tmp(conn, tmp)
+        if not live:
+            continue
+
+        # Group by (rdc, st_cd, article) — one history row per combo.
+        grouped: Dict = {}
+        for r in live:
+            k = (r[0], r[1], r[2])
+            cur = grouped.setdefault(k, {"maj_cat": r[3], "qty": 0.0})
+            cur["qty"] += float(r[4] or 0)
+
+        rebuild_payload = [
+            {"alloc": str(op_key)[:50],
+             "rdc":   k[0],
+             "st_cd": k[1] or None,
+             "art":   k[2],
+             "mc":    v["maj_cat"],
+             "qty":   v["qty"],
+             "by":    created_by}
+            for k, v in grouped.items()
+            if v["qty"] > 0
+        ]
+        if not rebuild_payload:
+            continue
+
+        prev_max_id = conn.execute(text(f"""
+            SELECT ISNULL(MAX(ID), 0) FROM {BDC_HISTORY_TABLE}
+            WHERE ALLOCATION_NUMBER = :a
+        """), {"a": str(op_key)[:50]}).scalar() or 0
+
+        conn.execute(text(f"""
+            INSERT INTO {BDC_HISTORY_TABLE}
+                (ALLOCATION_NUMBER, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
+                 BDC_QTY, DO_RECEIVED, STATUS, CREATED_BY)
+            VALUES (:alloc, :rdc, :st_cd, :art, :mc, :qty, 0, 'OPEN', :by)
+        """), rebuild_payload)
+        conn.commit()
+
+        new_ids = [int(r[0]) for r in conn.execute(text(f"""
+            SELECT ID FROM {BDC_HISTORY_TABLE}
+            WHERE ALLOCATION_NUMBER = :a AND ID > :prev
+            ORDER BY ID
+        """), {"a": str(op_key)[:50], "prev": int(prev_max_id)}).fetchall()]
+
+        payload["history_ids"] = new_ids
+        payload["_recovered"]  = True
+        conn.execute(text(f"""
+            UPDATE {OPERATIONS_TABLE} SET PAYLOAD = :p WHERE OP_ID = :id
+        """), {"p": _json.dumps(payload, default=str), "id": int(op_id)})
+        conn.commit()
+
+        rebuilt += 1
+        history_rows_inserted += len(new_ids)
+        logger.info(
+            f"[recover_bdc_history] op_id={op_id} key={op_key}: "
+            f"inserted {len(new_ids)} history rows, payload patched"
+        )
+
+    return {"found": found, "rebuilt": rebuilt,
+            "history_rows_inserted": history_rows_inserted,
+            "applied": not dry_run}
+
+
+def close_orphan_open_bdc_history(conn, dry_run: bool = True) -> Dict:
+    """Close stale OPEN rows in ARS_BDC_HISTORY whose underlying PEND_ALC
+    state says the units have already shipped (or were never going to).
+
+    Why it's needed: `apply_do_deductions` closes PEND_ALC.IS_CLOSED=1 when
+    DO_QTY >= ALLOC_QTY but never touches BDC_HISTORY.STATUS. Likewise,
+    `update_bdc_history_with_do` only matches by allocation_number or
+    (RDC, ST_CD, ARTICLE) FIFO — if a DO file references a specific
+    allocation_number, OTHER open BDC history rows for the same combo are
+    not touched and stay OPEN forever. The dashboard "Pending DO (Open
+    BDC)" tile then over-counts by 5-10× on systems with multiple BDC
+    cycles per article.
+
+    Strategy (set-based via a single SQL UPDATE..FROM with a CASE for the
+    target STATUS):
+
+        For each OPEN BDC_HISTORY row, look up the live PEND_ALC sums per
+        (RDC, ST_CD, ARTICLE):
+          - has_open       = COUNT(*) where IS_CLOSED=0
+          - sum_alloc      = SUM(ALLOC_QTY) where IS_CLOSED=0
+          - sum_bdc_open   = SUM(BDC_QTY)   where IS_CLOSED=0
+          - sum_do_open    = SUM(DO_QTY)    where IS_CLOSED=0
+          - had_adhoc      = 1 if any row's REMARKS LIKE 'ADHOC:%' (even closed)
+
+        Decide:
+          - has_open=0 AND sum_do >= sum_bdc on the closed pend → CONFIRMED
+          - has_open=0 AND sum_do > 0  → CLOSED_PARTIAL
+          - has_open=0 AND sum_do = 0 AND had_adhoc=1 → CANCELLED
+          - has_open=0 AND sum_do = 0 → CANCELLED (PEND_ALC reverted/deleted)
+          - has_open>0 AND sum_bdc_open <= sum_do_open → CONFIRMED
+          - else → leave OPEN (legitimately in-flight)
+
+    Args:
+        dry_run: if True (default), returns the bucket counts that WOULD
+                 close without writing anything.
+
+    Returns: {found, closed_confirmed, closed_partial, cancelled,
+              left_open, applied}.
+    """
+    ensure_bdc_history_table(conn)
+
+    # Build a temp table with one row per OPEN BDC_HISTORY row + the live
+    # PEND_ALC sums for its key. Doing it as a CTE inside a single UPDATE
+    # would also work but separating makes the dry-run preview easy.
+    tmp = f"#orphan_close_{uuid.uuid4().hex[:8]}"
+    try:
+        conn.execute(text(f"""
+            CREATE TABLE {tmp} (
+                history_id      BIGINT      NOT NULL,
+                old_status      NVARCHAR(20) NOT NULL,
+                new_status      NVARCHAR(20) NULL,
+                has_open        INT         NOT NULL,
+                sum_alloc_open  FLOAT       NOT NULL,
+                sum_bdc_open    FLOAT       NOT NULL,
+                sum_do_open     FLOAT       NOT NULL,
+                sum_alloc_all   FLOAT       NOT NULL,
+                sum_do_all      FLOAT       NOT NULL,
+                had_adhoc       BIT         NOT NULL
+            )
+        """))
+
+        # Populate. Aggregate PEND_ALC once per (RDC, ST_CD, ARTICLE), then
+        # join every OPEN history row to that aggregate.
+        conn.execute(text(f"""
+            ;WITH agg AS (
+                SELECT P.RDC,
+                       ISNULL(P.ST_CD,'')                       AS ST_CD,
+                       P.ARTICLE_NUMBER,
+                       SUM(CASE WHEN P.IS_CLOSED=0 THEN 1   ELSE 0   END) AS has_open,
+                       SUM(CASE WHEN P.IS_CLOSED=0 THEN ISNULL(P.ALLOC_QTY,0) ELSE 0 END) AS sum_alloc_open,
+                       SUM(CASE WHEN P.IS_CLOSED=0 THEN ISNULL(P.BDC_QTY,0)   ELSE 0 END) AS sum_bdc_open,
+                       SUM(CASE WHEN P.IS_CLOSED=0 THEN ISNULL(P.DO_QTY,0)    ELSE 0 END) AS sum_do_open,
+                       SUM(ISNULL(P.ALLOC_QTY,0))                                          AS sum_alloc_all,
+                       SUM(ISNULL(P.DO_QTY,0))                                             AS sum_do_all,
+                       MAX(CASE WHEN P.REMARKS LIKE 'ADHOC:%' THEN 1 ELSE 0 END)           AS had_adhoc
+                FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
+                GROUP BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+            )
+            INSERT INTO {tmp} (history_id, old_status, new_status,
+                               has_open, sum_alloc_open, sum_bdc_open, sum_do_open,
+                               sum_alloc_all, sum_do_all, had_adhoc)
+            SELECT H.ID,
+                   H.STATUS,
+                   CASE
+                       -- No live PEND_ALC at all → CANCELLED (history orphan).
+                       WHEN agg.RDC IS NULL THEN 'CANCELLED'
+                       -- All matching PEND_ALC closed.
+                       WHEN ISNULL(agg.has_open, 0) = 0 THEN
+                           CASE
+                               WHEN ISNULL(agg.sum_do_all, 0) >= ISNULL(agg.sum_alloc_all, 0)
+                                    AND ISNULL(agg.sum_alloc_all, 0) > 0 THEN 'CONFIRMED'
+                               WHEN ISNULL(agg.sum_do_all, 0) > 0 THEN 'CLOSED_PARTIAL'
+                               WHEN ISNULL(agg.had_adhoc, 0) = 1 THEN 'CANCELLED'
+                               ELSE 'CANCELLED'
+                           END
+                       -- PEND_ALC still has open rows, but DO has caught up.
+                       WHEN ISNULL(agg.sum_bdc_open, 0) <= ISNULL(agg.sum_do_open, 0)
+                            AND ISNULL(agg.sum_bdc_open, 0) > 0 THEN 'CONFIRMED'
+                       ELSE NULL
+                   END AS new_status,
+                   ISNULL(agg.has_open, 0),
+                   ISNULL(agg.sum_alloc_open, 0),
+                   ISNULL(agg.sum_bdc_open, 0),
+                   ISNULL(agg.sum_do_open, 0),
+                   ISNULL(agg.sum_alloc_all, 0),
+                   ISNULL(agg.sum_do_all, 0),
+                   ISNULL(agg.had_adhoc, 0)
+            FROM {BDC_HISTORY_TABLE} H WITH (NOLOCK)
+            LEFT JOIN agg
+              ON agg.RDC = H.RDC
+             AND agg.ST_CD = ISNULL(H.ST_CD,'')
+             AND agg.ARTICLE_NUMBER = H.ARTICLE_NUMBER
+            WHERE H.STATUS = 'OPEN'
+        """))
+
+        # Bucket counts (dry-run + post-apply both use this).
+        buckets = conn.execute(text(f"""
+            SELECT
+                COUNT(*)                                                AS found,
+                SUM(CASE WHEN new_status = 'CONFIRMED'      THEN 1 ELSE 0 END) AS closed_confirmed,
+                SUM(CASE WHEN new_status = 'CLOSED_PARTIAL' THEN 1 ELSE 0 END) AS closed_partial,
+                SUM(CASE WHEN new_status = 'CANCELLED'      THEN 1 ELSE 0 END) AS cancelled,
+                SUM(CASE WHEN new_status IS NULL            THEN 1 ELSE 0 END) AS left_open
+            FROM {tmp}
+        """)).fetchone()
+
+        result = {
+            "found":             int(buckets[0] or 0),
+            "closed_confirmed":  int(buckets[1] or 0),
+            "closed_partial":    int(buckets[2] or 0),
+            "cancelled":         int(buckets[3] or 0),
+            "left_open":         int(buckets[4] or 0),
+            "applied":           False,
+        }
+
+        if dry_run:
+            return result
+
+        # Apply: one set-based UPDATE for each non-OPEN new_status. Avoids
+        # touching the "left_open" rows entirely.
+        res = conn.execute(text(f"""
+            UPDATE H
+               SET H.STATUS = t.new_status,
+                   H.LAST_DO_AT = CASE
+                       WHEN t.new_status IN ('CONFIRMED', 'CLOSED_PARTIAL')
+                            AND H.LAST_DO_AT IS NULL THEN GETDATE()
+                       ELSE H.LAST_DO_AT
+                   END
+            FROM {BDC_HISTORY_TABLE} H
+            JOIN {tmp} t ON t.history_id = H.ID
+            WHERE t.new_status IS NOT NULL
+        """))
+        conn.commit()
+        result["applied"]      = True
+        result["rows_updated"] = int(res.rowcount or 0)
+
+        # One synthetic ops_log row so the cleanup is auditable (and
+        # recoverable for a window — though revert of a bulk close like
+        # this is rarely meaningful; the safety belt is the ops_log entry
+        # alone).
+        try:
+            log_operation(
+                conn,
+                op_type="ADHOC_CLOSE",
+                op_key=f"orphan-cleanup-{datetime.date.today().strftime('%Y%m%d')}",
+                payload={
+                    "reason":           "Auto-closed orphan OPEN BDC history "
+                                        "from close_orphan_open_bdc_history",
+                    "rows_updated":     result["rows_updated"],
+                    "closed_confirmed": result["closed_confirmed"],
+                    "closed_partial":   result["closed_partial"],
+                    "cancelled":        result["cancelled"],
+                },
+                summary=(f"Orphan BDC history cleanup: "
+                         f"{result['rows_updated']} rows closed "
+                         f"({result['closed_confirmed']} CONFIRMED, "
+                         f"{result['closed_partial']} CLOSED_PARTIAL, "
+                         f"{result['cancelled']} CANCELLED)")[:500],
+                rows_affected=result["rows_updated"],
+                qty_total=0,
+            )
+        except Exception as le:
+            logger.warning(f"[close_orphan_bdc] ops_log skipped: {le}")
+
+        return result
+    finally:
+        _drop_tmp(conn, tmp)
+
+
+def backfill_approve_qty(conn, dry_run: bool = True) -> Dict:
+    """Backfill QTY_TOTAL + SUMMARY on legacy APPROVE rows that were logged
+    with qty_total=0 (the field was hardcoded before the fix). Reads
+    SUM(ALLOC_QTY) from ARS_PEND_ALC by SESSION_ID for each affected op.
+
+    Only touches active (non-reverted) APPROVE ops with QTY_TOTAL = 0.
+    Idempotent — re-running after a fix only updates rows still at 0.
+    """
+    ensure_operations_table(conn)
+    rows = conn.execute(text(f"""
+        SELECT OP_ID, OP_KEY, ROWS_AFFECTED, CREATED_BY
+        FROM {OPERATIONS_TABLE}
+        WHERE OP_TYPE = 'APPROVE'
+          AND ISNULL(QTY_TOTAL, 0) = 0
+          AND REVERTED_AT IS NULL
+    """)).fetchall()
+    found = len(rows)
+    if dry_run or found == 0:
+        return {"found": found, "updated": 0, "applied": False}
+
+    updated = 0
+    for op_id, op_key, n_rows, by in rows:
+        qty = float(conn.execute(text(f"""
+            SELECT ISNULL(SUM(ALLOC_QTY), 0)
+            FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid
+        """), {"sid": op_key}).scalar() or 0)
+        if qty <= 0:
+            continue
+        conn.execute(text(f"""
+            UPDATE {OPERATIONS_TABLE}
+               SET QTY_TOTAL = :q,
+                   SUMMARY   = :s
+             WHERE OP_ID = :id
+        """), {
+            "q":  qty,
+            "s":  (f"Approve {op_key}: {int(n_rows or 0)} pend rows, "
+                   f"{int(qty)} units, by {by or '?'}")[:500],
+            "id": int(op_id),
+        })
+        updated += 1
+    conn.commit()
+    return {"found": found, "updated": updated, "applied": True}
+
+
 def _bulk_load_ids(conn, ids) -> str:
     # Bulk-load ids into a fresh #tmp table and return its name. Caller
     # must DROP it in a finally block. Replaces literal `WHERE ID IN (lit,
@@ -716,6 +1094,8 @@ def preview_revert(conn, op_id: int) -> Dict:
         errors = _check_bdc_revert(conn, op)
     elif op["op_type"] == "DO":
         errors = _check_do_revert(conn, op)
+    elif op["op_type"] == "ADHOC_CLOSE":
+        errors = _check_adhoc_close_revert(conn, op)
     elif op["op_type"] == "MANUAL":
         errors = _check_manual_revert(conn, op)
     elif op["op_type"] == "APPROVE":
@@ -753,6 +1133,8 @@ def revert_operation(
         errors = _check_bdc_revert(conn, op)
     elif op["op_type"] == "DO":
         errors = _check_do_revert(conn, op)
+    elif op["op_type"] == "ADHOC_CLOSE":
+        errors = _check_adhoc_close_revert(conn, op)
     elif op["op_type"] == "MANUAL":
         errors = _check_manual_revert(conn, op)
     elif op["op_type"] == "APPROVE":
@@ -768,6 +1150,8 @@ def revert_operation(
         result = _revert_bdc(conn, payload)
     elif op["op_type"] == "DO":
         result = _revert_do(conn, payload)
+    elif op["op_type"] == "ADHOC_CLOSE":
+        result = _revert_adhoc_close(conn, payload)
     elif op["op_type"] == "MANUAL":
         result = _revert_manual(conn, payload)
     elif op["op_type"] == "APPROVE":
@@ -789,45 +1173,111 @@ def revert_operation(
     # whose -1 with the current resolver can't perfectly undo. The bootstrap
     # rewrites PEND_ALC = SUM(open PA.PEND_QTY) per grain, which is the
     # canonical state regardless of upload/revert history.
-    try:
-        bg = bootstrap_grid_pend_sync(conn)
-        result["grid_resync"] = bg
-        logger.info(
-            f"[revert] post-sync grids: var={bg.get('grid_var',0)} "
-            f"gen={bg.get('grid_gen',0)} rollups={bg.get('grid_rollup',0)}"
-        )
-    except Exception as e:
-        logger.warning(f"[revert] post-sync bootstrap_grid_pend_sync failed: {e}")
-        result["grid_resync_error"] = str(e)
+    #
+    # Handlers that already produce a canonically-correct state (e.g. the
+    # set-based APPROVE revert) set `_skip_post_bootstrap=True` so we skip
+    # these two full-table scans — they were dominating revert latency for
+    # APPROVE (multi-minute on large MSA tables).
+    skip_bootstrap = bool(result.pop("_skip_post_bootstrap", False))
+    if not skip_bootstrap:
+        try:
+            bg = bootstrap_grid_pend_sync(conn)
+            result["grid_resync"] = bg
+            logger.info(
+                f"[revert] post-sync grids: var={bg.get('grid_var',0)} "
+                f"gen={bg.get('grid_gen',0)} rollups={bg.get('grid_rollup',0)}"
+            )
+        except Exception as e:
+            logger.warning(f"[revert] post-sync bootstrap_grid_pend_sync failed: {e}")
+            result["grid_resync_error"] = str(e)
 
-    try:
-        bm = bootstrap_msa_pend_sync(conn)
-        result["msa_resync"] = bm
-    except Exception as e:
-        logger.warning(f"[revert] post-sync bootstrap_msa_pend_sync failed: {e}")
-        result["msa_resync_error"] = str(e)
+        try:
+            bm = bootstrap_msa_pend_sync(conn)
+            result["msa_resync"] = bm
+        except Exception as e:
+            logger.warning(f"[revert] post-sync bootstrap_msa_pend_sync failed: {e}")
+            result["msa_resync_error"] = str(e)
 
     return {"success": True, **result}
 
 
 def _revert_bdc(conn, payload: Dict) -> Dict:
-    """Restore BDC_QTY/LAST_BDC_AT on stamped rows + delete history rows."""
+    """Restore BDC_QTY/LAST_BDC_AT on stamped rows + delete history rows.
+
+    Set-based: stamped_rows is bulk-loaded into a temp table via
+    fast_executemany, then one UPDATE..JOIN restores every row in a single
+    pass. Replaces the per-row Python loop (N round-trips → minutes on
+    50K-row BDCs) with one bulk write.
+
+    `old_last_bdc_at` was serialized by stamp_bdc_qty as an ISO-8601 string
+    with a 'T' separator. SQL Server's implicit string→datetime cast
+    rejects that (SQLSTATE 22007), so we parse it to a Python `datetime`
+    here and pyodbc binds it as a real DATETIME2 parameter.
+    """
+    import datetime as _datetime
+
     stamped = payload.get("stamped_rows") or []
     history_ids = payload.get("history_ids") or []
 
     rows_restored = 0
-    for s in stamped:
+    if stamped:
+        tmp = f"#bdc_unstamp_{uuid.uuid4().hex[:8]}"
         conn.execute(text(f"""
-            UPDATE {PEND_ALC_TABLE}
-               SET BDC_QTY     = :q,
-                   LAST_BDC_AT = :t
-             WHERE ID = :id
-        """), {
-            "q":  float(s.get("old_bdc_qty") or 0),
-            "t":  s.get("old_last_bdc_at"),
-            "id": int(s["pend_alc_id"]),
-        })
-        rows_restored += 1
+            CREATE TABLE {tmp} (
+                pend_alc_id     BIGINT      NOT NULL,
+                old_bdc_qty     FLOAT       NOT NULL,
+                old_last_bdc_at DATETIME2   NULL
+            )
+        """))
+        try:
+            def _parse_dt(v):
+                if not v:
+                    return None
+                if isinstance(v, _datetime.datetime):
+                    return v
+                try:
+                    # fromisoformat handles '2026-06-03T10:21:12.397000'.
+                    # Strip trailing 'Z' if present (UTC indicator — Python
+                    # 3.10 doesn't parse it; we treat it as naive UTC).
+                    s = str(v).rstrip("Z")
+                    return _datetime.datetime.fromisoformat(s)
+                except Exception:
+                    return None
+
+            params = [
+                (
+                    int(s["pend_alc_id"]),
+                    float(s.get("old_bdc_qty") or 0),
+                    _parse_dt(s.get("old_last_bdc_at")),
+                )
+                for s in stamped
+                if s.get("pend_alc_id") is not None
+            ]
+
+            cur = conn.connection.cursor()
+            try:
+                try:
+                    cur.fast_executemany = True
+                except Exception:
+                    pass
+                cur.executemany(
+                    f"INSERT INTO {tmp} (pend_alc_id, old_bdc_qty, old_last_bdc_at) "
+                    f"VALUES (?, ?, ?)",
+                    params,
+                )
+            finally:
+                cur.close()
+
+            res = conn.execute(text(f"""
+                UPDATE P
+                   SET P.BDC_QTY     = t.old_bdc_qty,
+                       P.LAST_BDC_AT = t.old_last_bdc_at
+                FROM {PEND_ALC_TABLE} P
+                JOIN {tmp} t ON t.pend_alc_id = P.ID
+            """))
+            rows_restored = int(res.rowcount or 0)
+        finally:
+            _drop_tmp(conn, tmp)
 
     history_deleted = 0
     if history_ids:
@@ -842,8 +1292,14 @@ def _revert_bdc(conn, payload: Dict) -> Dict:
         finally:
             _drop_tmp(conn, tmp)
 
-    return {"pend_alc_rows_restored": rows_restored,
-            "bdc_history_rows_deleted": history_deleted}
+    # BDC revert only writes BDC_QTY / LAST_BDC_AT. PEND_QTY is the
+    # computed column (ALLOC_QTY - DO_QTY) and is untouched here, so the
+    # post-revert bootstrap_grid_pend_sync / bootstrap_msa_pend_sync rewrite
+    # Grid PEND_ALC and MSA PEND_QTY/FNL_Q from values that didn't change —
+    # full-table scans that produce no diff. Skip them.
+    return {"pend_alc_rows_restored":    rows_restored,
+            "bdc_history_rows_deleted":  history_deleted,
+            "_skip_post_bootstrap":      True}
 
 
 def _revert_do(conn, payload: Dict) -> Dict:
@@ -861,6 +1317,21 @@ def _revert_do(conn, payload: Dict) -> Dict:
       • BDC_HISTORY.DO_RECEIVED / STATUS / LAST_DO_AT restored to the
         pre-apply values captured at apply time.
     """
+    import datetime as _datetime
+
+    def _parse_dt(v):
+        # Payload stores DATETIMEs as ISO-8601 with 'T' separator. SQL Server's
+        # implicit string→datetime cast rejects that (SQLSTATE 22007), so we
+        # parse to a Python datetime and let pyodbc bind it as DATETIME2.
+        if not v:
+            return None
+        if isinstance(v, _datetime.datetime):
+            return v
+        try:
+            return _datetime.datetime.fromisoformat(str(v).rstrip("Z"))
+        except Exception:
+            return None
+
     pend_updates = payload.get("pend_updates") or []
     history_updates = payload.get("history_updates") or []
 
@@ -891,7 +1362,7 @@ def _revert_do(conn, payload: Dict) -> Dict:
                     [(int(u["pend_alc_id"]),
                       float(u.get("qty_added") or 0),
                       1 if u.get("was_just_closed") else 0,
-                      u.get("prev_last_do_at"))
+                      _parse_dt(u.get("prev_last_do_at")))
                      for u in pend_updates],
                 )
             finally:
@@ -936,7 +1407,7 @@ def _revert_do(conn, payload: Dict) -> Dict:
                     [(int(h["history_id"]),
                       float(h.get("old_do_received") or 0),
                       (h.get("old_status") or "OPEN")[:20],
-                      h.get("old_last_do_at"))
+                      _parse_dt(h.get("old_last_do_at")))
                      for h in history_updates],
                 )
             finally:
@@ -957,8 +1428,57 @@ def _revert_do(conn, payload: Dict) -> Dict:
             except Exception:
                 pass
 
-    return {"pend_alc_rows_reverted": pend_rows,
-            "bdc_history_rows_reverted": history_rows}
+    # Restore any BDC_HISTORY rows that were auto-closed by apply_do_deductions
+    # when a PEND_ALC row went IS_CLOSED=1. Without this, reverting a DO
+    # leaves those history rows stuck at CONFIRMED even though their
+    # underlying PEND_ALC is open again.
+    auto_history_closes = payload.get("auto_history_closes") or []
+    auto_closes_reverted = 0
+    if auto_history_closes:
+        tmp_a = f"#do_rev_auto_{uuid.uuid4().hex[:8]}"
+        try:
+            conn.execute(text(
+                f"CREATE TABLE {tmp_a} ("
+                "  id          BIGINT       NOT NULL,"
+                "  old_status  NVARCHAR(20) NOT NULL,"
+                "  prev_do_at  DATETIME     NULL"
+                ")"
+            ))
+            raw = conn.connection
+            cur = raw.cursor()
+            try:
+                try:
+                    cur.fast_executemany = True
+                except Exception:
+                    pass
+                cur.executemany(
+                    f"INSERT INTO {tmp_a} (id, old_status, prev_do_at) "
+                    f"VALUES (?, ?, ?)",
+                    [(int(h["history_id"]),
+                      (h.get("old_status") or "OPEN")[:20],
+                      _parse_dt(h.get("prev_last_do_at")))
+                     for h in auto_history_closes],
+                )
+            finally:
+                cur.close()
+
+            res = conn.execute(text(f"""
+                UPDATE H
+                   SET H.STATUS     = u.old_status,
+                       H.LAST_DO_AT = u.prev_do_at
+                FROM {BDC_HISTORY_TABLE} H
+                JOIN {tmp_a} u ON H.ID = u.id
+            """))
+            auto_closes_reverted = int(res.rowcount or 0)
+        finally:
+            try:
+                conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_a}') IS NOT NULL DROP TABLE {tmp_a}"))
+            except Exception:
+                pass
+
+    return {"pend_alc_rows_reverted":      pend_rows,
+            "bdc_history_rows_reverted":   history_rows,
+            "auto_history_closes_reverted": auto_closes_reverted}
 
 
 def _revert_manual(conn, payload: Dict) -> Dict:
@@ -1037,75 +1557,67 @@ def _revert_manual(conn, payload: Dict) -> Dict:
 
 
 def _revert_approve(conn, payload: Dict) -> Dict:
-    """Reverse an approved listing's downstream effects on PEND_ALC + MSA +
-    HOLD_TRACKING. Symmetric inverse of `parked_history.approve_parked`'s
-    post-promotion work (pend_alc INSERTs, MSA +1 delta, hold-tracking
-    apply).
+    """Reverse `approve_parked` end-to-end so the session lands back in the
+    Parked Runs queue as if approve never happened.
 
-    Does NOT touch ARS_ALLOC_HISTORY / ARS_LISTING_*_HISTORY — history is
-    the permanent audit record of "this was approved by this user at this
-    time", and clearing it would break the alloc-history report. To
-    re-allocate after revert, run a fresh listing.
+    Steps (must run in this order — delta reads PEND_ALC before DELETE):
+      1. Apply -1 MSA/Grid delta straight from PEND_ALC by SESSION_ID
+         (set-based — no Python round-trip).
+      2. DELETE FROM ARS_PEND_ALC by SESSION_ID.
+      3. Restore ARS_NL_TBL_HOLD_TRACKING from the pre-approve snapshot via
+         `_revert_hold_tracking`.
+      4. Demote HISTORY → PARKED for all six snapshot targets via
+         `revert_approved_to_parked` so the user can re-Approve or Reject.
 
-    Steps (every step best-effort; one failure shouldn't strand the rest):
-      1. Snapshot the rows we're about to delete so we can pass them to
-         apply_pend_alc_delta with sign=-1 (delta needs grain + qty).
-      2. DELETE FROM ARS_PEND_ALC WHERE SESSION_ID = :sid.
-      3. Apply -1 MSA/Grid delta against the snapshotted rows.
-      4. Call parked_history._revert_hold_tracking to restore
-         ARS_NL_TBL_HOLD_TRACKING from its pre-approve snapshot.
+    Returns `_skip_post_bootstrap: True` so `revert_operation` skips its
+    full-table bootstrap_grid/msa_pend_sync — the scoped delta above is
+    already correct and the bootstraps were the slow part of revert.
     """
     session_id = payload.get("session_id")
     if not session_id:
         return {"pend_alc_rows_deleted": 0,
-                "error": "missing session_id in payload"}
+                "error":                 "missing session_id in payload"}
 
-    rows_to_revert = [
-        {
-            "rdc":            r[0],
-            "st_cd":          r[1],
-            "article_number": r[2],
-            "maj_cat":        r[3],
-            "gen_art_number": r[4],
-            "clr":            r[5],
-            "alloc_qty":      float(r[6] or 0),
-            "do_qty":         float(r[7] or 0),
-        }
-        for r in conn.execute(text(f"""
-            SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                   ALLOC_QTY, ISNULL(DO_QTY, 0)
-            FROM {PEND_ALC_TABLE}
-            WHERE SESSION_ID = :sid
-        """), {"sid": session_id}).fetchall()
-    ]
+    result: Dict = {"_skip_post_bootstrap": True}
 
+    # 1. -1 MSA/Grid delta — set-based, reads PEND_ALC directly.
+    try:
+        result["msa_delta"] = apply_pend_alc_delta(
+            conn, sign=-1, from_session_id=session_id,
+        )
+    except Exception as e:
+        logger.warning(f"[revert] APPROVE -1 delta skipped: {e}")
+        result["msa_delta_error"] = str(e)
+
+    # 2. Delete the PEND rows.
     res = conn.execute(text(
         f"DELETE FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid"
     ), {"sid": session_id})
-    deleted = int(res.rowcount or 0)
+    result["pend_alc_rows_deleted"] = int(res.rowcount or 0)
     conn.commit()
 
-    result: Dict = {"pend_alc_rows_deleted": deleted}
-
-    if rows_to_revert:
-        try:
-            result["msa_delta"] = apply_pend_alc_delta(
-                conn, rows_to_revert, sign=-1
-            )
-        except Exception as e:
-            logger.warning(f"[revert] APPROVE -1 delta skipped: {e}")
-            result["msa_delta_error"] = str(e)
-
+    # 3. Restore HOLD tracking.
     try:
         from app.services.parked_history import _revert_hold_tracking
         result["hold_revert"] = _revert_hold_tracking(conn, session_id)
-        conn.commit()
     except Exception as e:
         logger.warning(f"[revert] APPROVE hold-tracking revert skipped: {e}")
         result["hold_revert_error"] = str(e)
 
+    # 4. Demote HISTORY → PARKED for all six targets so the session
+    #    reappears in the Parked Runs UI for re-review.
+    try:
+        from app.services.parked_history import revert_approved_to_parked
+        result["demoted_by_table"] = revert_approved_to_parked(conn, session_id)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[revert] APPROVE history→parked demote failed: {e}")
+        result["demote_error"] = str(e)
+
     logger.info(
-        f"[revert] APPROVE session={session_id}: deleted {deleted} pend rows"
+        f"[revert] APPROVE session={session_id}: "
+        f"deleted {result['pend_alc_rows_deleted']} pend rows, "
+        f"demoted {result.get('demoted_by_table')}"
     )
     return result
 
@@ -2019,6 +2531,22 @@ def insert_bdc_history(
         }
         for r in rows
     ]
+    # Snapshot the highest existing ID for THIS allocation_number BEFORE
+    # insert so the post-insert SELECT picks up only rows from this call.
+    # Older code read back by `WHERE ALLOCATION_NUMBER = :a` alone — that
+    # was correct ONLY if alloc_no was unique per BDC. The generator
+    # (_get_next_allocation_no) used to collide on '{FY}-001' whenever
+    # ARS_ALLOCATION_MASTER was empty, and the collision caused this
+    # readback to grab PRIOR ops' history_ids into the new op's payload.
+    # Reverting the new op then deleted the prior op's history too,
+    # leaving PEND_ALC stamped with BDC_QTY > 0 but no history to gate
+    # `_NO_OPEN_BDC_PREDICATE` — every subsequent BDC re-stamped the
+    # same rows. Mirror the prev-MAX pattern from write_manual_pend_alc.
+    prev_max_id = conn.execute(text(f"""
+        SELECT ISNULL(MAX(ID), 0) FROM {BDC_HISTORY_TABLE}
+        WHERE ALLOCATION_NUMBER = :a
+    """), {"a": alloc}).scalar() or 0
+
     conn.execute(text(f"""
         INSERT INTO {BDC_HISTORY_TABLE}
             (ALLOCATION_NUMBER, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
@@ -2026,12 +2554,12 @@ def insert_bdc_history(
         VALUES (:alloc, :rdc, :st_cd, :art, :mc, :qty, 0, 'OPEN', :by)
     """), payload)
     conn.commit()
-    # Read back the IDs we just inserted — allocation_number is unique per
-    # BDC generation so this is safe.
+
     ids = conn.execute(text(f"""
         SELECT ID FROM {BDC_HISTORY_TABLE}
-        WHERE ALLOCATION_NUMBER = :a ORDER BY ID
-    """), {"a": alloc}).fetchall()
+        WHERE ALLOCATION_NUMBER = :a AND ID > :prev
+        ORDER BY ID
+    """), {"a": alloc, "prev": int(prev_max_id)}).fetchall()
     return [int(r[0]) for r in ids]
 
 
@@ -2052,7 +2580,10 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
     (1 SELECT + N UPDATEs per input row → minutes on 5K rows) with three
     bulk passes (sub-second total).
 
-    Updates DO_RECEIVED and flips STATUS to PARTIAL or CONFIRMED.
+    Updates DO_RECEIVED and flips STATUS to CONFIRMED (DO fully covered) or
+    CLOSED_PARTIAL (DO arrived short — terminal; residual ALLOC_QTY-DO_QTY in
+    PEND_ALC is free for the next BDC since /bdc-generate only skips
+    STATUS='OPEN').
 
     do_rows: dicts with rdc, article_number, do_qty,
              optional st_cd, optional allocation_number.
@@ -2188,7 +2719,12 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
                        ), 0) AS cum_before
                 FROM {BDC_HISTORY_TABLE} H
-                WHERE H.STATUS <> 'CONFIRMED' AND (H.BDC_QTY - H.DO_RECEIVED) > 0
+                -- Only OPEN (and legacy PARTIAL, kept matchable for pre-cutover
+                -- rows) accept further DO. CLOSED_PARTIAL / CONFIRMED /
+                -- CANCELLED are terminal — residual flows to a fresh BDC, not
+                -- back into this row.
+                WHERE H.STATUS IN ('OPEN','PARTIAL')
+                  AND (H.BDC_QTY - H.DO_RECEIVED) > 0
             ),
             alloc_plan AS (
                 SELECT o.ID,
@@ -2203,8 +2739,12 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
             )
             UPDATE H
                SET H.DO_RECEIVED = H.DO_RECEIVED + alloc_plan.apply_qty,
+                   -- Any DO that doesn't fully cover the BDC closes it as
+                   -- CLOSED_PARTIAL (terminal). The residual PEND_QTY is then
+                   -- free to flow into the next /bdc-generate — see the
+                   -- _NO_OPEN_BDC_PREDICATE filter in pend_alc.py.
                    H.STATUS      = CASE WHEN H.DO_RECEIVED + alloc_plan.apply_qty >= H.BDC_QTY
-                                        THEN 'CONFIRMED' ELSE 'PARTIAL' END,
+                                        THEN 'CONFIRMED' ELSE 'CLOSED_PARTIAL' END,
                    H.LAST_DO_AT  = GETDATE()
             OUTPUT INSERTED.ID,
                    INSERTED.DO_RECEIVED - DELETED.DO_RECEIVED AS qty_added,
@@ -2251,6 +2791,247 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
 
     conn.commit()
     return {"touched": len(history_updates), "history_updates": history_updates}
+
+
+def apply_adhoc_close(
+    conn,
+    rows: List[Dict],
+    reason: str = "",
+    created_by: Optional[str] = None,
+) -> Dict:
+    """Adhoc-close PEND_ALC rows for keys whose BDC should be abandoned
+    (e.g. bot-generated BDC for an article with no MSA stock).
+
+    For every input (RDC, ST_CD, ARTICLE):
+      - PEND_ALC matching rows with IS_CLOSED=0 → IS_CLOSED=1, REMARKS
+        prefixed with `ADHOC: <reason>` so it's visible in reco.
+      - Any STATUS='OPEN' rows in BDC_HISTORY for the same key → STATUS=
+        'CANCELLED' so the in-flight predicate stops blocking re-BDC.
+
+    Pre-images are captured for both sides so the operation can be reverted
+    via the existing operations-log machinery.
+
+    rows: dicts with rdc, article_number, optional st_cd.
+    Returns: {touched_pend, touched_history, pend_updates, history_updates}.
+    """
+    ensure_pend_alc_table(conn)
+    ensure_bdc_history_table(conn)
+
+    keys: List[Dict] = []
+    for r in rows or []:
+        rdc = str(r.get("rdc") or "").strip()
+        art = str(r.get("article_number") or "").strip()
+        if not rdc or not art:
+            continue
+        keys.append({
+            "rdc":   rdc,
+            "st_cd": (str(r.get("st_cd") or "").strip() or ""),
+            "art":   art,
+        })
+    if not keys:
+        return {"touched_pend": 0, "touched_history": 0,
+                "pend_updates": [], "history_updates": []}
+
+    safe_reason = (reason or "").strip()[:400]
+    remarks_prefix = f"ADHOC: {safe_reason}" if safe_reason else "ADHOC"
+
+    tmp = f"#adhoc_close_{uuid.uuid4().hex[:8]}"
+    pend_updates: List[Dict] = []
+    history_updates: List[Dict] = []
+    try:
+        conn.execute(text(
+            f"CREATE TABLE {tmp} ("
+            "  rdc   NVARCHAR(20) NOT NULL,"
+            "  st_cd NVARCHAR(20) NOT NULL,"   # '' means any-store
+            "  art   NVARCHAR(30) NOT NULL"
+            ")"
+        ))
+        raw = conn.connection
+        cur = raw.cursor()
+        try:
+            try:
+                cur.fast_executemany = True
+            except Exception:
+                pass
+            cur.executemany(
+                f"INSERT INTO {tmp} (rdc, st_cd, art) VALUES (?, ?, ?)",
+                [(k["rdc"], k["st_cd"], k["art"]) for k in keys],
+            )
+        finally:
+            cur.close()
+
+        # Close matching PEND_ALC rows.  An empty st_cd in the input means
+        # "any store for this (RDC, ARTICLE)" — kept symmetric with the
+        # rest of the service so an ops user can clear the whole article
+        # without enumerating every store.
+        for r in conn.execute(text(f"""
+            UPDATE P
+               SET P.IS_CLOSED = 1,
+                   P.REMARKS   = CASE
+                       WHEN P.REMARKS IS NULL OR P.REMARKS = '' THEN :prefix
+                       ELSE LEFT(:prefix + ' | ' + P.REMARKS, 500)
+                   END
+            OUTPUT INSERTED.ID, DELETED.IS_CLOSED, DELETED.REMARKS
+            FROM {PEND_ALC_TABLE} P
+            JOIN {tmp} u
+              ON P.RDC = u.rdc
+             AND P.ARTICLE_NUMBER = u.art
+             AND (u.st_cd = '' OR ISNULL(P.ST_CD,'') = u.st_cd)
+            WHERE P.IS_CLOSED = 0
+        """), {"prefix": remarks_prefix}).fetchall():
+            pend_updates.append({
+                "pend_alc_id":   int(r[0]),
+                "was_closed":    int(r[1] or 0),
+                "old_remarks":   r[2],
+            })
+
+        # Cancel any still-OPEN history rows for the same keys.  Already
+        # CLOSED_PARTIAL / CONFIRMED / CANCELLED rows are terminal and
+        # left untouched.
+        for r in conn.execute(text(f"""
+            UPDATE H
+               SET H.STATUS = 'CANCELLED'
+            OUTPUT INSERTED.ID, DELETED.STATUS
+            FROM {BDC_HISTORY_TABLE} H
+            JOIN {tmp} u
+              ON H.RDC = u.rdc
+             AND H.ARTICLE_NUMBER = u.art
+             AND (u.st_cd = '' OR ISNULL(H.ST_CD,'') = u.st_cd)
+            WHERE H.STATUS = 'OPEN'
+        """)).fetchall():
+            history_updates.append({
+                "history_id": int(r[0]),
+                "old_status": r[1] or "OPEN",
+            })
+    finally:
+        try:
+            conn.execute(text(
+                f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
+            ))
+        except Exception:
+            pass
+
+    conn.commit()
+    if created_by:
+        logger.info(
+            f"[pend_alc] adhoc-close by {created_by}: keys={len(keys)} "
+            f"pend_touched={len(pend_updates)} hist_touched={len(history_updates)} "
+            f"reason={safe_reason!r}"
+        )
+    return {
+        "touched_pend":    len(pend_updates),
+        "touched_history": len(history_updates),
+        "pend_updates":    pend_updates,
+        "history_updates": history_updates,
+    }
+
+
+def _check_adhoc_close_revert(conn, op: Dict) -> List[str]:
+    """Block ADHOC_CLOSE revert if a downstream op has already touched any
+    of the affected PEND_ALC rows after this close (would be re-opened into
+    an inconsistent state).
+    """
+    errors: List[str] = []
+    pend_updates = op["payload"].get("pend_updates") or []
+    pend_ids = {int(u["pend_alc_id"]) for u in pend_updates
+                if u.get("pend_alc_id") is not None}
+    if not pend_ids:
+        return errors
+    tmp = _bulk_load_ids(conn, pend_ids)
+    try:
+        cnt = conn.execute(text(f"""
+            SELECT COUNT(DISTINCT P.ID)
+            FROM {PEND_ALC_TABLE} P
+            JOIN {tmp} t ON t.id = P.ID
+            WHERE P.LAST_DO_AT > :d OR P.LAST_BDC_AT > :d
+        """), {"d": op["op_date"]}).scalar() or 0
+    finally:
+        _drop_tmp(conn, tmp)
+    if cnt > 0:
+        errors.append(
+            f"{cnt} row(s) have a newer BDC/DO event after this adhoc close — "
+            f"revert the newer op first"
+        )
+    return errors
+
+
+def _revert_adhoc_close(conn, payload: Dict) -> Dict:
+    """Restore IS_CLOSED + REMARKS on PEND_ALC and STATUS on BDC_HISTORY."""
+    pend_updates = payload.get("pend_updates") or []
+    history_updates = payload.get("history_updates") or []
+    pend_rows = 0
+    hist_rows = 0
+
+    if pend_updates:
+        tmp = f"#adhoc_rev_pa_{uuid.uuid4().hex[:8]}"
+        try:
+            conn.execute(text(
+                f"CREATE TABLE {tmp} ("
+                "  id          BIGINT        NOT NULL,"
+                "  was_closed  BIT           NOT NULL,"
+                "  old_remarks NVARCHAR(500) NULL"
+                ")"
+            ))
+            cur = conn.connection.cursor()
+            try:
+                try:
+                    cur.fast_executemany = True
+                except Exception:
+                    pass
+                cur.executemany(
+                    f"INSERT INTO {tmp} (id, was_closed, old_remarks) VALUES (?, ?, ?)",
+                    [(int(u["pend_alc_id"]),
+                      int(u.get("was_closed") or 0),
+                      u.get("old_remarks"))
+                     for u in pend_updates],
+                )
+            finally:
+                cur.close()
+            res = conn.execute(text(f"""
+                UPDATE P
+                   SET P.IS_CLOSED = u.was_closed,
+                       P.REMARKS   = u.old_remarks
+                FROM {PEND_ALC_TABLE} P
+                JOIN {tmp} u ON u.id = P.ID
+            """))
+            pend_rows = int(res.rowcount or 0)
+        finally:
+            _drop_tmp(conn, tmp)
+
+    if history_updates:
+        tmp = f"#adhoc_rev_h_{uuid.uuid4().hex[:8]}"
+        try:
+            conn.execute(text(
+                f"CREATE TABLE {tmp} ("
+                "  id     BIGINT       NOT NULL,"
+                "  status NVARCHAR(20) NOT NULL"
+                ")"
+            ))
+            cur = conn.connection.cursor()
+            try:
+                try:
+                    cur.fast_executemany = True
+                except Exception:
+                    pass
+                cur.executemany(
+                    f"INSERT INTO {tmp} (id, status) VALUES (?, ?)",
+                    [(int(h["history_id"]), (h.get("old_status") or "OPEN")[:20])
+                     for h in history_updates],
+                )
+            finally:
+                cur.close()
+            res = conn.execute(text(f"""
+                UPDATE H
+                   SET H.STATUS = u.status
+                FROM {BDC_HISTORY_TABLE} H
+                JOIN {tmp} u ON u.id = H.ID
+            """))
+            hist_rows = int(res.rowcount or 0)
+        finally:
+            _drop_tmp(conn, tmp)
+
+    return {"pend_alc_rows_reverted": pend_rows,
+            "bdc_history_rows_reverted": hist_rows}
 
 
 def stamp_bdc_qty(
@@ -2387,7 +3168,13 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
 
     tmp_in   = f"#do_in_{uuid.uuid4().hex[:8]}"
     tmp_out  = f"#do_out_{uuid.uuid4().hex[:8]}"
+    tmp_sync = f"#do_sync_{uuid.uuid4().hex[:8]}"
     pend_updates: List[Dict] = []
+    # `auto_history_closes` records OPEN→CONFIRMED transitions on
+    # ARS_BDC_HISTORY that happen as a side effect of a PEND_ALC row
+    # going IS_CLOSED=1 here. Recorded in the operations log payload so a
+    # DO revert can restore them.
+    auto_history_closes: List[Dict] = []
     touched = 0
 
     try:
@@ -2518,6 +3305,62 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             })
         touched = len(pend_updates)
 
+        # ---- Auto-close matching OPEN BDC_HISTORY when a PEND row closed -------
+        # When `apply_do_deductions` flips a PEND row to IS_CLOSED=1 (DO_QTY
+        # >= ALLOC_QTY) we want any remaining `STATUS='OPEN'` BDC history
+        # for the same (RDC, ST_CD, ARTICLE) to transition to CONFIRMED.
+        # Historically this never happened — the result was orphan OPEN
+        # history rows that inflated the "Pending DO (Open BDC)" tile by
+        # 5-10× and silently blocked the next /bdc-generate via the
+        # _NO_OPEN_BDC_PREDICATE filter. We close them here so PEND_ALC
+        # and BDC_HISTORY stay in lock-step.
+        #
+        # CONFIRMED (not CLOSED_PARTIAL) is correct: the PEND row only
+        # reaches IS_CLOSED=1 when DO_QTY >= ALLOC_QTY, so by definition
+        # every unit that was supposed to ship has shipped. Older BDC
+        # cycles are fully covered.
+        any_just_closed = any(u["was_just_closed"] for u in pend_updates)
+        if any_just_closed:
+            conn.execute(text(
+                f"CREATE TABLE {tmp_sync} ("
+                "  history_id  BIGINT       NOT NULL,"
+                "  old_status  NVARCHAR(20) NOT NULL,"
+                "  prev_last_do_at DATETIME NULL"
+                ")"
+            ))
+            conn.execute(text(f"""
+                ;WITH closed_keys AS (
+                    SELECT DISTINCT
+                           P.RDC,
+                           ISNULL(P.ST_CD,'') AS ST_CD,
+                           P.ARTICLE_NUMBER
+                    FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
+                    JOIN {tmp_out} o ON o.pend_alc_id = P.ID
+                    WHERE o.was_just_closed = 1
+                )
+                UPDATE H
+                   SET H.STATUS     = 'CONFIRMED',
+                       H.LAST_DO_AT = ISNULL(H.LAST_DO_AT, GETDATE())
+                OUTPUT INSERTED.ID,
+                       DELETED.STATUS,
+                       DELETED.LAST_DO_AT
+                  INTO {tmp_sync} (history_id, old_status, prev_last_do_at)
+                FROM {BDC_HISTORY_TABLE} H
+                JOIN closed_keys k
+                  ON  k.RDC = H.RDC
+                 AND k.ST_CD = ISNULL(H.ST_CD,'')
+                 AND k.ARTICLE_NUMBER = H.ARTICLE_NUMBER
+                WHERE H.STATUS = 'OPEN'
+            """))
+            for r in conn.execute(text(
+                f"SELECT history_id, old_status, prev_last_do_at FROM {tmp_sync}"
+            )).fetchall():
+                auto_history_closes.append({
+                    "history_id":     int(r[0]),
+                    "old_status":     r[1] or "OPEN",
+                    "prev_last_do_at": r[2].isoformat() if r[2] else None,
+                })
+
         # Hold tracking (ARS_NL_TBL_HOLD_TRACKING) is intentionally NOT
         # touched here. DO upload only updates PEND_ALC + BDC_HISTORY now.
         # Holds are released by a different lifecycle event (or never, per
@@ -2525,20 +3368,26 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     except Exception:
         # Drop temp tables, re-raise to bubble up to endpoint
         try:
-            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')  IS NOT NULL DROP TABLE {tmp_in}"))
-            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}') IS NOT NULL DROP TABLE {tmp_out}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')   IS NOT NULL DROP TABLE {tmp_in}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}')  IS NOT NULL DROP TABLE {tmp_out}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_sync}') IS NOT NULL DROP TABLE {tmp_sync}"))
         except Exception:
             pass
         raise
     else:
         try:
-            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')  IS NOT NULL DROP TABLE {tmp_in}"))
-            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}') IS NOT NULL DROP TABLE {tmp_out}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_in}')   IS NOT NULL DROP TABLE {tmp_in}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_out}')  IS NOT NULL DROP TABLE {tmp_out}"))
+            conn.execute(text(f"IF OBJECT_ID('tempdb..{tmp_sync}') IS NOT NULL DROP TABLE {tmp_sync}"))
         except Exception:
             pass
 
     conn.commit()
-    return {"touched": touched, "pend_updates": pend_updates}
+    return {
+        "touched":             touched,
+        "pend_updates":        pend_updates,
+        "auto_history_closes": auto_history_closes,
+    }
 
 
 def adjust_msa_after_pend_insert(
@@ -3199,10 +4048,24 @@ def _build_rollup_bootstrap_sql(
     """
 
 
-def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
+def apply_pend_alc_delta(
+    conn,
+    rows: Optional[List[Dict]] = None,
+    sign: int = +1,
+    from_session_id: Optional[str] = None,
+) -> Dict:
     """Apply a +qty (insert) or -qty (revert) delta across MSA + Grid for each
-    ARS_PEND_ALC row. Symmetric: the same `rows` with sign=-1 exactly reverses
-    a prior sign=+1 call.
+    ARS_PEND_ALC row. Symmetric: the same source rows with sign=-1 exactly
+    reverses a prior sign=+1 call.
+
+    Two source modes:
+      - `rows`: list of dicts (legacy path — used by insert callers that
+        already have the source rows in Python).
+      - `from_session_id`: load the delta source directly from PEND_ALC
+        rows tagged with this SESSION_ID via a single SQL INSERT..SELECT.
+        Skips the Python round-trip + executemany overhead, which is the
+        bottleneck on large reverts (50K+ rows = 30 s saved). Used by
+        _revert_approve.
 
     rows[i] keys: rdc, st_cd, article_number, maj_cat, gen_art_number, clr,
                   alloc_qty, do_qty (default 0)
@@ -3218,23 +4081,7 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
         "error":       None,
     }
 
-    # Build payload (skip zero-qty rows)
-    payload = []
-    for r in rows:
-        eff = (float(r.get("alloc_qty", 0) or 0)
-               - float(r.get("do_qty", 0) or 0)) * sign
-        if eff == 0:
-            continue
-        payload.append({
-            "r": str(r["rdc"]),
-            "s": str(r.get("st_cd") or ""),
-            "a": str(r["article_number"]),
-            "m": str(r.get("maj_cat") or ""),
-            "g": str(r.get("gen_art_number") or ""),
-            "c": str(r.get("clr") or ""),
-            "q": eff,
-        })
-    if not payload:
+    if from_session_id is None and not rows:
         return result
 
     tmp = f"#delta_{uuid.uuid4().hex[:8]}"
@@ -3250,10 +4097,51 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
                 qty      FLOAT
             )
         """))
-        conn.execute(
-            text(f"INSERT INTO {tmp} VALUES (:r, :s, :a, :m, :g, :c, :q)"),
-            payload,
-        )
+
+        if from_session_id is not None:
+            # Set-based load: read straight from PEND_ALC into the temp
+            # table, sign-applied. One round-trip, no Python loop. Empty
+            # session is a no-op (zero rows inserted → all UPDATEs match 0).
+            conn.execute(text(f"""
+                INSERT INTO {tmp} (rdc, st_cd, art, maj_cat, gen_art, clr, qty)
+                SELECT RDC,
+                       ISNULL(ST_CD, ''),
+                       ARTICLE_NUMBER,
+                       ISNULL(MAJ_CAT, ''),
+                       ISNULL(GEN_ART_NUMBER, ''),
+                       ISNULL(CLR, ''),
+                       (ISNULL(ALLOC_QTY, 0) - ISNULL(DO_QTY, 0)) * :sign
+                FROM {PEND_ALC_TABLE}
+                WHERE SESSION_ID = :sid
+                  AND (ISNULL(ALLOC_QTY, 0) - ISNULL(DO_QTY, 0)) <> 0
+            """), {"sid": from_session_id, "sign": sign})
+        else:
+            # Build payload (skip zero-qty rows) — legacy Python-rows path.
+            payload = []
+            for r in rows:
+                eff = (float(r.get("alloc_qty", 0) or 0)
+                       - float(r.get("do_qty", 0) or 0)) * sign
+                if eff == 0:
+                    continue
+                payload.append({
+                    "r": str(r["rdc"]),
+                    "s": str(r.get("st_cd") or ""),
+                    "a": str(r["article_number"]),
+                    "m": str(r.get("maj_cat") or ""),
+                    "g": str(r.get("gen_art_number") or ""),
+                    "c": str(r.get("clr") or ""),
+                    "q": eff,
+                })
+            if not payload:
+                # Nothing to do — drop temp table and return.
+                conn.execute(text(
+                    f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
+                ))
+                return result
+            conn.execute(
+                text(f"INSERT INTO {tmp} VALUES (:r, :s, :a, :m, :g, :c, :q)"),
+                payload,
+            )
 
         # ── Probe deployment-specific column names. Article/gen_art column
         # names vary across deployments (VAR_ART vs ARTICLE_NUMBER vs ARTICLE,
@@ -3440,29 +4328,12 @@ def apply_pend_alc_delta(conn, rows: List[Dict], sign: int = +1) -> Dict:
 def apply_pend_alc_delta_by_session(
     conn, session_id: str, sign: int = +1
 ) -> Dict:
-    """Convenience wrapper: read PEND_ALC rows by session_id, then apply the
-    delta. Used by approve_parked which only has the session_id, not the
-    original row dicts.
+    """Convenience wrapper: apply the delta for every PEND_ALC row tagged
+    with `session_id`. Used by approve_parked (sign=+1) and _revert_approve
+    (sign=-1). Set-based — no Python round-trip; the temp table is built
+    via INSERT..SELECT inside apply_pend_alc_delta.
     """
-    rows = [
-        {
-            "rdc":            r[0],
-            "st_cd":          r[1],
-            "article_number": r[2],
-            "maj_cat":        r[3],
-            "gen_art_number": r[4],
-            "clr":            r[5],
-            "alloc_qty":      float(r[6] or 0),
-            "do_qty":         float(r[7] or 0),
-        }
-        for r in conn.execute(text(f"""
-            SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                   ALLOC_QTY, ISNULL(DO_QTY, 0)
-            FROM {PEND_ALC_TABLE}
-            WHERE SESSION_ID = :sid
-        """), {"sid": session_id}).fetchall()
-    ]
-    return apply_pend_alc_delta(conn, rows, sign=sign)
+    return apply_pend_alc_delta(conn, sign=sign, from_session_id=session_id)
 
 
 def bootstrap_msa_pend_sync(conn) -> Dict:
