@@ -346,14 +346,18 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     engine = get_data_engine()
     with engine.connect() as conn:
         ensure_sessions_table(conn)
+        # NOLOCK + LOCK_TIMEOUT: poll endpoint. The background thread
+        # rewrites STEP_TIMINGS on this row throughout the run; dirty reads
+        # are fine, blocking past 120s (Cloudflare edge timeout) is not.
         row = conn.execute(text(f"""
+            SET LOCK_TIMEOUT 5000;
             SELECT SESSION_ID, USER_NAME, STARTED_AT, COMPLETED_AT, DURATION_SEC,
                    STATUS, ALLOCATION_MODE, PARALLEL_WORKERS,
                    RDC_MODE, STORE_COUNT, MAJCAT_COUNT,
                    LISTED_OPTS, ALLOC_ROWS, SHIP_QTY_TOTAL, HOLD_QTY_TOTAL,
                    FAILED_MAJCATS, ERROR_MSG, STEP_TIMINGS, REQUEST_JSON,
                    LOG_FILE_PATH, TABLES_AFFECTED, PARKED_STATUS
-            FROM {SESSIONS_TABLE} WHERE SESSION_ID = :sid
+            FROM {SESSIONS_TABLE} WITH (NOLOCK) WHERE SESSION_ID = :sid
         """), {"sid": session_id}).fetchone()
     if not row:
         return None

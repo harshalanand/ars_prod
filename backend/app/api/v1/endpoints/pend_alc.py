@@ -198,7 +198,16 @@ def pend_alc_sessions(current_user: User = Depends(get_current_user)):
     with that session's PEND_ALC rows. When the same key sits in multiple
     sessions, the open BDC is split evenly across them; not a perfect
     accounting but the only deterministic answer without a FK from
-    BDC_HISTORY → PEND_ALC, and stable for reconciliation."""
+    BDC_HISTORY → PEND_ALC, and stable for reconciliation.
+
+    A session row is included in the fair-split for a key ONLY if its
+    PEND_ALC row for that key has BDC_QTY > 0 (i.e., it actually
+    participated in a BDC stamping). A freshly-approved session whose
+    rows have never been stamped (BDC_QTY = 0 on every row for the
+    matching key) should never appear in BDC IN FLIGHT — it is not in
+    flight to SAP yet. This prevents bleed-through from older overlapping
+    sessions onto a brand-new session that has nothing to do with that
+    historical BDC."""
     try:
         with _engine().connect() as conn:
             ensure_pend_alc_table(conn)
@@ -217,20 +226,32 @@ def pend_alc_sessions(current_user: User = Depends(get_current_user)):
                     WHERE IS_CLOSED = 0
                     GROUP BY SESSION_ID, ISNULL(SOURCE,'AUTO')
                 ),
-                key_session_count AS (
-                    -- How many open sessions share each (RDC, ST_CD, ARTICLE).
-                    -- Used to fairly split open BDC across overlapping sessions.
-                    SELECT RDC, ISNULL(ST_CD,'') AS ST_CD, ARTICLE_NUMBER,
-                           COUNT(DISTINCT SESSION_ID) AS n
-                    FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                    WHERE IS_CLOSED = 0
-                    GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER
-                ),
-                session_keys AS (
-                    SELECT DISTINCT P.SESSION_ID,
+                -- Only sessions whose PEND_ALC row for the key has been
+                -- stamped (BDC_QTY > 0) participate in the in-flight
+                -- attribution. A brand-new session that hasn't been part
+                -- of any /bdc-generate run yet must not absorb open-BDC
+                -- residual that belongs to an older overlapping session.
+                stamped_keys AS (
+                    SELECT P.SESSION_ID,
                            P.RDC, ISNULL(P.ST_CD,'') AS ST_CD, P.ARTICLE_NUMBER
                     FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                     WHERE P.IS_CLOSED = 0
+                      AND ISNULL(P.BDC_QTY, 0) > 0
+                    GROUP BY P.SESSION_ID, P.RDC, ISNULL(P.ST_CD,''),
+                             P.ARTICLE_NUMBER
+                ),
+                key_session_count AS (
+                    -- How many *stamped* open sessions share each
+                    -- (RDC, ST_CD, ARTICLE). Used to fairly split open
+                    -- BDC across overlapping participating sessions.
+                    SELECT RDC, ST_CD, ARTICLE_NUMBER,
+                           COUNT(DISTINCT SESSION_ID) AS n
+                    FROM stamped_keys
+                    GROUP BY RDC, ST_CD, ARTICLE_NUMBER
+                ),
+                session_keys AS (
+                    SELECT DISTINCT SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER
+                    FROM stamped_keys
                 ),
                 inflight AS (
                     SELECT sk.SESSION_ID,
@@ -313,7 +334,7 @@ def pend_alc_detail(
     page_size:    int            = Query(100, ge=1, le=10000),
     # Sort
     sort_by:      Optional[str]  = Query(None),
-    sort_dir:     str            = Query("desc", regex="^(asc|desc)$"),
+    sort_dir:     str            = Query("desc", pattern="^(asc|desc)$"),
     # Per-column multi-value filters
     f_rdc:        Optional[str] = Query(None),
     f_st_cd:      Optional[str] = Query(None),
@@ -515,17 +536,13 @@ class DoUpdateRow(BaseModel):
     rdc:               str
     article_number:    str
     do_qty:            float
-    allocation_number: str  # mandatory — must match the BDC's Allocation Number
+    # Optional — when provided, apply_do_deductions resolves the BDC's
+    # ST_CD and pins the deduction to that destination store. When blank,
+    # falls through to FIFO on (RDC, ST_CD, ART) or (RDC, ART). UI labels
+    # this field "Allocation No. (OPTIONAL)".
+    allocation_number: Optional[str] = None
     st_cd:             Optional[str] = None
     do_number:         Optional[str] = None
-
-    @field_validator("allocation_number")
-    @classmethod
-    def _alloc_no_not_blank(cls, v: str) -> str:
-        s = (v or "").strip()
-        if not s:
-            raise ValueError("allocation_number is mandatory and cannot be blank")
-        return s
 
 
 class DoUpdateRequest(BaseModel):
@@ -580,8 +597,14 @@ def pend_alc_do_update(
         with _engine().connect() as conn:
             do_result   = apply_do_deductions(conn, rows)
             hist_result = update_bdc_history_with_do(conn, rows)
+            cancel_count = sum(
+                1 for h in (hist_result.get("history_updates") or [])
+                if (h.get("new_status") or "").upper() == "CANCELLED"
+            )
 
             total_qty = sum(float(r.get("do_qty") or 0) for r in rows)
+            overflow_rows = do_result.get("overflow_rows") or []
+            overflow_total = float(do_result.get("overflow_total_qty") or 0)
             # Chunk 1 INSERTs the audit row; chunks 2..N MERGE pend_updates /
             # history_updates into the existing row so the entire upload
             # remains revertable as one unit.
@@ -597,22 +620,33 @@ def pend_alc_do_update(
                     # writes done by apply_do_deductions when a PEND row
                     # just closed. Revert restores them to OPEN.
                     "auto_history_closes": do_result.get("auto_history_closes") or [],
+                    # D-2 fix: persist DO over-ship in the audit payload so
+                    # ops can review what didn't land.
+                    "overflow_rows":       overflow_rows,
                 },
-                summary=f"DO upload {session_id}: {len(rows)} input lines, "
-                        f"{int(total_qty)} units, "
-                        f"{do_result['touched']} pend_alc rows updated",
+                summary=(
+                    f"DO upload {session_id}: {len(rows)} input lines, "
+                    f"{int(total_qty)} units, "
+                    f"{do_result['touched']} pend_alc rows updated"
+                    + (f", {cancel_count} BDC cancelled (DO_QTY=0)"
+                       if cancel_count else "")
+                    + (f", overflow={int(overflow_total)} units"
+                       if overflow_total > 0 else "")
+                ),
                 rows_affected=do_result["touched"],
                 qty_total=total_qty,
                 created_by=getattr(current_user, "username", None),
                 is_first=body.is_first_chunk,
                 merge_payload_lists=["pend_updates", "history_updates",
-                                     "auto_history_closes"],
+                                     "auto_history_closes", "overflow_rows"],
             )
         logger.info(
             f"[pend_alc] do-update by {getattr(current_user,'username','?')}: "
             f"{len(rows)} input → {do_result['touched']} pend_alc rows updated, "
             f"{hist_result['touched']} bdc_history rows updated, "
+            f"{cancel_count} cancelled, "
             f"{len(do_result.get('auto_history_closes') or [])} bdc_history auto-closed, "
+            f"overflow_rows={len(overflow_rows)} ({overflow_total} units), "
             f"session_id={session_id}, "
             f"chunk(first={body.is_first_chunk}, last={body.is_last_chunk})"
         )
@@ -620,10 +654,13 @@ def pend_alc_do_update(
             "success":              True,
             "updated_rows":         do_result["touched"],
             "bdc_history_updated":  hist_result["touched"],
+            "bdc_cancelled":        cancel_count,
             "session_id":           session_id,
             # Keep do_batch_id for backwards compatibility with any caller
             # that reads it (frontend currently ignores the value).
             "do_batch_id":          session_id,
+            "overflow_rows":        overflow_rows,
+            "overflow_total_qty":   overflow_total,
         }
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -1203,58 +1240,186 @@ def pend_alc_bdc_generate_async(
 # ---------------------------------------------------------------------------
 # DO upload — async wrapper
 # ---------------------------------------------------------------------------
+# Server-side micro-batch size. Bigger = fewer SQL passes, smaller = more
+# frequent progress updates. 25K balances ~1s of SQL work per slice (set-based
+# UPDATE on both ARS_PEND_ALC and ARS_BDC_HISTORY) against UX responsiveness.
+_DO_SLICE = 25_000
+
+
 def _do_run_job(job_id: str, rows: list, session_id: str, is_first: bool,
                 username):
-    """Worker: apply_do_deductions + history update + log_operation_upsert."""
+    """Worker: apply DO deductions to ARS_PEND_ALC + history update +
+    log_operation_upsert, slicing the input internally so progress can be
+    reported mid-flight.
+
+    The old design relied on the frontend to chunk a 200K-row upload into
+    8-9 sequential POSTs; every chunk paid HTTP RTT + a polling window, and
+    a single transient 502 on chunk N marked that chunk as failed even
+    though the backend job had succeeded. Now the entire payload arrives in
+    one POST, we slice in-process, and the user sees one resilient job with
+    smooth progress.
+
+    `is_first` is accepted for backward compatibility with older callers but
+    is no longer relevant — a single job owns the whole upload, so the
+    ops_log row is always written fresh.
+    """
     import time as _t
     t0 = _t.perf_counter()
+    total = len(rows)
     try:
         _job_update(job_id, status="running", started_at=_dt.now().isoformat(),
-                    progress=f"applying {len(rows):,} input lines")
+                    progress=f"applying 0 / {total:,} rows")
         from app.services.pend_alc_service import log_operation_upsert
+
+        agg_touched      = 0
+        agg_hist_touched = 0
+        agg_pend_updates: list = []
+        agg_hist_updates: list = []
+        agg_auto_closes:  list = []
+        agg_overflow:     list = []  # D-2 fix: surface DO over-ship in async path
+
         with _engine().connect() as conn:
-            do_result   = apply_do_deductions(conn, rows)
-            hist_result = update_bdc_history_with_do(conn, rows)
+            # D-5 fix: log_operation_upsert per slice — apply_do_deductions /
+            # update_bdc_history_with_do commit inside each slice, so if slice K
+            # raises, slices 1..K-1 are already in the DB but had no ops_log
+            # entry under the old code (one log_operation_upsert AFTER the
+            # whole loop). That left the committed changes unrevertable. Now
+            # slice 1 INSERTs the ops_log row and slices 2..N MERGE their
+            # payload lists into it — same pattern as the sync /do-update.
+            slices_total = (total + _DO_SLICE - 1) // _DO_SLICE if total else 0
+            for slice_idx, i in enumerate(range(0, total, _DO_SLICE)):
+                sl = rows[i:i + _DO_SLICE]
+                do_result   = apply_do_deductions(conn, sl)
+                hist_result = update_bdc_history_with_do(conn, sl)
+                agg_touched      += int(do_result.get("touched") or 0)
+                agg_hist_touched += int(hist_result.get("touched") or 0)
+                slice_pend_updates  = do_result.get("pend_updates") or []
+                slice_hist_updates  = hist_result.get("history_updates") or []
+                slice_auto_closes   = do_result.get("auto_history_closes") or []
+                slice_overflow_rows = do_result.get("overflow_rows") or []
+                agg_pend_updates.extend(slice_pend_updates)
+                agg_hist_updates.extend(slice_hist_updates)
+                agg_auto_closes.extend(slice_auto_closes)
+                agg_overflow.extend(slice_overflow_rows)
+
+                # Persist this slice's effect to ops_log BEFORE moving on, so a
+                # crash on slice K+1 still leaves a revertable audit row for
+                # slices 1..K. log_operation_upsert is best-effort: if the log
+                # write itself fails we log CRITICAL and continue — the DB
+                # changes already committed and skipping further slices on a
+                # log-write hiccup would orphan more state.
+                slice_qty = sum(float(r.get("do_qty") or 0) for r in sl)
+                slice_cancel_count = sum(
+                    1 for h in slice_hist_updates
+                    if (h.get("new_status") or "").upper() == "CANCELLED"
+                )
+                try:
+                    log_operation_upsert(
+                        conn,
+                        op_type="DO",
+                        op_key=session_id,
+                        payload={
+                            "session_id":          session_id,
+                            "pend_updates":        slice_pend_updates,
+                            "history_updates":     slice_hist_updates,
+                            "auto_history_closes": slice_auto_closes,
+                            "overflow_rows":       slice_overflow_rows,
+                        },
+                        summary=(
+                            f"DO upload {session_id}: applied "
+                            f"{min(i + len(sl), total)}/{total} input lines"
+                        ),
+                        rows_affected=int(do_result.get("touched") or 0),
+                        qty_total=slice_qty,
+                        created_by=username,
+                        is_first=(slice_idx == 0),
+                        merge_payload_lists=["pend_updates", "history_updates",
+                                             "auto_history_closes",
+                                             "overflow_rows"],
+                    )
+                except Exception as log_err:
+                    logger.critical(
+                        f"[do-update-async] {session_id}: ops_log upsert "
+                        f"FAILED on slice {slice_idx + 1}/{slices_total} — "
+                        f"DB changes are committed but this slice is NOT in "
+                        f"ops_log. err={log_err}"
+                    )
+
+                applied = min(i + len(sl), total)
+                _job_update(
+                    job_id,
+                    progress=f"applied {applied:,} / {total:,} rows",
+                )
+
             total_qty = sum(float(r.get("do_qty") or 0) for r in rows)
-            log_operation_upsert(
-                conn,
-                op_type="DO",
-                op_key=session_id,
-                payload={
-                    "session_id":          session_id,
-                    "pend_updates":        do_result["pend_updates"],
-                    "history_updates":     hist_result["history_updates"],
-                    "auto_history_closes": do_result.get("auto_history_closes") or [],
-                },
-                summary=f"DO upload {session_id}: {len(rows)} input lines, "
-                        f"{int(total_qty)} units, "
-                        f"{do_result['touched']} pend_alc rows updated",
-                rows_affected=do_result["touched"],
-                qty_total=total_qty,
-                created_by=username,
-                is_first=is_first,
-                merge_payload_lists=["pend_updates", "history_updates",
-                                     "auto_history_closes"],
+            # Cancellations (do_qty=0 input rows that flipped an OPEN BDC to
+            # CANCELLED) surface in history_updates with new_status='CANCELLED'.
+            # Count them separately so the user sees both numbers — DO
+            # applications and cancellations are very different audit events.
+            cancel_count = sum(
+                1 for h in agg_hist_updates
+                if (h.get("new_status") or "").upper() == "CANCELLED"
             )
+            overflow_total = float(sum(o.get("overflow_qty") or 0 for o in agg_overflow))
+            # Final summary refresh — no payload merge (slices already merged
+            # their lists in). Just stamp the totals + final summary string.
+            try:
+                log_operation_upsert(
+                    conn,
+                    op_type="DO",
+                    op_key=session_id,
+                    payload={},  # ignored when merge_payload_lists is None and
+                                 # is_first=False — only summary + totals refresh
+                    summary=(
+                        f"DO upload {session_id}: {total} input lines, "
+                        f"{int(total_qty)} units, "
+                        f"{agg_touched} pend_alc rows updated"
+                        + (f", {cancel_count} BDC cancelled (DO_QTY=0)"
+                           if cancel_count else "")
+                        + (f", overflow={int(overflow_total)} units"
+                           if overflow_total > 0 else "")
+                    ),
+                    # Don't double-count rows_affected / qty_total — the per-
+                    # slice upserts already incremented them. Pass 0 deltas.
+                    rows_affected=0,
+                    qty_total=0,
+                    created_by=username,
+                    is_first=False,
+                    merge_payload_lists=None,
+                )
+            except Exception as log_err:
+                logger.warning(
+                    f"[do-update-async] final summary refresh failed: {log_err}"
+                )
         logger.info(
-            f"[do-update-async] {session_id}: input={len(rows)} "
-            f"touched={do_result['touched']} hist={hist_result['touched']} "
-            f"auto-closed={len(do_result.get('auto_history_closes') or [])} "
-            f"first={is_first} total={_t.perf_counter()-t0:.2f}s"
+            f"[do-update-async] {session_id}: input={total} "
+            f"touched={agg_touched} hist={agg_hist_touched} "
+            f"cancelled={cancel_count} "
+            f"auto-closed={len(agg_auto_closes)} "
+            f"overflow_rows={len(agg_overflow)} ({overflow_total} units) "
+            f"slices={slices_total} "
+            f"total={_t.perf_counter()-t0:.2f}s"
         )
         _job_update(
             job_id,
             status="completed",
-            progress="done",
+            progress=(
+                f"done — {agg_touched:,} rows updated"
+                + (f", {cancel_count:,} BDC cancelled" if cancel_count else "")
+                + (f", {int(overflow_total):,} overflow" if overflow_total > 0 else "")
+            ),
             finished_at=_dt.now().isoformat(),
             duration=round(_t.perf_counter() - t0, 2),
             result={
                 "session_id":          session_id,
                 "do_batch_id":         session_id,
-                "updated_rows":        do_result["touched"],
-                "bdc_history_updated": hist_result["touched"],
-                "input_lines":         len(rows),
+                "updated_rows":        agg_touched,
+                "bdc_history_updated": agg_hist_touched,
+                "bdc_cancelled":       cancel_count,
+                "input_lines":         total,
                 "total_qty":           int(total_qty),
+                "overflow_rows":       agg_overflow,
+                "overflow_total_qty":  overflow_total,
             },
         )
     except Exception as e:
@@ -2186,43 +2351,17 @@ def pend_alc_manual_upload(
         ]
         from app.services.pend_alc_service import log_operation_upsert
         with _engine().connect() as conn:
+            # M-2 / M-3 fix: write_manual_pend_alc now applies the MSA+grid
+            # delta per-chunk, scoped to the rows it just inserted. The old
+            # "deferred delta on is_last_chunk" path here is removed — it
+            # mis-fired in two ways: (a) if the client crashed before sending
+            # is_last_chunk=True, MSA stayed stale; (b) if the client sent
+            # is_last_chunk=True twice (retry), the delta was applied over the
+            # whole session each time, double-counting. is_first_chunk /
+            # is_last_chunk are still accepted for backward compatibility but
+            # no longer gate any MSA write.
             res = write_manual_pend_alc(conn, rows, session_id=body.session_id)
-
-            # ── Deferred delta: per-chunk MSA+grid sync was making each
-            # chunk take ~3-4 seconds, which on a 40-chunk upload meant 2+
-            # minutes of waiting and frequent mid-stream interruptions. We
-            # now skip the delta on chunks 1..N-1 (each chunk just runs
-            # fast_executemany INSERT, ~1 sec) and run ONE delta covering
-            # every row from this session_id when the last chunk arrives.
-            # Net effect: same final state, ~3× faster, lock contention drops
-            # because there's only one big UPDATE pass on MSA/grid.
-            msa_adjusted = None
-            if body.is_last_chunk:
-                from sqlalchemy import text as _text
-                all_rows = [
-                    {
-                        "rdc":            r[0],
-                        "st_cd":          r[1],
-                        "article_number": r[2],
-                        "maj_cat":        r[3],
-                        "gen_art_number": r[4],
-                        "clr":            r[5],
-                        "alloc_qty":      float(r[6] or 0),
-                        "do_qty":         float(r[7] or 0),
-                    }
-                    for r in conn.execute(_text(f"""
-                        SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                               ALLOC_QTY, ISNULL(DO_QTY, 0)
-                        FROM ARS_PEND_ALC
-                        WHERE SESSION_ID = :sid
-                    """), {"sid": res["session_id"]}).fetchall()
-                ]
-                if all_rows:
-                    msa_adjusted = apply_pend_alc_delta(conn, all_rows, sign=+1)
-                    logger.info(
-                        f"[pend_alc] deferred delta applied for session {res['session_id']}: "
-                        f"{len(all_rows)} total rows synced to MSA + grids"
-                    )
+            msa_adjusted = res.get("msa_adjusted")
 
             # Log per-chunk: chunk 1 INSERTs the ops_log row, chunks 2..N
             # UPDATE it (accumulating rows_affected + qty_total).
@@ -2246,7 +2385,7 @@ def pend_alc_manual_upload(
             f"[pend_alc] manual-upload by {getattr(current_user,'username','?')}: "
             f"{res['inserted']} rows inserted, session_id={res['session_id']}, "
             f"chunk(first={body.is_first_chunk}, last={body.is_last_chunk}), "
-            f"delta_applied={msa_adjusted is not None}"
+            f"delta_applied={msa_adjusted is not None and not (msa_adjusted or {}).get('error')}"
         )
         return {
             "success":       True,
@@ -2271,6 +2410,11 @@ class CloseRow(BaseModel):
 class CloseRowsRequest(BaseModel):
     rows:   List[CloseRow]
     reason: Optional[str] = None  # global reason if not set per-row
+    # A-1 fix: blank ST_CD in the input means "close every store for this
+    # (RDC, ARTICLE)" — silently nukes whole articles if a user uploads a
+    # spreadsheet with the ST_CD column accidentally empty. Require explicit
+    # confirmation; otherwise the API rejects with 400 + the offending keys.
+    confirm_close_all_stores: Optional[bool] = False
 
 
 @router.post("/close-rows")
@@ -2302,6 +2446,35 @@ def pend_alc_close_rows(
             "article_number": r.article_number,
             "reason":         per_row_reason,
         })
+
+    # A-1 fix: refuse blank-ST_CD wildcard unless caller confirms. A blank
+    # ST_CD on the service side closes EVERY store for the (RDC, ARTICLE),
+    # which is the right behavior for a deliberate sweep but a footgun for
+    # a user who left the column empty by accident.
+    wildcard_rows = [
+        {"rdc": r["rdc"], "article_number": r["article_number"]}
+        for r in rows
+        if not (r.get("st_cd") or "").strip()
+    ]
+    if wildcard_rows and not bool(body.confirm_close_all_stores):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "detail": (
+                    "Some rows have blank ST_CD (would close ALL stores for "
+                    "the RDC+ARTICLE). Set confirm_close_all_stores=true if "
+                    "intentional."
+                ),
+                "wildcard_rows":  wildcard_rows[:50],  # cap for response size
+                "wildcard_count": len(wildcard_rows),
+            },
+        )
+    if wildcard_rows:
+        logger.warning(
+            f"Adhoc close: explicit wildcard for {len(wildcard_rows)} "
+            f"(rdc, article) keys by reason={(body.reason or '')!r}"
+        )
+
     # One log entry per call; use the global reason if every per-row reason
     # is blank, else first-non-blank as the audit summary.
     summary_reason = (
@@ -2351,6 +2524,7 @@ def pend_alc_close_rows(
 async def pend_alc_close_rows_file(
     file: UploadFile = File(..., description="CSV/Excel with RDC, ARTICLE_NUMBER, [ST_CD], [REASON]"),
     reason: Optional[str] = None,
+    confirm_close_all_stores: bool = False,
     current_user: User = Depends(get_current_user),
 ):
     """Bulk adhoc-close from a CSV / Excel file.
@@ -2358,6 +2532,10 @@ async def pend_alc_close_rows_file(
     Required columns:  RDC, ARTICLE_NUMBER
     Optional columns:  ST_CD, REASON
     Top-level `reason` query param applies to rows that don't carry their own.
+
+    A-1 guard: rows with blank ST_CD close EVERY store for (RDC, ARTICLE).
+    Set `confirm_close_all_stores=true` to opt-in; otherwise the request is
+    rejected with 400.
     """
     try:
         content = await file.read()
@@ -2365,13 +2543,16 @@ async def pend_alc_close_rows_file(
             raise HTTPException(400, "File is empty")
         lower = (file.filename or "").lower()
         if lower.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(content))
+            df = pd.read_csv(io.BytesIO(content), dtype=str)
         elif lower.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(io.BytesIO(content))
+            df = pd.read_excel(io.BytesIO(content), dtype=str)
         else:
             raise HTTPException(400, "Unsupported file — use CSV or Excel")
         if df.empty:
             raise HTTPException(400, "File contains no data rows")
+        # Empty cells in mixed columns come back as NaN (a truthy float, str(NaN)=='nan')
+        # which would silently poison the SQL match. Force every cell to a real string.
+        df = df.fillna("")
         # Normalise column names (uppercase, strip)
         df.columns = [str(c).strip().upper() for c in df.columns]
         if "RDC" not in df.columns or "ARTICLE_NUMBER" not in df.columns:
@@ -2393,6 +2574,32 @@ async def pend_alc_close_rows_file(
             })
         if not rows:
             raise HTTPException(400, "No valid rows after parsing")
+
+        # A-1 fix: same blank-ST_CD wildcard guard as the JSON endpoint.
+        wildcard_rows = [
+            {"rdc": r["rdc"], "article_number": r["article_number"]}
+            for r in rows
+            if not (r.get("st_cd") or "").strip()
+        ]
+        if wildcard_rows and not confirm_close_all_stores:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "detail": (
+                        "Some rows have blank ST_CD (would close ALL stores "
+                        "for the RDC+ARTICLE). Set confirm_close_all_stores="
+                        "true if intentional."
+                    ),
+                    "wildcard_rows":  wildcard_rows[:50],
+                    "wildcard_count": len(wildcard_rows),
+                },
+            )
+        if wildcard_rows:
+            logger.warning(
+                f"Adhoc close (file {file.filename}): explicit wildcard for "
+                f"{len(wildcard_rows)} (rdc, article) keys by "
+                f"reason={(reason or '')!r}"
+            )
 
         summary_reason = global_reason or next((r["reason"] for r in rows if r["reason"]), "")
         username = getattr(current_user, "username", None)
@@ -2487,7 +2694,7 @@ def pend_alc_reco(
     # Sort
     sort_by:     Optional[str]  = Query(None,
         description="Column key from _RECO_SORTABLE (e.g. 'pend_qty')"),
-    sort_dir:    str            = Query("desc", regex="^(asc|desc)$"),
+    sort_dir:    str            = Query("desc", pattern="^(asc|desc)$"),
     # Per-column multi-value filters (CSV: 'DH24,DW01')
     f_rdc:        Optional[str] = Query(None),
     f_st_cd:      Optional[str] = Query(None),
@@ -3117,4 +3324,327 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
             },
         }
     except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /pend-alc/pend-vs-msa-gap          — open pending whose MSA pool is
+#                                          missing or too small to cover it.
+# GET /pend-alc/pend-vs-msa-gap-export   — same data, CSV download.
+#
+# Returns one row per (RDC, ARTICLE_NUMBER) where:
+#   * the article has open PEND_QTY > 0 in ARS_PEND_ALC, AND
+#   * either MSA_TOTAL has no row for that (RDC, ARTICLE) — "NO_MSA", or
+#     STK_QTY - HOLD_QTY < PEND_QTY (un-clamped — FNL_Q is floored at 0 and
+#     hides the shortfall) — "SHORT".
+#
+# gap = PEND_QTY - max(STK_QTY - HOLD_QTY, 0)
+# ---------------------------------------------------------------------------
+def _msa_total_article_col(conn) -> Optional[str]:
+    """Probe ARS_MSA_TOTAL for the article column (varies by deployment).
+    Returns None if ARS_MSA_TOTAL itself doesn't exist."""
+    exists = conn.execute(text(
+        "SELECT CASE WHEN OBJECT_ID('dbo.ARS_MSA_TOTAL','U') IS NULL "
+        "            THEN 0 ELSE 1 END"
+    )).scalar() or 0
+    if not exists:
+        return None
+    for candidate in ("ARTICLE_NUMBER", "VAR_ART", "ARTICLE"):
+        found = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME='ARS_MSA_TOTAL' AND COLUMN_NAME=:c"
+        ), {"c": candidate}).scalar() or 0
+        if found:
+            return candidate
+    return "ARTICLE_NUMBER"
+
+
+def _msa_total_has_col(conn, col: str) -> bool:
+    found = conn.execute(text(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME='ARS_MSA_TOTAL' AND COLUMN_NAME=:c"
+    ), {"c": col}).scalar() or 0
+    return bool(found)
+
+
+def _pend_vs_msa_gap_query(art_col: Optional[str], rdc_filter: bool, maj_cat_filter: bool,
+                           status_filter: Optional[str], has_hold: bool = True,
+                           has_fnl: bool = True, has_msa_pend: bool = True) -> str:
+    pend_filters = ["IS_CLOSED = 0", "PEND_QTY > 0"]
+    if rdc_filter:     pend_filters.append("RDC = :rdc")
+    if maj_cat_filter: pend_filters.append("MAJ_CAT = :mc")
+    pend_where = " AND ".join(pend_filters)
+
+    if not art_col:
+        # MSA_TOTAL missing — every open pending row is NO_MSA.
+        msa_cte = (
+            "msa AS (SELECT TOP 0 CAST(NULL AS NVARCHAR(20)) AS RDC, "
+            "                       CAST(NULL AS NVARCHAR(30)) AS ART, "
+            "                       CAST(0 AS FLOAT) AS STK_QTY, "
+            "                       CAST(0 AS FLOAT) AS HOLD_QTY, "
+            "                       CAST(0 AS FLOAT) AS MSA_PEND_QTY, "
+            "                       CAST(0 AS FLOAT) AS FNL_Q "
+            "        FROM ARS_PEND_ALC WHERE 1=0)"
+        )
+    else:
+        hold_sel = ("SUM(TRY_CAST(HOLD_QTY AS FLOAT))" if has_hold else "CAST(0 AS FLOAT)")
+        fnl_sel  = ("SUM(TRY_CAST(FNL_Q    AS FLOAT))" if has_fnl  else "CAST(0 AS FLOAT)")
+        pend_sel = ("SUM(TRY_CAST(PEND_QTY AS FLOAT))" if has_msa_pend else "CAST(0 AS FLOAT)")
+        msa_cte = (
+            f"msa AS (SELECT RDC, [{art_col}] AS ART, "
+            f"         SUM(TRY_CAST(STK_QTY  AS FLOAT)) AS STK_QTY, "
+            f"         {hold_sel} AS HOLD_QTY, "
+            f"         {pend_sel} AS MSA_PEND_QTY, "
+            f"         {fnl_sel}  AS FNL_Q "
+            f"        FROM ARS_MSA_TOTAL WITH (NOLOCK) "
+            f"        GROUP BY RDC, [{art_col}])"
+        )
+
+    status_where = ""
+    if status_filter == "NO_MSA":
+        status_where = "AND m.STK_QTY IS NULL"
+    elif status_filter == "SHORT":
+        status_where = "AND m.STK_QTY IS NOT NULL"
+
+    return f"""
+        ;WITH pend_agg AS (
+            SELECT RDC, ARTICLE_NUMBER,
+                   MAX(MAJ_CAT)        AS MAJ_CAT,
+                   MAX(GEN_ART_NUMBER) AS GEN_ART_NUMBER,
+                   MAX(CLR)            AS CLR,
+                   SUM(TRY_CAST(PEND_QTY AS FLOAT)) AS PEND_QTY,
+                   COUNT(*)            AS PEND_ROWS
+            FROM {PEND_ALC_TABLE} WITH (NOLOCK)
+            WHERE {pend_where}
+            GROUP BY RDC, ARTICLE_NUMBER
+        ), {msa_cte}
+        SELECT p.RDC, p.ARTICLE_NUMBER, p.MAJ_CAT,
+               p.GEN_ART_NUMBER, p.CLR,
+               p.PEND_QTY,
+               p.PEND_ROWS,
+               ISNULL(m.STK_QTY, 0)      AS STK_QTY,
+               ISNULL(m.HOLD_QTY, 0)     AS HOLD_QTY,
+               ISNULL(m.MSA_PEND_QTY, 0) AS MSA_PEND_QTY,
+               ISNULL(m.FNL_Q, 0)        AS FNL_Q,
+               CASE
+                   WHEN m.STK_QTY IS NULL                            THEN 0
+                   WHEN ISNULL(m.STK_QTY,0)-ISNULL(m.HOLD_QTY,0) < 0 THEN 0
+                   ELSE                ISNULL(m.STK_QTY,0)-ISNULL(m.HOLD_QTY,0)
+               END AS AVAILABLE,
+               p.PEND_QTY -
+               CASE
+                   WHEN m.STK_QTY IS NULL                            THEN 0
+                   WHEN ISNULL(m.STK_QTY,0)-ISNULL(m.HOLD_QTY,0) < 0 THEN 0
+                   ELSE                ISNULL(m.STK_QTY,0)-ISNULL(m.HOLD_QTY,0)
+               END AS GAP,
+               CASE WHEN m.STK_QTY IS NULL THEN 'NO_MSA' ELSE 'SHORT' END AS STATUS
+        FROM pend_agg p
+        LEFT JOIN msa m
+               ON m.RDC = p.RDC AND m.ART = p.ARTICLE_NUMBER
+        WHERE (m.STK_QTY IS NULL
+            OR p.PEND_QTY > CASE WHEN ISNULL(m.STK_QTY,0)-ISNULL(m.HOLD_QTY,0) < 0
+                                  THEN 0
+                                  ELSE ISNULL(m.STK_QTY,0)-ISNULL(m.HOLD_QTY,0) END)
+              {status_where}
+    """
+
+
+@router.get("/pend-vs-msa-gap")
+def pend_vs_msa_gap(
+    rdc:        Optional[str] = Query(None),
+    maj_cat:    Optional[str] = Query(None),
+    status:     Optional[str] = Query(None, pattern="^(NO_MSA|SHORT)$"),
+    page:       int           = Query(1,   ge=1),
+    page_size:  int           = Query(200, ge=1, le=5000),
+    sort_by:    str           = Query("gap", pattern="^(gap|pend_qty|rdc|article_number|maj_cat|available)$"),
+    sort_dir:   str           = Query("desc", pattern="^(asc|desc)$"),
+    current_user: User = Depends(get_current_user),
+):
+    """Paged report of open pending qty whose MSA stock can't cover it.
+
+    A row appears when:
+      * the (RDC, ARTICLE) has open PEND_QTY > 0 in ARS_PEND_ALC, AND
+      * ARS_MSA_TOTAL either has no row for that key (status='NO_MSA') or
+        STK_QTY - HOLD_QTY < PEND_QTY (status='SHORT').
+
+    `gap` = PEND_QTY - max(STK_QTY - HOLD_QTY, 0).
+    """
+    try:
+        with _engine().connect() as conn:
+            ensure_pend_alc_table(conn)
+            art_col = _msa_total_article_col(conn)
+            has_hold     = art_col is not None and _msa_total_has_col(conn, "HOLD_QTY")
+            has_fnl      = art_col is not None and _msa_total_has_col(conn, "FNL_Q")
+            has_msa_pend = art_col is not None and _msa_total_has_col(conn, "PEND_QTY")
+
+            params: dict = {}
+            if rdc:     params["rdc"] = rdc
+            if maj_cat: params["mc"]  = maj_cat
+
+            base_sql = _pend_vs_msa_gap_query(
+                art_col, rdc_filter=bool(rdc), maj_cat_filter=bool(maj_cat),
+                status_filter=status,
+                has_hold=has_hold, has_fnl=has_fnl, has_msa_pend=has_msa_pend,
+            )
+
+            # T-SQL doesn't let us wrap a CTE-led query in a subquery, so we
+            # materialise the gap set to a temp table once and run summary +
+            # paged SELECTs against it.
+            tmp = f"#gap_{_uuid.uuid4().hex[:8]}"
+            # Inject INTO right before the final FROM by string-replace —
+            # base_sql is fully under our control so this is safe.
+            into_sql = base_sql.replace(
+                "FROM pend_agg p\n        LEFT JOIN msa m",
+                f"INTO {tmp}\n        FROM pend_agg p\n        LEFT JOIN msa m",
+                1,
+            )
+            conn.execute(text(into_sql), params)
+
+            summary_row = conn.execute(text(f"""
+                SELECT
+                    COUNT(*)                                                     AS rows_total,
+                    ISNULL(SUM(GAP), 0)                                          AS gap_total,
+                    ISNULL(SUM(PEND_QTY), 0)                                     AS pend_total,
+                    ISNULL(SUM(CASE WHEN STATUS='NO_MSA' THEN 1 ELSE 0 END), 0)  AS rows_no_msa,
+                    ISNULL(SUM(CASE WHEN STATUS='NO_MSA' THEN GAP ELSE 0 END),0) AS gap_no_msa,
+                    ISNULL(SUM(CASE WHEN STATUS='SHORT'  THEN 1 ELSE 0 END), 0)  AS rows_short,
+                    ISNULL(SUM(CASE WHEN STATUS='SHORT'  THEN GAP ELSE 0 END),0) AS gap_short
+                FROM {tmp}
+            """)).fetchone()
+
+            sort_col = {
+                "gap": "GAP", "pend_qty": "PEND_QTY", "rdc": "RDC",
+                "article_number": "ARTICLE_NUMBER", "maj_cat": "MAJ_CAT",
+                "available": "AVAILABLE",
+            }[sort_by]
+            order = "DESC" if sort_dir.lower() == "desc" else "ASC"
+            offset = (page - 1) * page_size
+
+            rows = conn.execute(text(f"""
+                SELECT * FROM {tmp}
+                ORDER BY {sort_col} {order}, RDC ASC, ARTICLE_NUMBER ASC
+                OFFSET :off ROWS FETCH NEXT :ps ROWS ONLY
+            """), {"off": offset, "ps": page_size}).mappings().all()
+
+            try:
+                conn.execute(text(f"DROP TABLE {tmp}"))
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "data": {
+                "rows": [
+                    {
+                        "rdc":            r["RDC"],
+                        "article_number": r["ARTICLE_NUMBER"],
+                        "maj_cat":        r["MAJ_CAT"],
+                        "gen_art_number": r["GEN_ART_NUMBER"],
+                        "clr":            r["CLR"],
+                        "pend_qty":       float(r["PEND_QTY"] or 0),
+                        "pend_rows":      int(r["PEND_ROWS"] or 0),
+                        "stk_qty":        float(r["STK_QTY"] or 0),
+                        "hold_qty":       float(r["HOLD_QTY"] or 0),
+                        "msa_pend_qty":   float(r["MSA_PEND_QTY"] or 0),
+                        "fnl_q":          float(r["FNL_Q"] or 0),
+                        "available":      float(r["AVAILABLE"] or 0),
+                        "gap":            float(r["GAP"] or 0),
+                        "status":         r["STATUS"],
+                    }
+                    for r in rows
+                ],
+                "page":      page,
+                "page_size": page_size,
+                "total":     int(summary_row[0] or 0),
+                "summary": {
+                    "rows_total":  int(summary_row[0] or 0),
+                    "gap_total":   float(summary_row[1] or 0),
+                    "pend_total":  float(summary_row[2] or 0),
+                    "rows_no_msa": int(summary_row[3] or 0),
+                    "gap_no_msa":  float(summary_row[4] or 0),
+                    "rows_short":  int(summary_row[5] or 0),
+                    "gap_short":   float(summary_row[6] or 0),
+                    "msa_available": art_col is not None,
+                },
+            },
+        }
+    except Exception as e:
+        logger.exception(f"[pend_alc] pend-vs-msa-gap failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.get("/pend-vs-msa-gap-export")
+def pend_vs_msa_gap_export(
+    rdc:     Optional[str] = Query(None),
+    maj_cat: Optional[str] = Query(None),
+    status:  Optional[str] = Query(None, pattern="^(NO_MSA|SHORT)$"),
+    current_user: User = Depends(get_current_user),
+):
+    """CSV export of the full filtered gap report (no row cap)."""
+    try:
+        with _engine().connect() as conn:
+            ensure_pend_alc_table(conn)
+            art_col = _msa_total_article_col(conn)
+            has_hold     = art_col is not None and _msa_total_has_col(conn, "HOLD_QTY")
+            has_fnl      = art_col is not None and _msa_total_has_col(conn, "FNL_Q")
+            has_msa_pend = art_col is not None and _msa_total_has_col(conn, "PEND_QTY")
+
+            params: dict = {}
+            if rdc:     params["rdc"] = rdc
+            if maj_cat: params["mc"]  = maj_cat
+
+            base_sql = _pend_vs_msa_gap_query(
+                art_col, rdc_filter=bool(rdc), maj_cat_filter=bool(maj_cat),
+                status_filter=status,
+                has_hold=has_hold, has_fnl=has_fnl, has_msa_pend=has_msa_pend,
+            )
+            tmp = f"#gap_exp_{_uuid.uuid4().hex[:8]}"
+            into_sql = base_sql.replace(
+                "FROM pend_agg p\n        LEFT JOIN msa m",
+                f"INTO {tmp}\n        FROM pend_agg p\n        LEFT JOIN msa m",
+                1,
+            )
+            conn.execute(text(into_sql), params)
+            rows = conn.execute(text(f"""
+                SELECT * FROM {tmp}
+                ORDER BY GAP DESC, RDC, ARTICLE_NUMBER
+            """)).mappings().all()
+            try:
+                conn.execute(text(f"DROP TABLE {tmp}"))
+            except Exception:
+                pass
+
+        buf = io.StringIO()
+        buf.write("RDC,ARTICLE_NUMBER,MAJ_CAT,GEN_ART_NUMBER,CLR,STATUS,"
+                  "PEND_QTY,PEND_ROWS,STK_QTY,HOLD_QTY,MSA_PEND_QTY,FNL_Q,"
+                  "AVAILABLE,GAP\n")
+        def _q(v):
+            if v is None: return ""
+            s = str(v)
+            if any(c in s for c in (",", '"', "\n", "\r")):
+                return '"' + s.replace('"', '""') + '"'
+            return s
+        for r in rows:
+            buf.write(",".join([
+                _q(r["RDC"]), _q(r["ARTICLE_NUMBER"]), _q(r["MAJ_CAT"]),
+                _q(r["GEN_ART_NUMBER"]), _q(r["CLR"]), _q(r["STATUS"]),
+                f"{float(r['PEND_QTY'] or 0):.0f}",
+                str(int(r["PEND_ROWS"] or 0)),
+                f"{float(r['STK_QTY'] or 0):.0f}",
+                f"{float(r['HOLD_QTY'] or 0):.0f}",
+                f"{float(r['MSA_PEND_QTY'] or 0):.0f}",
+                f"{float(r['FNL_Q'] or 0):.0f}",
+                f"{float(r['AVAILABLE'] or 0):.0f}",
+                f"{float(r['GAP'] or 0):.0f}",
+            ]) + "\n")
+
+        fname = f"PEND_VS_MSA_GAP_{datetime.date.today().strftime('%Y%m%d')}.csv"
+        body = "﻿" + buf.getvalue()
+        return StreamingResponse(
+            iter([body]),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+    except Exception as e:
+        logger.exception(f"[pend_alc] pend-vs-msa-gap-export failed: {e}")
         raise HTTPException(500, str(e))

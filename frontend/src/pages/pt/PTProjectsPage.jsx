@@ -1,7 +1,8 @@
 // Project Tracker — All Projects (list view with hierarchy indentation)
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Plus, Search, X, FolderTree, Filter, Pencil, Archive } from 'lucide-react'
+import { Plus, Search, X, FolderTree, Filter, Pencil, Archive,
+         ArrowUp, ArrowDown, ChevronsUpDown } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { ptAPI } from '@/services/api'
 import { StatusBadge, PriorityChip, PhaseChip } from '@/components/pt/StatusBadge'
@@ -54,15 +55,17 @@ export default function PTProjectsPage() {
   const nav = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
 
-  // Filter state — initialised from URL so dashboard tile clicks deep-link
+  // Filter state — initialised from URL so dashboard tile clicks deep-link.
+  // `open_only` defaults to true: hide COMPLETED/CANCELLED unless asked.
   const [filters, setFilters] = useState(() => ({
-    status:   searchParams.get('status') || '',
-    priority: searchParams.get('priority') || '',
-    phase:    searchParams.get('phase') || '',
-    owner:    searchParams.get('owner') || '',
-    q:        searchParams.get('q') || '',
-    overdue:  searchParams.get('overdue') === '1',
-    archived: searchParams.get('archived') === '1',
+    status:    searchParams.get('status') || '',
+    priority:  searchParams.get('priority') || '',
+    phase:     searchParams.get('phase') || '',
+    owner:     searchParams.get('owner') || '',
+    q:         searchParams.get('q') || '',
+    overdue:   searchParams.get('overdue') === '1',
+    archived:  searchParams.get('archived') === '1',
+    open_only: searchParams.get('open_only') !== '0',  // default ON
   }))
 
   const [rows, setRows]       = useState([])
@@ -70,12 +73,19 @@ export default function PTProjectsPage() {
   const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState(null)
+  // Sort state — null key = use hierarchical order from buildOrdered
+  const [sort, setSort] = useState({ key: null, dir: 'asc' })
 
   // Sync URL ↔ filters
   useEffect(() => {
     const sp = {}
     Object.entries(filters).forEach(([k, v]) => {
-      if (v && v !== false) sp[k] = v === true ? '1' : v
+      if (k === 'open_only') {
+        // Persist only when user explicitly disables it (default is ON)
+        if (v === false) sp[k] = '0'
+      } else if (v && v !== false) {
+        sp[k] = v === true ? '1' : v
+      }
     })
     setSearchParams(sp, { replace: true })
   }, [filters])
@@ -83,13 +93,14 @@ export default function PTProjectsPage() {
   const load = () => {
     setLoading(true)
     const params = {}
-    if (filters.status)   params.status   = filters.status
-    if (filters.priority) params.priority = filters.priority
-    if (filters.phase)    params.phase    = filters.phase
-    if (filters.owner)    params.owner    = filters.owner
-    if (filters.q)        params.q        = filters.q
-    if (filters.overdue)  params.overdue  = true
-    if (filters.archived) params.archived = true
+    if (filters.status)    params.status    = filters.status
+    if (filters.priority)  params.priority  = filters.priority
+    if (filters.phase)     params.phase     = filters.phase
+    if (filters.owner)     params.owner     = filters.owner
+    if (filters.q)         params.q         = filters.q
+    if (filters.overdue)   params.overdue   = true
+    if (filters.archived)  params.archived  = true
+    if (filters.open_only) params.open_only = true
     ptAPI.list(params)
       .then(res => setRows(res.data?.data || []))
       .finally(() => setLoading(false))
@@ -104,22 +115,76 @@ export default function PTProjectsPage() {
     ptAPI.tree({ archived: false }).then(res => setAllProjects(res.data?.data || []))
   }, [showForm])
 
-  const ordered = useMemo(() => buildOrdered(rows), [rows])
+  // Priority + status get semantic order rather than alphabetical
+  const PRIORITY_RANK = { CRITICAL: 1, HIGH: 2, MEDIUM: 3, LOW: 4 }
+  const STATUS_RANK   = { DRAFT: 1, NOT_STARTED: 2, IN_PROGRESS: 3,
+                          BLOCKED: 4, ON_HOLD: 5, COMPLETED: 6, CANCELLED: 7 }
+
+  const sortValue = (row, key) => {
+    switch (key) {
+      case 'PROJECT_CODE':   return row.PROJECT_CODE || ''
+      case 'NAME':           return (row.NAME || '').toLowerCase()
+      case 'STATUS':         return STATUS_RANK[row.STATUS] ?? 99
+      case 'PRIORITY':       return PRIORITY_RANK[row.PRIORITY] ?? 99
+      case 'PHASE':          return row.PHASE || ''
+      case 'OWNER_USERNAME': return (row.OWNER_USERNAME || '').toLowerCase()
+      case 'DUE_DATE':       return row.DUE_DATE || ''
+      case 'PROGRESS_PCT':   return row.PROGRESS_PCT ?? 0
+      default:               return ''
+    }
+  }
+
+  const ordered = useMemo(() => {
+    if (!sort.key) return buildOrdered(rows)
+    // Active sort → flat list, hierarchy ignored
+    const copy = [...rows]
+    const sign = sort.dir === 'desc' ? -1 : 1
+    copy.sort((a, b) => {
+      const av = sortValue(a, sort.key)
+      const bv = sortValue(b, sort.key)
+      // Push empty strings / null-equivalents to the end regardless of dir
+      const aEmpty = av === '' || av == null
+      const bEmpty = bv === '' || bv == null
+      if (aEmpty && !bEmpty) return 1
+      if (!aEmpty && bEmpty) return -1
+      if (av < bv) return -1 * sign
+      if (av > bv) return  1 * sign
+      return 0
+    })
+    return copy.map(r => ({ ...r, _depth: 0 }))
+  }, [rows, sort])
+
+  const toggleSort = (key) => {
+    setSort(prev => {
+      if (prev.key !== key) return { key, dir: 'asc' }
+      if (prev.dir === 'asc') return { key, dir: 'desc' }
+      return { key: null, dir: 'asc' }  // third click clears sort
+    })
+  }
+
+  const SortIcon = ({ col }) => {
+    if (sort.key !== col) return <ChevronsUpDown size={11} color="#cbd5e1" />
+    return sort.dir === 'asc' ? <ArrowUp size={11} /> : <ArrowDown size={11} />
+  }
 
   const handleCreate = () => { setEditing(null); setShowForm(true) }
   const handleEdit   = (row) => { setEditing(row); setShowForm(true) }
 
   const handleSave = async (payload) => {
     try {
+      let newId = null
       if (editing) {
         await ptAPI.update(editing.PROJECT_ID, payload)
         toast.success('Updated')
+        newId = editing.PROJECT_ID
       } else {
         const res = await ptAPI.create(payload)
         toast.success(`Created ${res.data?.data?.project_code}`)
+        newId = res.data?.data?.project_id ?? null
       }
       setShowForm(false); setEditing(null)
       load()
+      return newId
     } catch (e) { /* toast handled by axios interceptor */ }
   }
 
@@ -134,7 +199,8 @@ export default function PTProjectsPage() {
 
   const setF = (k, v) => setFilters(f => ({ ...f, [k]: v }))
   const clearFilters = () => setFilters({
-    status: '', priority: '', phase: '', owner: '', q: '', overdue: false, archived: false,
+    status: '', priority: '', phase: '', owner: '', q: '',
+    overdue: false, archived: false, open_only: true,
   })
 
   return (
@@ -179,10 +245,17 @@ export default function PTProjectsPage() {
         </select>
         <input style={inputStyle} placeholder="Owner" value={filters.owner}
           onChange={e => setF('owner', e.target.value)} />
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#374151' }}>
-          <input type="checkbox" checked={filters.overdue}
-            onChange={e => setF('overdue', e.target.checked)} /> Overdue only
-        </label>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#374151', whiteSpace: 'nowrap' }}
+                 title="Hide completed & cancelled">
+            <input type="checkbox" checked={filters.open_only}
+              onChange={e => setF('open_only', e.target.checked)} /> Open only
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#374151', whiteSpace: 'nowrap' }}>
+            <input type="checkbox" checked={filters.overdue}
+              onChange={e => setF('overdue', e.target.checked)} /> Overdue only
+          </label>
+        </div>
         <button onClick={clearFilters} style={{
           padding: '6px 12px', border: '1px solid #d1d5db', background: '#fff',
           borderRadius: 6, fontSize: 12, cursor: 'pointer', display: 'flex',
@@ -198,14 +271,14 @@ export default function PTProjectsPage() {
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
           <thead>
             <tr style={{ borderBottom: '1px solid #e5e7eb', textAlign: 'left', color: '#6b7280', background: '#f9fafb' }}>
-              <th style={{ padding: '10px 12px', minWidth: 120 }}>Code</th>
-              <th style={{ padding: '10px 12px' }}>Name</th>
-              <th style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>Status</th>
-              <th style={{ padding: '10px 12px' }}>Priority</th>
-              <th style={{ padding: '10px 12px' }}>Phase</th>
-              <th style={{ padding: '10px 12px' }}>Owner</th>
-              <th style={{ padding: '10px 12px' }}>Due</th>
-              <th style={{ padding: '10px 12px', minWidth: 130 }}>Progress</th>
+              <SortableTh col="PROJECT_CODE"   label="Code"     minWidth={120} sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="NAME"           label="Name"                            sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="STATUS"         label="Status"   nowrap                 sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="PRIORITY"       label="Priority"                        sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="PHASE"          label="Phase"                           sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="OWNER_USERNAME" label="Owner"                           sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="DUE_DATE"       label="Due"                             sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
+              <SortableTh col="PROGRESS_PCT"   label="Progress" minWidth={130}         sort={sort} onClick={toggleSort} SortIcon={SortIcon} />
               <th style={{ padding: '10px 12px' }}></th>
             </tr>
           </thead>
@@ -278,4 +351,27 @@ export default function PTProjectsPage() {
 const iconBtn = {
   background: 'transparent', border: 'none', padding: 6, cursor: 'pointer',
   color: '#6b7280', borderRadius: 4, marginLeft: 2,
+}
+
+function SortableTh({ col, label, minWidth, nowrap, sort, onClick, SortIcon }) {
+  const active = sort.key === col
+  return (
+    <th onClick={() => onClick(col)}
+        title={active
+          ? `Sorted ${sort.dir === 'asc' ? 'ascending' : 'descending'} — click to ${sort.dir === 'asc' ? 'reverse' : 'clear'}`
+          : `Sort by ${label}`}
+        style={{
+          padding: '10px 12px',
+          minWidth: minWidth || undefined,
+          whiteSpace: nowrap ? 'nowrap' : undefined,
+          cursor: 'pointer',
+          userSelect: 'none',
+          color: active ? '#4f46e5' : undefined,
+        }}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+        {label}
+        <SortIcon col={col} />
+      </span>
+    </th>
+  )
 }

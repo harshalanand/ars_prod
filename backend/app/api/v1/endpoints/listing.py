@@ -17,6 +17,7 @@ Endpoints:
 """
 import io
 import json
+import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -84,13 +85,20 @@ class GenerateRequest(BaseModel):
     age_threshold: int = 15            # Articles with AGE < X use PER_OPT_SALE in OPT_MBQ
     req_weight: float = 0.4            # Store ranking: weight for requirement rank
     fill_weight: float = 0.6           # Store ranking: weight for fill rate rank
-    # Allocation:
-    # Secondary-grid dispatch cap toggle.
-    # When True (default), main pass enforces cap = SEC_CAP_DEFAULT_PCT% (130)
-    # on every grid where grid_group='Secondary' in ARS_GRID_BUILDER.
+    # Secondary-grid dispatch cap (strict mode — only mode after 2026-06-16).
+    # When True, the main-pass pre-gate enforces, per grid where
+    # ARS_GRID_BUILDER.sec_cap_applicable=1:
+    #   budget = max(0, MBQ_ORIG × sec_cap_pct% − STK_TTL); breach = block.
+    # Per-grid % comes from ARS_GRID_BUILDER.sec_cap_pct (default 130 when
+    # NULL). No high-demand override — strict binary semantics.
     apply_sec_cap_in_normal: bool = True
     default_acs_d: float = 18.0        # Default ACS_D when NULL/0 (used in OPT_TYPE fallback classification)
     min_size_count: int = 3            # Min sizes required for TBL listing (alternative to 60% ratio)
+    # R07 size-coverage gate. Skip TBL when VAR_FNL_COUNT / VAR_COUNT < size_threshold
+    # AND VAR_FNL_COUNT < min_size_count. Independent of stock_threshold_pct (which
+    # only drives OPT_TYPE classification). Defaults 0.6 to preserve prior behavior
+    # — until this was split, R07 silently reused stock_threshold_pct.
+    size_threshold: float = 0.6
     # PRI_CT% >= 100 gate (R06 + revalidation SKIP_PRI_BROKEN). TBL always enforces.
     # When False, the opt_type is allowed in even if primary grid coverage is < 100%
     # (and the boosted MBQ-cap path is activated instead). Default False — matches
@@ -123,8 +131,17 @@ class GenerateRequest(BaseModel):
     # waterfall MJ_REQ_REM recompute) reads the scaled ceiling with no math
     # change.  Original MJ_REQ value is kept in MJ_REQ_ORIG for audit.
     mj_req_growth_pct: float = 100.0
-    # Allocation mode. pandas = multi-process per MAJ_CAT (fast). sequential = single-thread fallback.
-    allocation_mode:  str = "pandas"  # "sequential" | "pandas"
+    # Allocation mode:
+    #   pandas      – vectorized cumulative-window race (today, default)
+    #   per_opt     – one-OPT-at-a-time sequential engine; flips ARS_PER_OPT_MODE=1
+    #                 and dispatches through pandas path. See rule_engine_per_opt.py.
+    #   sequential  – single-thread SQL fallback
+    allocation_mode:  str = "pandas"  # "sequential" | "pandas" | "per_opt"
+    # Execution order for per_opt mode. opt_type_first = RL all rounds → TBC all
+    # rounds → TBL all rounds (Order A, today's nesting). round_first = R1 across
+    # all OPT_TYPEs → R2 across all → R3 (Order B, fairer to TBL). Engine wiring
+    # for round_first is pending — currently both options run as opt_type_first.
+    exec_order:       str = "opt_type_first"  # "opt_type_first" | "round_first"
     parallel_workers: int = 8        # used only by pandas mode
     # Per-run override for the single-writer-queue path. None → use .env default
     # (settings.USE_WRITER_QUEUE). True/False → force on/off for this run only.
@@ -306,6 +323,7 @@ _SETTING_DEFAULTS = {
     "apply_sec_cap_in_normal": "true",
     "default_acs_d": "18",
     "min_size_count": "3",
+    "size_threshold": "0.6",
     "pri_ct_check_rl": "false",
     "pri_ct_check_tbc": "false",
     "rl_mj_req_cap_pct": "100.0",
@@ -449,11 +467,13 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     # by admins from Settings → Application.  The request-payload field is
     # kept for backwards compatibility but ignored here — non-admins can't
     # smuggle in `allow_multi_parked=true` via a hand-crafted call.
+    de = get_data_engine()
     try:
         with de.connect() as _pc:
             _persisted = _load_listing_settings(_pc).get("allow_multi_parked", "false")
         _allow_mp = str(_persisted).lower() in ("true", "1", "yes")
-    except Exception:
+    except Exception as _e:
+        logger.warning(f"[generate] failed to read persisted parking mode: {_e}")
         _allow_mp = False
     # Reflect the persisted value back onto the request so downstream
     # consumers (audit log, persisted-settings rewrite at line ~585) see
@@ -647,6 +667,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "apply_sec_cap_in_normal": str(req.apply_sec_cap_in_normal).lower(),
                 "default_acs_d": str(req.default_acs_d),
                 "min_size_count": str(req.min_size_count),
+                "size_threshold": str(req.size_threshold),
                 "pri_ct_check_rl": str(req.pri_ct_check_rl).lower(),
                 "pri_ct_check_tbc": str(req.pri_ct_check_tbc).lower(),
                 "rl_mj_req_cap_pct": str(req.rl_mj_req_cap_pct),
@@ -676,6 +697,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             ("LISTING",    "age_threshold",         str(req.age_threshold)),
             ("LISTING",    "default_acs_d",         str(req.default_acs_d)),
             ("LISTING",    "min_size_count",        str(req.min_size_count)),
+            ("LISTING",    "size_threshold",        str(req.size_threshold)),
             ("LISTING",    "mix_mode",              str(req.mix_mode)),
             ("LISTING",    "rdc_mode",              str(req.rdc_mode)),
             ("LISTING",    "run_mode",              str(req.run_mode)),
@@ -1929,10 +1951,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         t0 = _time_step("Part 4d (ART_EXCESS + EXCESS_STK)", t0)
 
         # ── Part 4e: Per-grid stock deduction + REQ calc ────────────────
-        # For each grid:
+        # Sec-grids (FAB, MACRO_MVGR, …):
         #   1. Aggregate ART_EXCESS by that grid's hierarchy keys.
         #   2. Deduct from {prefix}_STK_TTL (clamped to 0).
         #   3. REQ = MAX(0, {prefix}_MBQ - deducted_{prefix}_STK_TTL).
+        # MJ only (conservative cap, since MJ_REQ is the binding budget downstream):
+        #   1. Snapshot raw stock to MJ_STK_TTL_ORIG (used later by the growth-lift block).
+        #   2. MJ_REQ_WITH_EXC = MAX(0, MJ_MBQ - raw_STK_TTL)        (excess treated as in-stock)
+        #   3. MJ_REQ_NO_EXC   = MAX(0, MJ_MBQ - deducted_STK_TTL)   (excess stripped from stock)
+        #   4. MJ_REQ = MAX(0, MIN(WITH_EXC, NO_EXC)).
         # Part 4 rewrites STK_TTL fresh on every rebuild, so deduction is idempotent.
         listing_cols = _get_columns(conn, LISTING_TABLE)
         req_log = []
@@ -1985,6 +2012,61 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 f"THEN ROUND(ISNULL(L.[{stk_col}], 0) - ISNULL(E.exc, 0), 0) "
                 f"ELSE 0 END"
             )
+
+            if prefix == "MJ":
+                # Ensure audit columns exist (idempotent across rebuilds).
+                for _col in ("MJ_STK_TTL_ORIG", "MJ_REQ_WITH_EXC", "MJ_REQ_NO_EXC"):
+                    try:
+                        _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [{_col}] FLOAT NULL")
+                    except Exception:
+                        pass
+
+                # WITH_EXC: req using raw stock (excess is part of available stock).
+                with_exc_expr = (
+                    f"CASE WHEN ISNULL(L.[{mbq_col}], 0) - ISNULL(L.[{stk_col}], 0) > 0 "
+                    f"THEN ROUND(ISNULL(L.[{mbq_col}], 0) - ISNULL(L.[{stk_col}], 0), 0) "
+                    f"ELSE 0 END"
+                )
+                # NO_EXC: req using deducted stock (excess stripped out → higher req).
+                no_exc_expr = (
+                    f"CASE WHEN ISNULL(L.[{mbq_col}], 0) - ({deducted_stk}) > 0 "
+                    f"THEN ROUND(ISNULL(L.[{mbq_col}], 0) - ({deducted_stk}), 0) "
+                    f"ELSE 0 END"
+                )
+                # MIN of the two branches; outer MAX(0, …) is defensive — both
+                # inputs are already ≥ 0, but it protects future formula edits.
+                min_expr = (
+                    f"CASE WHEN ({with_exc_expr}) < ({no_exc_expr}) "
+                    f"THEN ({with_exc_expr}) ELSE ({no_exc_expr}) END"
+                )
+                try:
+                    _run(conn, f"""
+                        ;WITH ExcessByGrid AS (
+                            SELECT [WERKS], [MAJ_CAT]{extra_sel},
+                                   SUM(ISNULL([ART_EXCESS], 0)) AS exc
+                            FROM [{LISTING_TABLE}]
+                            WHERE [WERKS] IS NOT NULL
+                            GROUP BY [WERKS], [MAJ_CAT]{extra_sel}
+                        )
+                        UPDATE L SET
+                            L.[MJ_STK_TTL_ORIG] = ISNULL(L.[{stk_col}], 0),
+                            L.[MJ_REQ_WITH_EXC] = {with_exc_expr},
+                            L.[MJ_REQ_NO_EXC]   = {no_exc_expr},
+                            L.[{stk_col}]       = {deducted_stk},
+                            L.[{req_col}]       = CASE WHEN ({min_expr}) > 0
+                                                       THEN ({min_expr})
+                                                       ELSE 0 END
+                        FROM [{LISTING_TABLE}] L
+                        LEFT JOIN ExcessByGrid E
+                          ON L.[WERKS] = E.[WERKS]
+                         AND L.[MAJ_CAT] = E.[MAJ_CAT]{extra_join}
+                    """)
+                    grp_label = ",".join(["WERKS", "MAJ_CAT"] + group_cols)
+                    req_log.append(f"{req_col}=MIN(WITH_EXC,NO_EXC) by {grp_label}")
+                except Exception as e:
+                    logger.warning(f"Part 4e: {req_col} (MJ MIN) failed: {str(e)[:150]}")
+                continue
+
             try:
                 _run(conn, f"""
                     ;WITH ExcessByGrid AS (
@@ -2097,6 +2179,93 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         logger.warning(f"{RANK_TABLE} creation failed: {e}")
     t0 = _time_step("Part 6 (Store Ranking)", t0)
 
+    # ── PART 6.6: Materialize eligibility into ELIG_FLAG / ELIG_REASON ─
+    # Codifies the legacy Part 7 WHERE clause (listing flag, MSA stock,
+    # store demand, display capacity, TBL size coverage) into two columns
+    # on ARS_LISTING.  Part 7's filter then collapses to a single column,
+    # and the row count for each rejection reason is trivially queryable:
+    #     SELECT ELIG_REASON, COUNT(*) FROM ARS_LISTING GROUP BY ELIG_REASON
+    #
+    # ELIG_FLAG is the conjunctive AND of every applicable gate.  Reason
+    # priority below (NOT_LISTED → NO_STOCK → NO_DEMAND → NO_DISPLAY →
+    # TBL_SIZE_LT_60) only governs which label a failing row reports; it
+    # does not change which rows are eligible.
+    try:
+        with de.connect() as ec:
+            elig_cols_upper = {c.upper() for c in _get_columns(ec, LISTING_TABLE)}
+            if "ELIG_FLAG" not in elig_cols_upper:
+                ec.execute(text(f"ALTER TABLE [{LISTING_TABLE}] ADD [ELIG_FLAG] INT NOT NULL DEFAULT 0"))
+                ec.commit()
+            if "ELIG_REASON" not in elig_cols_upper:
+                ec.execute(text(f"ALTER TABLE [{LISTING_TABLE}] ADD [ELIG_REASON] NVARCHAR(50) NULL"))
+                ec.commit()
+            elig_cols_upper = {c.upper() for c in _get_columns(ec, LISTING_TABLE)}
+
+            _has_listing = "LISTING"      in elig_cols_upper
+            _has_msa     = "MSA_FNL_Q"    in elig_cols_upper
+            _has_hold    = "RL_HOLD_QTY"  in elig_cols_upper
+            _has_req     = "OPT_REQ_WH"   in elig_cols_upper
+            _has_disp    = "MJ_DISP_Q"    in elig_cols_upper
+            _has_opttype = "OPT_TYPE"     in elig_cols_upper
+            _has_var     = "VAR_COUNT" in elig_cols_upper and "VAR_FNL_COUNT" in elig_cols_upper
+
+            # "1=1" means "gate not applicable" — never fails, never names a reason.
+            gate_listed  = "ISNULL(TRY_CAST([LISTING] AS INT), 1) = 1" if _has_listing else "1=1"
+            if _has_msa and _has_hold:
+                gate_stock = "(ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)"
+            elif _has_msa:
+                gate_stock = "ISNULL([MSA_FNL_Q], 0) > 0"
+            else:
+                gate_stock = "1=1"
+            gate_demand  = "ISNULL([OPT_REQ_WH], 0) >= 1" if _has_req else "1=1"
+            gate_display = "ISNULL(TRY_CAST([MJ_DISP_Q] AS FLOAT), 0) > 0" if _has_disp else "1=1"
+
+            _t = float(req.stock_threshold_pct or 0.6)
+            _min_sz = int(req.min_size_count or 0)
+            if _has_var and _has_opttype:
+                _min_sz_rescue = f" OR ISNULL([VAR_FNL_COUNT], 0) >= {_min_sz}" if _min_sz > 0 else ""
+                gate_size = (
+                    f"(ISNULL([OPT_TYPE], '') != 'TBL' "
+                    f"OR ISNULL([VAR_COUNT], 0) = 0 "
+                    f"OR CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / NULLIF([VAR_COUNT], 0) >= {_t}"
+                    f"{_min_sz_rescue})"
+                )
+            else:
+                gate_size = "1=1"
+
+            _run(ec, f"""
+                UPDATE [{LISTING_TABLE}] SET
+                  [ELIG_REASON] = CASE
+                    WHEN NOT ({gate_listed})  THEN 'NOT_LISTED'
+                    WHEN NOT ({gate_stock})   THEN 'NO_STOCK'
+                    WHEN NOT ({gate_demand})  THEN 'NO_DEMAND'
+                    WHEN NOT ({gate_display}) THEN 'NO_DISPLAY'
+                    WHEN NOT ({gate_size})    THEN 'TBL_SIZE_LT_60'
+                    ELSE 'OK'
+                  END,
+                  [ELIG_FLAG] = CASE
+                    WHEN ({gate_listed}) AND ({gate_stock}) AND ({gate_demand})
+                     AND ({gate_display}) AND ({gate_size})
+                    THEN 1 ELSE 0
+                  END
+            """)
+
+            try:
+                _run(ec, f"CREATE NONCLUSTERED INDEX IX_{LISTING_TABLE}_ELIG ON [{LISTING_TABLE}]([ELIG_FLAG])")
+            except Exception:
+                pass
+
+            _diag_rows = ec.execute(text(
+                f"SELECT [ELIG_REASON], COUNT(*) FROM [{LISTING_TABLE}] GROUP BY [ELIG_REASON]"
+            )).fetchall()
+            logger.info(
+                f"Part 6.6 eligibility breakdown: "
+                f"{ {r[0]: r[1] for r in _diag_rows} }"
+            )
+    except Exception as e:
+        logger.warning(f"Part 6.6 (eligibility) failed: {e}")
+    t0 = _time_step("Part 6.6 (Eligibility flag)", t0)
+
     # ── Auto-create ARS_LISTING_WORKING (filtered copy) ───────────────
     working_rows = 0
     try:
@@ -2108,34 +2277,24 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 col_list = ", ".join(f"[{c}]" for c in selected)
                 _run(wc, f"IF OBJECT_ID('{FINAL_TABLE}','U') IS NOT NULL DROP TABLE [{FINAL_TABLE}]")
 
-                where = []
-                # Keep rows with a fresh MSA pool OR pending hold from a prior run.
-                # Both conditions together mean there is something to work with.
-                if "MSA_FNL_Q" in all_upper and "RL_HOLD_QTY" in all_upper:
-                    where.append("(ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)")
-                elif "MSA_FNL_Q" in all_upper:
-                    where.append("ISNULL([MSA_FNL_Q], 0) > 0")
-                if "OPT_REQ_WH" in all_upper:
-                    where.append("ISNULL([OPT_REQ_WH], 0) >= 1")
-                # VAR ratio check: only for TBL (new listings need proper size coverage)
-                # RL/TBC skip this — they only need replenishment on available sizes
-                # Condition: ratio >= 60%, and if MinSz active: OR count >= min_size_count
-                min_sz = int(req.min_size_count or 0)
-                if "VAR_COUNT" in all_upper and "VAR_FNL_COUNT" in all_upper and "OPT_TYPE" in all_upper:
-                    min_sz_clause = f" OR ISNULL([VAR_FNL_COUNT], 0) >= {min_sz}" if min_sz > 0 else ""
-                    where.append(
-                        f"(ISNULL([OPT_TYPE], '') != 'TBL' OR ISNULL([VAR_COUNT], 0) = 0 OR "
-                        f"CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / NULLIF([VAR_COUNT], 0) >= {threshold}"
-                        f"{min_sz_clause})"
+                # All eligibility gates (stock / demand / display / listing /
+                # TBL size coverage) are materialized into ELIG_FLAG by Part 6.6
+                # above.  When the toggle is OFF we filter here; when ON the
+                # working table mirrors ARS_LISTING (audit mode) and downstream
+                # readers anchor on ELIG_FLAG = 1 themselves.
+                shift_all_to_working = False
+                try:
+                    from app.api.v1.endpoints.settings import load_app_settings as _load_app_settings
+                    _app_cfg = _load_app_settings()
+                    shift_all_to_working = bool(
+                        (_app_cfg.get("application") or {}).get("shift_all_to_working", False)
                     )
-                # Only listed OPTs (LISTING = 1)
-                if "LISTING" in all_upper:
-                    where.append("ISNULL(TRY_CAST([LISTING] AS INT), 1) = 1")
-                # MAJ_CAT display capacity must be positive — if the store has
-                # no display slots for this MAJ_CAT, the OPT can't be allocated.
-                if "MJ_DISP_Q" in all_upper:
-                    where.append("ISNULL(TRY_CAST([MJ_DISP_Q] AS FLOAT), 0) > 0")
-                where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+                except Exception as _cfg_err:
+                    logger.warning(f"shift_all_to_working lookup failed, defaulting OFF: {_cfg_err}")
+                if shift_all_to_working or "ELIG_FLAG" not in all_upper:
+                    where_sql = ""
+                else:
+                    where_sql = "WHERE [ELIG_FLAG] = 1"
 
                 _run(wc, f"""
                     SELECT {col_list}
@@ -2144,7 +2303,16 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     {where_sql}
                 """)
                 working_rows = wc.execute(text(f"SELECT COUNT(*) FROM [{FINAL_TABLE}]")).scalar()
-                logger.info(f"{FINAL_TABLE}: {working_rows} rows (MSA_FNL_Q>0 OR HOLD_QTY>0, OPT_REQ_WH>=1, MJ_DISP_Q>0)")
+                logger.info(
+                    f"{FINAL_TABLE}: {working_rows} rows "
+                    f"(shift_all_to_working={shift_all_to_working}, where='{where_sql}')"
+                )
+                # Index on ELIG_FLAG so downstream `WHERE ELIG_FLAG = 1` reads
+                # stay cheap when audit mode triples the row count.
+                try:
+                    _run(wc, f"CREATE NONCLUSTERED INDEX IX_{FINAL_TABLE}_ELIG ON [{FINAL_TABLE}]([ELIG_FLAG])")
+                except Exception:
+                    pass
 
                 # ── Allocation Gate: MBQ growth headroom (MJ + all sec-grids) ─
                 # Lift the per-(WERKS, MAJ_CAT[, extras]) target by scaling
@@ -2231,13 +2399,43 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         SET [{mbq_rev_col}] = ROUND(ISNULL([{mbq_orig_col}], 0) * {growth_pct} / 100.0, 0)
                     """)
                     if has_req and has_stk:
-                        _run(wc, f"""
-                            UPDATE [{FINAL_TABLE}]
-                            SET [{req_rev_col}] = CASE
-                                WHEN ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0) > 0
-                                THEN ROUND(ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0), 0)
-                                ELSE 0 END
-                        """)
+                        # MJ uses the same MIN(WITH_EXC, NO_EXC) logic as Part 4e,
+                        # but against the revised MBQ. WITH_EXC needs raw stock,
+                        # which Part 4e snapshotted to MJ_STK_TTL_ORIG; STK_TTL
+                        # carries deducted stock. MJ_REQ_WITH_EXC / MJ_REQ_NO_EXC
+                        # are refreshed alongside so the audit columns reflect
+                        # the post-growth view that drives MJ_REQ.
+                        if prefix == "MJ" and "MJ_STK_TTL_ORIG" in final_cols_upper:
+                            with_exc_branch = (
+                                f"CASE WHEN ISNULL([{mbq_rev_col}], 0) - ISNULL([MJ_STK_TTL_ORIG], 0) > 0 "
+                                f"THEN ROUND(ISNULL([{mbq_rev_col}], 0) - ISNULL([MJ_STK_TTL_ORIG], 0), 0) "
+                                f"ELSE 0 END"
+                            )
+                            no_exc_branch = (
+                                f"CASE WHEN ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0) > 0 "
+                                f"THEN ROUND(ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0), 0) "
+                                f"ELSE 0 END"
+                            )
+                            min_branch = (
+                                f"CASE WHEN ({with_exc_branch}) < ({no_exc_branch}) "
+                                f"THEN ({with_exc_branch}) ELSE ({no_exc_branch}) END"
+                            )
+                            _run(wc, f"""
+                                UPDATE [{FINAL_TABLE}]
+                                SET [MJ_REQ_WITH_EXC] = {with_exc_branch},
+                                    [MJ_REQ_NO_EXC]   = {no_exc_branch},
+                                    [{req_rev_col}]   = CASE WHEN ({min_branch}) > 0
+                                                             THEN ({min_branch})
+                                                             ELSE 0 END
+                            """)
+                        else:
+                            _run(wc, f"""
+                                UPDATE [{FINAL_TABLE}]
+                                SET [{req_rev_col}] = CASE
+                                    WHEN ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0) > 0
+                                    THEN ROUND(ISNULL([{mbq_rev_col}], 0) - ISNULL([{stk_col}], 0), 0)
+                                    ELSE 0 END
+                            """)
 
                     # Promote: lifted MBQ → live column, only when growth ≠ 100.
                     if growth_pct != 100.0:
@@ -2441,7 +2639,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 conn=ac,
                 final_table=FINAL_TABLE,
                 alloc_table=ALLOC_TABLE,
-                size_threshold=req.stock_threshold_pct,
+                size_threshold=req.size_threshold,
             )
 
     alloc_rows = 0
@@ -2450,6 +2648,26 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     mode = (req.allocation_mode or "pandas").lower()
     n_workers = max(2, min(8, int(req.parallel_workers or 4)))
     _growth = req.mj_req_growth_pct
+    # Per-OPT engine activation: setting allocation_mode="per_opt" sets the
+    # ARS_PER_OPT_MODE env var (inherited by worker processes) and then runs
+    # the pandas dispatch path. rule_engine_pandas._is_per_opt_mode() reads
+    # this env var fresh at each session, swapping _run_band with
+    # rule_engine_per_opt._run_band_per_opt. See rule_engine_per_opt.py.
+    if mode == "per_opt":
+        os.environ["ARS_PER_OPT_MODE"] = "1"
+        # exec_order is also surfaced as an env var so the per-OPT engine (once
+        # round_first is wired) can pick up the loop nesting choice without
+        # plumbing changes. Today only opt_type_first is implemented.
+        os.environ["ARS_EXEC_ORDER"] = (req.exec_order or "opt_type_first").strip().lower()
+        mode = "pandas"
+        logger.info(
+            f"[alloc] allocation_mode=per_opt exec_order={os.environ['ARS_EXEC_ORDER']} "
+            f"→ ARS_PER_OPT_MODE=1, dispatching via pandas engine"
+        )
+    else:
+        # Explicitly disable in case a prior request left it on in this process.
+        os.environ.pop("ARS_PER_OPT_MODE", None)
+        os.environ.pop("ARS_EXEC_ORDER", None)
     try:
         if mode == "pandas":
             from app.services.rule_engine_pandas import (
@@ -2461,7 +2679,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 alloc_table=ALLOC_TABLE,
                 n_workers=n_workers,
                 batch_id=preset_batch_id,
-                size_threshold=req.stock_threshold_pct,
+                size_threshold=req.size_threshold,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
                 pri_ct_check_tbc=req.pri_ct_check_tbc,
@@ -2484,7 +2702,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     working_table=FINAL_TABLE,
                     listed_table="ARS_LISTED_OPT",
                     alloc_table=ALLOC_TABLE,
-                    size_threshold=req.stock_threshold_pct,
+                    size_threshold=req.size_threshold,
                     min_size_count=req.min_size_count,
                     pri_ct_check_rl=req.pri_ct_check_rl,
                     pri_ct_check_tbc=req.pri_ct_check_tbc,
@@ -2584,7 +2802,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 except Exception:
                     pass  # column exists
             _run(ac, f"""
-                UPDATE [{FINAL_TABLE}] SET
+                UPDATE [{FINAL_TABLE}] WITH (ROWLOCK, UPDLOCK) SET
                   [OPT_STATUS] = CASE
                     WHEN [OPT_TYPE] = 'RL' THEN 'RL'
                     WHEN [OPT_TYPE] = 'TBC' AND ISNULL([ALLOC_QTY],0) > 0
@@ -2794,17 +3012,31 @@ def alloc_progress(batch_id: str,
     )
     de = get_data_engine()
     with de.connect() as conn:
+        progress = get_progress(conn, batch_id)
+        failed   = get_failed_list(conn, batch_id)
+        # Skip the SUM aggregate while the batch still has open rows — its
+        # totals are only meaningful once everything is DONE, and running it
+        # mid-run was the worst lock-contention query on every 3s poll.
+        if int(progress.get("pending", 0)) + int(progress.get("in_progress", 0)) > 0:
+            summary = {
+                "ship_total":   0.0, "hold_total":   0.0,
+                "rows_total":   0,
+                "max_duration": 0.0, "sum_duration": 0.0,
+            }
+        else:
+            summary = get_done_summary(conn, batch_id)
         return {
             "success":  True,
-            "progress": get_progress(conn, batch_id),
-            "failed":   get_failed_list(conn, batch_id),
-            "summary":  get_done_summary(conn, batch_id),
+            "progress": progress,
+            "failed":   failed,
+            "summary":  summary,
         }
 
 
 class RetryFailedRequest(BaseModel):
     batch_id:         str
-    allocation_mode:  str = "pandas"  # "sequential" | "pandas"
+    allocation_mode:  str = "pandas"  # "sequential" | "pandas" | "per_opt"
+    exec_order:       str = "opt_type_first"  # "opt_type_first" | "round_first"
     parallel_workers: int = 8
 
 

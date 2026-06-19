@@ -146,7 +146,7 @@ export default function SettingsPage() {
           trust_cert: 'yes', encrypt: 'no',
         },
         email: { smtp_server: '', smtp_port: 587, smtp_username: '', smtp_password: '', from_address: '', use_tls: true, notifications_enabled: false },
-        application: { app_name: 'ARS', max_upload_size_mb: 500, session_timeout_minutes: 60, enable_audit_logging: true, enable_row_level_security: true, default_page_size: 50, max_export_rows: 500000 },
+        application: { app_name: 'ARS', max_upload_size_mb: 500, session_timeout_minutes: 60, enable_audit_logging: true, enable_row_level_security: true, default_page_size: 50, max_export_rows: 500000, shift_all_to_working: false },
         ui: { primary_color: '#4f46e5', sidebar_collapsed: false, show_row_numbers: true, date_format: 'YYYY-MM-DD', number_format: 'en-US' },
       })
     } finally {
@@ -649,6 +649,36 @@ export default function SettingsPage() {
                     className="w-4 h-4 rounded border-gray-300"
                   />
                   <span className="text-sm text-gray-700">Enable Row-Level Security</span>
+                </label>
+              </div>
+
+              {/* Listing audit mode — when ON, every ARS_LISTING row is copied
+                  into ARS_LISTING_WORKING (including ineligible OPTs). The
+                  allocation engine still only processes ELIG_FLAG=1 rows, so
+                  results are byte-identical to OFF — this toggle only changes
+                  what's visible in the working table preview. */}
+              <div className="pt-4 border-t">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={settings.application?.shift_all_to_working || false}
+                    onChange={e => updateSetting('application', 'shift_all_to_working', e.target.checked)}
+                    className="w-4 h-4 rounded border-gray-300 mt-0.5"
+                  />
+                  <div>
+                    <div className="text-sm font-semibold text-gray-900">
+                      Audit mode — shift all rows to ARS_LISTING_WORKING
+                    </div>
+                    <div className="text-xs text-gray-500 mt-0.5 max-w-xl">
+                      When enabled, every row from ARS_LISTING is copied into the working table,
+                      including OPTs that fail eligibility (no stock, no demand, not listed, no
+                      display, or insufficient TBL size coverage). Allocation still respects the
+                      <span className="font-mono"> ELIG_FLAG </span>
+                      column — output is byte-identical to OFF. Use this for diagnostics: query
+                      <span className="font-mono"> ELIG_REASON </span>
+                      to see why a row was excluded. Larger snapshots / parked tables when ON.
+                    </div>
+                  </div>
                 </label>
               </div>
 

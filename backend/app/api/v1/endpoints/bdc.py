@@ -517,7 +517,10 @@ def _update_do_qty(output_df: pd.DataFrame, engine):
     try:
         cursor = raw.cursor()
         # Create local temp table
-        cols_sql = ", ".join(f"[{c}] NVARCHAR(200)" for c in agg.columns[:-1])
+        cols_sql = ", ".join(
+            f"[{c}] NVARCHAR(200) COLLATE DATABASE_DEFAULT"
+            for c in agg.columns[:-1]
+        )
         cursor.execute(f"CREATE TABLE [{tmp}] ({cols_sql}, [qty] FLOAT)")
         rows = [tuple(r) for r in agg.itertuples(index=False)]
         cursor.executemany(f"INSERT INTO [{tmp}] VALUES({','.join(['?']*len(agg.columns))})", rows)
@@ -790,10 +793,19 @@ async def upload_delivery_order(
             cursor = raw_conn.cursor()
             cursor.fast_executemany = True
 
-            # 1. Create local temp table — all NVARCHAR for safe comparison
+            # 1. Create local temp table — all NVARCHAR for safe comparison.
+            # COLLATE DATABASE_DEFAULT forces the temp columns to take the
+            # user DB's collation instead of tempdb's, otherwise the JOIN
+            # below raises SQL 468 (collation conflict) when the deployment's
+            # tempdb (Latin1_General_CI_AS) differs from the app DB
+            # (SQL_Latin1_General_CP1_CI_AS).
             cursor.execute(f"""
                 CREATE TABLE #do_update_{_do_suffix} (
-                    v NVARCHAR(50), s NVARCHAR(50), m NVARCHAR(50), a NVARCHAR(50), q INT
+                    v NVARCHAR(50) COLLATE DATABASE_DEFAULT,
+                    s NVARCHAR(50) COLLATE DATABASE_DEFAULT,
+                    m NVARCHAR(50) COLLATE DATABASE_DEFAULT,
+                    a NVARCHAR(50) COLLATE DATABASE_DEFAULT,
+                    q INT
                 )
             """)
 

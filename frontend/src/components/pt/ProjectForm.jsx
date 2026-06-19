@@ -1,9 +1,28 @@
 // Modal form for creating or editing a Project Tracker item.
 // `initial` populates the form for edit mode; absence = create mode.
 // `parents` is the flat tree (used to populate the parent-picker).
-// On submit, calls `onSave(payload)` and waits for the promise to resolve.
-import { useEffect, useState } from 'react'
-import { X } from 'lucide-react'
+// On submit, calls `onSave(payload)`. Caller MUST resolve with the project_id
+// (number) so post-create attachment uploads can target it.
+import { useEffect, useRef, useState } from 'react'
+import { Paperclip, Trash2, X, Download, Upload } from 'lucide-react'
+import toast from 'react-hot-toast'
+import { ptAPI } from '@/services/api'
+
+const ATTACH_ALLOWED = ['.xlsx', '.xls', '.csv', '.pdf', '.png', '.jpg', '.jpeg',
+                        '.docx', '.doc', '.txt', '.zip']
+const ATTACH_MAX_BYTES = 25 * 1024 * 1024
+
+function fmtBytes(n) {
+  if (n == null) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+function extOf(name) {
+  const i = (name || '').lastIndexOf('.')
+  return i >= 0 ? name.slice(i).toLowerCase() : ''
+}
 
 const ENUM_FALLBACK = {
   status:   ['DRAFT','NOT_STARTED','IN_PROGRESS','BLOCKED','ON_HOLD','COMPLETED','CANCELLED'],
@@ -25,6 +44,7 @@ const labelStyle = {
 
 export default function ProjectForm({ initial, parents = [], enums, onSave, onClose }) {
   const isEdit = !!initial?.PROJECT_ID
+  const projectId = initial?.PROJECT_ID || null
   const [busy, setBusy] = useState(false)
   const [form, setForm] = useState(() => ({
     parent_id:        initial?.PARENT_ID ?? null,
@@ -43,12 +63,103 @@ export default function ProjectForm({ initial, parents = [], enums, onSave, onCl
     progress_pct:     initial?.PROGRESS_PCT ?? 0,
   }))
 
+  // ── Attachments ──────────────────────────────────────────────────────────
+  // Edit mode: existing[] hydrated from server; uploads happen immediately.
+  // Create mode: staged[] holds File objects to upload after project is created.
+  const [existing, setExisting] = useState([])
+  const [staged,   setStaged]   = useState([]) // [{file, error?}]
+  const [attBusy,  setAttBusy]  = useState(false)
+  const fileInputRef = useRef(null)
+
+  useEffect(() => {
+    if (!projectId) return
+    ptAPI.attachments.list(projectId)
+      .then(r => setExisting(r.data?.data || []))
+      .catch(() => {})
+  }, [projectId])
+
+  const validateFile = (f) => {
+    if (!ATTACH_ALLOWED.includes(extOf(f.name)))
+      return `Type not allowed (${extOf(f.name) || 'no ext'})`
+    if (f.size > ATTACH_MAX_BYTES)
+      return `Too large (${fmtBytes(f.size)} > 25 MB)`
+    if (f.size === 0) return 'File is empty'
+    return null
+  }
+
+  const onPickFiles = async (e) => {
+    const files = Array.from(e.target.files || [])
+    e.target.value = '' // allow re-selecting the same file later
+    if (!files.length) return
+
+    if (!isEdit) {
+      // Stage for upload after create
+      setStaged(prev => [
+        ...prev,
+        ...files.map(f => ({ file: f, error: validateFile(f) })),
+      ])
+      return
+    }
+
+    // Edit mode → upload now
+    setAttBusy(true)
+    try {
+      for (const f of files) {
+        const err = validateFile(f)
+        if (err) { toast.error(`${f.name}: ${err}`); continue }
+        try {
+          await ptAPI.attachments.upload(projectId, f)
+          toast.success(`Uploaded ${f.name}`)
+        } catch {
+          toast.error(`Failed to upload ${f.name}`)
+        }
+      }
+      const r = await ptAPI.attachments.list(projectId)
+      setExisting(r.data?.data || [])
+    } finally {
+      setAttBusy(false)
+    }
+  }
+
+  const removeStaged = (idx) => {
+    setStaged(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  const deleteExisting = async (aid, name) => {
+    if (!confirm(`Remove attachment '${name}'?`)) return
+    try {
+      await ptAPI.attachments.delete(aid)
+      setExisting(prev => prev.filter(a => a.ATTACHMENT_ID !== aid))
+      toast.success('Removed')
+    } catch {
+      toast.error('Failed to remove')
+    }
+  }
+
+  const downloadExisting = async (aid, name) => {
+    try {
+      const res = await ptAPI.attachments.download(aid)
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url; a.download = name
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch {
+      toast.error('Failed to download')
+    }
+  }
+
   const enumFor = (k) => (enums?.[k] && enums[k].length ? enums[k] : ENUM_FALLBACK[k])
   const setField = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     if (!form.name.trim()) return
+    // Block submit if any staged file has a validation error
+    if (staged.some(s => s.error)) {
+      toast.error('Fix attachment errors before saving')
+      return
+    }
     setBusy(true)
     try {
       const payload = { ...form }
@@ -62,7 +173,16 @@ export default function ProjectForm({ initial, parents = [], enums, onSave, onCl
       if (payload.parent_id === '' || payload.parent_id === undefined) payload.parent_id = null
       if (payload.parent_id !== null) payload.parent_id = parseInt(payload.parent_id, 10)
 
-      await onSave(payload)
+      const savedId = await onSave(payload)
+
+      // Upload staged files for newly-created project (best-effort)
+      if (!isEdit && staged.length && savedId) {
+        for (const s of staged) {
+          if (s.error) continue
+          try { await ptAPI.attachments.upload(savedId, s.file) }
+          catch { toast.error(`Failed to upload ${s.file.name}`) }
+        }
+      }
     } finally {
       setBusy(false)
     }
@@ -219,6 +339,110 @@ export default function ProjectForm({ initial, parents = [], enums, onSave, onCl
               onChange={e => setField('tags', e.target.value)}
               placeholder="comma, separated, tags" />
           </div>
+
+          {/* Attachments */}
+          <div>
+            <label style={labelStyle}>
+              <Paperclip size={11} style={{ display: 'inline', marginRight: 4, verticalAlign: -1 }} />
+              Attachments — sample / reference data
+            </label>
+            <div style={{
+              border: '1px dashed #d1d5db', borderRadius: 6, padding: 10,
+              background: '#f9fafb',
+            }}>
+              <input ref={fileInputRef} type="file" multiple
+                accept={ATTACH_ALLOWED.join(',')}
+                onChange={onPickFiles}
+                style={{ display: 'none' }} />
+              <button type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={attBusy}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '6px 12px', background: '#fff',
+                  border: '1px solid #d1d5db', borderRadius: 6,
+                  fontSize: 12, fontWeight: 600, cursor: attBusy ? 'wait' : 'pointer',
+                  color: '#374151',
+                }}>
+                <Upload size={13} />
+                {attBusy ? 'Uploading…' : 'Add files'}
+              </button>
+              <span style={{ marginLeft: 10, fontSize: 11, color: '#6b7280' }}>
+                xlsx, xls, csv, pdf, docx, doc, txt, png, jpg, zip · max 25 MB each
+              </span>
+
+              {/* Existing (edit mode) */}
+              {existing.length > 0 && (
+                <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+                  {existing.map(a => (
+                    <div key={a.ATTACHMENT_ID} style={attRowStyle}>
+                      <Paperclip size={12} color="#6b7280" />
+                      <button type="button"
+                        onClick={() => downloadExisting(a.ATTACHMENT_ID, a.ORIGINAL_NAME)}
+                        style={{ background: 'transparent', border: 'none', padding: 0,
+                                 color: '#4f46e5', fontSize: 12, fontWeight: 500,
+                                 textAlign: 'left', cursor: 'pointer', flex: 1,
+                                 overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                        title={a.ORIGINAL_NAME}>
+                        {a.ORIGINAL_NAME}
+                      </button>
+                      <span style={{ fontSize: 11, color: '#6b7280' }}>{fmtBytes(a.FILE_SIZE)}</span>
+                      <span style={{ fontSize: 11, color: '#9ca3af' }}>{a.UPLOADED_BY}</span>
+                      <button type="button" title="Download"
+                        onClick={() => downloadExisting(a.ATTACHMENT_ID, a.ORIGINAL_NAME)}
+                        style={iconLinkStyle}>
+                        <Download size={13} />
+                      </button>
+                      <button type="button" title="Remove"
+                        onClick={() => deleteExisting(a.ATTACHMENT_ID, a.ORIGINAL_NAME)}
+                        style={{ ...iconLinkStyle, color: '#dc2626' }}>
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Staged (create mode) */}
+              {staged.length > 0 && (
+                <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+                  {staged.map((s, i) => (
+                    <div key={i} style={{ ...attRowStyle,
+                                          background: s.error ? '#fef2f2' : '#eef2ff',
+                                          borderColor: s.error ? '#fecaca' : '#c7d2fe' }}>
+                      <Paperclip size={12} color={s.error ? '#dc2626' : '#4f46e5'} />
+                      <span style={{ fontSize: 12, fontWeight: 500, flex: 1,
+                                     color: s.error ? '#991b1b' : '#374151',
+                                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                            title={s.file.name}>
+                        {s.file.name}
+                      </span>
+                      <span style={{ fontSize: 11, color: '#6b7280' }}>{fmtBytes(s.file.size)}</span>
+                      {s.error && (
+                        <span style={{ fontSize: 11, color: '#dc2626' }}>{s.error}</span>
+                      )}
+                      <button type="button" title="Remove"
+                        onClick={() => removeStaged(i)}
+                        style={{ ...iconLinkStyle, color: '#dc2626' }}>
+                        <X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                  {!isEdit && (
+                    <div style={{ fontSize: 11, color: '#6b7280', marginTop: 2 }}>
+                      These files will upload after the project is created.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {existing.length === 0 && staged.length === 0 && (
+                <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 8 }}>
+                  No files attached yet.
+                </div>
+              )}
+            </div>
+          </div>
         </div>
 
         {/* Footer */}
@@ -240,4 +464,16 @@ export default function ProjectForm({ initial, parents = [], enums, onSave, onCl
       </form>
     </div>
   )
+}
+
+const attRowStyle = {
+  display: 'flex', alignItems: 'center', gap: 8,
+  padding: '6px 10px', borderRadius: 6,
+  background: '#fff', border: '1px solid #e5e7eb',
+}
+
+const iconLinkStyle = {
+  background: 'transparent', border: 'none', cursor: 'pointer',
+  padding: 4, display: 'inline-flex', alignItems: 'center',
+  color: '#6b7280', borderRadius: 4, textDecoration: 'none',
 }

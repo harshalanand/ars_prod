@@ -84,18 +84,18 @@ def run_listing_and_allocation(
     # and does not re-scale; this param is informational (audit log only).
     mj_req_growth_pct:  float = 100.0,
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only (default = all)
-    apply_sec_cap_in_normal: bool = True,    # 130% cap on Secondary grids in main pass
+    apply_sec_cap_in_normal: bool = True,    # strict per-grid cap on Secondary + opted-in Primary grids
 ) -> Dict:
     """
     Orchestrates Stages A–D. See docs/NEW_RULE_ENGINE_SPEC.md.
 
     Secondary-grid cap (when apply_sec_cap_in_normal=True): after the main
     waterfall completes and before Stage D, every OPT is re-evaluated by
-    `_apply_sec_grid_cap_pre_gate` at OPT grain. An OPT is skipped whole if
-    shipping it would push any of its Secondary grids
-    (per ARS_GRID_BUILDER.grid_group) over 130% of that grid's MBQ — UNLESS
-    OPT_REQ ≥ SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT × OPT_MBQ, in which case the
-    high demand earns the OPT an override.
+    `_apply_sec_grid_cap_pre_gate` at OPT grain. An OPT is skipped whole when
+    shipping it would push any participating grid past its budget — strict
+    semantics, no high-demand override. Budget per grid grain is
+    max(0, MBQ_ORIG × cap_pct − STK_TTL). Grids with
+    ARS_GRID_BUILDER.sec_cap_applicable=0 are skipped entirely.
 
     TBL is no longer MBQ-capped. Its natural per-size SZ_REQ ceiling
     (Σ SZ_REQ across sizes == MJ_REQ) plus a final downward clamp
@@ -1940,6 +1940,7 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
                                      tbc_cap_pct: float,
                                      tbl_cap_pct: float,
                                      mbq_gate_factor: float = 0.5,
+                                     skip_tbl_branch: bool = False,
                                      ) -> None:
     """OPT-grain MJ_REQ gate (sequential req_rem consumption).
 
@@ -2077,6 +2078,16 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
             n_shipped += 1
             n_shipped_in_slice += 1
             continue
+        # Per-OPT engine ownership: when skip_tbl_branch=True (ARS_PER_OPT_MODE
+        # path), the TBL MJ_REQ_GATE has already been evaluated PRE-allocation
+        # in rule_engine_per_opt._run_band_per_opt. Treat surviving TBL OPTs
+        # the same as RL/TBC here — consume req_rem for accounting only, do
+        # NOT add to skip_records (would zero their SHIP/HOLD post-hoc).
+        if skip_tbl_branch:
+            req_rem -= opt_ship
+            n_shipped += 1
+            n_shipped_in_slice += 1
+            continue
         if cap_pct <= 0.0:
             # TBL cap disabled → always skip
             skip_records.append({
@@ -2161,14 +2172,17 @@ def _stage_c_apply_opt_mj_req_gate(conn, alloc_table: str, working_table: str,
             _run(conn, "DROP TABLE #OptSkip")
         except Exception:
             pass
+        # COLLATE DATABASE_DEFAULT forces these NVARCHAR columns to use the
+        # Rep_Data DB collation instead of tempdb's, so JOINs against the
+        # persistent allocation tables don't trip error 468.
         _run(conn, """
             CREATE TABLE #OptSkip (
-                WERKS          NVARCHAR(80)   NOT NULL,
-                MAJ_CAT        NVARCHAR(120)  NOT NULL,
-                GEN_ART_NUMBER NVARCHAR(80)   NOT NULL,
-                CLR_K          NVARCHAR(80)   NOT NULL,
-                OPT_TYPE       NVARCHAR(10)   NOT NULL,
-                skip_reason    NVARCHAR(500)  NOT NULL,
+                WERKS          NVARCHAR(80)   COLLATE DATABASE_DEFAULT NOT NULL,
+                MAJ_CAT        NVARCHAR(120)  COLLATE DATABASE_DEFAULT NOT NULL,
+                GEN_ART_NUMBER NVARCHAR(80)   COLLATE DATABASE_DEFAULT NOT NULL,
+                CLR_K          NVARCHAR(80)   COLLATE DATABASE_DEFAULT NOT NULL,
+                OPT_TYPE       NVARCHAR(10)   COLLATE DATABASE_DEFAULT NOT NULL,
+                skip_reason    NVARCHAR(500)  COLLATE DATABASE_DEFAULT NOT NULL,
                 budget         DECIMAL(18, 2) NULL,
                 opt_mbq        DECIMAL(18, 2) NULL,
                 PRIMARY KEY (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR_K, OPT_TYPE)
@@ -2972,7 +2986,7 @@ def _stage_d_reflect(conn, working_table, alloc_table):
     # row in alloc_table. All sizes of the same OPT share one number.
     try:
         _run(conn, f"""
-            UPDATE A SET A.ALLOC_SEQ = W.ALLOC_SEQ
+            UPDATE A WITH (ROWLOCK, UPDLOCK) SET A.ALLOC_SEQ = W.ALLOC_SEQ
             FROM [{alloc_table}] A
             INNER JOIN [{working_table}] W
                 ON  W.WERKS          = A.WERKS
@@ -3048,26 +3062,56 @@ def _stage_d_reflect(conn, working_table, alloc_table):
     # Split the "no pool" bucket into the two real causes so users can tell
     # demand-side issues (OPT_REQ=0 → store didn't need stock) from supply-side
     # issues (had demand, RDC pool was empty → MSA exhausted at OPT-grain).
+    #
+    # SEC_CAP-aware: when an OPT was blocked by the sec-cap pre-gate (per-OPT
+    # OR post-pass), the alloc rows already carry SKIP_REASON='SEC_CAP_PRE_*'
+    # and a plain-English remark. In that case use the sec-cap reason on
+    # the working row (instead of appending the misleading NO_POOL_MSA tag)
+    # and replace the working-row remark with the clean sec-cap narrative so
+    # both alloc-grain and OPT-grain views agree.
     _run(conn, f"""
-        UPDATE [{working_table}] SET ALLOC_STATUS = 'NOT_ALLOCATED',
-               ALLOC_PHASE  = ISNULL(ALLOC_PHASE, 'MAIN'),
-               ALLOC_REASON = ISNULL(ALLOC_REASON,
-                   CASE WHEN ISNULL(OPT_REQ, 0) <= 0
-                        THEN 'BLOCKED_NO_REQ'
-                        ELSE 'BLOCKED_NO_POOL_MSA' END),
-               ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'') +
-                   CASE WHEN ISNULL(OPT_REQ, 0) <= 0
-                        THEN ' NO_REQ(OPT_REQ=0, OPT_MBQ='
-                             + CAST(ISNULL(OPT_REQ,0) AS NVARCHAR(20))
-                             + '/' + CAST(ISNULL(OPT_MBQ,0) AS NVARCHAR(20)) + ')'
-                        ELSE ' NO_POOL_MSA(OPT_REQ='
-                             + CAST(ISNULL(OPT_REQ,0) AS NVARCHAR(20))
-                             + ', MSA_FNL_Q=' + CAST(ISNULL(MSA_FNL_Q,0) AS NVARCHAR(20))
-                             + ', MSA_FNL_Q_REM=' + CAST(ISNULL(MSA_FNL_Q_REM,0) AS NVARCHAR(20))
-                             + ')' END
-        WHERE LISTED_FLAG = 1
-          AND (ALLOC_QTY  IS NULL OR ALLOC_QTY  = 0)
-          AND (HOLD_QTY   IS NULL OR HOLD_QTY   = 0)
+        ;WITH sec_blocked AS (
+            SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, ISNULL(CLR,'') AS CLR_J,
+                   MAX(SKIP_REASON)    AS sec_skip,
+                   MAX(ALLOC_REMARKS)  AS sec_remark
+            FROM [{alloc_table}]
+            WHERE SKIP_REASON LIKE 'SEC_CAP_PRE_%'
+            GROUP BY WERKS, MAJ_CAT, GEN_ART_NUMBER, ISNULL(CLR,'')
+        )
+        UPDATE W SET
+            W.ALLOC_STATUS = 'NOT_ALLOCATED',
+            W.ALLOC_PHASE  = ISNULL(W.ALLOC_PHASE, 'MAIN'),
+            W.ALLOC_REASON = ISNULL(W.ALLOC_REASON,
+                CASE WHEN B.sec_skip IS NOT NULL THEN B.sec_skip
+                     WHEN ISNULL(W.OPT_REQ, 0) <= 0 THEN 'BLOCKED_NO_REQ'
+                     ELSE 'BLOCKED_NO_POOL_MSA' END),
+            W.ALLOC_REMARKS = CASE
+                WHEN B.sec_skip IS NOT NULL THEN
+                    -- Replace prior working-row remark (which may contain
+                    -- a stale waterfall "B[…] ship=N" prefix) with the
+                    -- clean sec-cap narrative copied from the alloc row.
+                    ISNULL(B.sec_remark, '')
+                ELSE
+                    ISNULL(W.ALLOC_REMARKS,'') +
+                    CASE WHEN ISNULL(W.OPT_REQ, 0) <= 0
+                         THEN ' NO_REQ(OPT_REQ=0, OPT_MBQ='
+                              + CAST(ISNULL(W.OPT_REQ,0) AS NVARCHAR(20))
+                              + '/' + CAST(ISNULL(W.OPT_MBQ,0) AS NVARCHAR(20)) + ')'
+                         ELSE ' NO_POOL_MSA(OPT_REQ='
+                              + CAST(ISNULL(W.OPT_REQ,0) AS NVARCHAR(20))
+                              + ', MSA_FNL_Q=' + CAST(ISNULL(W.MSA_FNL_Q,0) AS NVARCHAR(20))
+                              + ', MSA_FNL_Q_REM=' + CAST(ISNULL(W.MSA_FNL_Q_REM,0) AS NVARCHAR(20))
+                              + ')' END
+            END
+        FROM [{working_table}] W
+        LEFT JOIN sec_blocked B
+            ON  B.WERKS = W.WERKS
+            AND B.MAJ_CAT = W.MAJ_CAT
+            AND B.GEN_ART_NUMBER = W.GEN_ART_NUMBER
+            AND B.CLR_J = ISNULL(W.CLR, '')
+        WHERE W.LISTED_FLAG = 1
+          AND (W.ALLOC_QTY  IS NULL OR W.ALLOC_QTY  = 0)
+          AND (W.HOLD_QTY   IS NULL OR W.HOLD_QTY   = 0)
     """)
 
 
@@ -3220,14 +3264,6 @@ def _ensure_phase_reason_cols(conn, alloc_table: str,
 # ARS_GRID_BUILDER.sec_cap_pct is NULL (no per-grid override).
 SEC_CAP_DEFAULT_PCT = 130.0
 
-# High-demand override for the pre-gate sec-cap: when an OPT would breach a
-# Secondary grid's 130% budget, admit it anyway if its OPT_REQ is at least
-# this fraction of its OPT_MBQ. Rationale — only OPTs the store needs at
-# full display capacity (or higher) get to bypass the sec-cap; lower-demand
-# OPTs respect the grid budget. The earlier 50% default was too lax —
-# virtually every listed OPT cleared 50% × OPT_MBQ, making the cap a no-op.
-SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT = 100.0
-
 
 def _discover_all_active_grids(conn) -> Dict[str, Dict]:
     """
@@ -3331,56 +3367,36 @@ def _apply_sec_grid_cap_pre_gate(
     include_primary: bool = False,
 ) -> Dict[str, Any]:
     """
-    Secondary-grid PRE-GATE cap (main pass, May-2026 redesign).
+    Sec-cap PRE-GATE (main pass, strict mode — June 2026).
 
-    Unlike _apply_sec_grid_cap (post-trim) — which lets the waterfall ship
-    everything and then trims partial rows backwards — this helper decides at
-    OPT grain whether the whole OPT may ship. An OPT either ships in full to
-    the store or doesn't ship at all; no half-trimmed VAR_ART × SZ rows.
+    Decides at OPT grain whether the whole OPT may ship. An OPT either ships
+    in full to the store or doesn't ship at all; no half-trimmed rows.
 
-    Algorithm — "keep checking" (a skip does NOT close the grid):
-
-      1. For each Secondary grid (per ARS_GRID_BUILDER.grid_group), precompute
-         budget per (WERKS, MAJ_CAT, <grid_extras>) = MAX(MBQ_<grid>) × 1.30.
+    Algorithm:
+      1. For each opted-in grid (ARS_GRID_BUILDER.sec_cap_applicable=1; MJ
+         participates when include_primary=True), precompute per-grain budget
+            budget = max(0, MBQ_ORIG_grain × cap_pct − STK_TTL_grain)
+         using {prefix}_MBQ_ORIG and {prefix}_STK_TTL on the working table.
+         Per-grid cap_pct comes from ARS_GRID_BUILDER.sec_cap_pct (defaults
+         to max(SEC_CAP_DEFAULT_PCT, growth_pct) when NULL).
       2. Aggregate alloc_table to OPT grain — one row per
-         (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE) carrying SUM(SHIP_QTY),
-         OPT_REQ, OPT_MBQ, and every Secondary grid's extra
-         (FAB, MICRO_MVGR, CLR, M_VND_CD).
+         (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE) carrying
+         SUM(SHIP_QTY) and every participating grid's extra column.
       3. Walk OPTs in priority order (OPT_PRIORITY_RANK ASC, ST_RANK ASC,
          GEN_ART_NUMBER ASC, CLR ASC, OPT_TYPE ASC), keeping per-grid running
-         totals.
-      4. For each OPT, evaluate ALL its Secondary grids. A grid is skipped
-         entirely for the OPT when EITHER applicability gate fails (OR logic
-         — running totals are NOT advanced on a skipped grid):
-            GH_<HC> = 0 for this MAJ_CAT — the grid does not apply (per
-                ARS_GRID_HIERARCHY / Part 7), OR
-            <grid>_MBQ = 0 at this grain — no MBQ configured (*_MBQ columns
-                are sparse; zero means "unconstrained", not "zero").
-         On grids that survive both gates, breach = (running + opt_ship >
-         budget). The first breaching grid wins the blame for SKIP_REASON
-         (multi-grid AND short-circuits on the first failure).
-      5. HIGH-DEMAND OVERRIDE: when a breach exists, check
-            OPT_REQ >= SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT / 100 × OPT_MBQ.
-         If yes — admit the OPT despite the breach, advance running on every
-         grid, and stamp an 'SEC_CAP_PRE_OVERRIDE(...)' remark on its rows.
-         If no — block the OPT, running totals are NOT advanced.
-      6. Bulk-update alloc_table: blocked OPTs get SHIP_QTY=0, ALLOC_QTY=0,
-         ALLOC_STATUS=SKIPPED, SKIP_REASON='SEC_CAP_PRE_<grid>', ALLOC_REMARKS
-         appended with the diagnostic 'SEC_CAP_PRE_BLOCK(grid=…, running=…,
-         intended=…, budget=…)'. Overridden OPTs keep their SHIP_QTY and get
-         only the override remark.
+         totals. A grid is skipped for an OPT when GH_<HC>=0 or the grain has
+         no MBQ configured. On surviving grids, breach = (running + opt_ship
+         > budget). First breaching grid wins the SKIP_REASON.
+      4. Strict: breach = block. No high-demand override. Blocked OPTs get
+         SHIP_QTY=0, ALLOC_STATUS='SKIPPED', SKIP_REASON='SEC_CAP_PRE_<grid>',
+         and a diagnostic ALLOC_REMARKS narrative with all the numbers.
 
-    Why no pool restore: blocked OPTs were never *committed* in the sense that
-    the waterfall already deducted their units from #nre_pool when SHIP_QTY was
-    written. To restore correctly we'd need the same logic as the post-trim
-    helper. The simpler path the user requested: keep blocked stock in the
-    SHIP_QTY=0 alloc rows; downstream fallback re-derives the pool from the
-    current FNL_Q_REM state (see rule_engine_pandas main-pass pool rebuild)
-    or re-reads alloc_table totals. The net effect is the same — stock the
-    main pass would have shipped is now available for fallback.
+    Pool restore is not needed: the SHIP_QTY=0 alloc rows leave the
+    waterfall-deducted #nre_pool units available; downstream rebuild reads
+    the current FNL_Q_REM state.
 
     Returns audit dict: {mode, cap_pct, grids_evaluated, opts_blocked,
-    units_blocked, blocks_by_grid}.
+    units_blocked, blocks_by_grid, cap_pct_by_grid}.
     """
     # Decision 2: effective cap = max(SEC_CAP_DEFAULT_PCT, growth_pct).
     # Growth REPLACES the 130% baseline when it's larger — caps don't stack.
@@ -3439,11 +3455,20 @@ def _apply_sec_grid_cap_pre_gate(
         # Anchor the cap to {prefix}_MBQ_ORIG (pre-growth) when present, so
         # the gate respects "growth replaces 130%, doesn't stack".  Engine
         # falls back to live MBQ on legacy deployments without ORIG.
-        mbq_orig = f"{meta.get('prefix','')}_MBQ_ORIG" if meta.get("prefix") else ""
+        prefix = meta.get("prefix", "") or ""
+        mbq_orig = f"{prefix}_MBQ_ORIG" if prefix else ""
         anchor_col = mbq_orig if mbq_orig and mbq_orig.upper() in work_cols else mbq
+        # STK_TTL at the grid grain — strict budget subtracts this from the
+        # MBQ_ORIG × cap_factor ceiling. Materialised by /listing-build Part 4
+        # for every grid. Falls back to None on legacy grids without the
+        # column; the loader then treats missing STK as 0 for that grid.
+        stk_ttl_col = f"{prefix}_STK_TTL" if prefix else ""
+        stk_col_eff = stk_ttl_col if stk_ttl_col and stk_ttl_col.upper() in work_cols else None
         sec_grids.append((g_name, {
             "mbq":        anchor_col,        # budget reads ORIG → post-growth-stable
             "mbq_live":   mbq,               # kept for diagnostics
+            "stk_ttl":    stk_col_eff,       # grain-level current stock (subtracted from cap)
+            "prefix":     prefix,
             "extras":     extras,
             "is_primary": is_primary_mj,
             "gh_col":     gh_col if gh_col.upper() in work_cols else None,
@@ -3454,15 +3479,11 @@ def _apply_sec_grid_cap_pre_gate(
     audit: Dict[str, Any] = {
         "mode": "pre_gate",
         "cap_pct": cap_pct,  # global default; per-grid overrides recorded below
-        "override_req_pct": SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT,
         "grids_evaluated": len(sec_grids),
         "grids_skipped_not_applicable": skipped_not_applicable,
         "opts_blocked": 0,
         "units_blocked": 0.0,
-        "opts_overridden": 0,
-        "units_overridden": 0.0,
         "blocks_by_grid": {n: 0 for n, _ in sec_grids},
-        "overrides_by_grid": {n: 0 for n, _ in sec_grids},
         "cap_pct_by_grid": {n: m["cap_pct"] for n, m in sec_grids},
     }
     if not sec_grids:
@@ -3480,18 +3501,29 @@ def _apply_sec_grid_cap_pre_gate(
     ot_params: Dict[str, Any] = {"ot": opt_type} if opt_type else {}
 
     # ── Step 1: budgets per (grid, grain) ─────────────────────────────────
-    # Budget uses the *per-grid* cap_factor (m["cap_factor"]). Falls back to
-    # the global SEC_CAP_DEFAULT_PCT factor when the grid has no override.
-    budgets: Dict[str, Dict[tuple, float]] = {}
+    # Strict formula: budget = max(0, MBQ_ORIG × cap_factor − STK_TTL_grain).
+    # `budgets_pre_stk` preserves the pre-STK ceiling so the skip-grid test
+    # below can distinguish "no MBQ configured at this grain" (skip the grid)
+    # from "grain already over the cap" (must block).
+    # Legacy grids without the {prefix}_STK_TTL column treat STK as 0 (the
+    # strict formula then degenerates to the old MBQ × cap_factor budget for
+    # that single grid — back-compat).
+    budgets: Dict[str, Dict[tuple, float]] = {}          # max(0, ceiling − stk)
+    budgets_pre_stk: Dict[str, Dict[tuple, float]] = {}  # ceiling = MBQ_ORIG × cap_factor
+    stk_grain: Dict[str, Dict[tuple, float]] = {}        # STK_TTL at grain (for remarks)
+    mbq_grain: Dict[str, Dict[tuple, float]] = {}        # MBQ_ORIG at grain (for remarks)
     for g_name, m in sec_grids:
         extras = m["extras"]
         mbq = m["mbq"]
+        stk_col = m.get("stk_ttl")
         grid_factor = m["cap_factor"]
         sel_keys = ["WERKS", "MAJ_CAT"] + extras
         sel_sql = ", ".join(f"[{k}]" for k in sel_keys)
+        stk_sel = (f", MAX(ISNULL([{stk_col}], 0)) AS stk_val"
+                   if stk_col else "")
         try:
             rows = conn.execute(text(f"""
-                SELECT {sel_sql}, MAX(ISNULL([{mbq}], 0)) AS mbq_val
+                SELECT {sel_sql}, MAX(ISNULL([{mbq}], 0)) AS mbq_val{stk_sel}
                 FROM [{working_table}]
                 GROUP BY {sel_sql}
             """)).fetchall()
@@ -3499,10 +3531,25 @@ def _apply_sec_grid_cap_pre_gate(
             logger.warning(f"[sec_cap_pre] budget load failed for {g_name}: {str(e)[:200]}")
             continue
         bmap: Dict[tuple, float] = {}
+        bmap_pre: Dict[tuple, float] = {}
+        smap: Dict[tuple, float] = {}
+        mmap: Dict[tuple, float] = {}
         for r in rows:
             grain = tuple(r[i] for i in range(len(sel_keys)))
-            bmap[grain] = float(r[-1] or 0) * grid_factor
+            mbq_val = float(r[len(sel_keys)] or 0)
+            pre = mbq_val * grid_factor
+            bmap_pre[grain] = pre
+            mmap[grain] = mbq_val
+            if stk_col:
+                stk_val = float(r[len(sel_keys) + 1] or 0)
+                smap[grain] = stk_val
+                bmap[grain] = max(0.0, pre - stk_val)
+            else:
+                bmap[grain] = pre
         budgets[g_name] = bmap
+        budgets_pre_stk[g_name] = bmap_pre
+        stk_grain[g_name] = smap
+        mbq_grain[g_name] = mmap
 
     # ── Step 1b: GH_<HC> per MAJ_CAT per grid (grid applicability flag) ──
     # GH_<HC> is set in Part 7 to 1 when the grid's hierarchy column is active
@@ -3541,25 +3588,12 @@ def _apply_sec_grid_cap_pre_gate(
     extra_sel = ", ".join(f"MAX(A.[{e}]) AS [{e}]" for e in extra_cols)
     extra_sel_sql = (", " + extra_sel) if extra_sel else ""
 
-    # OPT-grain REQ / MBQ for the high-demand override. Both originate at
-    # OPT grain in working_table and are propagated to alloc_table by Stage B.
-    # MAX is fine because every VAR_ART × SZ row for the same OPT carries the
-    # same value.
-    has_opt_req = "OPT_REQ" in alloc_cols
-    has_opt_mbq = "OPT_MBQ" in alloc_cols
-    opt_req_sel = "MAX(ISNULL(A.OPT_REQ, 0)) AS opt_req" if has_opt_req \
-                  else "CAST(0 AS FLOAT) AS opt_req"
-    opt_mbq_sel = "MAX(ISNULL(A.OPT_MBQ, 0)) AS opt_mbq" if has_opt_mbq \
-                  else "CAST(0 AS FLOAT) AS opt_mbq"
-
     try:
         opts = conn.execute(text(f"""
             SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR, A.OPT_TYPE,
                    MAX(ISNULL(A.OPT_PRIORITY_RANK, 999999)) AS opt_pri,
                    MAX(ISNULL(A.ST_RANK,           999999)) AS st_rank,
-                   SUM(ISNULL(A.SHIP_QTY, 0))               AS opt_ship,
-                   {opt_req_sel},
-                   {opt_mbq_sel}
+                   SUM(ISNULL(A.SHIP_QTY, 0))               AS opt_ship
                    {extra_sel_sql}
             FROM [{alloc_table}] A
             WHERE ISNULL(A.SHIP_QTY, 0) > 0 {ot_filter}
@@ -3577,16 +3611,13 @@ def _apply_sec_grid_cap_pre_gate(
         return audit
 
     base_cols = ["WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "OPT_TYPE",
-                 "opt_pri", "st_rank", "opt_ship", "opt_req", "opt_mbq"]
+                 "opt_pri", "st_rank", "opt_ship"]
     col_index = {c: i for i, c in enumerate(base_cols + extra_cols)}
 
     # ── Step 3: priority-ordered walk with per-grid running totals ────────
-    override_ratio = SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT / 100.0
     running: Dict[tuple, float] = {}  # (g_name, grain) -> running ship
     blocked: List[tuple] = []
     # (WERKS, MAJ_CAT, GEN_ART, CLR, OPT_TYPE, blocking_grid, running, intended, budget)
-    overridden: List[tuple] = []
-    # (WERKS, MAJ_CAT, GEN_ART, CLR, OPT_TYPE, breach_grid, running, intended, budget, opt_req, opt_mbq)
 
     for r in opts:
         werks   = r[col_index["WERKS"]]
@@ -3595,8 +3626,6 @@ def _apply_sec_grid_cap_pre_gate(
         clr     = r[col_index["CLR"]]
         otype   = r[col_index["OPT_TYPE"]]
         ship    = float(r[col_index["opt_ship"]] or 0)
-        opt_req = float(r[col_index["opt_req"]] or 0)
-        opt_mbq = float(r[col_index["opt_mbq"]] or 0)
         if ship <= 0:
             continue
 
@@ -3622,31 +3651,30 @@ def _apply_sec_grid_cap_pre_gate(
             # (column missing); fall back to MBQ-only gate in that case.
             gh_map = gh_by_grid.get(g_name) or {}
             gh_applies = (gh_map.get(majc, 1) == 1) if gh_map else True
-            if (not gh_applies) or (budget <= 0):
+            # Skip-grid criterion uses the PRE-STK budget so that
+            # "no MBQ configured at this grain" (legitimate skip) is
+            # distinguished from "grain already over the cap" (must block).
+            budget_pre = budgets_pre_stk.get(g_name, {}).get(grain, 0.0)
+            if (not gh_applies) or (budget_pre <= 0):
                 continue
 
             per_grid.append((g_name, grain, run_before, budget))
             if breach is None and run_before + ship > budget:
                 breach = (g_name, grain, run_before, budget)
-                # Don't break — finish gathering per_grid for the override path
-                # so we can advance running on every grid if we admit.
+                # Don't break — finish gathering per_grid so we know every
+                # grid this OPT touches for diagnostic purposes (only the
+                # first breaching grid wins SKIP_REASON).
 
         if breach is not None:
             g_name, grain, run_before, budget = breach
-            # High-demand override: OPT_REQ >= 50% × OPT_MBQ → admit anyway.
-            if opt_mbq > 0 and opt_req >= override_ratio * opt_mbq:
-                for gn, gr, rb, _ in per_grid:
-                    running[(gn, gr)] = rb + ship
-                overridden.append((werks, majc, gen, clr, otype,
-                                   g_name, run_before, ship, budget,
-                                   opt_req, opt_mbq))
-                audit["opts_overridden"]  += 1
-                audit["units_overridden"] += ship
-                audit["overrides_by_grid"][g_name] = audit["overrides_by_grid"].get(g_name, 0) + 1
-                continue
-            # No override — block.
+            # Strict semantics: breach = block, no exceptions.
+            # Carry stk / mbq_orig / ceiling for the user-facing remark.
+            stk_val = stk_grain.get(g_name, {}).get(grain, 0.0)
+            mbq_orig_val = mbq_grain.get(g_name, {}).get(grain, 0.0)
+            ceiling_val = budgets_pre_stk.get(g_name, {}).get(grain, 0.0)
             blocked.append((werks, majc, gen, clr, otype,
-                            g_name, run_before, ship, budget))
+                            g_name, run_before, ship, budget,
+                            stk_val, mbq_orig_val, ceiling_val))
             audit["opts_blocked"]   += 1
             audit["units_blocked"]  += ship
             audit["blocks_by_grid"][g_name] = audit["blocks_by_grid"].get(g_name, 0) + 1
@@ -3656,16 +3684,23 @@ def _apply_sec_grid_cap_pre_gate(
         for g_name, grain, run_before, _ in per_grid:
             running[(g_name, grain)] = run_before + ship
 
-    if not blocked and not overridden:
+    if not blocked:
         logger.info(
             f"[sec_cap_pre] cap={cap_pct:.0f}% grids={[n for n,_ in sec_grids]} "
-            f"evaluated={len(opts)} blocked=0 overridden=0"
+            f"evaluated={len(opts)} blocked=0"
         )
         return audit
 
-    # ── Step 4: bulk-update blocked + overridden OPTs ─────────────────────
-    # One temp table carries both groups, distinguished by `decision`. Types
-    # for the key columns mirror alloc_table via a 0-row SELECT INTO.
+    # ── Step 4: bulk-update blocked OPTs ─────────────────────────────────
+    # Two-phase update so the remark only lands on rows that the waterfall
+    # had actually shipped (ISNULL(SHIP_QTY,0) > 0). Rows already SKIPPED for
+    # other reasons (ALREADY_STOCKED, NO_POOL_MSA, SKIP_PRI_BROKEN) keep
+    # their own remarks untouched — they didn't cause the breach.
+    #
+    # ALLOC_REMARKS is REPLACED (not appended) for shipping rows so the
+    # misleading waterfall "B[…] ship=N" prefix doesn't sit next to a
+    # SHIP_QTY=0 outcome. The original waterfall narrative is preserved
+    # inside the new message as "waterfall_intended=…" for audit.
     try:
         _run(conn, "IF OBJECT_ID('tempdb..#sec_cap_pre_decisions') IS NOT NULL DROP TABLE #sec_cap_pre_decisions")
         _run(conn, f"""
@@ -3676,74 +3711,92 @@ def _apply_sec_grid_cap_pre_gate(
         """)
         _run(conn, """
             ALTER TABLE #sec_cap_pre_decisions ADD
-                decision      NVARCHAR(10)  NULL,
                 blocking_grid NVARCHAR(100) NULL,
                 running_val   FLOAT         NULL,
                 intended_val  FLOAT         NULL,
                 budget_val    FLOAT         NULL,
-                opt_req_val   FLOAT         NULL,
-                opt_mbq_val   FLOAT         NULL,
-                cap_pct_val   FLOAT         NULL
+                cap_pct_val   FLOAT         NULL,
+                stk_val       FLOAT         NULL,
+                mbq_orig_val  FLOAT         NULL,
+                ceiling_val   FLOAT         NULL
         """)
 
         insert_sql = text("""
             INSERT INTO #sec_cap_pre_decisions
                 (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE,
-                 decision, blocking_grid, running_val, intended_val, budget_val,
-                 opt_req_val, opt_mbq_val, cap_pct_val)
-            VALUES (:w, :m, :g, :c, :o, :dec, :grid, :run, :int_v, :bud,
-                    :req, :mbq, :cap)
+                 blocking_grid, running_val, intended_val, budget_val,
+                 cap_pct_val, stk_val, mbq_orig_val, ceiling_val)
+            VALUES (:w, :m, :g, :c, :o, :grid, :run, :int_v, :bud, :cap,
+                    :stk, :mbq, :ceil)
         """)
         params: List[Dict[str, Any]] = []
-        # Resolve per-grid cap_pct so the REMARKS can say e.g. "cap=130%".
+        # Resolve per-grid cap_pct so REMARKS can say e.g. "cap=130%".
         cap_pct_by_grid = audit.get("cap_pct_by_grid", {}) or {}
-        for (w, mj, gn, cv, ov, grid, rv, iv, bv) in blocked:
+        for (w, mj, gn, cv, ov, grid, rv, iv, bv, sv, mv, ce) in blocked:
             params.append({
                 "w": w, "m": mj, "g": int(gn) if gn is not None else None,
                 "c": cv, "o": ov,
-                "dec": "BLOCK", "grid": grid,
+                "grid": grid,
                 "run": float(rv), "int_v": float(iv), "bud": float(bv),
-                "req": 0.0, "mbq": 0.0,
                 "cap": float(cap_pct_by_grid.get(grid, cap_pct)),
-            })
-        for (w, mj, gn, cv, ov, grid, rv, iv, bv, rq, mq) in overridden:
-            params.append({
-                "w": w, "m": mj, "g": int(gn) if gn is not None else None,
-                "c": cv, "o": ov,
-                "dec": "OVERRIDE", "grid": grid,
-                "run": float(rv), "int_v": float(iv), "bud": float(bv),
-                "req": float(rq), "mbq": float(mq),
-                "cap": float(cap_pct_by_grid.get(grid, cap_pct)),
+                "stk": float(sv), "mbq": float(mv), "ceil": float(ce),
             })
         if params:
             conn.execute(insert_sql, params)
 
-        # Blocked: zero SHIP/ALLOC, stamp SKIPPED + SEC_CAP_PRE_<grid> reason.
-        # SKIP_REASON: short categorical (grouped for filtering / dashboards).
-        # ALLOC_REMARKS: human-readable narrative — why blocked + every number
-        # the reviewer needs (cap %, running, intended, budget, overflow).
+        # Single UPDATE — SQL Server reads RHS values (incl. A.SHIP_QTY,
+        # A.ALLOC_REMARKS) before applying SET, so we can branch on the
+        # pre-update SHIP_QTY when deciding whether to rewrite remarks.
+        #
+        # Remark phrasing (single line, plain English):
+        #   already-overstocked grain  (budget=0, running=0)
+        #     "Grid <G> already at <STK> / ceiling <CEIL> (MBQ <M> × <P>%).
+        #      No room for new dispatch. Waterfall would have shipped
+        #      <INT> — cancelled."
+        #   cumulative shipping crossed budget  (else)
+        #     "Grid <G> cap reached. Stock <STK> + already-shipped <RUN>
+        #      + this OPT <INT> = <TOTAL> > ceiling <CEIL> (MBQ <M> × <P>%).
+        #      Waterfall ship cancelled."
         if blocked:
             _run(conn, f"""
                 UPDATE A SET
-                    A.SHIP_QTY    = 0,
-                    A.ALLOC_QTY   = 0,
+                    A.SHIP_QTY     = 0,
+                    A.ALLOC_QTY    = 0,
                     A.ALLOC_STATUS = 'SKIPPED',
-                    A.SKIP_REASON = CASE
+                    A.SKIP_REASON  = CASE
                         WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
                              THEN 'SEC_CAP_PRE_' + B.blocking_grid
                                   + '(cap=' + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%)'
                         ELSE A.SKIP_REASON END,
-                    A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS, '')
-                        + ' SEC_CAP_PRE_BLOCK(why="OPT would push grid '
-                        + B.blocking_grid + ' over its sec-cap ceiling"'
-                        + ', grid='        + B.blocking_grid
-                        + ', cap='         + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%'
-                        + ', before_ship=' + CAST(B.running_val  AS NVARCHAR(20))
-                        + ', opt_ship='    + CAST(B.intended_val AS NVARCHAR(20))
-                        + ', would_total=' + CAST(B.running_val + B.intended_val AS NVARCHAR(20))
-                        + ', budget='      + CAST(B.budget_val   AS NVARCHAR(20))
-                        + ', exceeded_by=' + CAST((B.running_val + B.intended_val) - B.budget_val AS NVARCHAR(20))
-                        + ', no_override=true);'
+                    A.ALLOC_REMARKS = CASE
+                        WHEN ISNULL(A.SHIP_QTY, 0) > 0 THEN
+                            CASE
+                              WHEN B.budget_val <= 0 THEN
+                                  'SKIPPED by sec-cap | grid=' + B.blocking_grid
+                                + ' | grain already at stock ' + CAST(CAST(B.stk_val AS INT) AS NVARCHAR(20))
+                                + ' which meets/exceeds ceiling '
+                                + CAST(CAST(B.ceiling_val AS INT) AS NVARCHAR(20))
+                                + ' (= MBQ_ORIG ' + CAST(CAST(B.mbq_orig_val AS INT) AS NVARCHAR(20))
+                                + ' x ' + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%)'
+                                + ' | no room for new dispatch'
+                                + ' | waterfall_intended=' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20))
+                                + ' -> final_ship=0'
+                              ELSE
+                                  'SKIPPED by sec-cap | grid=' + B.blocking_grid
+                                + ' | stock ' + CAST(CAST(B.stk_val AS INT) AS NVARCHAR(20))
+                                + ' + already_shipped_this_run ' + CAST(CAST(B.running_val AS INT) AS NVARCHAR(20))
+                                + ' + this_OPT ' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20))
+                                + ' = ' + CAST(CAST(B.stk_val + B.running_val + B.intended_val AS INT) AS NVARCHAR(20))
+                                + ' would exceed ceiling '
+                                + CAST(CAST(B.ceiling_val AS INT) AS NVARCHAR(20))
+                                + ' (= MBQ_ORIG ' + CAST(CAST(B.mbq_orig_val AS INT) AS NVARCHAR(20))
+                                + ' x ' + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%)'
+                                + ' by ' + CAST(CAST((B.stk_val + B.running_val + B.intended_val) - B.ceiling_val AS INT) AS NVARCHAR(20))
+                                + ' | waterfall_intended=' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20))
+                                + ' -> final_ship=0'
+                            END
+                        ELSE A.ALLOC_REMARKS  -- already-skipped row: don't touch
+                    END
                 FROM [{alloc_table}] A
                 INNER JOIN #sec_cap_pre_decisions B
                     ON  A.WERKS = B.WERKS
@@ -3751,34 +3804,6 @@ def _apply_sec_grid_cap_pre_gate(
                     AND A.GEN_ART_NUMBER = B.GEN_ART_NUMBER
                     AND ISNULL(A.CLR, '') = ISNULL(B.CLR, '')
                     AND A.OPT_TYPE = B.OPT_TYPE
-                WHERE B.decision = 'BLOCK'
-            """)
-
-        # Overridden: keep SHIP, append diagnostic remark only.
-        # Plain-English "why" explains the high-demand bypass rule.
-        if overridden:
-            _run(conn, f"""
-                UPDATE A SET
-                    A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS, '')
-                        + ' SEC_CAP_PRE_OVERRIDE(why="high-demand OPT bypassed sec-cap'
-                        + ' (OPT_REQ >= '
-                        + CAST(CAST({SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT} AS INT) AS NVARCHAR(8))
-                        + '% x OPT_MBQ)"'
-                        + ', grid='        + B.blocking_grid
-                        + ', cap='         + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%'
-                        + ', would_total=' + CAST(B.running_val + B.intended_val AS NVARCHAR(20))
-                        + ', budget='      + CAST(B.budget_val   AS NVARCHAR(20))
-                        + ', opt_req='     + CAST(B.opt_req_val  AS NVARCHAR(20))
-                        + ', opt_mbq='     + CAST(B.opt_mbq_val  AS NVARCHAR(20))
-                        + ');'
-                FROM [{alloc_table}] A
-                INNER JOIN #sec_cap_pre_decisions B
-                    ON  A.WERKS = B.WERKS
-                    AND A.MAJ_CAT = B.MAJ_CAT
-                    AND A.GEN_ART_NUMBER = B.GEN_ART_NUMBER
-                    AND ISNULL(A.CLR, '') = ISNULL(B.CLR, '')
-                    AND A.OPT_TYPE = B.OPT_TYPE
-                WHERE B.decision = 'OVERRIDE'
             """)
 
         _run(conn, "IF OBJECT_ID('tempdb..#sec_cap_pre_decisions') IS NOT NULL DROP TABLE #sec_cap_pre_decisions")
@@ -3790,18 +3815,16 @@ def _apply_sec_grid_cap_pre_gate(
             pass
         return audit
 
-    # Render per-grid caps inline (e.g. "FAB@150 MICRO_MVGR@130") so the log
-    # makes the override pattern explicit. Skipped grids (sec_cap_applicable=0)
-    # are listed separately so operators can see what was NOT capped.
+    # Render per-grid caps inline (e.g. "FAB@150 MICRO_MVGR@130"). Skipped
+    # grids (sec_cap_applicable=0) are listed separately so operators can see
+    # what was NOT capped.
     pct_str = " ".join(f"{n}@{m['cap_pct']:.0f}" for n, m in sec_grids)
     skip_str = (f" skipped(applicable=0)={skipped_not_applicable}"
                 if skipped_not_applicable else "")
     logger.info(
-        f"[sec_cap_pre] override>={SEC_CAP_PRE_OVERRIDE_OPT_REQ_PCT:.0f}%×OPT_MBQ "
-        f"caps={{{pct_str}}}{skip_str}: "
+        f"[sec_cap_pre] caps={{{pct_str}}}{skip_str}: "
         f"blocked={audit['opts_blocked']} OPTs ({audit['units_blocked']:.0f}u) "
-        f"overridden={audit['opts_overridden']} OPTs ({audit['units_overridden']:.0f}u) "
-        f"by_grid_block={audit['blocks_by_grid']} by_grid_over={audit['overrides_by_grid']}"
+        f"by_grid_block={audit['blocks_by_grid']}"
     )
     return audit
 

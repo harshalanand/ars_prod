@@ -585,6 +585,10 @@ export default function ListingPage() {
   const [defaultAcsD, setDefaultAcsD] = useState(18)              // Default ACS_D fallback
   const [enableMinSize, setEnableMinSize] = useState(false)        // Toggle min size check
   const [minSizeCount, setMinSizeCount] = useState(3)             // Min sizes for TBL listing
+  // R07 size-coverage gate. Independent of stockThresholdPct (which only drives
+  // OPT_TYPE classification). Default 0.6 preserves prior behavior — pre-split,
+  // R07 silently shared stockThresholdPct.
+  const [sizeThreshold, setSizeThreshold] = useState(0.6)
   // PRI_CT%>=100 gate applied per opt_type (TBL always on). Off = allow
   // RL/TBC to list/allocate even if primary grid coverage is below 100%.
   const [priCheckRL, setPriCheckRL]   = useState(false)
@@ -717,7 +721,15 @@ export default function ListingPage() {
   }
 
   // ── Parallel allocation (Part 8) ─────────────────────────────────────
-  const [allocationMode, setAllocationMode] = useState('pandas') // 'sequential' | 'pandas'
+  // 'pandas'   – legacy cumulative-window race (default, today's behaviour)
+  // 'per_opt'  – one-OPT-at-a-time sequential engine with pre-validated gates
+  // 'sequential' – single-thread SQL fallback
+  const [allocationMode, setAllocationMode] = useState('pandas')
+  // Execution order for per_opt mode. opt_type_first matches today's loop nesting
+  // (RL all rounds → TBC all rounds → TBL all rounds). round_first reorders to
+  // round outermost (everyone gets 1× MBQ before anyone gets 2×). Backend wiring
+  // for round_first is pending — current per_opt engine always runs opt_type_first.
+  const [execOrder, setExecOrder] = useState('opt_type_first')
   const [allocOtFilter, setAllocOtFilter]   = useState('all')   // 'all' | 'rl' | 'rl_tbc'
   // Default 4 (not 8) — on Azure SQL with a small SKU, 8 workers cause
   // 'generic waitable object' deadlocks (tempdb metadata + memory-grant
@@ -756,6 +768,10 @@ export default function ListingPage() {
   const [parkedDetail, setParkedDetail] = useState(null)
   const [parkedDetailLoading, setParkedDetailLoading] = useState(false)
   const [parkedActionBusy, setParkedActionBusy] = useState(false)
+  // Track which row/op is in flight so we can show "Approving…" / "Rejecting…"
+  // on the right button instead of just dimming everything to 50%.
+  const [parkedActionKind, setParkedActionKind] = useState(null)  // 'approve' | 'reject' | null
+  const [parkedActionSid,  setParkedActionSid]  = useState(null)
   // 'alloc' = ARS_ALLOC_PARKED, 'listing' = ARS_LISTING_WORKING_PARKED.
   // Both tables move atomically on Approve/Reject; this just toggles which
   // rows the drawer is currently showing.
@@ -807,6 +823,7 @@ export default function ListingPage() {
           setApplySecCapInNormal(s.apply_sec_cap_in_normal === 'true' || s.apply_sec_cap_in_normal === true)
         if (s.default_acs_d) setDefaultAcsD(parseFloat(s.default_acs_d))
         if (s.min_size_count) setMinSizeCount(parseInt(s.min_size_count, 10))
+        if (s.size_threshold) setSizeThreshold(parseFloat(s.size_threshold))
         if (s.pri_ct_check_rl !== undefined)
           setPriCheckRL(s.pri_ct_check_rl === 'true' || s.pri_ct_check_rl === true)
         if (s.pri_ct_check_tbc !== undefined)
@@ -899,10 +916,20 @@ export default function ListingPage() {
       `Approve session ${sid}?\n\nAll 6 snapshots will move to history and be removed from the parked queue:\n  • ARS_ALLOC_HISTORY\n  • ARS_LISTING_WORKING_HISTORY\n  • ARS_LISTING_HISTORY\n  • ARS_MSA_TOTAL_HISTORY\n  • ARS_MSA_GEN_ART_HISTORY\n  • ARS_MSA_VAR_ART_HISTORY`
     )) return
     setParkedActionBusy(true)
+    setParkedActionKind('approve')
+    setParkedActionSid(sid)
+    // Persistent loading toast so the user sees the op is in flight — these
+    // can take several minutes on multi-million-row sessions.
+    const toastId = toast.loading(
+      `Approving ${sid}… writing PEND_ALC + promoting 6 tables to history. Don't close this tab.`
+    )
     try {
       const { data } = await listingAPI.approveParked(sid)
+      toast.dismiss(toastId)
       if (data?.already_approved) {
         toast(`Session ${sid} was already approved`, { icon: 'ℹ️' })
+      } else if (data?.error) {
+        toast.error(data.error)
       } else {
         const by = data?.by_table || {}
         const total = (data?.approved_rows || 0).toLocaleString()
@@ -919,9 +946,12 @@ export default function ListingPage() {
       closeParkedDetail()
       loadParkedRuns()
     } catch {
-      // toast already shown by the response interceptor
+      // toast already shown by the response interceptor; dismiss the loader
+      toast.dismiss(toastId)
     } finally {
       setParkedActionBusy(false)
+      setParkedActionKind(null)
+      setParkedActionSid(null)
     }
   }, [closeParkedDetail, loadParkedRuns])
 
@@ -933,8 +963,14 @@ export default function ListingPage() {
     )
     if (note === null) return  // user cancelled
     setParkedActionBusy(true)
+    setParkedActionKind('reject')
+    setParkedActionSid(sid)
+    const toastId = toast.loading(
+      `Rejecting ${sid}… deleting parked rows in chunks. Don't close this tab.`
+    )
     try {
       const { data } = await listingAPI.rejectParked(sid, note)
+      toast.dismiss(toastId)
       toast(
         `Rejected ${(data?.rejected_rows || 0).toLocaleString()} rows`,
         { icon: '🚫' }
@@ -943,8 +979,11 @@ export default function ListingPage() {
       loadParkedRuns()
     } catch {
       // toast already shown
+      toast.dismiss(toastId)
     } finally {
       setParkedActionBusy(false)
+      setParkedActionKind(null)
+      setParkedActionSid(null)
     }
   }, [closeParkedDetail, loadParkedRuns])
 
@@ -1054,6 +1093,7 @@ export default function ListingPage() {
         apply_sec_cap_in_normal: !!applySecCapInNormal,
         default_acs_d: parseFloat(defaultAcsD) || 18,
         min_size_count: enableMinSize ? (parseInt(minSizeCount, 10) || 3) : 0,
+        size_threshold: parseFloat(sizeThreshold) || 0.6,
         pri_ct_check_rl: !!priCheckRL,
         pri_ct_check_tbc: !!priCheckTBC,
         // Checkbox forces strict 100%; otherwise the slider value applies.
@@ -1073,6 +1113,7 @@ export default function ListingPage() {
           : (parseFloat(tbcMbqCapPct) || 100),
         tbl_mbq_cap_pct: mbqGrowthUseDefault ? 100 : (parseFloat(mjReqGrowthPct) || 100),
         allocation_mode: allocationMode,
+        exec_order: execOrder,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
         use_writer_queue: useWriterQueue,
         ssn_values: selectedSsn,
@@ -1309,6 +1350,7 @@ export default function ListingPage() {
       const { data } = await listingAPI.retryFailed({
         batch_id: allocBatchId,
         allocation_mode: allocationMode,
+        exec_order: execOrder,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
       })
       // The backend now returns one of:
@@ -1645,13 +1687,33 @@ export default function ListingPage() {
                   textTransform: 'uppercase', letterSpacing: 0.4 }}>Alloc</span>
                 <select value={allocationMode}
                   onChange={(e) => setAllocationMode(e.target.value)}
+                  title="pandas = today's vectorized cumulative-window race. per_opt = sequential one-OPT-at-a-time with pre-validated gates and honest SKIP_REASONs (R07_SIZE_RATIO_LIVE / POOL_EMPTY / MBQ_CAP_*). sequential = single-thread SQL fallback."
                   style={{ height: 26, fontSize: 11, fontWeight: 600,
                     border: `1px solid ${C.cardBorder}`, borderRadius: 6,
                     padding: '0 6px', background: '#fff', color: C.text,
                     cursor: 'pointer' }}>
                   <option value="pandas">Pandas (in-memory)</option>
+                  <option value="per_opt">Per-OPT (sequential, new)</option>
                   <option value="sequential">Sequential (fallback)</option>
                 </select>
+                {allocationMode === 'per_opt' && (
+                  <>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
+                      textTransform: 'uppercase', letterSpacing: 0.4, marginLeft: 4 }}
+                      title="Order A (opt_type_first): RL all rounds → TBC all rounds → TBL all rounds. Order B (round_first): R1 across RL/TBC/TBL → R2 across all → R3. Order B fairer to TBL; backend wiring pending — currently both run as opt_type_first.">
+                      Order
+                    </span>
+                    <select value={execOrder}
+                      onChange={(e) => setExecOrder(e.target.value)}
+                      style={{ height: 26, fontSize: 11, fontWeight: 600,
+                        border: `1px solid ${C.cardBorder}`, borderRadius: 6,
+                        padding: '0 6px', background: '#fff', color: C.text,
+                        cursor: 'pointer' }}>
+                      <option value="opt_type_first">A · OPT_TYPE first</option>
+                      <option value="round_first">B · Round first (preview)</option>
+                    </select>
+                  </>
+                )}
                 {allocationMode !== 'sequential' && (
                   <>
                     <span style={{ fontSize: 10, color: C.textMuted }}
@@ -1857,7 +1919,8 @@ export default function ListingPage() {
                               background: C.green, color: '#fff', border: 'none',
                               cursor: parkedActionBusy ? 'not-allowed' : 'pointer',
                               opacity: parkedActionBusy ? 0.5 : 1 }}>
-                            Approve
+                            {parkedActionKind === 'approve' && parkedActionSid === r.session_id
+                              ? 'Approving…' : 'Approve'}
                           </button>
                           <button
                             disabled={parkedActionBusy}
@@ -1867,7 +1930,8 @@ export default function ListingPage() {
                               background: '#fef2f2', color: C.red, border: '1px solid #fecaca',
                               cursor: parkedActionBusy ? 'not-allowed' : 'pointer',
                               opacity: parkedActionBusy ? 0.5 : 1 }}>
-                            Reject
+                            {parkedActionKind === 'reject' && parkedActionSid === r.session_id
+                              ? 'Rejecting…' : 'Reject'}
                           </button>
                         </td>
                       </tr>
@@ -1929,7 +1993,8 @@ export default function ListingPage() {
                     fontWeight: 700, background: C.green, color: '#fff', border: 'none',
                     cursor: parkedActionBusy ? 'not-allowed' : 'pointer',
                     opacity: parkedActionBusy ? 0.5 : 1 }}>
-                  Approve → History (5 tables)
+                  {parkedActionKind === 'approve' && parkedActionSid === parkedDetailSid
+                    ? 'Approving…' : 'Approve → History (5 tables)'}
                 </button>
                 <button
                   disabled={parkedActionBusy}
@@ -1939,7 +2004,8 @@ export default function ListingPage() {
                     border: '1px solid #fecaca',
                     cursor: parkedActionBusy ? 'not-allowed' : 'pointer',
                     opacity: parkedActionBusy ? 0.5 : 1 }}>
-                  Reject
+                  {parkedActionKind === 'reject' && parkedActionSid === parkedDetailSid
+                    ? 'Rejecting…' : 'Reject'}
                 </button>
                 <button onClick={closeParkedDetail}
                   style={{ height: 28, width: 28, borderRadius: 6, background: '#f1f5f9',
@@ -2375,7 +2441,7 @@ export default function ListingPage() {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 16 }}>
           <ParamGroup title="Stock & Excess" color="#0891b2">
             <ParamInput label="Stock %"    value={stockThresholdPct} setter={setStockThresholdPct} step={0.05}
-              hint={`${Math.round(stockThresholdPct*100)}%`}    tip="Threshold to classify as RL/NL"/>
+              hint={`${Math.round(stockThresholdPct*100)}%`}    tip="OPT_TYPE classification: STK ≥ X × ACS_D → RL (else TBC/TBL/MIX). Does NOT affect R07 — see Size Cov % under Allocation Gates."/>
             <ParamInput label="Excess ×"   value={excessMultiplier}  setter={setExcessMultiplier}  step={0.5}
               hint={`${excessMultiplier}× OPT_MBQ`}             tip="Excess if STK > X × OPT_MBQ"/>
             <ParamInput label="Hold Days"  value={holdDays}          setter={setHoldDays}          step={1}
@@ -2420,6 +2486,9 @@ export default function ListingPage() {
                 hint={`+${mjReqGrowthPct - 100}% headroom (all grids); RL/TBC/TBL caps inherit this %`}
                 tip="Scale every non-pivot grid's MBQ to *_MBQ_REV per MAJ_CAT (MJ + FAB + MICRO_MVGR + M_VND_CD + RNG_SEG …). Multiplier reads *_MBQ_ORIG so re-runs never compound. *_REQ_REV is re-derived as MAX(0, MBQ_REV − STK_TTL); engine consumes the lifted columns via *_MBQ / *_REQ. Sec-cap automatically widens to max(130%, growth%). Per-OPT_TYPE dispatch caps follow this %; override per OPT_TYPE only via the PRI ≥ 100% toggles above."/>
             )}
+            <ParamInput label="Size Cov %" value={sizeThreshold} setter={setSizeThreshold} step={0.05} min={0} max={1}
+              hint={`${Math.round(sizeThreshold*100)}%`}
+              tip="R07 size-coverage gate. Skip TBL when VAR_FNL_COUNT / VAR_COUNT below this ratio AND VAR_FNL_COUNT < Min size #. Independent of Stock %."/>
             <ToggleRow checked={enableMinSize} setChecked={setEnableMinSize}
               label="Min sizes for TBL" color="#7c3aed"
               hint="Reject TBL options that have fewer than X distinct sizes"/>
@@ -2444,8 +2513,8 @@ export default function ListingPage() {
               and moved here as a standalone control. */}
           <ParamGroup title="Secondary-grid Cap" color={C.amber}>
             <ToggleRow checked={applySecCapInNormal} setChecked={setApplySecCapInNormal}
-              label="Sec-grid Cap 130%" color={C.primary}
-              hint="Cap Secondary grids at 130% of MBQ in main pass"/>
+              label="Sec-grid Cap" color={C.primary}
+              hint="Per-grid cap: max(0, MBQ_ORIG × cap% − STK_TTL); breach = block. Per-grid % set in Grid Builder."/>
           </ParamGroup>
         </div>
       </div>
@@ -2863,17 +2932,21 @@ export default function ListingPage() {
                 </thead>
                 <tbody>
                   {preview.data.map((row, i) => (
-                    <tr key={i} style={{ background: row.IS_NEW ? '#fffbeb' : i % 2 ? '#fafbfc' : '#fff' }}>
+                    <tr key={i} style={{ background: row.ELIG_FLAG === 0 ? '#fef2f2' : row.IS_NEW ? '#fffbeb' : i % 2 ? '#fafbfc' : '#fff' }}>
                       {preview.columns.map(col => (
                         <td key={col} style={{ padding: '3px 6px', borderBottom: '1px solid #f1f5f9',
                           whiteSpace: 'nowrap', fontFamily: typeof row[col] === 'number' ? 'monospace' : 'inherit',
-                          textAlign: col === 'IS_NEW' ? 'center' : typeof row[col] === 'number' ? 'right' : 'left',
+                          textAlign: col === 'IS_NEW' || col === 'ELIG_FLAG' ? 'center' : typeof row[col] === 'number' ? 'right' : 'left',
                           color: col === 'IS_NEW' ? (row[col] ? C.amber : C.green)
                             : col === 'OPT_TYPE' ? (row[col] === 'RL' ? C.green : row[col] === 'NL' ? C.amber : row[col] === 'MIX-L' ? C.red : C.textMuted)
+                            : col === 'ELIG_FLAG' ? (row[col] ? C.green : C.red)
+                            : col === 'ELIG_REASON' ? (row[col] === 'OK' || row[col] == null ? C.textMuted : C.red)
                             : C.text,
-                          fontWeight: col === 'IS_NEW' || col === 'OPT_TYPE' ? 700 : 400 }}>
+                          fontWeight: col === 'IS_NEW' || col === 'OPT_TYPE' || col === 'ELIG_FLAG' || col === 'ELIG_REASON' ? 700 : 400 }}>
                           {col === 'IS_NEW' ? (row[col] ? 'NEW' : 'OK')
                             : col === 'OPT_TYPE' ? (row[col] || '-')
+                            : col === 'ELIG_FLAG' ? (row[col] ? '✓' : '✗')
+                            : col === 'ELIG_REASON' ? (row[col] || '-')
                             : col === 'GEN_ART_NUMBER' || col === 'ARTICLE_NUMBER' || col === 'MATNR'
                               ? row[col] ?? ''
                             : typeof row[col] === 'number'

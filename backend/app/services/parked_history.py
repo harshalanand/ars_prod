@@ -81,18 +81,6 @@ _SNAPSHOT_TARGETS: List[Dict[str, str]] = [
         "parked":  "ARS_MSA_TOTAL_PARKED",
         "history": "ARS_MSA_TOTAL_HISTORY",
     },
-    {
-        "label":   "msa_gen_art",
-        "source":  "ARS_MSA_GEN_ART",
-        "parked":  "ARS_MSA_GEN_ART_PARKED",
-        "history": "ARS_MSA_GEN_ART_HISTORY",
-    },
-    {
-        "label":   "msa_var_art",
-        "source":  "ARS_MSA_VAR_ART",
-        "parked":  "ARS_MSA_VAR_ART_PARKED",
-        "history": "ARS_MSA_VAR_ART_HISTORY",
-    },
 ]
 
 SESSIONS_TABLE = "ARS_LISTING_SESSIONS"
@@ -570,6 +558,54 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
     Returns {approved_rows, by_table, already_approved, error}.
     """
     engine = get_data_engine()
+
+    # Serialise concurrent approve calls for the same SESSION_ID. Without
+    # this, two parallel POSTs can both pass the idempotency check, both
+    # promote history atomically, and both run write_pend_alc / hold tracking
+    # / MSA delta — producing 2× PEND_ALC rows + 2× MSA deduction. Observed
+    # on session 20260606_180459_639 (2026-06-07: two POSTs 3 min apart, no
+    # server-side guard). sp_getapplock @LockOwner='Session' binds the lock
+    # to lock_conn, which we hold open for the duration of the approve and
+    # release explicitly in the finally block below.
+    lock_resource = f"approve_parked:{session_id}"
+    lock_conn = engine.connect()
+    acquired = False
+    try:
+        res = lock_conn.execute(text("""
+            DECLARE @r INT;
+            EXEC @r = sp_getapplock
+                @Resource = :resource,
+                @LockMode = 'Exclusive',
+                @LockOwner = 'Session',
+                @LockTimeout = 60000;
+            SELECT @r;
+        """), {"resource": lock_resource}).scalar()
+        # -1 timeout / -2 cancelled / -3 deadlock victim / -999 validation
+        if res is not None and int(res) < 0:
+            logger.warning(
+                f"[approve] sp_getapplock returned {res} for session "
+                f"{session_id} — another approve already in progress"
+            )
+            try:
+                lock_conn.close()
+            except Exception:
+                pass
+            return {
+                "approved_rows":    0,
+                "by_table":         {},
+                "already_approved": False,
+                "error":            f"Approve already in progress for session {session_id}",
+            }
+        acquired = True
+    except Exception as lock_err:
+        # If the lock primitive itself fails (permission denied on
+        # sp_getapplock, etc.), fall back to running unguarded so the
+        # approve still completes. The race window remains but a normal
+        # single-click approve still works.
+        logger.warning(
+            f"[approve] sp_getapplock failed (proceeding without lock): {lock_err}"
+        )
+
     try:
         # 1. Ensure all schemas exist (each helper commits internally).
         with engine.connect() as conn:
@@ -797,6 +833,19 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
             "already_approved": False,
             "error":            str(e),
         }
+    finally:
+        if acquired:
+            try:
+                lock_conn.execute(text(
+                    "EXEC sp_releaseapplock @Resource = :resource, "
+                    "@LockOwner = 'Session'"
+                ), {"resource": lock_resource})
+            except Exception as rel_err:
+                logger.warning(f"[approve] sp_releaseapplock failed: {rel_err}")
+        try:
+            lock_conn.close()
+        except Exception:
+            pass
 
 
 def reject_parked(session_id: str, user: str,
@@ -809,15 +858,38 @@ def reject_parked(session_id: str, user: str,
     """
     engine = get_data_engine()
     rejected_by_table: Dict[str, Any] = {}
+    # Chunk size for parked DELETEs. A single 6.4M-row DELETE filled
+    # Rep_Data's transaction log on session 20260606_153242_920 (2026-06-07,
+    # ARS_LISTING_PARKED ~3.4M rows alone), rolling back the entire reject.
+    # 50000 keeps each batch's log growth bounded and lets SQL Server
+    # truncate between commits — measured ok on the ~3.4M-row table.
+    BATCH = 50000
     try:
         with engine.connect() as conn:
-            # 1. Delete parked snapshot rows for all configured targets.
+            # 1. Delete parked snapshot rows for all configured targets in
+            # chunks. Each TOP-N batch commits independently so the log can
+            # be reclaimed between iterations. The PARK_STATUS='PARKED'
+            # filter keeps the loop idempotent — a retry after partial
+            # failure picks up exactly the rows the previous run didn't
+            # finish deleting.
             for tgt in _SNAPSHOT_TARGETS:
-                res = conn.execute(text(
-                    f"DELETE FROM [{tgt['parked']}] "
-                    f" WHERE SESSION_ID = :sid AND PARK_STATUS = 'PARKED'"
-                ), {"sid": session_id})
-                rejected_by_table[tgt["label"]] = int(res.rowcount or 0)
+                tbl = tgt["parked"]
+                total = 0
+                while True:
+                    res = conn.execute(text(
+                        f"DELETE TOP ({BATCH}) FROM [{tbl}] "
+                        f" WHERE SESSION_ID = :sid AND PARK_STATUS = 'PARKED'"
+                    ), {"sid": session_id})
+                    n = int(res.rowcount or 0)
+                    conn.commit()
+                    total += n
+                    if n < BATCH:
+                        break
+                rejected_by_table[tgt["label"]] = total
+                logger.info(
+                    f"[parked_history:reject] {tbl}: {total} rows deleted "
+                    f"in chunks of {BATCH}"
+                )
 
             # 2. Revert ARS_NL_TBL_HOLD_TRACKING to its pre-run snapshot.
             _ensure_hold_snapshot_tables(conn)

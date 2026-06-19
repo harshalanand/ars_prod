@@ -64,6 +64,11 @@ export default function MSAStockCalculationPage() {
   const [availableDates, setAvailableDates] = useState([]);
   const [dataDate, setDataDate] = useState(null);
   const [distinctValues, setDistinctValues] = useState({});
+  // Per-column fetch state for non-cascading filters. Lets the UI tell
+  // "still fetching" from "fetched but the date has no rows" — without
+  // this an empty array silently rendered as "Loading values…" forever
+  // (the SEG bug observed on 2026-06-11).
+  const [loadingValues, setLoadingValues] = useState({});
   const [presetName, setPresetName] = useState('msa_filter');
   const [savedPresets, setSavedPresets] = useState({});
   const [selectedPreset, setSelectedPreset] = useState('msa_filter');
@@ -454,6 +459,14 @@ export default function MSAStockCalculationPage() {
             });
             return updated;
           });
+          // Mark every loaded column as "loading" so the UI shows
+          // "Loading values…" instead of "No values for this date" while
+          // the per-column fetch promises below are in flight.
+          setLoadingValues(prev => {
+            const updated = { ...prev };
+            loadedColumns.forEach(col => { updated[col] = true; });
+            return updated;
+          });
           
           // Fetch distinct values for each column
           const distinctPromises = loadedColumns.map(col =>
@@ -485,6 +498,9 @@ export default function MSAStockCalculationPage() {
               .catch(err => {
                 console.error(`  ❌ ${col}: Error - ${err.message}`);
                 setDistinctValues(prev => ({ ...prev, [col]: [] }));
+              })
+              .finally(() => {
+                setLoadingValues(prev => ({ ...prev, [col]: false }));
               })
           );
           
@@ -538,51 +554,66 @@ export default function MSAStockCalculationPage() {
     toast.success(`Preset "${selectedPreset}" deleted`);
   };
 
+  // Centralized distinct-value fetcher used by Add-Column, preset-load,
+  // and the on-date-change refresh effect. Tracks loading state so the UI
+  // can distinguish "still fetching" from "fetched but empty".
+  const fetchDistinctFor = (col, forDate) => {
+    setLoadingValues(prev => ({ ...prev, [col]: true }));
+
+    const timeoutId = setTimeout(() => {
+      console.warn(`⏱️ Timeout loading values for ${col}`);
+      setDistinctValues(prev => ({ ...prev, [col]: [] }));
+      setLoadingValues(prev => ({ ...prev, [col]: false }));
+    }, 10000);
+
+    return msaAPI.getDistinct(col, forDate)
+      .then(res => {
+        clearTimeout(timeoutId);
+        const values = res.data?.data?.values || res.data?.values || [];
+        console.log(`✅ Loaded ${values.length} distinct values for ${col} (date=${forDate || 'none'})`);
+        setDistinctValues(prev => ({ ...prev, [col]: values }));
+      })
+      .catch(err => {
+        clearTimeout(timeoutId);
+        console.error(`❌ Error loading values for ${col}:`, err.message);
+        setDistinctValues(prev => ({ ...prev, [col]: [] }));
+      })
+      .finally(() => {
+        setLoadingValues(prev => ({ ...prev, [col]: false }));
+      });
+  };
+
   const handleAddFilterColumn = (col) => {
     if (!filterColumns.includes(col)) {
       setFilterColumns(prev => [...prev, col]);
       console.log(`📋 Added filter column: ${col}`);
-      
-      // Initialize with "Loading..." state
       setDistinctValues(prev => ({ ...prev, [col]: [] }));
-      
-      // Fetch distinct values for this column with timeout
-      console.log(`🔄 Fetching distinct values for ${col}...`);
-      const timeoutId = setTimeout(() => {
-        console.warn(`⏱️ Timeout loading values for ${col}`);
-        setDistinctValues(prev => ({ ...prev, [col]: [] }));
-      }, 10000); // 10 second timeout
-      
-      msaAPI.getDistinct(col, date)
-        .then(res => {
-          clearTimeout(timeoutId);
-          console.log(`📨 Full API response for ${col}:`, res);
-          console.log(`📦 Response data structure:`, res.data);
-          
-          const values = res.data?.data?.values || res.data?.values || [];
-          console.log(`✅ Loaded ${values.length} distinct values for ${col}:`, values);
-          
-          if (values.length === 0) {
-            console.warn(`⚠️ No values returned for ${col}, checking response...`);
-          }
-          
-          // Store values in state for dropdown
-          setDistinctValues(prev => ({ ...prev, [col]: values }));
-        })
-        .catch(err => {
-          clearTimeout(timeoutId);
-          console.error(`❌ Error loading values for ${col}:`, err.message);
-          console.error(`Error response:`, err.response?.data);
-          // On error, set empty array so dropdown still works
-          setDistinctValues(prev => ({ ...prev, [col]: [] }));
-        });
+      fetchDistinctFor(col, date);
     }
   };
+
+  // When the user changes the date, re-fetch distinct values for every
+  // non-cascading filter column. Cascading columns refresh themselves via
+  // the CascadingFilters component's own date-dependent effect; this
+  // useEffect handles the gap that left SEG (and any other non-cascading
+  // column) stuck on stale empty arrays after the user corrected the date
+  // — the bug that produced "Loading values…" forever on 2026-06-11.
+  useEffect(() => {
+    if (!date || !isInitializedRef.current) return;
+    const nonCascading = filterColumns.filter(
+      c => !cascadingColumnHierarchy.includes(c)
+    );
+    if (nonCascading.length === 0) return;
+    console.log(`🔄 Date changed to ${date} — refetching non-cascading filters: ${nonCascading.join(', ')}`);
+    nonCascading.forEach(c => fetchDistinctFor(c, date));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date]);
 
   const handleRemoveFilterColumn = (col) => {
     setFilterColumns(prev => prev.filter(c => c !== col));
     setFilters(f => { const n = { ...f }; delete n[col]; return n; });
     setDistinctValues(prev => { const n = { ...prev }; delete n[col]; return n; });
+    setLoadingValues(prev => { const n = { ...prev }; delete n[col]; return n; });
   };
 
   // Calculate MSA - call new calculate endpoint
@@ -664,6 +695,17 @@ export default function MSAStockCalculationPage() {
           );
           console.warn(`[msa] Missing RDCs: ${missingList} | Covered: ${coveredList}`);
         }
+
+        // Surface soft-failure warnings from the backend (e.g. Step 7.5
+        // variant backfill skipped because the SQL connection dropped).
+        // The calculation itself succeeded — these tell the user that
+        // some non-fatal slice didn't complete and the results may be
+        // incomplete in a specific way.
+        const warnings = result.warnings || [];
+        warnings.forEach(w => {
+          toast.error(`⚠️ ${w}`, { duration: 10000 });
+          console.warn(`[msa] backend warning:`, w);
+        });
 
         setLoading(false);
 
@@ -908,8 +950,12 @@ export default function MSAStockCalculationPage() {
                           {filters[col]?.includes(val) && <X size={10} />}
                         </button>
                       ))
+                    ) : loadingValues[col] ? (
+                      <p className="text-gray-400 italic text-[11px]">Loading values…</p>
                     ) : (
-                      <p className="text-gray-400 italic text-[11px]">Loading values...</p>
+                      <p className="text-amber-600 italic text-[11px]">
+                        No values for {col} on this date — try a different date.
+                      </p>
                     )}
                   </div>
                 </div>

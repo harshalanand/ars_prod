@@ -285,7 +285,7 @@ def mark_failed(conn, batch_id: str, mc: str,
 def get_progress(conn, batch_id: str) -> Dict:
     """Counts grouped by STATUS for the given batch — for UI live poll."""
     rows = conn.execute(text(f"""
-        SELECT STATUS, COUNT(*) FROM {QUEUE_TABLE}
+        SELECT STATUS, COUNT(*) FROM {QUEUE_TABLE} WITH (NOLOCK)
         WHERE BATCH_ID = :b GROUP BY STATUS
     """), {"b": batch_id}).fetchall()
     counts = {r[0]: int(r[1]) for r in rows}
@@ -305,7 +305,7 @@ def get_progress(conn, batch_id: str) -> Dict:
 def get_failed_list(conn, batch_id: str) -> List[Dict]:
     rows = conn.execute(text(f"""
         SELECT MAJ_CAT, ATTEMPTS, ERROR_MSG, DURATION_SEC, COMPLETED_AT
-        FROM {QUEUE_TABLE}
+        FROM {QUEUE_TABLE} WITH (NOLOCK)
         WHERE BATCH_ID = :b AND STATUS = 'FAILED'
         ORDER BY MAJ_CAT
     """), {"b": batch_id}).fetchall()
@@ -323,14 +323,19 @@ def get_failed_list(conn, batch_id: str) -> List[Dict]:
 
 def get_done_summary(conn, batch_id: str) -> Dict:
     """Final totals for a batch (after run completes)."""
+    # NOLOCK + LOCK_TIMEOUT: this is a UI poll. Dirty reads are acceptable
+    # (numbers stabilise once the batch finishes) and we must never block
+    # behind worker X-locks long enough for Cloudflare's 120s edge timeout
+    # to fire.
     row = conn.execute(text(f"""
+        SET LOCK_TIMEOUT 5000;
         SELECT
             ISNULL(SUM(SHIP_QTY),0)      AS ship_total,
             ISNULL(SUM(HOLD_QTY),0)      AS hold_total,
             ISNULL(SUM(ROWS_AFFECTED),0) AS rows_total,
             ISNULL(MAX(DURATION_SEC),0)  AS max_duration,
             ISNULL(SUM(DURATION_SEC),0)  AS sum_duration
-        FROM {QUEUE_TABLE}
+        FROM {QUEUE_TABLE} WITH (NOLOCK)
         WHERE BATCH_ID = :b AND STATUS = 'DONE'
     """), {"b": batch_id}).fetchone()
     return {

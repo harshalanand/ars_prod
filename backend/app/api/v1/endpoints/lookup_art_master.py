@@ -136,8 +136,12 @@ def _do_lookup(df_upload: pd.DataFrame, join_column: str,
             "DROP TABLE #lookup_keys"
         )
         # NVARCHAR(450) is the indexable max for nvarchar; covers any realistic key.
+        # COLLATE DATABASE_DEFAULT pins the column to the user DB's collation so
+        # the JOIN against VW_MASTER_PRODUCT doesn't trip SQL 468 on deployments
+        # where tempdb collation differs from the app DB.
         cursor.execute(
-            "CREATE TABLE #lookup_keys (k NVARCHAR(450) NOT NULL PRIMARY KEY)"
+            "CREATE TABLE #lookup_keys ("
+            "k NVARCHAR(450) COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY)"
         )
         cursor.executemany(
             "INSERT INTO #lookup_keys (k) VALUES (?)",

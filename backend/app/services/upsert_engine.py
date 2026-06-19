@@ -348,7 +348,14 @@ class UpsertEngine:
             # batch size. 4000 is the upper bound for non-LOB nvarchar in
             # SQL Server; longer values would need MAX (extremely rare for
             # the data we stage — markers are short, IDs are short).
-            col_defs = ", ".join(f"[{c}] NVARCHAR(4000) NULL" for c in df.columns)
+            # COLLATE DATABASE_DEFAULT — same fix as _build_create_temp_sql.
+            # Staging table sits in tempdb; without this clause its columns
+            # inherit tempdb's collation, which on this deployment differs
+            # from the app DB and trips SQL Server error 468 on the MERGE.
+            col_defs = ", ".join(
+                f"[{c}] NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL"
+                for c in df.columns
+            )
             cursor.execute(f"CREATE TABLE {staging} ({col_defs})")
             t_create = time.time()
 
@@ -676,14 +683,29 @@ class UpsertEngine:
     ) -> str:
         """
         Build CREATE TABLE SQL for temp table.
-        
+
         All columns use NVARCHAR to support special markers like __SKIP__ and __NULL__.
         The MERGE statement handles casting back to target types.
+
+        Force COLLATE DATABASE_DEFAULT on every string column so the temp
+        table inherits the *app database's* collation rather than tempdb's.
+        Without this, when tempdb collation differs from the app DB
+        (server=Latin1_General_CI_AS, db=SQL_Latin1_General_CP1_CI_AS on
+        this deployment), the MERGE ON predicate
+        `target.[pk] = source.[pk]` raised SQL Server error 468
+        "Cannot resolve the collation conflict between
+        Latin1_General_CI_AS and SQL_Latin1_General_CP1_CI_AS" — caught
+        on the 2026-06-11 Master_ALC_INPUT_ST_MASTER upload. Aligning the
+        temp column collation up-front removes the conflict on every
+        comparison (JOIN, change-detect CASE) without sprinkling COLLATE
+        clauses across the MERGE.
         """
         col_defs = []
         for col in df.columns:
             # Always use NVARCHAR for temp table to handle special markers
-            col_defs.append(f"[{col}] NVARCHAR(500) NULL")
+            col_defs.append(
+                f"[{col}] NVARCHAR(500) COLLATE DATABASE_DEFAULT NULL"
+            )
 
         return f"CREATE TABLE {temp_table} ({', '.join(col_defs)})"
 
@@ -780,8 +802,17 @@ class UpsertEngine:
 
         # Build output table columns and OUTPUT clause
         if enable_row_audit:
-            # Include PK columns for row-level audit
-            pk_output_cols = ", ".join([f"[pk_{pk}] NVARCHAR(MAX)" for pk in primary_key_columns])
+            # Include PK columns for row-level audit.
+            # COLLATE DATABASE_DEFAULT — same reason as the temp/staging
+            # tables: the output table lives in tempdb, and without this
+            # the row-changes JOIN back to the target tripped error 468
+            # ("Cannot resolve collation conflict") on every upsert
+            # against tables in a database whose collation differs from
+            # the server / tempdb default.
+            pk_output_cols = ", ".join(
+                f"[pk_{pk}] NVARCHAR(MAX) COLLATE DATABASE_DEFAULT"
+                for pk in primary_key_columns
+            )
             output_table_cols = f"action_type NVARCHAR(10), {pk_output_cols}"
             
             pk_inserted_refs = ", ".join([f"inserted.[{pk}]" for pk in primary_key_columns])

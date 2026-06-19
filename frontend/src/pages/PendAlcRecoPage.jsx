@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { pendAlcAPI } from '@/services/api'
 import toast from 'react-hot-toast'
-import { RefreshCw, BarChart2, Download, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
+import { RefreshCw, BarChart2, Download, AlertTriangle, ChevronDown, ChevronRight, AlertOctagon } from 'lucide-react'
 import DataGrid from '@/components/DataGrid'
 
 const C = {
@@ -168,6 +168,20 @@ export default function PendAlcRecoPage() {
   const [fAgingBand,  setFAgingBand]  = useState('')
   const [exporting,   setExporting]   = useState('')   // tile id currently exporting
 
+  // Pending vs MSA gap report — open pending whose MSA pool can't cover it.
+  // Self-contained (no DataGrid) — small dataset since it's the actionable
+  // subset of pending where ops should intervene (adhoc-close or wait for
+  // the next MSA refresh).
+  const [gapCollapsed, setGapCollapsed] = useState(false)
+  const [gapData, setGapData]           = useState(null)
+  const [gapLoading, setGapLoading]     = useState(false)
+  const [gapPage, setGapPage]           = useState(1)
+  const [gapPageSize]                   = useState(200)
+  const [gapSortBy, setGapSortBy]       = useState('gap')
+  const [gapSortDir, setGapSortDir]     = useState('desc')
+  const [gapStatusFilter, setGapStatusFilter] = useState('') // '' | NO_MSA | SHORT
+  const [gapExporting, setGapExporting] = useState(false)
+
   // BDC
   const [bdcLoading, setBdcLoading] = useState(false)
   const [bdcModalOpen, setBdcModalOpen] = useState(false)
@@ -197,6 +211,52 @@ export default function PendAlcRecoPage() {
       setSummaryLoading(false)
     }
   }, [])
+
+  const loadGap = useCallback(async () => {
+    setGapLoading(true)
+    try {
+      const params = { page: gapPage, page_size: gapPageSize,
+                       sort_by: gapSortBy, sort_dir: gapSortDir }
+      if (fRdc)            params.rdc     = fRdc
+      if (fMajCat)         params.maj_cat = fMajCat
+      if (gapStatusFilter) params.status  = gapStatusFilter
+      const { data } = await pendAlcAPI.pendVsMsaGap(params)
+      setGapData(data?.data || null)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Failed to load gap report')
+      setGapData(null)
+    } finally {
+      setGapLoading(false)
+    }
+  }, [fRdc, fMajCat, gapStatusFilter, gapPage, gapPageSize, gapSortBy, gapSortDir])
+
+  const exportGap = async () => {
+    setGapExporting(true)
+    try {
+      const params = {}
+      if (fRdc)            params.rdc     = fRdc
+      if (fMajCat)         params.maj_cat = fMajCat
+      if (gapStatusFilter) params.status  = gapStatusFilter
+      const { data: blob } = await pendAlcAPI.pendVsMsaGapExport(params)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a'); a.href = url
+      const today = new Date().toISOString().slice(0,10).replace(/-/g,'')
+      a.download = `PEND_VS_MSA_GAP_${today}.csv`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      toast.success('CSV downloaded')
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Export failed')
+    } finally {
+      setGapExporting(false)
+    }
+  }
+
+  const toggleGapSort = (col) => {
+    if (gapSortBy === col) setGapSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setGapSortBy(col); setGapSortDir(col === 'rdc' || col === 'article_number' ? 'asc' : 'desc') }
+    setGapPage(1)
+  }
 
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true)
@@ -239,6 +299,10 @@ export default function PendAlcRecoPage() {
   )
 
   useEffect(() => { loadSummary(); loadSessions() }, [loadSummary, loadSessions])
+  // Gap report — refetches whenever the user toggles status, sort, page,
+  // or the page-level RDC/MAJ_CAT filters. Skipped while the section is
+  // collapsed so we don't hammer the DB unnecessarily.
+  useEffect(() => { if (!gapCollapsed) loadGap() }, [loadGap, gapCollapsed])
 
   // Tile → filter mapping. Each tile sets `closed`, `f_bdc_status`,
   // `f_aging_band` to scope the detail grid + Excel export. Click the same
@@ -493,7 +557,7 @@ export default function PendAlcRecoPage() {
         </div>
         <div style={{ flex: 1 }}/>
         <button style={_btn()}
-          onClick={() => { loadSummary(); loadSessions(); setGridBumpKey(k => k + 1) }}
+          onClick={() => { loadSummary(); loadSessions(); loadGap(); setGridBumpKey(k => k + 1) }}
           disabled={summaryLoading}>
           <RefreshCw size={11}
             style={{ animation: summaryLoading ? 'spin 1s linear infinite' : 'none' }}/>
@@ -897,6 +961,197 @@ export default function PendAlcRecoPage() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </div>
+
+      {/* Pending vs MSA — Gap report. Surfaces open pending qty whose
+          RDC+article has NO MSA row (bot mis-allocated) or where the
+          MSA pool (STK − HOLD) is smaller than the pending. These are
+          the actionable candidates for an Adhoc Close, so the section
+          lives right above the detail filters. */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`,
+                    borderRadius: 8, overflow: 'hidden', marginBottom: 14 }}>
+        <div onClick={() => setGapCollapsed(v => !v)}
+             role="button" tabIndex={0}
+             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') setGapCollapsed(v => !v) }}
+             style={{ padding: '8px 12px',
+                      borderBottom: gapCollapsed ? 'none' : `1px solid ${C.border}`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      cursor: 'pointer', userSelect: 'none' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {gapCollapsed
+              ? <ChevronRight size={12} color={C.textSub}/>
+              : <ChevronDown  size={12} color={C.textSub}/>}
+            <AlertOctagon size={12} color={C.red}/>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
+              PENDING vs MSA — GAP REPORT
+            </div>
+            <div style={{ fontSize: 9, color: C.textMuted, marginLeft: 6 }}>
+              open pending whose MSA stock is missing or smaller than the pending qty
+            </div>
+          </div>
+          <div style={{ fontSize: 9, color: C.textMuted }}>
+            {gapLoading
+              ? 'loading…'
+              : gapData
+                ? `${gapData.summary.rows_total.toLocaleString()} row${gapData.summary.rows_total === 1 ? '' : 's'} · gap ${fmt(gapData.summary.gap_total)}`
+                : '—'}
+          </div>
+        </div>
+
+        {gapCollapsed ? null : (
+          <div style={{ padding: 12 }}>
+            {/* Summary tiles. Clicking a tile toggles its status filter. */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)',
+                          gap: 8, marginBottom: 10 }}>
+              <StatusTile color={C.red} label="TOTAL GAP"
+                hint="Open pending qty not covered by current MSA stock"
+                rows={gapData?.summary.rows_total || 0}
+                qty={gapData?.summary.gap_total || 0}
+                active={gapStatusFilter === ''}
+                onClick={() => { setGapStatusFilter(''); setGapPage(1) }}/>
+              <StatusTile color={C.amber} label="NO MSA"
+                hint="Click to filter · article has no MSA row for that RDC (bot mis-allocated)"
+                rows={gapData?.summary.rows_no_msa || 0}
+                qty={gapData?.summary.gap_no_msa || 0}
+                active={gapStatusFilter === 'NO_MSA'}
+                onClick={() => { setGapStatusFilter(s => s === 'NO_MSA' ? '' : 'NO_MSA'); setGapPage(1) }}/>
+              <StatusTile color={C.blue} label="SHORT (MSA < PEND)"
+                hint="Click to filter · MSA stock exists but is less than the pending qty"
+                rows={gapData?.summary.rows_short || 0}
+                qty={gapData?.summary.gap_short || 0}
+                active={gapStatusFilter === 'SHORT'}
+                onClick={() => { setGapStatusFilter(s => s === 'SHORT' ? '' : 'SHORT'); setGapPage(1) }}/>
+            </div>
+
+            {/* Action row */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <div style={{ fontSize: 9, color: C.textMuted }}>
+                Honours page-level RDC / MAJ_CAT filters · sorted by{' '}
+                <b>{gapSortBy.toUpperCase()}</b> {gapSortDir}
+              </div>
+              <div style={{ flex: 1 }}/>
+              <button style={_btn()} onClick={loadGap} disabled={gapLoading}>
+                <RefreshCw size={10}
+                  style={{ animation: gapLoading ? 'spin 1s linear infinite' : 'none' }}/>
+                Refresh
+              </button>
+              <button onClick={exportGap} disabled={gapExporting || gapLoading}
+                style={_btn('primary')}>
+                <Download size={10}/>
+                {gapExporting ? 'Exporting…' : 'Export CSV'}
+              </button>
+            </div>
+
+            {/* Table */}
+            {gapLoading && !gapData ? (
+              <div style={{ padding: 20, textAlign: 'center', color: C.textMuted, fontSize: 11 }}>
+                Loading gap report…
+              </div>
+            ) : !gapData || gapData.rows.length === 0 ? (
+              <div style={{ padding: 20, textAlign: 'center', fontSize: 11,
+                            background: C.green + '12', border: `1px solid ${C.green}40`,
+                            borderRadius: 4, color: C.green, fontWeight: 600 }}>
+                {gapData && gapData.summary.msa_available === false
+                  ? 'ARS_MSA_TOTAL not found — cannot compute MSA-side stock.'
+                  : 'No gap. Every open pending qty is fully covered by MSA stock.'}
+              </div>
+            ) : (
+              <>
+                <div style={{ maxHeight: 420, overflow: 'auto',
+                              border: `1px solid ${C.border}`, borderRadius: 4 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+                    <thead><tr style={{ background: C.bg, position: 'sticky', top: 0 }}>
+                      {[
+                        ['rdc',            'RDC',         false],
+                        ['article_number', 'ARTICLE',     false],
+                        ['maj_cat',        'MAJ_CAT',     false],
+                        [null,             'CLR',         false],
+                        [null,             'STATUS',      false],
+                        ['pend_qty',       'PEND',        true],
+                        [null,             'STK',         true],
+                        [null,             'HOLD',        true],
+                        ['available',      'AVAILABLE',   true],
+                        ['gap',            'GAP',         true],
+                      ].map(([key, label, right], i) => (
+                        <th key={i}
+                            onClick={key ? () => toggleGapSort(key) : undefined}
+                            style={{ padding: '7px 10px',
+                                     textAlign: right ? 'right' : 'left',
+                                     fontSize: 9, fontWeight: 700, color: C.textSub,
+                                     letterSpacing: '.05em', whiteSpace: 'nowrap',
+                                     borderBottom: `1px solid ${C.border}`,
+                                     cursor: key ? 'pointer' : 'default',
+                                     userSelect: 'none' }}>
+                          {label}
+                          {key && gapSortBy === key && (
+                            <span style={{ marginLeft: 4, color: C.primary }}>
+                              {gapSortDir === 'asc' ? '↑' : '↓'}
+                            </span>
+                          )}
+                        </th>
+                      ))}
+                    </tr></thead>
+                    <tbody>
+                      {gapData.rows.map((r, i) => (
+                        <tr key={`${r.rdc}|${r.article_number}`}
+                            style={{ borderBottom: `1px solid ${C.border}`,
+                                     background: i % 2 === 0 ? '#fff' : C.bg }}>
+                          <td style={{ padding: '5px 10px', fontWeight: 600 }}>{r.rdc}</td>
+                          <td style={{ padding: '5px 10px', fontFamily: 'monospace', fontSize: 9 }}>
+                            {r.article_number}
+                          </td>
+                          <td style={{ padding: '5px 10px', color: C.textSub }}>{r.maj_cat || '—'}</td>
+                          <td style={{ padding: '5px 10px', color: C.textSub }}>{r.clr || '—'}</td>
+                          <td style={{ padding: '5px 10px' }}>
+                            <span style={{ fontSize: 8, fontWeight: 700, padding: '2px 6px',
+                                           borderRadius: 3,
+                                           background: r.status === 'NO_MSA' ? C.amber + '22' : C.blue + '22',
+                                           color:      r.status === 'NO_MSA' ? C.amber : C.blue }}>
+                              {r.status}
+                            </span>
+                          </td>
+                          <td style={{ padding: '5px 10px', textAlign: 'right', fontWeight: 600 }}>
+                            {fmt(r.pend_qty)}
+                          </td>
+                          <td style={{ padding: '5px 10px', textAlign: 'right', color: C.textSub }}>
+                            {fmt(r.stk_qty)}
+                          </td>
+                          <td style={{ padding: '5px 10px', textAlign: 'right', color: C.textMuted }}>
+                            {fmt(r.hold_qty)}
+                          </td>
+                          <td style={{ padding: '5px 10px', textAlign: 'right' }}>
+                            {fmt(r.available)}
+                          </td>
+                          <td style={{ padding: '5px 10px', textAlign: 'right',
+                                       fontWeight: 800, color: C.red }}>
+                            {fmt(r.gap)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {/* Paging */}
+                {gapData.total > gapPageSize && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8,
+                                marginTop: 8, fontSize: 10, color: C.textSub }}>
+                    <span>
+                      Page {gapPage} of {Math.ceil(gapData.total / gapPageSize)} ·{' '}
+                      {gapData.total.toLocaleString()} rows total
+                    </span>
+                    <div style={{ flex: 1 }}/>
+                    <button style={_btn()}
+                      onClick={() => setGapPage(p => Math.max(1, p - 1))}
+                      disabled={gapPage <= 1 || gapLoading}>Prev</button>
+                    <button style={_btn()}
+                      onClick={() => setGapPage(p => p + 1)}
+                      disabled={gapPage * gapPageSize >= gapData.total || gapLoading}>Next</button>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         )}
       </div>

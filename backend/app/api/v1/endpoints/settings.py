@@ -70,6 +70,12 @@ def load_app_settings() -> Dict[str, Any]:
             "enable_row_level_security": True,
             "default_page_size": 50,
             "max_export_rows": 500000,
+            # When True, Listing Part 7 copies every ARS_LISTING row into
+            # ARS_LISTING_WORKING (including ineligible rows). Allocation still
+            # processes only ELIG_FLAG=1 rows via the engine's own R01-R09 /
+            # E1-E7 chain, so output is byte-identical to OFF — toggle is for
+            # audit visibility only ("show me every excluded OPT and why").
+            "shift_all_to_working": False,
         },
         "ui": {
             "primary_color": "#4f46e5",

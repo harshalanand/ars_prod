@@ -2,7 +2,8 @@
 // Header summary, breadcrumb, children, activity log.
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, Pencil, Archive, Plus, Calendar, User, Tag, Clock } from 'lucide-react'
+import { ArrowLeft, Pencil, Archive, Plus, Calendar, User, Tag, Clock,
+         Paperclip, Download } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { ptAPI } from '@/services/api'
 import { StatusBadge, PriorityChip, PhaseChip } from '@/components/pt/StatusBadge'
@@ -36,7 +37,9 @@ function ActivityFeed({ items }) {
           <div style={{
             width: 8, height: 8, marginTop: 6, borderRadius: 999,
             background: a.ACTIVITY_TYPE === 'CREATED' ? '#16a34a' :
-                       a.ACTIVITY_TYPE === 'ARCHIVED' ? '#dc2626' : '#4f46e5',
+                       a.ACTIVITY_TYPE === 'ARCHIVED' ? '#dc2626' :
+                       a.ACTIVITY_TYPE === 'ATTACHMENT_REMOVED' ? '#dc2626' :
+                       a.ACTIVITY_TYPE === 'ATTACHMENT_ADDED' ? '#0891b2' : '#4f46e5',
             flexShrink: 0,
           }} />
           <div style={{ flex: 1, fontSize: 12 }}>
@@ -46,6 +49,8 @@ function ActivityFeed({ items }) {
               {a.ACTIVITY_TYPE === 'ARCHIVED' && 'archived this project'}
               {a.ACTIVITY_TYPE === 'RESTORED' && 'restored this project'}
               {a.ACTIVITY_TYPE === 'MOVED' && 'moved this project'}
+              {a.ACTIVITY_TYPE === 'ATTACHMENT_ADDED' && 'attached a file'}
+              {a.ACTIVITY_TYPE === 'ATTACHMENT_REMOVED' && 'removed an attachment'}
               {a.ACTIVITY_TYPE === 'FIELD_CHANGED' && (
                 <> changed <code style={{ background: '#f3f4f6', padding: '1px 5px', borderRadius: 3, fontSize: 11 }}>{a.FIELD_NAME}</code>
                 {' from '}<em>{a.OLD_VALUE ?? '—'}</em>{' to '}<em>{a.NEW_VALUE ?? '—'}</em></>
@@ -62,6 +67,13 @@ function ActivityFeed({ items }) {
   )
 }
 
+function fmtBytes(n) {
+  if (n == null) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
 export default function PTProjectDetailPage() {
   const { id } = useParams()
   const nav = useNavigate()
@@ -69,6 +81,7 @@ export default function PTProjectDetailPage() {
   const [ancestors, setAncestors] = useState([])
   const [children, setChildren] = useState([])
   const [activity, setActivity] = useState([])
+  const [attachments, setAttachments] = useState([])
   const [enums, setEnums]       = useState(null)
   const [allProjects, setAll]   = useState([])
   const [loading, setLoading]   = useState(true)
@@ -80,12 +93,14 @@ export default function PTProjectDetailPage() {
     Promise.all([
       ptAPI.get(id),
       ptAPI.activity(id),
-    ]).then(([detail, act]) => {
+      ptAPI.attachments.list(id).catch(() => ({ data: { data: [] } })),
+    ]).then(([detail, act, att]) => {
       const d = detail.data?.data
       setProject(d?.project)
       setAncestors(d?.ancestors || [])
       setChildren(d?.children || [])
       setActivity(act.data?.data || [])
+      setAttachments(att.data?.data || [])
     }).finally(() => setLoading(false))
   }
 
@@ -100,18 +115,33 @@ export default function PTProjectDetailPage() {
 
   const handleSave = async (payload) => {
     try {
+      let newId = null
       if (creatingChild) {
         payload.parent_id = project.PROJECT_ID
         const res = await ptAPI.create(payload)
         toast.success(`Created ${res.data?.data?.project_code}`)
+        newId = res.data?.data?.project_id ?? null
       } else {
         await ptAPI.update(project.PROJECT_ID, payload)
         toast.success('Updated')
+        newId = project.PROJECT_ID
       }
       setEditing(false); setCreatingChild(false)
       load()
+      return newId
     } catch (e) {}
   }
+  const downloadAttachment = async (aid, name) => {
+    try {
+      const res = await ptAPI.attachments.download(aid)
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url; a.download = name
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch { toast.error('Failed to download') }
+  }
+
   const handleArchive = async () => {
     if (!confirm(`Archive '${project.NAME}' and all sub-projects?`)) return
     try {
@@ -209,6 +239,59 @@ export default function PTProjectDetailPage() {
           </span>
         </div>
       </div>
+
+      {/* Attachments */}
+      {attachments.length > 0 && (
+        <div style={{
+          background: '#fff', borderRadius: 10, border: '1px solid #e5e7eb',
+          padding: 14, marginBottom: 14,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+            <Paperclip size={14} color="#6b7280" />
+            <span style={{ fontSize: 13, fontWeight: 600 }}>
+              Attachments <span style={{ color: '#6b7280', fontWeight: 400 }}>({attachments.length})</span>
+            </span>
+            <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
+              Click <em>Edit</em> to add or remove files
+            </span>
+          </div>
+          <div style={{ display: 'grid', gap: 6 }}>
+            {attachments.map(a => (
+              <div key={a.ATTACHMENT_ID} style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '6px 10px', borderRadius: 6,
+                background: '#f9fafb', border: '1px solid #e5e7eb',
+              }}>
+                <Paperclip size={12} color="#6b7280" />
+                <button type="button"
+                  onClick={() => downloadAttachment(a.ATTACHMENT_ID, a.ORIGINAL_NAME)}
+                  style={{
+                    background: 'transparent', border: 'none', padding: 0,
+                    color: '#4f46e5', fontSize: 12, fontWeight: 500,
+                    textAlign: 'left', cursor: 'pointer', flex: 1,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}
+                  title={a.ORIGINAL_NAME}>
+                  {a.ORIGINAL_NAME}
+                </button>
+                <span style={{ fontSize: 11, color: '#6b7280' }}>{fmtBytes(a.FILE_SIZE)}</span>
+                <span style={{ fontSize: 11, color: '#9ca3af' }}>
+                  {a.UPLOADED_BY} · {a.UPLOADED_AT?.slice(0, 10)}
+                </span>
+                <button type="button" title="Download"
+                  onClick={() => downloadAttachment(a.ATTACHMENT_ID, a.ORIGINAL_NAME)}
+                  style={{
+                    background: 'transparent', border: 'none', padding: 4,
+                    color: '#6b7280', borderRadius: 4, cursor: 'pointer',
+                    display: 'inline-flex', alignItems: 'center',
+                  }}>
+                  <Download size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Children + Activity grid */}
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 14 }}>

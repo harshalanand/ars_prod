@@ -254,7 +254,8 @@ export const gridBuilderAPI = {
   updateGrid:  (id, data)   => api.put(`/grid-builder/grids/${id}`, data),
   deleteGrid:  (id)         => api.delete(`/grid-builder/grids/${id}`),
   runGrid:     (id)         => api.post(`/grid-builder/grids/${id}/run`, null, { timeout: 600000 }),
-  runAll:      ()           => api.post('/grid-builder/run-all', null, { timeout: 1800000 }),
+  runAll:      ()           => api.post('/grid-builder/run-all', null, { timeout: 30000 }),
+  runAllStatus:()           => api.get('/grid-builder/run-all/status', { quiet: true, timeout: 15000 }),
   reorder:     (sequence)   => api.put('/grid-builder/reorder', { sequence }),
   calcPreview: ()           => api.get('/grid-builder/calculation-preview'),
   buildCalcTables: ()       => api.post('/grid-builder/build-calc-tables', null, { timeout: 600000 }),
@@ -596,7 +597,41 @@ export const holdDashboardAPI = {
   byAge:          () => api.get('/hold-dashboard/by-age'),
   timeline:       (params) => api.get('/hold-dashboard/timeline', { params }),
   detail:         (params) => api.get('/hold-dashboard/detail', { params }),
+  detailExport:   (params) => api.get('/hold-dashboard/detail/export', {
+                                params,
+                                responseType: 'blob',
+                                timeout: 10 * 60 * 1000,
+                              }),
   reconciliation: () => api.get('/hold-dashboard/reconciliation'),
+
+  // Adhoc clear-hold — cancel or release stock from a hold row. Triggers
+  // an MSA HOLD_QTY/FNL_Q resync for the affected (RDC, ARTICLE) keys so
+  // released qty becomes allocatable without a full MSA run.
+  clearHold:      (payload)     => api.post('/hold-dashboard/clear-hold', payload,
+                                      { timeout: 10 * 60 * 1000 }),
+  clearHoldFile:  (file, reason) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const params = reason ? { reason } : {}
+    return api.post('/hold-dashboard/clear-hold-file', fd, {
+      params, headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 10 * 60 * 1000,
+    })
+  },
+
+  // Adhoc revise-hold — increase HOLD_REM on existing tracker rows.
+  // Re-opens a closed row if matched. Same MSA resync as clearHold.
+  reviseHold:     (payload) => api.post('/hold-dashboard/revise-hold', payload,
+                                  { timeout: 10 * 60 * 1000 }),
+  reviseHoldFile: (file, reason) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const params = reason ? { reason } : {}
+    return api.post('/hold-dashboard/revise-hold-file', fd, {
+      params, headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 10 * 60 * 1000,
+    })
+  },
 }
 
 // ============== Pending Allocation (ARS_PEND_ALC) ==============
@@ -627,9 +662,12 @@ export const pendAlcAPI = {
   asyncJobDownload: (job_id)      => api.get(`/pend-alc/async-jobs/${job_id}/download`,
                                       { responseType: 'blob', timeout: 10 * 60 * 1000 }),
   // Async DO upload — same body as doUpdate(), returns { job_id, session_id }.
+  // Timeout is generous (10 min) so a single 200K+ row payload (~25 MB) can
+  // finish uploading even on a slow connection without axios aborting before
+  // the backend returns its synchronous job_id ack.
   doUpdateAsync: (payload)        => api.post('/pend-alc/do-update-async',
                                       Array.isArray(payload) ? { rows: payload } : payload,
-                                      { timeout: 60 * 1000 }),
+                                      { timeout: 10 * 60 * 1000 }),
   bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
   // Re-download an old BDC's SAP-ready 9-column Excel from history.
   bdcHistoryRedownload: (allocation_number) => api.get('/pend-alc/bdc-history-redownload',
@@ -658,6 +696,15 @@ export const pendAlcAPI = {
   recoExport:  (params = {})    => api.get('/pend-alc/reco-export',
                                     { params, responseType: 'blob',
                                       timeout: 10 * 60 * 1000 }),
+
+  // Pending vs MSA gap report — open pending qty whose MSA stock pool is
+  // missing (NO_MSA) or smaller than the pending (SHORT). gap = how much
+  // pending qty isn't covered. Drives the gap section on Reconciliation.
+  pendVsMsaGap:       (params = {}) => api.get('/pend-alc/pend-vs-msa-gap',
+                                          { params, timeout: 5 * 60 * 1000 }),
+  pendVsMsaGapExport: (params = {}) => api.get('/pend-alc/pend-vs-msa-gap-export',
+                                          { params, responseType: 'blob',
+                                            timeout: 10 * 60 * 1000 }),
 
   // Store BDC schedule (Mon-Sat per store)
   scheduleList:        ()                    => api.get('/pend-alc/schedule'),
@@ -724,6 +771,21 @@ export const ptAPI = {
                                                     { params: { limit } }),
   dashboard:    ()                       => api.get('/pt/dashboard'),
   myTasks:      ()                       => api.get('/pt/my-tasks'),
+  attachments: {
+    list:     (pid)      => api.get(`/pt/projects/${pid}/attachments`),
+    upload:   (pid, file) => {
+      const fd = new FormData()
+      fd.append('file', file)
+      return api.post(`/pt/projects/${pid}/attachments`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 5 * 60 * 1000,
+      })
+    },
+    downloadUrl: (aid)   => `${API_BASE}/pt/attachments/${aid}/download`,
+    download: (aid)      => api.get(`/pt/attachments/${aid}/download`,
+                                    { responseType: 'blob' }),
+    delete:   (aid)      => api.delete(`/pt/attachments/${aid}`),
+  },
 }
 
 export default api

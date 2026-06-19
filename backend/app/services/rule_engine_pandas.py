@@ -73,6 +73,18 @@ OPT_TYPE_ORDER = ["RL", "TBC", "TBL"]
 POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
 OPT_KEYS  = ["WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
 
+# Per-OPT sequential engine switch. Set ARS_PER_OPT_MODE=1 to swap the
+# cumulative-window race (_run_band) with the per-OPT loop (_run_band_per_opt).
+# Default OFF: production behavior unchanged. See rule_engine_per_opt.py for
+# the new engine's design rationale and SKIP_REASON taxonomy.
+#
+# Read dynamically (not at module import) so an API endpoint can flip it
+# mid-process by setting os.environ['ARS_PER_OPT_MODE']='1' before dispatch
+# — the next _run_majcat_waterfall call picks up the new value. Worker
+# processes inherit the parent env so they see the same flag.
+def _is_per_opt_mode() -> bool:
+    return os.getenv("ARS_PER_OPT_MODE", "0").strip() in ("1", "true", "True", "yes", "on")
+
 
 # ---------------------------------------------------------------------------
 # Per-MAJ_CAT worker — top-level so ProcessPoolExecutor can pickle it
@@ -107,6 +119,16 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
         defer_writes = False
         _extras = []
     tbl_mbq_cap_pct = float(_extras[0]) if _extras else 0.0
+    # _extras[1] (17th tuple element) carries the post-loop TBL MJ_REQ cap_pct
+    # forward to the per-OPT engine so the same threshold can be evaluated
+    # PRE-allocation (Fix B). Backwards-compatible: missing → 100% (the same
+    # default as run_listing_and_allocation_pandas).
+    tbl_mj_req_cap_pct = float(_extras[1]) if len(_extras) > 1 else 100.0
+    # _extras[2] (18th tuple element) carries the per-OPT sec-cap grid specs
+    # so each worker builds its MAJ_CAT-scoped budgets/running state inside
+    # _run_majcat_waterfall. Backwards-compatible: missing → None (post-pass
+    # SQL gate handles it instead).
+    sec_cap_grid_specs = _extras[2] if len(_extras) > 2 else None
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
@@ -178,6 +200,8 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
             size_threshold=size_threshold,
             min_size_count=min_size_count,
             opt_types=opt_types,
+            tbl_mj_req_cap_pct=tbl_mj_req_cap_pct,
+            sec_cap_grid_specs=sec_cap_grid_specs,
         )
         ship_mc = float(a_out['SHIP_QTY'].fillna(0).sum())
         hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
@@ -402,6 +426,13 @@ def _stage_d_apply_pak_sz_rounding(conn, alloc_table: str) -> None:
                        ISNULL(SHIP_QTY, 0)                       AS req
                 FROM [{alloc_table}]
                 WHERE ISNULL(SHIP_QTY, 0) > 0
+                  -- Per-OPT engine (rule_engine_per_opt._run_band_per_opt)
+                  -- applies pak rounding in-loop and stamps a PAK_SZ_GATE
+                  -- or PAK_SZ_ROUND marker in ALLOC_REMARKS. Skip those
+                  -- rows here so this safety-net does not re-round (and
+                  -- in particular does not undo the new stock-clipped
+                  -- SHIP values which are intentionally non-pak-aligned).
+                  AND CHARINDEX('PAK_SZ_', ISNULL(ALLOC_REMARKS, '')) = 0
             ),
             R AS (
                 SELECT P.*,
@@ -480,7 +511,7 @@ def run_listing_and_allocation_pandas(
     mj_req_growth_pct:  float = 100.0,
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only
     use_writer_queue: Optional[bool] = None, # per-run override; None = fall back to .env
-    apply_sec_cap_in_normal: bool = True,    # 130% Secondary-grid cap in main pass
+    apply_sec_cap_in_normal: bool = True,    # strict per-grid cap on opted-in grids
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -621,6 +652,48 @@ def run_listing_and_allocation_pandas(
     else:
         use_writer_queue = bool(use_writer_queue)
 
+    # ── Build per-OPT sec-cap grid specs once at the parent ──────────────
+    # A grid participates ONLY when ARS_GRID_BUILDER.sec_cap_applicable=1.
+    # Nothing is enforced by default — including MJ. If an operator wants
+    # the MAJ_CAT-level cap, they explicitly add an MJ row to Grid Builder
+    # with sec_cap_applicable=1 and a sec_cap_pct. Grids whose sec_cap_pct
+    # is NULL fall back to SEC_CAP_DEFAULT_PCT (130) just like before.
+    #
+    # This is the strict reading of "cap only applies to grids toggled on
+    # in Grid Builder, rest run as normal" — no Primary special case, no
+    # implicit MJ enforcement.
+    sec_cap_grid_specs: Optional[List[Tuple[str, Dict[str, Any]]]] = None
+    if _is_per_opt_mode() and apply_sec_cap_in_normal:
+        try:
+            with engine.connect() as _sc_conn:
+                _all = rne._discover_all_active_grids(_sc_conn)
+            sec_cap_grid_specs = []
+            skipped = []
+            for g_name, meta in _all.items():
+                if not meta.get("sec_cap_applicable"):
+                    skipped.append(g_name)
+                    continue
+                grid_pct = meta.get("sec_cap_pct")
+                cap_pct = float(grid_pct) if grid_pct else float(rne.SEC_CAP_DEFAULT_PCT)
+                sec_cap_grid_specs.append((g_name, {
+                    "prefix":     meta.get("prefix") or g_name,
+                    "extras":     list(meta.get("extras") or []),
+                    "cap_factor": cap_pct / 100.0,
+                    "cap_pct":    cap_pct,
+                    "gh_col":     meta.get("gh_col", ""),
+                }))
+            logger.info(
+                f"[C-pd] per-OPT sec-cap specs built — applicable grids: "
+                f"{[(g, s['cap_pct']) for g, s in sec_cap_grid_specs]} | "
+                f"skipped (sec_cap_applicable=0): {skipped}"
+            )
+        except Exception as _e:
+            logger.warning(
+                f"[C-pd] failed to build per-OPT sec-cap specs ({_e}) — "
+                f"falling back to post-pass SQL gate"
+            )
+            sec_cap_grid_specs = None
+
     # use_pool decides whether we'll spin up a ProcessPoolExecutor. Below the
     # min-MAJ_CATs threshold or with n_workers≤1 we fall back to inline
     # execution. defer_writes must be tied to use_pool: the writer thread
@@ -657,6 +730,13 @@ def run_listing_and_allocation_pandas(
             # unpack).
             defer_writes_flag,
             float(tbl_mbq_cap_pct),
+            # 17th element — TBL post-loop MJ_REQ cap_pct, forwarded so the
+            # per-OPT engine can evaluate the same gate PRE-allocation
+            # (Fix B). Falls back to 100% in the worker's unpack.
+            float(tbl_mj_req_cap_pct),
+            # 18th element — per-OPT sec-cap grid specs. None disables
+            # in-band sec-cap (post-pass SQL gate handles it instead).
+            sec_cap_grid_specs,
         )
         for mc in alloc_groups
     ]
@@ -846,11 +926,20 @@ def run_listing_and_allocation_pandas(
         # SHIP=HOLD=0 with SKIP_REASON='{OPT}_MJ_REQ_GATE_FAIL' or
         # '{OPT}_MJ_REQ_POST_WINNER'. Reuses the sequential engine's SQL
         # helper since the operation is identical across engines.
+        #
+        # Per-OPT mode (Fix B): the TBL portion of this gate is enforced
+        # PRE-allocation inside _run_band_per_opt. Use the new skip_tbl_branch
+        # flag so the post-loop bypasses the TBL skip-records logic entirely
+        # while still consuming req_rem for RL/TBC accounting consistency.
+        # IMPORTANT: do NOT set tbl_cap_pct=0 — that triggers the disabled
+        # branch which zeroes every TBL OPT (regression confirmed: 4,088
+        # TBL OPTs vaporized with TBL_MJ_REQ_GATE_DISABLED).
         rne._stage_c_apply_opt_mj_req_gate(
             conn, alloc_table, working_table,
             rl_cap_pct=rl_mj_req_cap_pct,
             tbc_cap_pct=tbc_mj_req_cap_pct,
             tbl_cap_pct=tbl_mj_req_cap_pct,
+            skip_tbl_branch=_is_per_opt_mode(),
         )
         # Safety-net: a SKIPPED row with no ship has no business holding WH
         # stock — zero its hold so the buffer is returned to FNL_Q_REM.  Rows
@@ -873,28 +962,34 @@ def run_listing_and_allocation_pandas(
               AND ISNULL(POOL_CONSUMED, 0) > 0
         """)
         # Recompute FNL_Q_REM per pool key: FNL_Q minus only real (non-zero) consumption.
-        run_sql(conn, f"""
-            UPDATE A SET A.FNL_Q_REM = ISNULL(A.FNL_Q, 0) - ISNULL(B.consumed, 0)
-            FROM [{alloc_table}] A
-            LEFT JOIN (
-                SELECT [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
-                       ISNULL([CLR],'') AS CLR, [VAR_ART], [SZ],
-                       SUM(ISNULL([POOL_CONSUMED], 0)) AS consumed
-                FROM   [{alloc_table}]
-                GROUP  BY [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
-                          ISNULL([CLR],''), [VAR_ART], [SZ]
-            ) B ON  A.[RDC]            = B.[RDC]
-                AND A.[MAJ_CAT]        = B.[MAJ_CAT]
-                AND A.[GEN_ART_NUMBER] = B.[GEN_ART_NUMBER]
-                AND ISNULL(A.[CLR],'') = B.[CLR]
-                AND A.[VAR_ART]        = B.[VAR_ART]
-                AND A.[SZ]             = B.[SZ]
-        """)
+        # In per-OPT mode the engine writes a live post-draw value into FNL_Q_REM
+        # at each OPT's turn (see rule_engine_per_opt.py step 5f.1) — that value
+        # is authoritative for audit (tells pool-exhausted apart from pak-gated)
+        # and must NOT be replaced with the aggregate residual.
+        if not _is_per_opt_mode():
+            run_sql(conn, f"""
+                UPDATE A WITH (ROWLOCK, UPDLOCK) SET A.FNL_Q_REM = ISNULL(A.FNL_Q, 0) - ISNULL(B.consumed, 0)
+                FROM [{alloc_table}] A
+                LEFT JOIN (
+                    SELECT [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
+                           ISNULL([CLR],'') AS CLR, [VAR_ART], [SZ],
+                           SUM(ISNULL([POOL_CONSUMED], 0)) AS consumed
+                    FROM   [{alloc_table}]
+                    GROUP  BY [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
+                              ISNULL([CLR],''), [VAR_ART], [SZ]
+                ) B ON  A.[RDC]            = B.[RDC]
+                    AND A.[MAJ_CAT]        = B.[MAJ_CAT]
+                    AND A.[GEN_ART_NUMBER] = B.[GEN_ART_NUMBER]
+                    AND ISNULL(A.[CLR],'') = B.[CLR]
+                    AND A.[VAR_ART]        = B.[VAR_ART]
+                    AND A.[SZ]             = B.[SZ]
+                OPTION (MAXDOP 1)
+            """)
         # PAK_SZ rounding moved earlier (before MJ_REQ cap). ALLOC_QTY now
         # reflects the post-cap, pak-aligned SHIP_QTY.
-        run_sql(conn, f"UPDATE [{alloc_table}] SET ALLOC_QTY = SHIP_QTY")
+        run_sql(conn, f"UPDATE [{alloc_table}] WITH (ROWLOCK, UPDLOCK) SET ALLOC_QTY = SHIP_QTY")
         run_sql(conn, f"""
-            UPDATE [{alloc_table}] SET
+            UPDATE [{alloc_table}] WITH (ROWLOCK, UPDLOCK) SET
                 ALLOC_STATUS = CASE
                     WHEN SHIP_QTY + HOLD_QTY > 0
                          AND SHIP_QTY + HOLD_QTY >= CASE
@@ -938,12 +1033,24 @@ def run_listing_and_allocation_pandas(
                          AND ISNULL(SZ_REQ, 0) <= 0 THEN 'NO_REQ'
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_MSA'
                     ELSE SKIP_REASON END
+            OPTION (MAXDOP 1)
         """)
         # ── Secondary-grid cap (main pass, toggle-controlled) ─
         # Pandas workers used in-memory pools; build a #nre_pool on the parent
         # from the current FNL_Q_REM state so the sec-cap helper can return
         # stock against the same authoritative table.
-        if apply_sec_cap_in_normal:
+        #
+        # IMPORTANT: when per-OPT mode is on AND sec_cap_grid_specs was built
+        # successfully, the per-OPT engine already enforced sec-cap inside
+        # each band — running totals were maintained as OPTs shipped, blocked
+        # OPTs never touched pool, remarks are clean. The post-pass SQL gate
+        # would then walk the same OPTs again, find no breaches (per-OPT
+        # already blocked the breakers), and waste a few seconds of work.
+        # Skip it.
+        _per_opt_sec_cap_already_ran = (
+            _is_per_opt_mode() and sec_cap_grid_specs is not None
+        )
+        if apply_sec_cap_in_normal and not _per_opt_sec_cap_already_ran:
             run_sql(conn, f"IF OBJECT_ID('tempdb..{rne.POOL_TABLE}') IS NOT NULL DROP TABLE {rne.POOL_TABLE}")
             run_sql(conn, f"""
                 SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
@@ -975,28 +1082,95 @@ def run_listing_and_allocation_pandas(
             # parent connection persists across runs in some callers.
             run_sql(conn, f"IF OBJECT_ID('tempdb..{rne.POOL_TABLE}') IS NOT NULL DROP TABLE {rne.POOL_TABLE}")
 
-        # Refund MJ_REQ_REM from final SHIP_QTY.
-        # The waterfall + _revalidate_after_band decremented MJ_REQ_REM using
-        # in-band ROUND_SHIP.  Post-waterfall stages (PAK_SZ rounding gate,
-        # OPT_MJ_REQ gate, SEC_CAP pre-gate) may have zeroed rows AFTER that
-        # decrement, leaving MJ_REQ_REM stale.  One authoritative recompute
-        # against the final SHIP_QTY restores the budget so it reflects what
-        # truly shipped — idempotent and gate-agnostic.
-        run_sql(conn, f"""
-            UPDATE W
-            SET W.[MJ_REQ_REM] = CASE
-                WHEN ISNULL(W.[MJ_REQ], 0) - ISNULL(S.shipped, 0) > 0
-                THEN ISNULL(W.[MJ_REQ], 0) - ISNULL(S.shipped, 0)
-                ELSE 0 END
-            FROM [{working_table}] W
-            LEFT JOIN (
-                SELECT WERKS, MAJ_CAT,
-                       SUM(ISNULL(SHIP_QTY, 0)) AS shipped
-                FROM [{alloc_table}]
-                GROUP BY WERKS, MAJ_CAT
-            ) S ON S.WERKS = W.WERKS AND S.MAJ_CAT = W.MAJ_CAT
-            WHERE ISNULL(W.[LISTED_FLAG], 0) = 1
-        """)
+        # Refund every Primary grid's *_REQ_REM from final SHIP_QTY, then
+        # recompute the row-level H_<grid>_REM flags and PRI_CT_REM that
+        # depend on them.
+        #
+        # The waterfall + _revalidate_after_band decremented *_REQ_REM with
+        # in-band ROUND_SHIP. Post-waterfall stages (PAK_SZ rounding gate,
+        # OPT_MJ_REQ gate, SEC_CAP pre-gate) may have zeroed SHIP_QTY AFTER
+        # that decrement. Without this refund, *_REQ_REM stays stale and
+        # H_<grid>_REM (set from *_REQ_REM > 0.5×ACS_D) likewise — leading
+        # to the visible inconsistency MJ_REQ_REM=139 / H_MJ_REM=0 on rows
+        # whose ship was reverted by a post-band gate.
+        #
+        # Idempotent and gate-agnostic — recomputes from scratch against
+        # whatever final SHIP_QTY ended up being.
+        grids_for_refund = rne._discover_primary_grids(conn)
+        work_cols_refund = {c.upper() for c in rne._cols(conn, working_table)}
+        alloc_cols_refund = {c.upper() for c in rne._cols(conn, alloc_table)}
+
+        # (1) Refund each grid's *_REQ_REM. Grids whose grain columns don't
+        # exist on alloc_table are skipped (they'd never have been touched
+        # by the waterfall either).
+        for req_col, meta in grids_for_refund.items():
+            req_rem = meta["req_rem"]
+            extras  = meta.get("extras", []) or []
+            if req_col.upper() not in work_cols_refund:
+                continue
+            if req_rem.upper() not in work_cols_refund:
+                continue
+            grain_cols = ["WERKS", "MAJ_CAT"] + list(extras)
+            if not all(c.upper() in alloc_cols_refund for c in grain_cols):
+                continue
+            grp_sql = ", ".join(f"[{c}]" for c in grain_cols)
+            join_sql = " AND ".join(
+                f"ISNULL(S.[{c}], '') = ISNULL(W.[{c}], '')" if c == "CLR"
+                else f"S.[{c}] = W.[{c}]"
+                for c in grain_cols
+            )
+            run_sql(conn, f"""
+                UPDATE W
+                SET W.[{req_rem}] = CASE
+                    WHEN ISNULL(W.[{req_col}], 0) - ISNULL(S.shipped, 0) > 0
+                    THEN ISNULL(W.[{req_col}], 0) - ISNULL(S.shipped, 0)
+                    ELSE 0 END
+                FROM [{working_table}] W
+                LEFT JOIN (
+                    SELECT {grp_sql},
+                           SUM(ISNULL(SHIP_QTY, 0)) AS shipped
+                    FROM [{alloc_table}]
+                    GROUP BY {grp_sql}
+                ) S ON {join_sql}
+                WHERE ISNULL(W.[LISTED_FLAG], 0) = 1
+            """)
+
+        # (2) Recompute H_<grid>_REM = 1 iff *_REQ_REM > 0.5×ACS_D AND GH=1.
+        # Same formula as _revalidate_after_band step (3) so values stay
+        # consistent across the pipeline.
+        h_rem_sets = []
+        pri_h, pri_gh = [], []
+        for req_col, meta in grids_for_refund.items():
+            h_rem  = meta["h_rem"]
+            gh_col = meta["gh_col"]
+            req_rem = meta["req_rem"]
+            if (h_rem.upper() in work_cols_refund
+                    and req_rem.upper() in work_cols_refund
+                    and gh_col.upper() in work_cols_refund):
+                h_rem_sets.append(
+                    f"[{h_rem}] = CASE "
+                    f"WHEN ISNULL([{req_rem}],0) > {rne.ACS_SKIP_FACTOR} * ISNULL(ACS_D,0) "
+                    f"AND ISNULL([{gh_col}],0) = 1 THEN 1 ELSE 0 END"
+                )
+                pri_h.append(h_rem)
+                pri_gh.append(gh_col)
+        if h_rem_sets:
+            run_sql(conn, f"""
+                UPDATE [{working_table}] SET {', '.join(h_rem_sets)}
+                WHERE ISNULL(LISTED_FLAG, 0) = 1
+            """)
+
+        # (3) Recompute PRI_CT_REM = Σ(H_<grid>_REM) / Σ(GH_<grid>) × 100.
+        if pri_h and pri_gh and "PRI_CT_REM" in work_cols_refund:
+            h_sum  = " + ".join(f"ISNULL([{c}],0)" for c in pri_h)
+            gh_sum = " + ".join(f"ISNULL([{c}],0)" for c in pri_gh)
+            run_sql(conn, f"""
+                UPDATE [{working_table}] SET
+                    PRI_CT_REM = CASE
+                        WHEN ({gh_sum}) = 0 THEN 0
+                        ELSE ROUND(CAST(({h_sum}) AS FLOAT) / ({gh_sum}) * 100, 1) END
+                WHERE ISNULL(LISTED_FLAG, 0) = 1
+            """)
 
         # Per-row reason classification before Stage D rolls up to the
         # listing working table.
@@ -1190,7 +1364,16 @@ def _load_tables(engine, alloc_table, working_table, grids, only_majcats):
 
 
 def _select_working_cols(conn, working_table, grids) -> List[str]:
-    """Return the working_table columns we need to load — base + per-grid."""
+    """Return the working_table columns we need to load — base + per-grid.
+
+    Also includes every `<prefix>_MBQ_ORIG`, `<prefix>_MBQ`, and
+    `<prefix>_STK_TTL` column that exists on the working table. These are
+    needed by the per-OPT sec-cap state-builder so it can compute
+    `budget = max(0, MBQ_ORIG × cap% − STK_TTL)` per grid grain. Loading
+    them unconditionally is cheap (~20 extra float columns) and avoids a
+    silent "grid not materialised" fallback when sec-cap specs reference
+    a grid the legacy loader didn't include.
+    """
     base = [
         'WERKS', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR',
         'OPT_TYPE', 'OPT_PRIORITY_RANK', 'LISTED_FLAG',
@@ -1199,7 +1382,8 @@ def _select_working_cols(conn, working_table, grids) -> List[str]:
         # MAJ_CAT-level store aggregates — used by the MBQ cap in _run_band
         'MJ_MBQ', 'MJ_STK_TTL', 'MJ_REQ', 'MJ_REQ_REM',
     ]
-    existing = {c.upper() for c in rne._cols(conn, working_table)}
+    existing_all = rne._cols(conn, working_table)
+    existing = {c.upper() for c in existing_all}
     cols = [c for c in base if c.upper() in existing]
     for meta in grids.values():
         for col in (meta['req_rem'], meta['h_rem'], meta['gh_col']):
@@ -1208,6 +1392,29 @@ def _select_working_cols(conn, working_table, grids) -> List[str]:
         for ex in meta.get('extras', []):
             if ex.upper() in existing and ex not in cols:
                 cols.append(ex)
+    # Per-grid MBQ / STK_TTL / GH columns — needed by the per-OPT sec-cap
+    # state-builder. Pull every column matching the known suffix patterns so
+    # we don't have to know each grid's prefix up front. Also pull the
+    # extras (hierarchy) column itself — derived from any `<prefix>_MBQ_ORIG`
+    # column whose <prefix> is also a column on the working table (these are
+    # secondary-grid extras like M_YARN_02, FIT, RNG_SEG, etc., not loaded
+    # by the legacy base list).
+    existing_set = set(existing_all)
+    for c in existing_all:
+        cu = c.upper()
+        if (cu.endswith('_MBQ_ORIG') or cu.endswith('_STK_TTL')
+                or cu.endswith('_MBQ') or cu.startswith('GH_')):
+            if c not in cols:
+                cols.append(c)
+        if cu.endswith('_MBQ_ORIG'):
+            prefix = c[:-len('_MBQ_ORIG')]
+            # Strip 'MJ_' if present? No — Secondary grid prefixes like
+            # 'M_YARN_02' don't have it; MJ has MJ_MBQ_ORIG → prefix='MJ',
+            # which isn't a hierarchy column. Only add prefix as an extras
+            # column when it exists ON the working table — that filters
+            # out non-extras prefixes like 'MJ'/'MERGE_RNG_SEG'.
+            if prefix in existing_set and prefix not in cols:
+                cols.append(prefix)
     return cols
 
 
@@ -1311,6 +1518,15 @@ def _run_majcat_waterfall(
     size_threshold: float = 0.6,
     min_size_count: int = 3,
     opt_types: Optional[List[str]] = None,
+    # Per-OPT engine only: drives the TBL MJ_REQ_GATE pre-check (Fix B).
+    # tbl_mj_req_cap_pct mirrors the post-loop _stage_c_apply_opt_mj_req_gate
+    # `tbl_cap_pct` so the pre-check and post-loop use the same threshold.
+    tbl_mj_req_cap_pct: float = 100.0,
+    # Per-OPT engine only: list of (grid_name, meta) tuples describing every
+    # grid that participates in sec-cap (sec_cap_applicable=1 + MJ when
+    # include_primary=True). Built once at the wrapper level via DB conn.
+    # None or empty disables per-OPT sec-cap (legacy post-pass still runs).
+    sec_cap_grid_specs: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run RL → TBC → TBL waterfall in pandas for one MAJ_CAT slice.
@@ -1350,6 +1566,75 @@ def _run_majcat_waterfall(
     # SKIPPED rows (which never enter elig_mask) always show a meaningful
     # FNL_Q_REM rather than NULL.
     _snapshot_fnl_q_rem(alloc_df, pool_dict)
+
+    per_opt_mode = _is_per_opt_mode()
+    if per_opt_mode:
+        logger.info(
+            "[C-pd] ARS_PER_OPT_MODE=1 — using sequential per-OPT engine "
+            f"(rule_engine_per_opt._run_band_per_opt) tbl_mj_req_cap_pct={tbl_mj_req_cap_pct}"
+        )
+
+    # Build per-OPT sec-cap state ONCE for this MAJ_CAT slice. Mutates its
+    # `running` dict in place as each OPT ships across bands/rounds. None
+    # when (a) per-OPT mode is off, or (b) sec_cap_grid_specs was not passed
+    # (legacy callers; post-pass gate still runs in that case).
+    sec_cap_state = None
+    if per_opt_mode and sec_cap_grid_specs:
+        try:
+            from app.services.rule_engine_per_opt import build_sec_cap_state
+            sec_cap_state = build_sec_cap_state(working_df, sec_cap_grid_specs)
+            n_grids = sum(1 for g in sec_cap_state.get("grids", []) or [])
+            logger.info(
+                f"[C-pd] per-OPT sec-cap state built — {n_grids} grids "
+                f"participating; pool stays live for blocked OPTs"
+            )
+        except Exception as _scerr:
+            logger.warning(
+                f"[C-pd] per-OPT sec-cap state build failed: {_scerr} — "
+                f"falling back to post-pass gate"
+            )
+            sec_cap_state = None
+
+    # Per-WERKS MJ_REQ_REM dict for the TBL MJ_REQ_GATE pre-check. Lives
+    # across the whole MAJ_CAT loop but is RE-SEEDED from the live
+    # working_df at the top of every band (see `_rebuild_mj_req_rem_dict`
+    # below) so it picks up the post-RL/TBC decrement that
+    # `_revalidate_after_band` writes back to working_df['MJ_REQ_REM'].
+    #
+    # Without that refresh the TBL band would see the pre-RL budget and
+    # admit more TBL OPTs than the remaining budget can cover — the
+    # HM30 × M_W_SHIRT_FS overshoot was caused exactly by this staleness.
+    mj_req_rem_dict: Dict[str, float] = {}
+
+    def _rebuild_mj_req_rem_dict() -> None:
+        nonlocal mj_req_rem_dict
+        if not per_opt_mode:
+            return
+        if working_df is None or 'MJ_REQ_REM' not in working_df.columns:
+            mj_req_rem_dict = {}
+            return
+        try:
+            _mw = working_df[['WERKS', 'MJ_REQ_REM']].copy()
+            _mw['MJ_REQ_REM'] = pd.to_numeric(_mw['MJ_REQ_REM'], errors='coerce').fillna(0.0)
+            # One value per WERKS (working_df has one row per OPT, but
+            # MJ_REQ_REM is a MAJ_CAT-level aggregate so all rows for a
+            # WERKS share the same value — first wins).
+            mj_req_rem_dict = {
+                str(k): float(v) for k, v in (
+                    _mw.drop_duplicates(subset=['WERKS'])
+                       .set_index('WERKS')['MJ_REQ_REM']
+                       .astype(float)
+                       .to_dict()
+                ).items()
+            }
+        except Exception as _err:
+            logger.warning(
+                f"[C-per-opt] failed to (re)build mj_req_rem_dict ({_err}) "
+                f"— TBL MJ_REQ_GATE pre-check disabled this run"
+            )
+            mj_req_rem_dict = {}
+
+    _rebuild_mj_req_rem_dict()
 
     active_ot = [ot for ot in OPT_TYPE_ORDER if not opt_types or ot in opt_types]
     for i, ot in enumerate(active_ot):
@@ -1395,7 +1680,14 @@ def _run_majcat_waterfall(
             # the pool state at the moment each row's allocation is attempted.
             # This lets users see exactly what pool was available and why skips
             # fired, rather than the post-waterfall depleted value.
-            _snapshot_fnl_q_rem(alloc_df, pool_dict, mask=elig_mask)
+            #
+            # In per-OPT mode the engine writes a live POST-draw value at each
+            # OPT's turn (rule_engine_per_opt step 5f.1) and that is the value
+            # the operator must see in history. Skipping the pre-band snapshot
+            # avoids overwriting prior rounds' per-OPT writes with a band-wide
+            # uniform pool value.
+            if not per_opt_mode:
+                _snapshot_fnl_q_rem(alloc_df, pool_dict, mask=elig_mask)
 
             # Rebuild the per-WERKS cap from the live MJ_REQ_REM at the start
             # of every band — captures all ships from prior opt_types AND prior
@@ -1413,11 +1705,30 @@ def _run_majcat_waterfall(
             # Round N finishes for ALL stores before round N+1 starts.
             # Cross-type eligibility (R06: MJ_REQ_REM < 0.5×ACS_D) is evaluated
             # by _pre_band_check before the first round of each OPT_TYPE.
-            _run_band(alloc_df, pool_dict, ot, int(r),
-                      mbq_budget=mbq_budget,
-                      hold_dict=hold_dict,
-                      size_threshold=size_threshold,
-                      min_size_count=min_size_count)
+            if per_opt_mode:
+                # Sequential per-OPT engine: pre-validates every gate at each
+                # OPT's turn against the LIVE pool, no post-loop refunds, honest
+                # SKIP_REASONs. See rule_engine_per_opt._run_band_per_opt.
+                #
+                # Re-seed mj_req_rem_dict from working_df so the TBL gate sees
+                # the latest remainder (RL/TBC ships of prior bands have already
+                # been written back by the previous `_revalidate_after_band`).
+                _rebuild_mj_req_rem_dict()
+                from app.services.rule_engine_per_opt import _run_band_per_opt
+                _run_band_per_opt(alloc_df, pool_dict, ot, int(r),
+                                  mbq_budget=mbq_budget,
+                                  hold_dict=hold_dict,
+                                  size_threshold=size_threshold,
+                                  min_size_count=min_size_count,
+                                  mj_req_rem_dict=mj_req_rem_dict,
+                                  tbl_mj_req_cap_pct=tbl_mj_req_cap_pct,
+                                  sec_cap_state=sec_cap_state)
+            else:
+                _run_band(alloc_df, pool_dict, ot, int(r),
+                          mbq_budget=mbq_budget,
+                          hold_dict=hold_dict,
+                          size_threshold=size_threshold,
+                          min_size_count=min_size_count)
 
             if revalidate_enabled:
                 _revalidate_after_band(
@@ -2320,6 +2631,70 @@ _ALLOC_WRITE_COLS = [
     'FNL_Q_REM',
 ]
 
+_SHORT_TEXT_BUFFER = 1000  # default cap for key/status columns
+_TEXT_HEADROOM     = 200   # safety margin above observed max length
+_TEXT_MIN_BUFFER   = 500   # never bind smaller than this
+# SQL_WVARCHAR maxes out at 4000 chars in MS SQL. Past that we must
+# escalate to SQL_WLONGVARCHAR (NVARCHAR(MAX) / LOB binding).
+_WVARCHAR_CAP      = 4000
+
+
+def _bind_string_buffers(cur, cols, out_df, numeric_cols):
+    """Explicitly size pyodbc string parameter buffers for fast_executemany.
+
+    Why this exists: when fast_executemany targets a TEMP table, pyodbc's
+    SQLDescribeParam can't read the temp-column metadata and falls back to
+    a 255-char buffer for every string parameter. The first long band-trace
+    raises 'String data, right truncation: length X buffer 510' even when
+    the temp column is NVARCHAR(MAX). setinputsizes() bypasses the fallback
+    by stating the buffer width up front, per-parameter.
+
+    Sizing strategy — buffer = max(observed_len + headroom, MIN), then:
+      - <= 4000 chars → SQL_WVARCHAR(buffer)
+      - >  4000 chars → SQL_WLONGVARCHAR(buffer)   (LOB)
+    pyodbc.fast_executemany pre-allocates buffer × num_rows for each
+    parameter, so binding the type's theoretical max (~1 GB) would
+    request tens of TB and raise MemoryError. Sizing to actual data
+    keeps the allocation bounded.
+
+    Every slot must be a valid (type, precision, scale) tuple — ODBC
+    Driver 18 rejects `None` with HY104 ('Invalid precision value (0)'),
+    so numeric params get an explicit SQL_DOUBLE spec rather than a
+    default.
+    """
+    import pyodbc as _pyodbc
+    sizes = []
+    for c in cols:
+        if c in numeric_cols:
+            # ODBC SQL_DOUBLE column-size is 15 (decimal digits), NOT 53
+            # (that's SQL_FLOAT's bit-precision). Driver 18 rejects 53
+            # with HY104 'Invalid precision value'.
+            sizes.append((_pyodbc.SQL_DOUBLE, 15, 0))
+            continue
+
+        # Probe actual max char length in this batch, with a NULL-safe
+        # fallback when the column is absent or entirely null.
+        try:
+            ser = out_df[c]
+            observed = int(ser.dropna().astype(str).str.len().max() or 0)
+        except Exception:
+            observed = 0
+        buf = max(observed + _TEXT_HEADROOM, _TEXT_MIN_BUFFER, _SHORT_TEXT_BUFFER)
+
+        if buf <= _WVARCHAR_CAP:
+            sizes.append((_pyodbc.SQL_WVARCHAR, buf, 0))
+        else:
+            # Past the WVARCHAR cap: must use the LOB type. pyodbc will
+            # pre-allocate `buf * row_count` per param — keep `buf` close
+            # to actual need rather than the type's theoretical max.
+            sizes.append((_pyodbc.SQL_WLONGVARCHAR, buf, 0))
+    try:
+        cur.setinputsizes(sizes)
+    except Exception as e:
+        # Old pyodbc versions or some drivers may reject setinputsizes —
+        # log and continue; fast_executemany will use its fallback buffer.
+        logger.warning(f"[pandas] setinputsizes failed: {e}")
+
 
 # Matches the band-trace tokens written by _run_band in
 # ALLOC_REMARKS, e.g. " B[TBL.r1.rk1] sh=5 hld=1 pool=382->376;".
@@ -2343,6 +2718,20 @@ def _apply_pak_sz_rounding_df(alloc_df: pd.DataFrame) -> pd.DataFrame:
     if 'SHIP_QTY' not in alloc_df.columns:
         return alloc_df
     nonzero = alloc_df['SHIP_QTY'].fillna(0) > 0
+    # Per-OPT engine stamps PAK_SZ_GATE / PAK_SZ_ROUND markers in
+    # ALLOC_REMARKS at allocation time. Those rows are already in their
+    # final form (including stock-clipped non-pak-aligned SHIP values),
+    # so the in-memory safety-net here must leave them untouched. Rows
+    # produced by the cumulative-window _run_band path do not carry the
+    # marker and continue to be rounded as before.
+    if 'ALLOC_REMARKS' in alloc_df.columns:
+        marker_mask = (
+            alloc_df['ALLOC_REMARKS']
+            .fillna('')
+            .astype(str)
+            .str.contains('PAK_SZ_', regex=False)
+        )
+        nonzero = nonzero & (~marker_mask)
     if not nonzero.any():
         return alloc_df
     pak_v = (
@@ -2474,9 +2863,13 @@ def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
             elif c in {'ALLOC_REMARKS', 'SKIP_REASON'}:
                 # Band-trace accumulates across many rounds × ranks — must
                 # not be truncated. Mirrors the persisted column types.
-                col_defs.append(f"[{c}] NVARCHAR(MAX) NULL")
+                # COLLATE DATABASE_DEFAULT pins the temp column to the
+                # user-DB collation (Latin1_General_CI_AS), not tempdb's
+                # default (SQL_Latin1_General_CP1_CI_AS), so the JOIN below
+                # doesn't hit error 468.
+                col_defs.append(f"[{c}] NVARCHAR(MAX) COLLATE DATABASE_DEFAULT NULL")
             else:
-                col_defs.append(f"[{c}] NVARCHAR(200) NULL")
+                col_defs.append(f"[{c}] NVARCHAR(200) COLLATE DATABASE_DEFAULT NULL")
         cur.execute(f"CREATE TABLE {tmp} ({', '.join(col_defs)})")
 
         placeholders = ", ".join("?" * len(cols))
@@ -2485,6 +2878,10 @@ def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
             tuple(None if (isinstance(v, float) and np.isnan(v)) else v for v in row)
             for row in out.itertuples(index=False, name=None)
         ]
+        _bind_string_buffers(cur, cols, out, numeric_cols={
+            'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'FROM_HOLD_QTY',
+            'POOL_CONSUMED', 'ALLOC_ROUND', 'FNL_Q_REM',
+        })
         cur.executemany(
             f"INSERT INTO {tmp} ({col_list}) VALUES ({placeholders})",
             rows,
@@ -2553,8 +2950,20 @@ def _write_back_working(engine, working_table: str, df: pd.DataFrame,
 
         col_defs = []
         for c in cols:
-            if c in OPT_KEYS or c in ('ALLOC_STATUS', 'ALLOC_REMARKS'):
-                col_defs.append(f"[{c}] NVARCHAR(400) NULL")
+            if c == 'ALLOC_REMARKS':
+                # Band-trace accumulates across many rounds × ranks — must
+                # not be truncated. pyodbc fast_executemany against a temp
+                # table falls back to a 255-char (510-byte) parameter buffer
+                # when SQLDescribeParam can't read column metadata, so any
+                # NVARCHAR(<N>) wider than 255 still raises "String data,
+                # right truncation: length X buffer 510". NVARCHAR(MAX) is
+                # bound as SQL_WLONGVARCHAR and bypasses the cap. Mirrors
+                # the persisted column + the fix in _write_back_alloc.
+                col_defs.append(f"[{c}] NVARCHAR(MAX) COLLATE DATABASE_DEFAULT NULL")
+            elif c in OPT_KEYS or c == 'ALLOC_STATUS':
+                # See _write_back_alloc — pin to DB collation to avoid
+                # error 468 on the JOIN against the persisted table.
+                col_defs.append(f"[{c}] NVARCHAR(400) COLLATE DATABASE_DEFAULT NULL")
             else:
                 col_defs.append(f"[{c}] FLOAT NULL")
         cur.execute(f"CREATE TABLE {tmp} ({', '.join(col_defs)})")
@@ -2565,6 +2974,13 @@ def _write_back_working(engine, working_table: str, df: pd.DataFrame,
             tuple(None if (isinstance(v, float) and np.isnan(v)) else v for v in row)
             for row in out.itertuples(index=False, name=None)
         ]
+        # _write_back_working col taxonomy: OPT_KEYS + ALLOC_STATUS/REMARKS
+        # are strings; everything else (MSA_FNL_Q_REM, PRI_CT_REM, grid
+        # _REM cols) is numeric.
+        _bind_string_buffers(cur, cols, out, numeric_cols={
+            c for c in cols if c not in OPT_KEYS
+            and c not in ('ALLOC_STATUS', 'ALLOC_REMARKS')
+        })
         cur.executemany(
             f"INSERT INTO {tmp} ({col_list}) VALUES ({placeholders})",
             rows,

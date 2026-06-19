@@ -51,7 +51,7 @@ MAPPING_TABLE      = "Cont_mappings"
 ASSIGNMENT_TABLE   = "Cont_mapping_assignments"
 JOB_TABLE          = "Cont_jobs"
 NUMERIC_SQL_TYPES  = {'int','bigint','smallint','tinyint','numeric','decimal','float','real','money','smallmoney'}
-VALID_GROUPING     = ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02')
+VALID_GROUPING     = ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02','FIT','BODY')
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────

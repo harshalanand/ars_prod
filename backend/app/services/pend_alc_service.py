@@ -485,7 +485,10 @@ def backfill_bdc_operations(conn, dry_run: bool = True) -> Dict:
         #    JOIN — handles 100k+ keys efficiently.
         tmp = f"#bf_keys_{uuid.uuid4().hex[:8]}"
         conn.execute(text(
-            f"CREATE TABLE {tmp} (rdc NVARCHAR(20), st_cd NVARCHAR(20), art NVARCHAR(30))"
+            f"CREATE TABLE {tmp} ("
+            f"rdc NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+            f"st_cd NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+            f"art NVARCHAR(30) COLLATE DATABASE_DEFAULT)"
         ))
         # Bulk insert keys
         conn.execute(
@@ -1100,6 +1103,10 @@ def preview_revert(conn, op_id: int) -> Dict:
         errors = _check_manual_revert(conn, op)
     elif op["op_type"] == "APPROVE":
         errors = _check_approve_revert(conn, op)
+    elif op["op_type"] == "HOLD_CLEAR":
+        errors = _check_hold_clear_revert(conn, op)
+    elif op["op_type"] == "HOLD_REVISE":
+        errors = _check_hold_revise_revert(conn, op)
     else:
         errors = [f"Unknown op_type: {op['op_type']}"]
 
@@ -1139,6 +1146,10 @@ def revert_operation(
         errors = _check_manual_revert(conn, op)
     elif op["op_type"] == "APPROVE":
         errors = _check_approve_revert(conn, op)
+    elif op["op_type"] == "HOLD_CLEAR":
+        errors = _check_hold_clear_revert(conn, op)
+    elif op["op_type"] == "HOLD_REVISE":
+        errors = _check_hold_revise_revert(conn, op)
     else:
         return {"success": False, "error": f"Unknown op_type: {op['op_type']}"}
     if errors:
@@ -1156,6 +1167,10 @@ def revert_operation(
         result = _revert_manual(conn, payload)
     elif op["op_type"] == "APPROVE":
         result = _revert_approve(conn, payload)
+    elif op["op_type"] == "HOLD_CLEAR":
+        result = _revert_hold_clear(conn, payload)
+    elif op["op_type"] == "HOLD_REVISE":
+        result = _revert_hold_revise(conn, payload)
 
     # Stamp the audit fields on the op row
     conn.execute(text(f"""
@@ -2440,14 +2455,74 @@ def write_manual_pend_alc(
     ]
     inserted = len(inserted_ids)
 
+    # M-2 / M-3 fix: apply the MSA + grid delta PER CHUNK, scoped to the rows
+    # we just inserted (ID > prev_max_id). Previously the delta was deferred
+    # to is_last_chunk=True in the endpoint and operated on the whole session
+    # — if the client never sent is_last_chunk, MSA stayed stale; if it sent
+    # it twice, the delta double-applied. Per-chunk delta closes both holes.
+    # Per-chunk delta — relies on caller chunk de-dup; identical retried chunks will double-apply
+    msa_adjusted: Optional[Dict] = None
+    if inserted_ids:
+        try:
+            tmp_ids = f"#manual_ids_{uuid.uuid4().hex[:8]}"
+            conn.execute(text(f"CREATE TABLE {tmp_ids} (id BIGINT NOT NULL)"))
+            cur = conn.connection.cursor()
+            try:
+                try: cur.fast_executemany = True
+                except Exception: pass
+                cur.executemany(
+                    f"INSERT INTO {tmp_ids} (id) VALUES (?)",
+                    [(int(i),) for i in inserted_ids],
+                )
+            finally:
+                cur.close()
+
+            delta_rows = [
+                {
+                    "rdc":            r[0],
+                    "st_cd":          r[1] or "",
+                    "article_number": r[2],
+                    "maj_cat":        r[3] or "",
+                    "gen_art_number": r[4] or "",
+                    "clr":            r[5] or "",
+                    "alloc_qty":      float(r[6] or 0),
+                    "do_qty":         float(r[7] or 0),
+                }
+                for r in conn.execute(text(f"""
+                    SELECT P.RDC, P.ST_CD, P.ARTICLE_NUMBER, P.MAJ_CAT,
+                           P.GEN_ART_NUMBER, P.CLR,
+                           P.ALLOC_QTY, ISNULL(P.DO_QTY, 0)
+                    FROM {PEND_ALC_TABLE} P
+                    JOIN {tmp_ids} t ON t.id = P.ID
+                """)).fetchall()
+            ]
+            try:
+                conn.execute(text(
+                    f"IF OBJECT_ID('tempdb..{tmp_ids}') IS NOT NULL "
+                    f"DROP TABLE {tmp_ids}"
+                ))
+            except Exception:
+                pass
+
+            if delta_rows:
+                msa_adjusted = apply_pend_alc_delta(conn, delta_rows, sign=+1)
+        except Exception as e:
+            logger.warning(
+                f"[pend_alc] manual upload: per-chunk delta failed "
+                f"(non-fatal — rows are inserted, MSA may be stale): {e}"
+            )
+            msa_adjusted = {"error": str(e)}
+
     logger.info(
         f"[pend_alc] manual upload complete: {inserted} rows inserted, "
-        f"session_id={session_id}"
+        f"session_id={session_id}, "
+        f"delta_applied={msa_adjusted is not None and not msa_adjusted.get('error')}"
     )
     return {
         "inserted":     inserted,
         "session_id":   session_id,
         "inserted_ids": inserted_ids,
+        "msa_adjusted": msa_adjusted,
     }
 
 
@@ -2585,7 +2660,19 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
     PEND_ALC is free for the next BDC since /bdc-generate only skips
     STATUS='OPEN').
 
-    do_rows: dicts with rdc, article_number, do_qty,
+    Cancellation semantics — do_qty=0:
+      An input row with do_qty=0 means "SAP confirmed this BDC line will
+      not be fulfilled — cancel it". Matching rows in ARS_BDC_HISTORY are
+      flipped from STATUS='OPEN' to STATUS='CANCELLED', which removes them
+      from BDC IN FLIGHT and lets the next /bdc-generate re-include the
+      underlying PEND_ALC row (the _NO_OPEN_BDC_PREDICATE filter no longer
+      blocks it). ARS_PEND_ALC is left untouched — PEND_QTY stays where it
+      was so the row is naturally eligible for the next BDC. Cancellations
+      are recorded in `history_updates` with qty_added=0 and
+      new_status='CANCELLED', so _revert_do restores STATUS='OPEN' via the
+      same payload shape it already uses for DO applications.
+
+    do_rows: dicts with rdc, article_number, do_qty (>=0),
              optional st_cd, optional allocation_number.
     Returns: {touched, history_updates} — history_updates payload format
     is byte-for-byte identical to the prior implementation so _revert_do
@@ -2598,9 +2685,18 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
     # Bucket input rows by routing path (alloc_no > st_cd > global).
     # Each bucket runs in its own set-based pass so the FIFO and matching
     # rules of the original per-row Python loop are preserved exactly.
-    by_alloc: List[Dict]  = []  # alloc_no path
-    by_store: List[Dict]  = []  # st_cd FIFO path
-    by_global: List[Dict] = []  # global FIFO path
+    #
+    # qty > 0  → DO application (FIFO consumption against open history)
+    # qty == 0 → cancellation (flip matching OPEN history rows to CANCELLED)
+    #
+    # Both flavours go into the same `tmp_in` staging table; cancel passes
+    # filter `qty = 0` and apply passes filter `qty > 0`.
+    by_alloc: List[Dict]  = []  # alloc_no path (qty > 0)
+    by_store: List[Dict]  = []  # st_cd FIFO path (qty > 0)
+    by_global: List[Dict] = []  # global FIFO path (qty > 0)
+    cx_alloc:  List[Dict] = []  # alloc_no path (qty = 0, cancel)
+    cx_store:  List[Dict] = []  # st_cd path    (qty = 0, cancel)
+    cx_global: List[Dict] = []  # global path   (qty = 0, cancel)
 
     for r in do_rows:
         rdc       = str(r.get("rdc") or "").strip()
@@ -2608,17 +2704,28 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
         st_cd     = (str(r.get("st_cd") or "").strip() or "")
         alloc_no  = (str(r.get("allocation_number") or "").strip() or "")
         qty       = float(r.get("do_qty") or 0)
-        if not rdc or not art or qty <= 0:
+        if not rdc or not art or qty < 0:
             continue
         rec = {"rdc": rdc, "art": art, "st_cd": st_cd, "alloc_no": alloc_no, "qty": qty}
-        if alloc_no:
-            by_alloc.append(rec)
-        elif st_cd:
-            by_store.append(rec)
+        if qty == 0:
+            # Cancellation route — same alloc/st/global key resolution as
+            # the apply route so the user's CSV format works identically.
+            if alloc_no:
+                cx_alloc.append(rec)
+            elif st_cd:
+                cx_store.append(rec)
+            else:
+                cx_global.append(rec)
         else:
-            by_global.append(rec)
+            if alloc_no:
+                by_alloc.append(rec)
+            elif st_cd:
+                by_store.append(rec)
+            else:
+                by_global.append(rec)
 
-    if not (by_alloc or by_store or by_global):
+    if not (by_alloc or by_store or by_global
+            or cx_alloc or cx_store or cx_global):
         return {"touched": 0, "history_updates": []}
 
     tmp_in  = f"#bdc_in_{uuid.uuid4().hex[:8]}"
@@ -2626,13 +2733,18 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
     history_updates: List[Dict] = []
 
     try:
+        # NVARCHAR columns use COLLATE DATABASE_DEFAULT so the temp table
+        # inherits the user DB's collation rather than tempdb's. Without it,
+        # the alloc/store/global JOINs against ARS_BDC_HISTORY fail with
+        # "Cannot resolve the collation conflict" on servers where the user
+        # DB is SQL_Latin1_General_CP1_CI_AS and tempdb is Latin1_General_CI_AS.
         conn.execute(text(
             f"CREATE TABLE {tmp_in} ("
-            "  bucket   NVARCHAR(10) NOT NULL,"   # 'alloc' / 'store' / 'global'
-            "  rdc      NVARCHAR(20) NOT NULL,"
-            "  st_cd    NVARCHAR(20) NOT NULL,"
-            "  art      NVARCHAR(30) NOT NULL,"
-            "  alloc_no NVARCHAR(50) NOT NULL,"
+            "  bucket   NVARCHAR(10) COLLATE DATABASE_DEFAULT NOT NULL,"   # 'alloc' / 'store' / 'global'
+            "  rdc      NVARCHAR(20) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  st_cd    NVARCHAR(20) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  art      NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  alloc_no NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  qty      FLOAT        NOT NULL"
             ")"
         ))
@@ -2647,6 +2759,12 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
                 [("alloc",  r["rdc"], r["st_cd"], r["art"], r["alloc_no"], r["qty"]) for r in by_alloc]
               + [("store",  r["rdc"], r["st_cd"], r["art"], "",            r["qty"]) for r in by_store]
               + [("global", r["rdc"], "",         r["art"], "",            r["qty"]) for r in by_global]
+              # Cancellation buckets — qty=0 marks the row as a cancel intent.
+              # Same bucket names so the cancel passes can JOIN with the same
+              # key columns the apply passes use.
+              + [("alloc",  r["rdc"], r["st_cd"], r["art"], r["alloc_no"], 0.0)      for r in cx_alloc]
+              + [("store",  r["rdc"], r["st_cd"], r["art"], "",            0.0)      for r in cx_store]
+              + [("global", r["rdc"], "",         r["art"], "",            0.0)      for r in cx_global]
             )
             cur.executemany(
                 f"INSERT INTO {tmp_in} (bucket, rdc, st_cd, art, alloc_no, qty) "
@@ -2691,6 +2809,50 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
              "rdc, art",
              "agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER"),
         ]
+
+        # Cancellation passes — run BEFORE the FIFO apply passes so that a
+        # user can both cancel an old in-flight BDC and apply a fresh DO in
+        # the same upload without the cancel being shadowed by the apply.
+        # Each pass flips matching OPEN history rows to STATUS='CANCELLED'
+        # and writes a pre-image to tmp_out so revert can restore.
+        cancel_passes = [
+            # (bucket, group_cols, join_pred — JOIN H ↔ agg)
+            ("alloc",
+             "rdc, art, alloc_no",
+             "agg.alloc_no = H.ALLOCATION_NUMBER "
+             "AND agg.rdc = H.RDC AND agg.art = H.ARTICLE_NUMBER"),
+            ("store",
+             "rdc, st_cd, art",
+             "agg.rdc = H.RDC AND agg.art = H.ARTICLE_NUMBER "
+             "AND agg.st_cd = ISNULL(H.ST_CD,'')"),
+            ("global",
+             "rdc, art",
+             "agg.rdc = H.RDC AND agg.art = H.ARTICLE_NUMBER"),
+        ]
+        for bucket, group_cols, join_pred in cancel_passes:
+            sql = f"""
+            ;WITH agg AS (
+                SELECT DISTINCT {group_cols}
+                FROM {tmp_in}
+                WHERE bucket = :bucket AND qty = 0
+            )
+            UPDATE H
+               SET H.STATUS = 'CANCELLED'
+            OUTPUT INSERTED.ID,
+                   CAST(0.0 AS FLOAT)              AS qty_added,
+                   DELETED.DO_RECEIVED             AS old_do_received,
+                   INSERTED.DO_RECEIVED            AS new_do_received,
+                   DELETED.STATUS                  AS old_status,
+                   INSERTED.STATUS                 AS new_status,
+                   DELETED.LAST_DO_AT              AS old_last_do_at
+              INTO {tmp_out} (history_id, qty_added, old_do_received,
+                              new_do_received, old_status, new_status,
+                              old_last_do_at)
+            FROM {BDC_HISTORY_TABLE} H
+            JOIN agg ON {join_pred}
+            WHERE H.STATUS = 'OPEN'
+            """
+            conn.execute(text(sql), {"bucket": bucket})
 
         for bucket, partition_cols, group_cols, join_pred in passes:
             sql = f"""
@@ -2841,9 +3003,9 @@ def apply_adhoc_close(
     try:
         conn.execute(text(
             f"CREATE TABLE {tmp} ("
-            "  rdc   NVARCHAR(20) NOT NULL,"
-            "  st_cd NVARCHAR(20) NOT NULL,"   # '' means any-store
-            "  art   NVARCHAR(30) NOT NULL"
+            "  rdc   NVARCHAR(20) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  st_cd NVARCHAR(20) COLLATE DATABASE_DEFAULT NOT NULL,"   # '' means any-store
+            "  art   NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL"
             ")"
         ))
         raw = conn.connection
@@ -2912,6 +3074,22 @@ def apply_adhoc_close(
             pass
 
     conn.commit()
+
+    # A-2 fix: re-sync MSA/grid PEND after adhoc close — they previously stayed inflated until next bootstrap
+    msa_resync: Dict = {}
+    grid_resync: Dict = {}
+    if pend_updates:
+        try:
+            msa_resync = bootstrap_msa_pend_sync(conn)
+        except Exception as e:
+            logger.warning(f"[pend_alc] adhoc-close: bootstrap_msa_pend_sync failed: {e}")
+            msa_resync = {"error": str(e)}
+        try:
+            grid_resync = bootstrap_grid_pend_sync(conn)
+        except Exception as e:
+            logger.warning(f"[pend_alc] adhoc-close: bootstrap_grid_pend_sync failed: {e}")
+            grid_resync = {"error": str(e)}
+
     if created_by:
         logger.info(
             f"[pend_alc] adhoc-close by {created_by}: keys={len(keys)} "
@@ -2923,6 +3101,8 @@ def apply_adhoc_close(
         "touched_history": len(history_updates),
         "pend_updates":    pend_updates,
         "history_updates": history_updates,
+        "msa_resync":      msa_resync,
+        "grid_resync":     grid_resync,
     }
 
 
@@ -3034,6 +3214,255 @@ def _revert_adhoc_close(conn, payload: Dict) -> Dict:
             "bdc_history_rows_reverted": hist_rows}
 
 
+# ---------------------------------------------------------------------------
+# HOLD_CLEAR / HOLD_REVISE revert handlers — restore ARS_NL_TBL_HOLD_TRACKING
+# rows to their pre-image and re-sync MSA HOLD_QTY/FNL_Q.
+#
+# Critical #1 fix: apply_hold_clear / apply_hold_revise already log to
+# ARS_PEND_ALC_OPERATIONS with op_type='HOLD_CLEAR' / 'HOLD_REVISE', so the
+# UI surfaces a Revert button — but revert_operation had no dispatch, so the
+# button returned "Unknown op_type". These handlers wire that up.
+#
+# Tracker grain: (WERKS, VAR_ART, SZ) — no ID column, so revert joins on those
+# three columns. The payload captures old_hold_rem, new_hold_rem, was_closed,
+# is_closed_now, old_closed_date (clear) or old_initial / new_initial (revise),
+# which is enough to drive a clean restore.
+# ---------------------------------------------------------------------------
+
+
+def _check_hold_clear_revert(conn, op: Dict) -> List[str]:
+    """Refuse revert if any tracker row touched by this clear has been
+    further modified since (HOLD_REM differs from the new_hold_rem we wrote).
+    Blocks the case where another adhoc clear/revise re-touched the row;
+    revert here would restore stale state on top of the newer change.
+    """
+    errors: List[str] = []
+    hold_updates = op["payload"].get("hold_updates") or []
+    if not hold_updates:
+        return errors
+    # Compare current HOLD_REM vs the new_hold_rem we wrote. A mismatch means
+    # someone (or another op) changed the row after our clear.
+    tmp = f"#chk_hc_{uuid.uuid4().hex[:8]}"
+    try:
+        # COLLATE DATABASE_DEFAULT so the temp table inherits the user DB
+        # collation, not tempdb's — without this the JOIN to
+        # ARS_NL_TBL_HOLD_TRACKING raises SQL 468 (collation conflict). Same
+        # pattern apply_pend_alc_delta uses.
+        conn.execute(text(
+            f"CREATE TABLE {tmp} ("
+            "  werks         NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  var_art       NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  sz            NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  expected_rem  FLOAT NOT NULL"
+            ")"
+        ))
+        cur = conn.connection.cursor()
+        try:
+            try: cur.fast_executemany = True
+            except Exception: pass
+            cur.executemany(
+                f"INSERT INTO {tmp} (werks, var_art, sz, expected_rem) "
+                "VALUES (?, ?, ?, ?)",
+                [(str(u.get("werks") or ""),
+                  str(u.get("var_art") or ""),
+                  str(u.get("sz") or ""),
+                  float(u.get("new_hold_rem") or 0))
+                 for u in hold_updates
+                 if u.get("werks") and u.get("var_art") is not None],
+            )
+        finally:
+            cur.close()
+        cnt = conn.execute(text(f"""
+            SELECT COUNT(*)
+            FROM [{HOLD_TRACKING_TABLE}] H
+            JOIN {tmp} u
+              ON  H.WERKS = u.werks
+             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+             AND ISNULL(H.SZ,'') = u.sz
+            WHERE ABS(ISNULL(H.HOLD_REM, 0) - u.expected_rem) > 0.001
+        """)).scalar() or 0
+    finally:
+        _drop_tmp(conn, tmp)
+    if cnt > 0:
+        errors.append(
+            f"{cnt} hold row(s) have been modified after this clear — "
+            f"revert the newer op first"
+        )
+    return errors
+
+
+def _check_hold_revise_revert(conn, op: Dict) -> List[str]:
+    """Symmetric check for HOLD_REVISE: refuse if HOLD_REM diverged from the
+    new_hold_rem we wrote at revise time."""
+    return _check_hold_clear_revert(conn, op)
+
+
+def _revert_hold_clear(conn, payload: Dict) -> Dict:
+    """Restore HOLD_REM / IS_CLOSED / CLOSED_DATE on tracker rows from the
+    clear's pre-image, then re-sync MSA HOLD_QTY / FNL_Q.
+
+    Joins on (WERKS, VAR_ART, SZ) — there's no tracker PK ID.
+    """
+    hold_updates = payload.get("hold_updates") or []
+    if not hold_updates:
+        return {"hold_rows_reverted": 0, "msa_resync": {}, "_skip_post_bootstrap": True}
+
+    tmp = f"#hc_rev_{uuid.uuid4().hex[:8]}"
+    rows_reverted = 0
+    try:
+        conn.execute(text(
+            f"CREATE TABLE {tmp} ("
+            "  werks            NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  var_art          NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  sz               NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  old_hold_rem     FLOAT        NOT NULL,"
+            "  old_is_closed    BIT          NOT NULL,"
+            "  old_closed_date  DATETIME     NULL"
+            ")"
+        ))
+        import datetime as _dt
+        def _parse_dt(v):
+            if not v: return None
+            if isinstance(v, _dt.datetime): return v
+            try:
+                return _dt.datetime.fromisoformat(str(v).rstrip("Z"))
+            except Exception:
+                return None
+        cur = conn.connection.cursor()
+        try:
+            try: cur.fast_executemany = True
+            except Exception: pass
+            cur.executemany(
+                f"INSERT INTO {tmp} (werks, var_art, sz, old_hold_rem, "
+                "                    old_is_closed, old_closed_date) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(str(u.get("werks") or ""),
+                  str(u.get("var_art") or ""),
+                  str(u.get("sz") or ""),
+                  float(u.get("old_hold_rem") or 0),
+                  int(u.get("was_closed") or 0),
+                  _parse_dt(u.get("old_closed_date")))
+                 for u in hold_updates
+                 if u.get("werks") and u.get("var_art") is not None],
+            )
+        finally:
+            cur.close()
+        res = conn.execute(text(f"""
+            UPDATE H
+               SET H.HOLD_REM    = u.old_hold_rem,
+                   H.IS_CLOSED   = u.old_is_closed,
+                   H.CLOSED_DATE = u.old_closed_date,
+                   H.LAST_UPDATED = GETDATE()
+            FROM [{HOLD_TRACKING_TABLE}] H
+            JOIN {tmp} u
+              ON  H.WERKS = u.werks
+             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+             AND ISNULL(H.SZ,'') = u.sz
+        """))
+        rows_reverted = int(res.rowcount or 0)
+    finally:
+        _drop_tmp(conn, tmp)
+
+    conn.commit()
+
+    # Re-sync MSA HOLD_QTY / FNL_Q full-table — the post-revert bootstrap in
+    # revert_operation handles PEND, not HOLD, so we run it here.
+    msa_resync: Dict = {}
+    try:
+        msa_resync = bootstrap_msa_hold_sync(conn)
+    except Exception as e:
+        logger.warning(f"[revert_hold_clear] bootstrap_msa_hold_sync failed: {e}")
+        msa_resync = {"error": str(e)}
+
+    return {
+        "hold_rows_reverted": rows_reverted,
+        "msa_resync":         msa_resync,
+        # Skip the PEND post-bootstrap in revert_operation — hold-clear didn't
+        # touch PEND_ALC and a PEND bootstrap here is pure overhead.
+        "_skip_post_bootstrap": True,
+    }
+
+
+def _revert_hold_revise(conn, payload: Dict) -> Dict:
+    """Restore HOLD_REM / HOLD_QTY_INITIAL / IS_CLOSED on tracker rows from
+    the revise's pre-image, then re-sync MSA HOLD_QTY / FNL_Q.
+
+    A revise can either accumulate (was_closed=0, both REM and INITIAL went
+    up by add_qty) or re-open (was_closed=1, REM and INITIAL set to add_qty,
+    IS_CLOSED flipped 1→0). Restoring old_hold_rem + old_initial + was_closed
+    reverses both branches symmetrically.
+    """
+    hold_updates = payload.get("hold_updates") or []
+    if not hold_updates:
+        return {"hold_rows_reverted": 0, "msa_resync": {}, "_skip_post_bootstrap": True}
+
+    tmp = f"#hr_rev_{uuid.uuid4().hex[:8]}"
+    rows_reverted = 0
+    try:
+        conn.execute(text(
+            f"CREATE TABLE {tmp} ("
+            "  werks         NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  var_art       NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  sz            NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  old_hold_rem  FLOAT        NOT NULL,"
+            "  old_initial   FLOAT        NOT NULL,"
+            "  was_closed    BIT          NOT NULL"
+            ")"
+        ))
+        cur = conn.connection.cursor()
+        try:
+            try: cur.fast_executemany = True
+            except Exception: pass
+            cur.executemany(
+                f"INSERT INTO {tmp} (werks, var_art, sz, old_hold_rem, "
+                "                    old_initial, was_closed) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(str(u.get("werks") or ""),
+                  str(u.get("var_art") or ""),
+                  str(u.get("sz") or ""),
+                  float(u.get("old_hold_rem") or 0),
+                  float(u.get("old_initial") or 0),
+                  int(u.get("was_closed") or 0))
+                 for u in hold_updates
+                 if u.get("werks") and u.get("var_art") is not None],
+            )
+        finally:
+            cur.close()
+        res = conn.execute(text(f"""
+            UPDATE H
+               SET H.HOLD_REM         = u.old_hold_rem,
+                   H.HOLD_QTY_INITIAL = u.old_initial,
+                   H.IS_CLOSED        = u.was_closed,
+                   H.CLOSED_DATE      = CASE WHEN u.was_closed = 1
+                                             THEN ISNULL(H.CLOSED_DATE, GETDATE())
+                                             ELSE NULL END,
+                   H.LAST_UPDATED     = GETDATE()
+            FROM [{HOLD_TRACKING_TABLE}] H
+            JOIN {tmp} u
+              ON  H.WERKS = u.werks
+             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+             AND ISNULL(H.SZ,'') = u.sz
+        """))
+        rows_reverted = int(res.rowcount or 0)
+    finally:
+        _drop_tmp(conn, tmp)
+
+    conn.commit()
+
+    msa_resync: Dict = {}
+    try:
+        msa_resync = bootstrap_msa_hold_sync(conn)
+    except Exception as e:
+        logger.warning(f"[revert_hold_revise] bootstrap_msa_hold_sync failed: {e}")
+        msa_resync = {"error": str(e)}
+
+    return {
+        "hold_rows_reverted": rows_reverted,
+        "msa_resync":         msa_resync,
+        "_skip_post_bootstrap": True,
+    }
+
+
 def stamp_bdc_qty(
     conn, article_rdc_pairs: Optional[List[Dict]] = None,
 ) -> List[Dict]:
@@ -3059,7 +3488,9 @@ def stamp_bdc_qty(
         tmp = f"#bdc_stamp_{uuid.uuid4().hex[:8]}"
         conn.execute(text(
             f"CREATE TABLE {tmp} "
-            f"(rdc NVARCHAR(20), st_cd NVARCHAR(20), art NVARCHAR(30))"
+            f"(rdc NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+            f"st_cd NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+            f"art NVARCHAR(30) COLLATE DATABASE_DEFAULT)"
         ))
         conn.execute(
             text(f"INSERT INTO {tmp} VALUES (:r, :s, :a)"),
@@ -3129,12 +3560,20 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     revert can subtract those exact qtys from those exact rows.
 
     rows: list of dicts with keys rdc, article_number, do_qty.
-          Optional: st_cd, do_number.
+          Optional: st_cd, do_number, allocation_number.
 
-    FIFO and matching semantics are IDENTICAL to the prior per-row loop:
+    FIFO and matching semantics:
       • Open rows ordered by APPROVED_AT ASC, ID ASC.
-      • st_cd-scoped input matches only rows with that ST_CD;
-        empty-st_cd input matches any row regardless of ST_CD.
+      • Rows carrying allocation_number → ST_CD is resolved from
+        ARS_BDC_HISTORY (the BDC for that allocation_number tells us the
+        destination store). If user-supplied ST_CD and BDC's ST_CD
+        disagree, BDC wins — allocation_number is the authoritative link
+        back to the originating BDC line. If BDC has no matching row
+        (allocation cancelled or never generated), the user-supplied
+        ST_CD is kept and the row falls through to the scoped/global
+        FIFO passes below; the DO is still accepted.
+      • st_cd-scoped input (after alloc-resolve) matches only rows with
+        that ST_CD; empty-st_cd input matches any row regardless of ST_CD.
       • st_cd-scoped input is applied first (in its own pass), then
         empty-st_cd input absorbs residual capacity. This matches the
         original input-order behavior in every realistic CSV (templates
@@ -3158,12 +3597,13 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     input_rows = []
     for seq, r in enumerate(valid):
         input_rows.append({
-            "seq":    seq,
-            "rdc":    str(r["rdc"]).strip(),
-            "st_cd":  (str(r.get("st_cd") or "").strip() or ""),
-            "art":    str(r["article_number"]).strip(),
-            "qty":    float(r["do_qty"]),
-            "do_num": (str(r.get("do_number") or "").strip() or None),
+            "seq":      seq,
+            "rdc":      str(r["rdc"]).strip(),
+            "st_cd":    (str(r.get("st_cd") or "").strip() or ""),
+            "art":      str(r["article_number"]).strip(),
+            "alloc_no": (str(r.get("allocation_number") or "").strip() or ""),
+            "qty":      float(r["do_qty"]),
+            "do_num":   (str(r.get("do_number") or "").strip() or None),
         })
 
     tmp_in   = f"#do_in_{uuid.uuid4().hex[:8]}"
@@ -3175,18 +3615,33 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     # going IS_CLOSED=1 here. Recorded in the operations log payload so a
     # DO revert can restore them.
     auto_history_closes: List[Dict] = []
+    # D-2 fix: per-agg-key over-ship — input do_qty minus applied qty per
+    # (rdc, st_cd, art). Surfaced in the response + ops_log so the user can
+    # see what didn't land. Audit-only; we don't auto-correct since the DO
+    # already happened in SAP.
+    overflow_rows: List[Dict] = []
     touched = 0
 
     try:
         # Stage input rows. Use fast_executemany for the bulk load.
+        # alloc_no carries the user-supplied ALLOCATION_NUMBER (or '') so the
+        # alloc-resolve pass below can look it up against ARS_BDC_HISTORY and
+        # pin the deduction to the BDC's destination store.
+        # NVARCHAR columns are declared COLLATE DATABASE_DEFAULT so the temp
+        # table inherits the user DB's collation instead of tempdb's. Without
+        # this, joins against ARS_BDC_HISTORY / ARS_PEND_ALC fail with
+        # "Cannot resolve the collation conflict" on servers where tempdb
+        # (Latin1_General_CI_AS) differs from the user DB
+        # (SQL_Latin1_General_CP1_CI_AS).
         conn.execute(text(
             f"CREATE TABLE {tmp_in} ("
-            "  seq    INT          NOT NULL,"
-            "  rdc    NVARCHAR(20) NOT NULL,"
-            "  st_cd  NVARCHAR(20) NOT NULL,"   # '' means no-store-scope
-            "  art    NVARCHAR(30) NOT NULL,"
-            "  qty    FLOAT        NOT NULL,"
-            "  do_num NVARCHAR(50) NULL"
+            "  seq      INT          NOT NULL,"
+            "  rdc      NVARCHAR(20) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  st_cd    NVARCHAR(20) COLLATE DATABASE_DEFAULT NOT NULL,"   # '' means no-store-scope
+            "  art      NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  alloc_no NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"   # '' means no allocation match
+            "  qty      FLOAT        NOT NULL,"
+            "  do_num   NVARCHAR(50) COLLATE DATABASE_DEFAULT NULL"
             ")"
         ))
         raw = conn.connection
@@ -3197,13 +3652,43 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             except Exception:
                 pass
             cur.executemany(
-                f"INSERT INTO {tmp_in} (seq, rdc, st_cd, art, qty, do_num) "
-                f"VALUES (?, ?, ?, ?, ?, ?)",
-                [(r["seq"], r["rdc"], r["st_cd"], r["art"], r["qty"], r["do_num"])
+                f"INSERT INTO {tmp_in} (seq, rdc, st_cd, art, alloc_no, qty, do_num) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(r["seq"], r["rdc"], r["st_cd"], r["art"], r["alloc_no"],
+                  r["qty"], r["do_num"])
                  for r in input_rows],
             )
         finally:
             cur.close()
+
+        # Resolve st_cd for rows that carry an ALLOCATION_NUMBER. The
+        # BDC_HISTORY for that allocation tells us which destination store
+        # the BDC was generated for; we use that ST_CD to pin the PEND_ALC
+        # deduction (symmetric with how update_bdc_history_with_do routes
+        # alloc-bearing rows to the exact ALLOCATION_NUMBER on BDC_HISTORY).
+        #
+        # If the user also provided ST_CD and it matches BDC, the ranking
+        # below picks it first. If they conflict, BDC wins — allocation_number
+        # is the authoritative link. If BDC has no matching row at all
+        # (allocation never generated, cancelled, etc.) the row's ST_CD is
+        # left as the user supplied it and falls through to the scoped/global
+        # FIFO passes below — DO still gets accepted.
+        conn.execute(text(f"""
+            UPDATE T
+               SET T.st_cd = ISNULL(BDC.st_cd, T.st_cd)
+              FROM {tmp_in} T
+            OUTER APPLY (
+                SELECT TOP 1 ISNULL(H.ST_CD,'') AS st_cd
+                  FROM [{BDC_HISTORY_TABLE}] H
+                 WHERE H.ALLOCATION_NUMBER = T.alloc_no
+                   AND H.RDC              = T.rdc
+                   AND H.ARTICLE_NUMBER   = T.art
+                 ORDER BY
+                    CASE WHEN ISNULL(H.ST_CD,'') = T.st_cd THEN 0 ELSE 1 END,
+                    H.ID
+            ) BDC
+             WHERE T.alloc_no <> ''
+        """))
 
         # Output capture table for OUTPUT INSERTED/DELETED → pend_updates.
         conn.execute(text(
@@ -3305,6 +3790,61 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             })
         touched = len(pend_updates)
 
+        # ---- D-2 fix: compute over-ship per agg key ----------------------
+        # For each (rdc, st_cd, art) input agg key, overflow = input_qty -
+        # SUM(qty_added across matching PEND rows). The FIFO inside the
+        # alloc_plan CTE caps apply_qty at o.need per row, so anything past
+        # the total open PEND capacity for the key vanishes — without this
+        # report the user has no way to see it.
+        try:
+            for r in conn.execute(text(f"""
+                ;WITH input_agg AS (
+                    SELECT rdc, st_cd, art, SUM(qty) AS do_qty
+                    FROM {tmp_in}
+                    WHERE qty > 0
+                    GROUP BY rdc, st_cd, art
+                ),
+                applied_agg AS (
+                    -- Group applied qty by the SAME (rdc, st_cd, art) shape as
+                    -- input_agg. Empty-st_cd input aggregates ALL stores' applied
+                    -- qty into one bucket via the LEFT JOIN below.
+                    SELECT P.RDC                 AS rdc,
+                           ISNULL(P.ST_CD,'')    AS st_cd,
+                           P.ARTICLE_NUMBER      AS art,
+                           SUM(o.qty_added)      AS applied_qty
+                    FROM {tmp_out} o
+                    JOIN {PEND_ALC_TABLE} P ON P.ID = o.pend_alc_id
+                    GROUP BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                ),
+                joined AS (
+                    SELECT i.rdc, i.st_cd, i.art, i.do_qty,
+                           CASE WHEN i.st_cd = ''
+                                THEN ( SELECT ISNULL(SUM(a.applied_qty), 0)
+                                       FROM applied_agg a
+                                       WHERE a.rdc = i.rdc AND a.art = i.art )
+                                ELSE ( SELECT ISNULL(SUM(a.applied_qty), 0)
+                                       FROM applied_agg a
+                                       WHERE a.rdc = i.rdc AND a.art = i.art
+                                         AND a.st_cd = i.st_cd )
+                           END AS applied_qty
+                    FROM input_agg i
+                )
+                SELECT rdc, st_cd, art, do_qty, applied_qty,
+                       (do_qty - applied_qty) AS overflow_qty
+                FROM joined
+                WHERE (do_qty - applied_qty) > 0.001
+            """)).fetchall():
+                overflow_rows.append({
+                    "rdc":          r[0],
+                    "st_cd":        r[1] or "",
+                    "art":          r[2],
+                    "do_qty":       float(r[3] or 0),
+                    "applied_qty":  float(r[4] or 0),
+                    "overflow_qty": float(r[5] or 0),
+                })
+        except Exception as e:
+            logger.warning(f"[do] overflow computation skipped: {e}")
+
         # ---- Auto-close matching OPEN BDC_HISTORY when a PEND row closed -------
         # When `apply_do_deductions` flips a PEND row to IS_CLOSED=1 (DO_QTY
         # >= ALLOC_QTY) we want any remaining `STATUS='OPEN'` BDC history
@@ -3387,6 +3927,9 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
         "touched":             touched,
         "pend_updates":        pend_updates,
         "auto_history_closes": auto_history_closes,
+        # D-2 fix: surface over-ship for ops/audit.
+        "overflow_rows":       overflow_rows,
+        "overflow_total_qty":  sum(o["overflow_qty"] for o in overflow_rows),
     }
 
 
@@ -3422,7 +3965,9 @@ def adjust_msa_after_pend_insert(
         # --- Build affected-articles temp table ---
         tmp = f"#patch_msa_{uuid.uuid4().hex[:8]}"
         conn.execute(text(
-            f"CREATE TABLE {tmp} (rdc NVARCHAR(20), art NVARCHAR(30))"
+            f"CREATE TABLE {tmp} ("
+            f"rdc NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+            f"art NVARCHAR(30) COLLATE DATABASE_DEFAULT)"
         ))
 
         if session_id:
@@ -3573,6 +4118,637 @@ def adjust_msa_after_pend_insert(
         logger.warning(f"[pend_alc] adjust_msa_after_pend_insert failed (non-fatal): {e}")
         result["error"] = str(e)
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Adhoc hold-clear — release qty from ARS_NL_TBL_HOLD_TRACKING and re-sync
+# MSA HOLD_QTY/FNL_Q so the released qty is immediately allocatable.
+#
+# Symmetric with apply_adhoc_close: takes a list of {werks, var_art, sz,
+# release_qty?}, captures before-image for each, updates HOLD_REM/IS_CLOSED,
+# then re-aggregates HOLD_QTY on ARS_MSA_TOTAL (and FNL_Q rolldown to
+# VAR_ART / GEN_ART) for affected (RDC, ARTICLE) keys.
+# ---------------------------------------------------------------------------
+HOLD_TRACKING_TABLE = "ARS_NL_TBL_HOLD_TRACKING"
+
+
+def _ensure_hold_audit_columns(conn) -> None:
+    """Idempotent ALTER: add LAST_REMARKS + LAST_UPDATED_BY to the hold
+    tracker. Adhoc clear/revise stamp these so the dashboard can show who
+    manually touched a row and why — the normal Step A/B flow leaves them
+    NULL.
+    """
+    conn.execute(text(f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.columns
+            WHERE object_id = OBJECT_ID('{HOLD_TRACKING_TABLE}')
+              AND name = 'LAST_REMARKS'
+        )
+        ALTER TABLE [{HOLD_TRACKING_TABLE}] ADD [LAST_REMARKS] NVARCHAR(500) NULL
+    """))
+    conn.execute(text(f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.columns
+            WHERE object_id = OBJECT_ID('{HOLD_TRACKING_TABLE}')
+              AND name = 'LAST_UPDATED_BY'
+        )
+        ALTER TABLE [{HOLD_TRACKING_TABLE}] ADD [LAST_UPDATED_BY] NVARCHAR(100) NULL
+    """))
+    conn.commit()
+
+
+def apply_hold_clear(
+    conn,
+    rows: List[Dict],
+    reason: str = "",
+    created_by: Optional[str] = None,
+) -> Dict:
+    """Clear (full or partial) hold rows for the given (WERKS, VAR_ART, SZ)
+    keys. Each input may carry an optional `release_qty`:
+      * omitted / >= HOLD_REM → full close (HOLD_REM = 0, IS_CLOSED = 1).
+      * 0 < release_qty < HOLD_REM → partial release (HOLD_REM -= release_qty).
+
+    After tracker mutation, re-aggregates HOLD_QTY on MSA_TOTAL from the
+    tracker (open rows only) for the affected (RDC, ARTICLE) keys and
+    recomputes FNL_Q = max(STK_QTY - PEND_QTY - HOLD_QTY, 0). FNL_Q is
+    then rolled up to ARS_MSA_VAR_ART / ARS_MSA_GEN_ART using the same
+    SQL shape as adjust_msa_after_pend_insert.
+
+    Returns: {touched_hold, hold_updates, msa_total, msa_var_art, msa_gen_art}.
+    `hold_updates` is the audit list for the operations log.
+    """
+    result: Dict = {
+        "touched_hold": 0, "hold_updates": [],
+        "msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0,
+        "error": None,
+    }
+
+    # Normalise input — accept ints/strings for VAR_ART.
+    norm_rows: List[Dict] = []
+    for r in rows or []:
+        werks = str(r.get("werks") or "").strip()
+        var_art = str(r.get("var_art") or "").strip().split(".")[0]
+        sz = str(r.get("sz") or "").strip()
+        if not werks or not var_art:
+            continue
+        rq = r.get("release_qty")
+        try:
+            rq_val = float(rq) if rq not in (None, "", "null") else None
+        except (TypeError, ValueError):
+            rq_val = None
+        norm_rows.append({"werks": werks, "var_art": var_art, "sz": sz,
+                          "release_qty": rq_val})
+    if not norm_rows:
+        return result
+
+    safe_reason = (reason or "").strip()[:500]
+    safe_user   = (created_by or "")[:100]
+    tmp_in   = f"#hold_clear_in_{uuid.uuid4().hex[:8]}"
+    tmp_keys = f"#hold_clear_keys_{uuid.uuid4().hex[:8]}"
+    try:
+        _ensure_hold_audit_columns(conn)
+        # 1. Stage the input keys + their release_qty.
+        conn.execute(text(
+            f"CREATE TABLE {tmp_in} ("
+            "  werks       NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  var_art     NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  sz          NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  release_qty FLOAT NULL"
+            ")"
+        ))
+        raw = conn.connection
+        cur = raw.cursor()
+        try:
+            try: cur.fast_executemany = True
+            except Exception: pass
+            cur.executemany(
+                f"INSERT INTO {tmp_in} (werks, var_art, sz, release_qty) "
+                "VALUES (?, ?, ?, ?)",
+                [(k["werks"], k["var_art"], k["sz"], k["release_qty"])
+                 for k in norm_rows],
+            )
+        finally:
+            cur.close()
+
+        # 2. Capture before-image + apply update in one OUTPUT clause so audit
+        # is consistent with what changed.
+        #
+        # SZ semantics: blank in the input means "every size for this
+        # (WERKS, VAR_ART)" — symmetric with apply_adhoc_close where blank
+        # ST_CD means "every store for this (RDC, ARTICLE)". With a real SZ
+        # value the join is exact.
+        #
+        # When release_qty is given on a multi-size match, the qty is the
+        # PER-ROW release — so a release_qty=5 on a 3-size match releases
+        # up to 5 from each size (capped at that size's HOLD_REM). For a
+        # full close, the SZ=blank case closes every size at once.
+        updates = conn.execute(text(f"""
+            UPDATE H
+               SET H.HOLD_REM = CASE
+                       WHEN u.release_qty IS NULL
+                            OR u.release_qty >= ISNULL(H.HOLD_REM, 0)
+                       THEN 0
+                       ELSE H.HOLD_REM - u.release_qty
+                   END,
+                   H.IS_CLOSED = CASE
+                       WHEN u.release_qty IS NULL
+                            OR u.release_qty >= ISNULL(H.HOLD_REM, 0)
+                       THEN 1
+                       ELSE H.IS_CLOSED
+                   END,
+                   H.CLOSED_DATE = CASE
+                       WHEN u.release_qty IS NULL
+                            OR u.release_qty >= ISNULL(H.HOLD_REM, 0)
+                       THEN GETDATE()
+                       ELSE H.CLOSED_DATE
+                   END,
+                   H.LAST_UPDATED    = GETDATE(),
+                   H.LAST_REMARKS    = :rmk,
+                   H.LAST_UPDATED_BY = :usr
+            OUTPUT INSERTED.WERKS, INSERTED.VAR_ART, INSERTED.SZ,
+                   INSERTED.RDC,
+                   DELETED.HOLD_REM   AS OLD_HOLD_REM,
+                   INSERTED.HOLD_REM  AS NEW_HOLD_REM,
+                   DELETED.IS_CLOSED  AS OLD_IS_CLOSED,
+                   INSERTED.IS_CLOSED AS NEW_IS_CLOSED,
+                   DELETED.CLOSED_DATE AS OLD_CLOSED_DATE
+            FROM [{HOLD_TRACKING_TABLE}] H
+            JOIN {tmp_in} u
+              ON  H.WERKS  = u.werks
+             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+             AND (u.sz = '' OR ISNULL(H.SZ,'') = u.sz)
+            WHERE ISNULL(H.IS_CLOSED, 0) = 0
+              AND ISNULL(H.HOLD_REM, 0)  > 0
+        """), {"rmk": (f"CLEAR: {safe_reason}" if safe_reason else "CLEAR"),
+                "usr": safe_user or None}).fetchall()
+
+        for r in updates:
+            result["hold_updates"].append({
+                "werks":           r[0],
+                "var_art":         int(r[1]) if r[1] is not None else None,
+                "sz":              r[2],
+                "rdc":             r[3],
+                "old_hold_rem":    float(r[4] or 0),
+                "new_hold_rem":    float(r[5] or 0),
+                "was_closed":      bool(r[6]),
+                "is_closed_now":   bool(r[7]),
+                "old_closed_date": r[8].isoformat() if r[8] else None,
+            })
+        result["touched_hold"] = len(updates)
+
+        # 3. MSA sync — only meaningful if MSA_TOTAL exists and we know the
+        # RDC for the touched keys. Aggregates remaining HOLD per (RDC, VAR_ART)
+        # straight from the tracker (open rows), updates MSA_TOTAL.HOLD_QTY +
+        # FNL_Q, then rolls FNL_Q + HOLD_QTY down to VAR_ART / GEN_ART.
+        msa_exists = conn.execute(text(
+            "SELECT CASE WHEN OBJECT_ID('dbo.ARS_MSA_TOTAL','U') IS NULL "
+            "            THEN 0 ELSE 1 END"
+        )).scalar() or 0
+        if msa_exists and result["touched_hold"] > 0:
+            # Probe article column name on MSA_TOTAL — same logic as
+            # adjust_msa_after_pend_insert.
+            def _col(*candidates):
+                for c in candidates:
+                    found = conn.execute(text(
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_NAME='ARS_MSA_TOTAL' AND COLUMN_NAME=:c"
+                    ), {"c": c}).scalar() or 0
+                    if found: return c
+                return candidates[0]
+            total_art = _col("ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+            var_art_c = conn.execute(text(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME='ARS_MSA_VAR_ART' "
+                "  AND COLUMN_NAME IN ('VAR_ART','ARTICLE_NUMBER','ARTICLE')"
+            )).scalar() or "VAR_ART"
+
+            # Affected (RDC, ARTICLE) keys, deduped.
+            conn.execute(text(
+                f"CREATE TABLE {tmp_keys} ("
+                f"rdc NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+                f"art NVARCHAR(30) COLLATE DATABASE_DEFAULT)"
+            ))
+            # The OUTPUT clause already populated `rows_updates` with RDC.
+            # Skip rows where RDC is NULL — can't match to MSA without it.
+            distinct = {
+                (r["rdc"], r["var_art"])
+                for r in result["hold_updates"]
+                if r["rdc"] and r["var_art"] is not None
+            }
+            if distinct:
+                cur = raw.cursor()
+                try:
+                    try: cur.fast_executemany = True
+                    except Exception: pass
+                    cur.executemany(
+                        f"INSERT INTO {tmp_keys} (rdc, art) VALUES (?, ?)",
+                        [(str(rdc), str(art)) for rdc, art in distinct],
+                    )
+                finally:
+                    cur.close()
+
+                # MSA_TOTAL: refresh HOLD_QTY from tracker + recompute FNL_Q.
+                r1 = conn.execute(text(f"""
+                    UPDATE T
+                       SET T.HOLD_QTY = ISNULL(H.HOLD_TOTAL, 0),
+                           T.FNL_Q   = CASE
+                               WHEN T.STK_QTY
+                                    - ISNULL(T.PEND_QTY, 0)
+                                    - ISNULL(H.HOLD_TOTAL, 0) < 0
+                               THEN 0
+                               ELSE T.STK_QTY
+                                    - ISNULL(T.PEND_QTY, 0)
+                                    - ISNULL(H.HOLD_TOTAL, 0)
+                           END
+                    FROM ARS_MSA_TOTAL T
+                    JOIN {tmp_keys} x
+                      ON T.RDC = x.rdc AND T.[{total_art}] = x.art
+                    LEFT JOIN (
+                        SELECT RDC,
+                               CAST(VAR_ART AS NVARCHAR(30)) AS ART_KEY,
+                               SUM(HOLD_REM) AS HOLD_TOTAL
+                        FROM [{HOLD_TRACKING_TABLE}]
+                        WHERE ISNULL(IS_CLOSED, 0) = 0
+                        GROUP BY RDC, CAST(VAR_ART AS NVARCHAR(30))
+                    ) H ON T.RDC = H.RDC AND T.[{total_art}] = H.ART_KEY
+                """))
+                result["msa_total"] = int(r1.rowcount or 0)
+                conn.commit()
+
+                # VAR_ART rollup — FNL_Q + HOLD_QTY (if VAR_ART has HOLD_QTY).
+                has_hold_var = conn.execute(text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME='ARS_MSA_VAR_ART' AND COLUMN_NAME='HOLD_QTY'"
+                )).scalar() or 0
+                hold_set_var = ", V.HOLD_QTY = agg.HOLD_SUM" if has_hold_var else ""
+                hold_sum_var = ", SUM(HOLD_QTY) AS HOLD_SUM" if has_hold_var else ""
+                try:
+                    r2 = conn.execute(text(f"""
+                        UPDATE V
+                           SET V.FNL_Q    = agg.FNL_Q_SUM,
+                               V.PEND_QTY = agg.PEND_SUM
+                               {hold_set_var}
+                        FROM ARS_MSA_VAR_ART V
+                        JOIN (
+                            SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                                   [{total_art}] AS ART_KEY,
+                                   SUM(FNL_Q)    AS FNL_Q_SUM,
+                                   SUM(PEND_QTY) AS PEND_SUM
+                                   {hold_sum_var}
+                            FROM ARS_MSA_TOTAL
+                            WHERE [{total_art}] IN (SELECT art FROM {tmp_keys})
+                            GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                                     [{total_art}]
+                        ) agg ON V.RDC = agg.RDC
+                             AND ISNULL(V.MAJ_CAT,'')        = ISNULL(agg.MAJ_CAT,'')
+                             AND ISNULL(V.GEN_ART_NUMBER,'') = ISNULL(agg.GEN_ART_NUMBER,'')
+                             AND ISNULL(V.CLR,'')             = ISNULL(agg.CLR,'')
+                             AND V.[{var_art_c}]              = agg.ART_KEY
+                    """))
+                    result["msa_var_art"] = int(r2.rowcount or 0)
+                    conn.commit()
+                except Exception as e2:
+                    logger.warning(f"[hold-clear] VAR_ART rollup skipped: {e2}")
+                    try: conn.rollback()
+                    except Exception: pass
+
+                # GEN_ART rollup — same pattern at gen-art grain.
+                has_hold_gen = conn.execute(text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME='ARS_MSA_GEN_ART' AND COLUMN_NAME='HOLD_QTY'"
+                )).scalar() or 0
+                hold_set_gen = ", G.HOLD_QTY = agg.HOLD_SUM" if has_hold_gen else ""
+                hold_sum_gen = ", SUM(HOLD_QTY) AS HOLD_SUM" if has_hold_gen else ""
+                try:
+                    r3 = conn.execute(text(f"""
+                        UPDATE G
+                           SET G.FNL_Q    = agg.FNL_Q_SUM,
+                               G.PEND_QTY = agg.PEND_SUM
+                               {hold_set_gen}
+                        FROM ARS_MSA_GEN_ART G
+                        JOIN (
+                            SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                                   SUM(FNL_Q)    AS FNL_Q_SUM,
+                                   SUM(PEND_QTY) AS PEND_SUM
+                                   {hold_sum_gen}
+                            FROM ARS_MSA_TOTAL
+                            WHERE [{total_art}] IN (SELECT art FROM {tmp_keys})
+                            GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
+                        ) agg ON G.RDC = agg.RDC
+                             AND ISNULL(G.MAJ_CAT,'')        = ISNULL(agg.MAJ_CAT,'')
+                             AND ISNULL(G.GEN_ART_NUMBER,'') = ISNULL(agg.GEN_ART_NUMBER,'')
+                             AND ISNULL(G.CLR,'')             = ISNULL(agg.CLR,'')
+                    """))
+                    result["msa_gen_art"] = int(r3.rowcount or 0)
+                    conn.commit()
+                except Exception as e3:
+                    logger.warning(f"[hold-clear] GEN_ART rollup skipped: {e3}")
+                    try: conn.rollback()
+                    except Exception: pass
+
+    finally:
+        for t in (tmp_in, tmp_keys):
+            try:
+                conn.execute(text(
+                    f"IF OBJECT_ID('tempdb..{t}') IS NOT NULL DROP TABLE {t}"
+                ))
+            except Exception:
+                pass
+
+    if created_by:
+        logger.info(
+            f"[hold-clear] by {created_by}: input={len(norm_rows)} "
+            f"touched={result['touched_hold']} "
+            f"msa_total={result['msa_total']} "
+            f"reason={safe_reason!r}"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Adhoc hold-revise — increase HOLD_REM (and HOLD_QTY_INITIAL by the same
+# delta) on existing tracker rows. Mirrors the MERGE / MATCHED branch of
+# _apply_hold_tracking_from_history's Step B: a re-open if the row was
+# previously closed.
+#
+# Doesn't INSERT new tracker rows — adding a brand-new hold needs RDC /
+# MAJ_CAT / GEN_ART / CLR that the file can't easily carry. Use the normal
+# MSA → listing → approve flow for new holds.
+# ---------------------------------------------------------------------------
+def apply_hold_revise(
+    conn,
+    rows: List[Dict],
+    reason: str = "",
+    created_by: Optional[str] = None,
+) -> Dict:
+    """Increase HOLD_REM and HOLD_QTY_INITIAL by `add_qty` on matching
+    tracker rows. Rows that are currently closed are re-opened with the
+    incoming qty as their new INITIAL / REM (same convention Step B uses
+    when a TBL alloc lands on a previously-closed key).
+
+    rows: `[{ werks, var_art, sz, add_qty }]`. Blank `sz` = every size for
+    that `(WERKS, VAR_ART)` — symmetric with apply_hold_clear.
+
+    After tracker mutation, the same MSA HOLD_QTY/FNL_Q resync runs so the
+    extra hold immediately reduces FNL_Q in the next allocation.
+    """
+    result: Dict = {
+        "touched_hold": 0, "hold_updates": [],
+        "msa_total": 0, "msa_var_art": 0, "msa_gen_art": 0,
+        "error": None,
+    }
+
+    norm_rows: List[Dict] = []
+    for r in rows or []:
+        werks = str(r.get("werks") or "").strip()
+        var_art = str(r.get("var_art") or "").strip().split(".")[0]
+        sz = str(r.get("sz") or "").strip()
+        if not werks or not var_art:
+            continue
+        try:
+            add_qty = float(r.get("add_qty"))
+        except (TypeError, ValueError):
+            continue
+        if add_qty <= 0:
+            continue
+        norm_rows.append({"werks": werks, "var_art": var_art, "sz": sz,
+                          "add_qty": add_qty})
+    if not norm_rows:
+        return result
+
+    safe_reason = (reason or "").strip()[:500]
+    safe_user   = (created_by or "")[:100]
+    tmp_in   = f"#hold_rev_in_{uuid.uuid4().hex[:8]}"
+    tmp_keys = f"#hold_rev_keys_{uuid.uuid4().hex[:8]}"
+    try:
+        _ensure_hold_audit_columns(conn)
+        conn.execute(text(
+            f"CREATE TABLE {tmp_in} ("
+            "  werks   NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  var_art NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  sz      NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  add_qty FLOAT NOT NULL"
+            ")"
+        ))
+        raw = conn.connection
+        cur = raw.cursor()
+        try:
+            try: cur.fast_executemany = True
+            except Exception: pass
+            cur.executemany(
+                f"INSERT INTO {tmp_in} (werks, var_art, sz, add_qty) "
+                "VALUES (?, ?, ?, ?)",
+                [(k["werks"], k["var_art"], k["sz"], k["add_qty"])
+                 for k in norm_rows],
+            )
+        finally:
+            cur.close()
+
+        # Update HOLD_REM/HOLD_QTY_INITIAL with re-open semantics: if the
+        # row was closed, treat add_qty as the new initial; otherwise
+        # accumulate on top of the existing values.
+        updates = conn.execute(text(f"""
+            UPDATE H
+               SET H.HOLD_QTY_INITIAL = CASE
+                       WHEN ISNULL(H.IS_CLOSED, 0) = 1 THEN u.add_qty
+                       ELSE ISNULL(H.HOLD_QTY_INITIAL, 0) + u.add_qty
+                   END,
+                   H.HOLD_REM = CASE
+                       WHEN ISNULL(H.IS_CLOSED, 0) = 1 THEN u.add_qty
+                       ELSE ISNULL(H.HOLD_REM, 0) + u.add_qty
+                   END,
+                   H.IS_CLOSED      = 0,
+                   H.CLOSED_DATE    = NULL,
+                   H.LAST_UPDATED   = GETDATE(),
+                   H.LAST_REMARKS   = :rmk,
+                   H.LAST_UPDATED_BY = :usr
+            OUTPUT INSERTED.WERKS, INSERTED.VAR_ART, INSERTED.SZ,
+                   INSERTED.RDC,
+                   DELETED.HOLD_REM         AS OLD_HOLD_REM,
+                   INSERTED.HOLD_REM        AS NEW_HOLD_REM,
+                   DELETED.HOLD_QTY_INITIAL AS OLD_INITIAL,
+                   INSERTED.HOLD_QTY_INITIAL AS NEW_INITIAL,
+                   DELETED.IS_CLOSED        AS WAS_CLOSED
+            FROM [{HOLD_TRACKING_TABLE}] H
+            JOIN {tmp_in} u
+              ON  H.WERKS  = u.werks
+             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+             AND (u.sz = '' OR ISNULL(H.SZ,'') = u.sz)
+        """), {"rmk": (f"REVISE: {safe_reason}" if safe_reason else "REVISE"),
+                "usr": safe_user or None}).fetchall()
+
+        for r in updates:
+            result["hold_updates"].append({
+                "werks":        r[0],
+                "var_art":      int(r[1]) if r[1] is not None else None,
+                "sz":           r[2],
+                "rdc":          r[3],
+                "old_hold_rem": float(r[4] or 0),
+                "new_hold_rem": float(r[5] or 0),
+                "old_initial":  float(r[6] or 0),
+                "new_initial":  float(r[7] or 0),
+                "was_closed":   bool(r[8]),
+            })
+        result["touched_hold"] = len(updates)
+
+        # MSA sync — same as clear-hold path. Increasing HOLD_QTY reduces
+        # FNL_Q for the affected (RDC, ARTICLE) so the freshly-added hold
+        # is honoured in the next allocation immediately.
+        msa_exists = conn.execute(text(
+            "SELECT CASE WHEN OBJECT_ID('dbo.ARS_MSA_TOTAL','U') IS NULL "
+            "            THEN 0 ELSE 1 END"
+        )).scalar() or 0
+        if msa_exists and result["touched_hold"] > 0:
+            def _col(*candidates):
+                for c in candidates:
+                    found = conn.execute(text(
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_NAME='ARS_MSA_TOTAL' AND COLUMN_NAME=:c"
+                    ), {"c": c}).scalar() or 0
+                    if found: return c
+                return candidates[0]
+            total_art = _col("ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
+            var_art_c = conn.execute(text(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME='ARS_MSA_VAR_ART' "
+                "  AND COLUMN_NAME IN ('VAR_ART','ARTICLE_NUMBER','ARTICLE')"
+            )).scalar() or "VAR_ART"
+
+            conn.execute(text(
+                f"CREATE TABLE {tmp_keys} ("
+                f"rdc NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
+                f"art NVARCHAR(30) COLLATE DATABASE_DEFAULT)"
+            ))
+            distinct = {
+                (r["rdc"], r["var_art"])
+                for r in result["hold_updates"]
+                if r["rdc"] and r["var_art"] is not None
+            }
+            if distinct:
+                cur = raw.cursor()
+                try:
+                    try: cur.fast_executemany = True
+                    except Exception: pass
+                    cur.executemany(
+                        f"INSERT INTO {tmp_keys} (rdc, art) VALUES (?, ?)",
+                        [(str(rdc), str(art)) for rdc, art in distinct],
+                    )
+                finally:
+                    cur.close()
+
+                r1 = conn.execute(text(f"""
+                    UPDATE T
+                       SET T.HOLD_QTY = ISNULL(H.HOLD_TOTAL, 0),
+                           T.FNL_Q   = CASE
+                               WHEN T.STK_QTY
+                                    - ISNULL(T.PEND_QTY, 0)
+                                    - ISNULL(H.HOLD_TOTAL, 0) < 0
+                               THEN 0
+                               ELSE T.STK_QTY
+                                    - ISNULL(T.PEND_QTY, 0)
+                                    - ISNULL(H.HOLD_TOTAL, 0)
+                           END
+                    FROM ARS_MSA_TOTAL T
+                    JOIN {tmp_keys} x
+                      ON T.RDC = x.rdc AND T.[{total_art}] = x.art
+                    LEFT JOIN (
+                        SELECT RDC,
+                               CAST(VAR_ART AS NVARCHAR(30)) AS ART_KEY,
+                               SUM(HOLD_REM) AS HOLD_TOTAL
+                        FROM [{HOLD_TRACKING_TABLE}]
+                        WHERE ISNULL(IS_CLOSED, 0) = 0
+                        GROUP BY RDC, CAST(VAR_ART AS NVARCHAR(30))
+                    ) H ON T.RDC = H.RDC AND T.[{total_art}] = H.ART_KEY
+                """))
+                result["msa_total"] = int(r1.rowcount or 0)
+                conn.commit()
+
+                has_hold_var = conn.execute(text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME='ARS_MSA_VAR_ART' AND COLUMN_NAME='HOLD_QTY'"
+                )).scalar() or 0
+                hold_set_var = ", V.HOLD_QTY = agg.HOLD_SUM" if has_hold_var else ""
+                hold_sum_var = ", SUM(HOLD_QTY) AS HOLD_SUM" if has_hold_var else ""
+                try:
+                    r2 = conn.execute(text(f"""
+                        UPDATE V
+                           SET V.FNL_Q    = agg.FNL_Q_SUM,
+                               V.PEND_QTY = agg.PEND_SUM
+                               {hold_set_var}
+                        FROM ARS_MSA_VAR_ART V
+                        JOIN (
+                            SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                                   [{total_art}] AS ART_KEY,
+                                   SUM(FNL_Q)    AS FNL_Q_SUM,
+                                   SUM(PEND_QTY) AS PEND_SUM
+                                   {hold_sum_var}
+                            FROM ARS_MSA_TOTAL
+                            WHERE [{total_art}] IN (SELECT art FROM {tmp_keys})
+                            GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                                     [{total_art}]
+                        ) agg ON V.RDC = agg.RDC
+                             AND ISNULL(V.MAJ_CAT,'')        = ISNULL(agg.MAJ_CAT,'')
+                             AND ISNULL(V.GEN_ART_NUMBER,'') = ISNULL(agg.GEN_ART_NUMBER,'')
+                             AND ISNULL(V.CLR,'')             = ISNULL(agg.CLR,'')
+                             AND V.[{var_art_c}]              = agg.ART_KEY
+                    """))
+                    result["msa_var_art"] = int(r2.rowcount or 0)
+                    conn.commit()
+                except Exception as e2:
+                    logger.warning(f"[hold-revise] VAR_ART rollup skipped: {e2}")
+                    try: conn.rollback()
+                    except Exception: pass
+
+                has_hold_gen = conn.execute(text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME='ARS_MSA_GEN_ART' AND COLUMN_NAME='HOLD_QTY'"
+                )).scalar() or 0
+                hold_set_gen = ", G.HOLD_QTY = agg.HOLD_SUM" if has_hold_gen else ""
+                hold_sum_gen = ", SUM(HOLD_QTY) AS HOLD_SUM" if has_hold_gen else ""
+                try:
+                    r3 = conn.execute(text(f"""
+                        UPDATE G
+                           SET G.FNL_Q    = agg.FNL_Q_SUM,
+                               G.PEND_QTY = agg.PEND_SUM
+                               {hold_set_gen}
+                        FROM ARS_MSA_GEN_ART G
+                        JOIN (
+                            SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                                   SUM(FNL_Q)    AS FNL_Q_SUM,
+                                   SUM(PEND_QTY) AS PEND_SUM
+                                   {hold_sum_gen}
+                            FROM ARS_MSA_TOTAL
+                            WHERE [{total_art}] IN (SELECT art FROM {tmp_keys})
+                            GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
+                        ) agg ON G.RDC = agg.RDC
+                             AND ISNULL(G.MAJ_CAT,'')        = ISNULL(agg.MAJ_CAT,'')
+                             AND ISNULL(G.GEN_ART_NUMBER,'') = ISNULL(agg.GEN_ART_NUMBER,'')
+                             AND ISNULL(G.CLR,'')             = ISNULL(agg.CLR,'')
+                    """))
+                    result["msa_gen_art"] = int(r3.rowcount or 0)
+                    conn.commit()
+                except Exception as e3:
+                    logger.warning(f"[hold-revise] GEN_ART rollup skipped: {e3}")
+                    try: conn.rollback()
+                    except Exception: pass
+
+    finally:
+        for t in (tmp_in, tmp_keys):
+            try:
+                conn.execute(text(
+                    f"IF OBJECT_ID('tempdb..{t}') IS NOT NULL DROP TABLE {t}"
+                ))
+            except Exception:
+                pass
+
+    if created_by:
+        logger.info(
+            f"[hold-revise] by {created_by}: input={len(norm_rows)} "
+            f"touched={result['touched_hold']} "
+            f"msa_total={result['msa_total']} "
+            f"reason={safe_reason!r}"
+        )
     return result
 
 
@@ -4086,14 +5262,22 @@ def apply_pend_alc_delta(
 
     tmp = f"#delta_{uuid.uuid4().hex[:8]}"
     try:
+        # NVARCHAR columns are pinned to DATABASE_DEFAULT so the temp table
+        # inherits the *user* database collation (SQL_Latin1_General_CP1_CI_AS
+        # on this server) instead of tempdb's (Latin1_General_CI_AS). Without
+        # this, every JOIN to ARS_MSA_TOTAL / ARS_MSA_VAR_ART / ARS_MSA_GEN_ART
+        # and the ARS_GRID_MJ* rollup grids raises SQL error 468 "Cannot
+        # resolve the collation conflict" and the delta block is silently
+        # swallowed, leaving MSA + grid rollups stale until the next full
+        # rebuild.
         conn.execute(text(f"""
             CREATE TABLE {tmp} (
-                rdc      NVARCHAR(20),
-                st_cd    NVARCHAR(20),
-                art      NVARCHAR(30),
-                maj_cat  NVARCHAR(200),
-                gen_art  NVARCHAR(30),
-                clr      NVARCHAR(50),
+                rdc      NVARCHAR(20)  COLLATE DATABASE_DEFAULT,
+                st_cd    NVARCHAR(20)  COLLATE DATABASE_DEFAULT,
+                art      NVARCHAR(30)  COLLATE DATABASE_DEFAULT,
+                maj_cat  NVARCHAR(200) COLLATE DATABASE_DEFAULT,
+                gen_art  NVARCHAR(30)  COLLATE DATABASE_DEFAULT,
+                clr      NVARCHAR(50)  COLLATE DATABASE_DEFAULT,
                 qty      FLOAT
             )
         """))
@@ -4354,9 +5538,15 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         # 1a. Seed PEND_QTY into ARS_MSA_TOTAL from open pend_alc rows.
         # MSA tables are UPDATE-only by design (user requirement): only
         # (RDC, article) keys already in the MSA universe get adjusted.
-        # Pend-only articles (no matching MSA row) are intentionally skipped
-        # — MSA represents the allocation-eligible universe and must not be
-        # polluted with stockless rows.
+        #
+        # As of the universe-anchored MSA build (msa_service Step 6), every
+        # (RDC, ARTICLE) referenced by an open ARS_PEND_ALC or HOLD_TRACKING
+        # row IS in the MSA universe — the variant backfill from
+        # vw_master_product inserts a zero-stock placeholder row at MSA
+        # build time. So this UPDATE should now find a target for every
+        # open pend row; any missing matches indicate either a master gap
+        # (article not in vw_master_product) or a stale TOTAL table that
+        # predates the universe-anchored build.
         r1 = conn.execute(text(f"""
             ;WITH P AS (
                 SELECT RDC, ARTICLE_NUMBER, SUM(PEND_QTY) AS qty

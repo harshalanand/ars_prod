@@ -13,22 +13,20 @@ import {
 
 // Above this row count, switch to bulk mode (no editable table render).
 const BULK_THRESHOLD = 100
-// Submit in chunks so the user sees progress and the request body stays
-// small. The set-based apply_do_deductions handles 25K rows in well under
-// Cloudflare's 100s edge timeout, so larger chunks = fewer round trips
-// and fewer polling waits.
-const SUBMIT_CHUNK = 25000
 // Uploads at or below this size skip the async/polling path entirely and
 // hit /do-update synchronously — saves the full polling overhead for the
 // common single-file daily DO entry.
 const SYNC_FAST_LANE_MAX = 25000
-// How often to poll an async job for completion. Was 2000ms; dropped to
-// 500ms because typical DO chunks finish in ~1s on the backend and the
-// old interval added 0–2s of pure waiting per chunk.
+// How often to poll an async job for status / progress updates.
 const POLL_INTERVAL_MS = 500
+// How many consecutive polling errors to tolerate before declaring a job
+// failed. A single 502/504 from Cloudflare or a brief tab throttle used to
+// kill a chunk while the backend job was still running fine. 5 × 500ms =
+// ~2.5s of unbroken errors before we give up.
+const POLL_ERROR_TOLERANCE = 5
 
-// Generate a per-upload session id so chunks roll up to ONE ops_log row
-// (revert covers the whole upload, not just chunk 1).
+// Generate a per-upload session id so the whole upload rolls up to ONE
+// ops_log row (revert covers the whole upload as a single unit).
 const newSessionId = () =>
   `DO-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-` +
   Math.random().toString(16).slice(2, 8)
@@ -66,7 +64,15 @@ function parseCsv(text) {
       do_number:         doIdx >= 0    ? (cols[doIdx]    || '').trim() : '',
       allocation_number: allocIdx >= 0 ? (cols[allocIdx] || '').trim() : '',
     }
-  }).filter(r => r.rdc && r.article_number && parseFloat(r.do_qty) > 0)
+  // DO_QTY = 0 is allowed and means "cancel the matching open BDC" — the
+  // backend flips ARS_BDC_HISTORY.STATUS to CANCELLED so the row drops out
+  // of BDC IN FLIGHT and re-enters the next /bdc-generate. Negative qty is
+  // still rejected (not a meaningful operation).
+  }).filter(r => {
+    if (!r.rdc || !r.article_number) return false
+    const q = parseFloat(r.do_qty)
+    return !isNaN(q) && q >= 0
+  })
 }
 
 export default function PendingDeliveryOrderPage() {
@@ -151,28 +157,29 @@ export default function PendingDeliveryOrderPage() {
 
   const handleSubmit = async () => {
     const sourceRows = bulkMode ? (bulkRowsRef.current || []) : rows
-    const valid = sourceRows.filter(
-      r => r.rdc && r.article_number && parseFloat(r.do_qty) > 0
-    )
+    // DO_QTY=0 is a valid cancellation row (backend cancels the matching
+    // open BDC); negative qty is rejected.
+    const valid = sourceRows.filter(r => {
+      if (!r.rdc || !r.article_number) return false
+      const q = parseFloat(r.do_qty)
+      return !isNaN(q) && q >= 0
+    })
     if (!valid.length) {
-      toast.error('No valid rows to submit (check RDC, Article Number, and DO QTY > 0)')
+      toast.error('No valid rows to submit (check RDC, Article Number, and DO QTY ≥ 0)')
       return
     }
     setSubmitting(true)
     setResult(null)
-    setProgress({ sent: 0, total: valid.length })
-
     const sessionId  = newSessionId()
     const totalRows  = valid.length
-    const numChunks  = Math.ceil(totalRows / SUBMIT_CHUNK)
-    let totalUpdated = 0
-    const failures   = []  // {chunkIdx, rows, message}
+    setProgress({ sent: 0, total: totalRows, message: '' })
 
-    // Fast lane: uploads small enough to fit one chunk go straight through
-    // the synchronous /do-update — no job, no polling, no detection latency.
-    // Cloudflare's 100s edge timeout is well past the ~2s the set-based
-    // apply_do_deductions needs for 25K rows.
-    if (totalRows <= SYNC_FAST_LANE_MAX && numChunks === 1) {
+    let totalUpdated = 0
+    let failureMsg   = null
+
+    // Fast lane: small uploads go straight through the synchronous
+    // /do-update — no job, no polling, no detection latency.
+    if (totalRows <= SYNC_FAST_LANE_MAX) {
       try {
         const payload = {
           rows:           valid.map(buildPayload),
@@ -182,71 +189,71 @@ export default function PendingDeliveryOrderPage() {
         }
         const resp = await pendAlcAPI.doUpdate(payload)
         totalUpdated = resp.data?.updated_rows || 0
-        setProgress({ sent: totalRows, total: totalRows })
+        setProgress({ sent: totalRows, total: totalRows, message: '' })
       } catch (e) {
-        failures.push({
-          chunkIdx: 1,
-          rows:     totalRows,
-          message:  e.response?.data?.detail || e.message || 'request failed',
-        })
+        failureMsg = e.response?.data?.detail || e.message || 'request failed'
       }
     } else {
-    // Per-chunk try/catch: one failure no longer abandons the whole upload.
-    // Every chunk gets a fair attempt; the user sees a summary at the end.
-    // Async path: kick off background job per chunk, poll until complete,
-    // then move to the next chunk. Survives the 100s Cloudflare timeout.
-    const waitForJob = (jobId) => new Promise((resolve, reject) => {
-      const timer = setInterval(async () => {
-        try {
-          const s = await pendAlcAPI.asyncJobStatus(jobId)
-          const j = s.data?.data
-          if (!j) return
-          if (j.status === 'completed') { clearInterval(timer); resolve(j) }
-          else if (j.status === 'failed') {
-            clearInterval(timer)
-            reject(new Error(j.error || 'job failed'))
+      // Async path: one POST, one job, resilient polling. The backend
+      // /do-update-async accepts arbitrary row counts and slices internally
+      // for memory + progress, so the frontend doesn't need to chunk.
+      // POLL_ERROR_TOLERANCE consecutive errors are tolerated so a single
+      // transient 502 from the edge no longer "fails" a job that is in
+      // fact running to completion server-side.
+      const waitForJob = (jobId) => new Promise((resolve, reject) => {
+        let consecErrors = 0
+        const timer = setInterval(async () => {
+          try {
+            const s = await pendAlcAPI.asyncJobStatus(jobId)
+            consecErrors = 0
+            const j = s.data?.data
+            if (!j) return
+            if (j.progress) {
+              setProgress({ sent: 0, total: totalRows, message: j.progress })
+            }
+            if (j.status === 'completed') {
+              clearInterval(timer); resolve(j)
+            } else if (j.status === 'failed') {
+              clearInterval(timer)
+              reject(new Error(j.error || 'job failed'))
+            }
+          } catch (err) {
+            if (++consecErrors >= POLL_ERROR_TOLERANCE) {
+              clearInterval(timer); reject(err)
+            }
           }
-        } catch (err) { clearInterval(timer); reject(err) }
-      }, POLL_INTERVAL_MS)
-    })
+        }, POLL_INTERVAL_MS)
+      })
 
-    for (let i = 0, idx = 0; i < totalRows; i += SUBMIT_CHUNK, idx += 1) {
-      const slice   = valid.slice(i, i + SUBMIT_CHUNK)
-      const payload = {
-        rows:           slice.map(buildPayload),
-        session_id:     sessionId,
-        is_first_chunk: idx === 0,
-        is_last_chunk:  idx === numChunks - 1,
-      }
       try {
+        const payload = {
+          rows:           valid.map(buildPayload),
+          session_id:     sessionId,
+          is_first_chunk: true,
+          is_last_chunk:  true,
+        }
         const startResp = await pendAlcAPI.doUpdateAsync(payload)
         const jobId = startResp.data?.job_id
         if (!jobId) throw new Error('No job_id from server')
         const finalJob = await waitForJob(jobId)
-        totalUpdated += (finalJob.result?.updated_rows || 0)
+        totalUpdated = finalJob.result?.updated_rows || 0
+        setProgress({ sent: totalRows, total: totalRows, message: '' })
       } catch (e) {
-        failures.push({
-          chunkIdx: idx + 1,
-          rows:     slice.length,
-          message:  e.response?.data?.detail || e.message || 'request failed',
-        })
+        failureMsg = e.response?.data?.detail || e.message || 'request failed'
       }
-      setProgress({ sent: Math.min(i + slice.length, totalRows), total: totalRows })
-    }
     }
 
-    setResult({ submitted: totalRows, updated: totalUpdated, failures: failures.length })
-    if (failures.length === 0) {
+    setResult({ submitted: totalRows, updated: totalUpdated,
+                failures: failureMsg ? 1 : 0 })
+    if (!failureMsg) {
       toast.success(`DO update applied — ${totalUpdated.toLocaleString()} ARS_PEND_ALC rows updated`)
       if (bulkMode) exitBulkMode()
       else setRows([{ ...EMPTY_ROW }])
     } else {
-      const failedRows = failures.reduce((s, f) => s + f.rows, 0)
       toast.error(
-        `Partial: ${totalUpdated.toLocaleString()} pend_alc rows updated, ` +
-        `${failures.length}/${numChunks} chunk(s) failed (${failedRows.toLocaleString()} rows). ` +
-        `First error: ${failures[0].message}`,
-        { duration: 8000 }
+        `DO upload failed after ${totalUpdated.toLocaleString()} rows updated. ` +
+        `Reason: ${failureMsg}. Check /pend-alc/operations for the partial ops_log row.`,
+        { duration: 10000 }
       )
     }
     loadHistory()
@@ -256,7 +263,11 @@ export default function PendingDeliveryOrderPage() {
 
   const submittable = useMemo(() => {
     if (bulkMode) return bulkCount > 0
-    return rows.some(r => r.rdc && r.article_number && parseFloat(r.do_qty) > 0)
+    return rows.some(r => {
+      if (!r.rdc || !r.article_number) return false
+      const q = parseFloat(r.do_qty)
+      return !isNaN(q) && q >= 0
+    })
   }, [bulkMode, bulkCount, rows])
 
   const fmt = (n) => typeof n === 'number'
@@ -290,6 +301,12 @@ export default function PendingDeliveryOrderPage() {
           <div style={{ fontSize: 9, color: C.textMuted }}>
             Required: RDC, Article_Number, DO_QTY — optional: ST_CD (dest store), DO_Number, Allocation_Number (links DO back to its BDC)
           </div>
+        </div>
+        <div style={{ fontSize: 9, color: C.amber, marginTop: 4,
+                      padding: '4px 8px', background: '#fef3c7',
+                      border: `1px solid ${C.amber}`, borderRadius: 4,
+                      display: 'inline-block' }}>
+          <strong>DO_QTY = 0</strong> cancels the matching open BDC (by Allocation_Number) — removes it from BDC IN FLIGHT and re-adds the row to the next BDC generation.
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={() => fileRef.current?.click()}
@@ -339,7 +356,7 @@ export default function PendingDeliveryOrderPage() {
                 Bulk upload mode — {bulkCount.toLocaleString()} rows ready
               </div>
               <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
-                Editable table is hidden for {'>'}{BULK_THRESHOLD} rows. Submitted in batches of {SUBMIT_CHUNK.toLocaleString()}.
+                Editable table is hidden for {'>'}{BULK_THRESHOLD} rows. Submitted in a single background job with live progress.
               </div>
             </div>
             <div style={{ flex: 1 }}/>
@@ -405,24 +422,38 @@ export default function PendingDeliveryOrderPage() {
         </div>
       )}
 
-      {/* Progress bar (shown during submit) */}
-      {progress && (
-        <div style={{ background: C.card, border: `1px solid ${C.primary}`, borderRadius: 8,
-                      padding: 12, marginBottom: 12 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between',
-                        fontSize: 10, fontWeight: 600, color: C.text, marginBottom: 6 }}>
-            <span>Uploading…</span>
-            <span>{progress.sent.toLocaleString()} / {progress.total.toLocaleString()} rows</span>
+      {/* Progress bar (shown during submit). When the backend job reports
+          progress like "applied 125,000 / 213,050 rows", parse it to drive
+          the bar; otherwise fall back to the client's sent/total counters. */}
+      {progress && (() => {
+        let sent  = progress.sent  || 0
+        let total = progress.total || 0
+        if (progress.message) {
+          const m = progress.message.match(/([\d,]+)\s*\/\s*([\d,]+)/)
+          if (m) {
+            sent  = parseInt(m[1].replace(/,/g, ''), 10) || sent
+            total = parseInt(m[2].replace(/,/g, ''), 10) || total
+          }
+        }
+        const pct = total > 0 ? Math.min(100, (sent / total) * 100) : 0
+        return (
+          <div style={{ background: C.card, border: `1px solid ${C.primary}`, borderRadius: 8,
+                        padding: 12, marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between',
+                          fontSize: 10, fontWeight: 600, color: C.text, marginBottom: 6 }}>
+              <span>{progress.message || 'Uploading…'}</span>
+              <span>{sent.toLocaleString()} / {total.toLocaleString()} rows</span>
+            </div>
+            <div style={{ background: C.bg, borderRadius: 4, overflow: 'hidden', height: 6 }}>
+              <div style={{
+                width: `${pct}%`,
+                height: '100%', background: C.primary,
+                transition: 'width 0.3s ease',
+              }}/>
+            </div>
           </div>
-          <div style={{ background: C.bg, borderRadius: 4, overflow: 'hidden', height: 6 }}>
-            <div style={{
-              width: `${(progress.sent / progress.total) * 100}%`,
-              height: '100%', background: C.primary,
-              transition: 'width 0.3s ease',
-            }}/>
-          </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* MANUAL MODE — editable table */}
       {!bulkMode && (

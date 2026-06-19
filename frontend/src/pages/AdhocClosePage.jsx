@@ -14,7 +14,7 @@ import { useState, useRef } from 'react'
 import { pendAlcAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
-  Upload, Plus, Trash2, Send, XCircle, FileText, AlertTriangle, RefreshCw,
+  Upload, Plus, Trash2, Send, XCircle, FileText, AlertTriangle, RefreshCw, Download,
 } from 'lucide-react'
 
 const C = {
@@ -71,6 +71,23 @@ export default function AdhocClosePage() {
   const addRow    = () => setRows(prev => [...prev, { ...EMPTY_ROW }])
   const removeRow = (i) => setRows(prev => prev.filter((_, j) => j !== i))
   const clearAll  = () => setRows([{ ...EMPTY_ROW }])
+
+  const downloadTemplate = () => {
+    const csv =
+      'RDC,ST_CD,ARTICLE_NUMBER,REASON\n' +
+      'DH24,,1110112278002,No MSA stock — bot mis-allocated\n' +
+      'DH24,V001,1110112278002,\n' +
+      'DH24,V002,1110112278003,Article delisted at store\n'
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'adhoc_close_template.csv'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
 
   const validRows = rows.filter(r => r.rdc.trim() && r.article_number.trim())
 
@@ -261,8 +278,16 @@ export default function AdhocClosePage() {
         {/* File upload */}
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
           <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`,
-                        fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
-            BULK UPLOAD
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
+              BULK UPLOAD
+            </div>
+            <button onClick={downloadTemplate}
+              style={{ fontSize: 10, padding: '4px 8px', border: `1px solid ${C.border}`,
+                       background: '#fff', color: C.primary, borderRadius: 4, cursor: 'pointer',
+                       display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Download size={11}/> Template
+            </button>
           </div>
           <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
             <div style={{ fontSize: 10, color: C.textSub }}>

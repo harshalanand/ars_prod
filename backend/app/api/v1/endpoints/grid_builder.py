@@ -17,8 +17,9 @@ Endpoints:
 """
 
 import json
+import threading
 import time
-from typing import Callable, List, Optional, Set, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, validator
@@ -41,6 +42,26 @@ router      = APIRouter(prefix="/grid-builder", tags=["Grid Builder"])
 GRID_TABLE  = "ARS_GRID_BUILDER"
 GRID_HIER_TABLE = "ARS_GRID_HIERARCHY"   # managed table with 1 column per grid hierarchy level
 VALID_STATUS = {"Active", "Inactive"}
+
+# ── Run-All async state ─────────────────────────────────────────────────────
+# A full Run All takes 5-15 minutes — far longer than Cloudflare's 120-second
+# proxy timeout. Running it synchronously kills the user's HTTP request long
+# before the work finishes, leaving the UI guessing whether anything is still
+# happening. We spawn the work onto a daemon thread and return immediately;
+# the UI polls /run-all/status (or just /grids) to track per-grid progress.
+_run_all_lock: threading.Lock = threading.Lock()
+_run_all_state: Dict[str, Any] = {
+    "running":       False,
+    "started_at":    None,    # epoch seconds
+    "started_by":    None,
+    "completed_at":  None,
+    "total_grids":   0,
+    "workers":       0,
+    "results":       [],
+    "msa_sync":      {},
+    "error":         None,
+    "calc_duration": None,
+}
 
 # Grids whose hierarchy contains these are article-level → skip for hierarchy table
 _ARTICLE_LEVEL_COLS = {"GEN_ART_NUMBER", "ARTICLE_NUMBER", "GEN_ART", "VAR_ART"}
@@ -106,21 +127,6 @@ class GridUpdate(BaseModel):
 # ── DDL / helpers ─────────────────────────────────────────────────────────────
 
 _run = run_sql  # shared helper: execute + commit
-
-
-def _shrink_db_files(engine):
-    """Shrink data DB files after heavy TRUNCATE/DROP to reclaim space."""
-    try:
-        with engine.connect() as conn:
-            files = conn.execute(text(
-                "SELECT name FROM sys.database_files WHERE type_desc = 'ROWS'"
-            )).fetchall()
-            for (fname,) in files:
-                conn.execute(text(f"DBCC SHRINKFILE ([{fname}], TRUNCATEONLY) WITH NO_INFOMSGS"))
-                conn.commit()
-            logger.info(f"SHRINKFILE completed for {len(files)} file(s)")
-    except Exception as e:
-        logger.warning(f"SHRINKFILE failed: {e}")
 
 
 T = TypeVar("T")
@@ -278,12 +284,17 @@ def _ensure_hierarchy_table(engine):
     columns are derived from ARS_GRID_BUILDER grid definitions.
 
     Rules:
-      - Base columns: WERKS, MAJ_CAT (always present)
+      - Base column: MAJ_CAT (always present, PK)
       - One column per active non-article grid, named after the LAST
         hierarchy column (e.g. RNG_SEG, MACRO_MVGR, FAB, CLR, M_VND_CD)
-      - Column order follows grid.seq
       - Grids with GEN_ART/VAR_ART in hierarchy are skipped
-      - Table is created if missing; new columns are ADDed, removed ones stay
+      - First-time creation: columns are created in grid.seq order
+      - Subsequent runs: ADD-ONLY. Columns for newly-active grids are added
+        via ALTER TABLE ADD. Columns for grids that were deleted or moved
+        to Inactive are NEVER dropped, so their data survives. Physical
+        column order is therefore not re-shuffled by reorder/deactivate
+        (consumers reference columns by name, not position). Use
+        /hierarchy/compact to prune orphan columns explicitly.
     """
     with engine.connect() as conn:
         # Read grid definitions
@@ -335,48 +346,22 @@ def _ensure_hierarchy_table(engine):
                 )
             """)
             logger.info(f"Created {GRID_HIER_TABLE} with columns: MAJ_CAT, {', '.join(c[0] for c in hier_cols)}")
-        else:
-            # Table exists — check if columns match expected order
-            existing_rows = conn.execute(text(
-                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-                "WHERE TABLE_NAME = :t ORDER BY ORDINAL_POSITION"
-            ), {"t": GRID_HIER_TABLE}).fetchall()
-            existing_ordered = [r[0].upper() for r in existing_rows]
-            expected_ordered = ["MAJ_CAT"] + [c[0] for c in hier_cols]
+            return
 
-            if existing_ordered == expected_ordered:
-                return  # Already in correct order, nothing to do
+        # Table exists — ADD missing columns only. Never DROP, never rebuild.
+        existing_upper = {r[0].upper() for r in conn.execute(text(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = :t"
+        ), {"t": GRID_HIER_TABLE}).fetchall()}
 
-            # Column list or order differs — rebuild table to match new seq
-            # 1. Save existing data
-            old_cols = [r[0] for r in existing_rows]
-            has_data = conn.execute(text(f"SELECT COUNT(*) FROM [{GRID_HIER_TABLE}]")).scalar() > 0
-            backup = f"#hier_backup"
-            if has_data:
-                _run(conn, f"SELECT * INTO {backup} FROM [{GRID_HIER_TABLE}]")
-
-            # 2. Drop + recreate with correct column order
-            _run(conn, f"DROP TABLE [{GRID_HIER_TABLE}]")
-            col_defs = "[MAJ_CAT] NVARCHAR(100) NOT NULL"
-            for col_name, gname, seq in hier_cols:
-                col_defs += f", [{col_name}] NVARCHAR(200) NULL"
-            _run(conn, f"""
-                CREATE TABLE [{GRID_HIER_TABLE}] (
-                    {col_defs},
-                    CONSTRAINT PK_{GRID_HIER_TABLE} PRIMARY KEY ([MAJ_CAT])
-                )
-            """)
-
-            # 3. Restore data (only columns that exist in both old and new)
-            if has_data:
-                new_cols = ["MAJ_CAT"] + [c[0] for c in hier_cols]
-                common = [c for c in new_cols if c in {x.upper() for x in old_cols}]
-                if common:
-                    col_list = ", ".join(f"[{c}]" for c in common)
-                    _run(conn, f"INSERT INTO [{GRID_HIER_TABLE}] ({col_list}) SELECT {col_list} FROM {backup}")
-                _run(conn, f"DROP TABLE {backup}")
-
-            logger.info(f"{GRID_HIER_TABLE}: rebuilt with column order: {expected_ordered}")
+        added = []
+        for col_name, gname, seq in hier_cols:
+            if col_name.upper() in existing_upper:
+                continue
+            _run(conn, f'ALTER TABLE [{GRID_HIER_TABLE}] ADD [{col_name}] NVARCHAR(200) NULL')
+            existing_upper.add(col_name.upper())
+            added.append(col_name)
+        if added:
+            logger.info(f"{GRID_HIER_TABLE}: added column(s) {added} (existing data preserved)")
 
 
 def _populate_merge_columns(engine) -> None:
@@ -584,6 +569,140 @@ def _resolve_template(template: str, hier_cols: List[str]) -> str:
 
 
 _get_col_type_sql = get_col_type_sql  # shared helper
+
+
+def _insert_missing_msa_rows(
+    conn,
+    out_table: str,
+    hier_cols: List[str],
+    slocs: List[str],
+    numeric_hier: Set[str],
+    mp_cols_upper: dict,
+    merge_case_cache: dict,
+) -> int:
+    """
+    Post-pivot synthetic-row injection.
+
+    For every (hier_cols) tuple that exists in the intended-dispatch universe
+    (ARS_MSA_TOTAL × Master_ALC_INPUT_ST_MASTER, joined by RDC) but is absent
+    from the just-built grid, insert one row with SLOC cols = 0 and STK_TTL=0.
+
+    Covers three scenarios uniformly:
+      (a) new MAJ_CAT — warehouse has stock, no in-store stock yet
+      (b) new store   — store opened, no stock loaded yet for any MAJ_CAT
+      (c) partial gap — (WERKS, MAJ_CAT) exists in grid for some sub-key values
+                        (e.g. MERGE_RNG_SEG='PSP') but not others (e.g. 'EV');
+                        the EV row gets injected based on MSA articles whose
+                        RNG_SEG maps to EV via ARS_MERGE_RULES.
+
+    Performance: the NOT EXISTS check runs at the GRID's full hier_cols grain
+    against the indexed output table — fast (hash anti-join). For mature
+    MAJ_CATs with full coverage, every Universe row is filtered out and the
+    INSERT is essentially free.
+
+    Runs AFTER the main pivot INSERT but BEFORE _apply_post_lookups, so the
+    LISTING filter / CONT lookup / MBQ / OPT_CNT calculations apply to
+    synthetic rows identically to real ones.
+
+    Returns: number of synthetic rows inserted (0 if no gaps or skipped).
+    """
+    # Skip cleanly when required source tables are absent.
+    msa_exists = conn.execute(text(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_MSA_TOTAL'"
+    )).scalar() > 0
+    stm_exists = conn.execute(text(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='Master_ALC_INPUT_ST_MASTER'"
+    )).scalar() > 0
+    if not (msa_exists and stm_exists):
+        return 0
+
+    # Universe is built by joining MSA (RDC-keyed) to ST_MASTER (WERKS=ST_CD,
+    # RDC) — both keys must be in the grid's hier for the result to be useful.
+    upper_hier = {c.upper() for c in hier_cols}
+    if 'WERKS' not in upper_hier or 'MAJ_CAT' not in upper_hier:
+        return 0
+
+    _msa_native = {"MAJ_CAT", "GEN_ART_NUMBER", "CLR", "ARTICLE_NUMBER"}
+    hier_select_parts = []
+    for col in hier_cols:
+        cu = col.upper()
+        default = "0" if cu in numeric_hier else "'NA'"
+        if cu == "WERKS":
+            hier_select_parts.append(f"SM.[ST_CD] AS [{col}]")
+        elif cu in ("ARTICLE_NUMBER", "MATNR"):
+            hier_select_parts.append(
+                f"ISNULL(TRY_CAST(MSA.[ARTICLE_NUMBER] AS BIGINT), {default}) AS [{col}]"
+            )
+        elif cu in _msa_native:
+            src = f"MSA.[{cu}]"
+            if cu in numeric_hier:
+                hier_select_parts.append(
+                    f"ISNULL(TRY_CAST({src} AS BIGINT), {default}) AS [{col}]"
+                )
+            else:
+                hier_select_parts.append(f"ISNULL({src}, {default}) AS [{col}]")
+        elif cu in merge_case_cache:
+            # MERGE_<col> derived from MP3 via the same CASE used by the main
+            # build — guarantees Universe and grid agree on derived values.
+            expr_mp3 = (merge_case_cache[cu]
+                        .replace("[MP].", "[MP3].")
+                        .replace("MP.", "MP3."))
+            hier_select_parts.append(f"ISNULL({expr_mp3}, {default}) AS [{col}]")
+        elif cu in mp_cols_upper:
+            actual = mp_cols_upper[cu]
+            hier_select_parts.append(f"ISNULL(MP3.[{actual}], {default}) AS [{col}]")
+        else:
+            hier_select_parts.append(f"{default} AS [{col}]")
+    msa_hier_select = ", ".join(hier_select_parts)
+
+    hier_cols_sql = ", ".join(f"[{c}]" for c in hier_cols)
+    sloc_cols_sql = ", ".join(f"[{s}]" for s in slocs) if slocs else ""
+    zero_sloc_vals = ", ".join("CAST(0 AS FLOAT)" for _ in slocs) if slocs else ""
+
+    if sloc_cols_sql:
+        insert_cols = f"{hier_cols_sql}, {sloc_cols_sql}, [STK_TTL]"
+        select_cols = f"{hier_cols_sql}, {zero_sloc_vals}, CAST(0 AS FLOAT)"
+    else:
+        insert_cols = f"{hier_cols_sql}, [STK_TTL]"
+        select_cols = f"{hier_cols_sql}, CAST(0 AS FLOAT)"
+
+    # NOT EXISTS at FULL hier_cols grain — every column of the grid's
+    # composite key is compared. ISNULL on the grid side handles rows whose
+    # hier values are still NULL at this stage (NULL→default fill happens
+    # later in step 8); the Universe side already has ISNULL'd defaults baked
+    # into msa_hier_select.
+    not_exists_parts = []
+    for col in hier_cols:
+        cu = col.upper()
+        default = "0" if cu in numeric_hier else "'NA'"
+        not_exists_parts.append(f"ISNULL(G.[{col}], {default}) = U.[{col}]")
+    not_exists_clause = " AND ".join(not_exists_parts)
+
+    insert_sql = f"""
+;WITH Universe AS (
+    SELECT DISTINCT
+        {msa_hier_select}
+    FROM dbo.ARS_MSA_TOTAL MSA WITH (NOLOCK)
+    INNER JOIN dbo.Master_ALC_INPUT_ST_MASTER SM WITH (NOLOCK)
+        ON SM.RDC = MSA.RDC
+       AND UPPER(SM.ST_STATUS) IN ('OLD','NEW','UPC')
+    LEFT JOIN dbo.vw_master_product MP3 WITH (NOLOCK)
+        ON TRY_CAST(MSA.ARTICLE_NUMBER AS BIGINT) = MP3.ARTICLE_NUMBER
+    WHERE MSA.sequence_id = (SELECT MAX(sequence_id) FROM dbo.ARS_MSA_TOTAL)
+)
+INSERT INTO [{out_table}] ({insert_cols})
+SELECT {select_cols}
+FROM Universe U
+WHERE NOT EXISTS (
+    SELECT 1 FROM [{out_table}] G WITH (NOLOCK)
+    WHERE {not_exists_clause}
+)
+"""
+
+    result = conn.execute(text(insert_sql))
+    n = result.rowcount if hasattr(result, "rowcount") and result.rowcount is not None else 0
+    conn.commit()
+    return int(n) if n and n > 0 else 0
 
 
 def _apply_post_lookups(
@@ -817,6 +936,7 @@ def _apply_post_lookups(
 # ==========================================================================
 # MBQ     = (SAL_PD * BGT_SL_GR_DGR) * ALC_D + (DISP_Q * DISP_GR_DGR)
 #           Default 1 if BGT_SL_GR_DGR or DISP_GR_DGR is blank/null
+#           If DISP_Q is 0/NULL → MBQ = 0 (no display fixture ⇒ no minimum buy)
 #           Then: MBQ = ROUND(MBQ * CONT, 1)
 # OPT_CNT = ROUND(DISP_Q * CONT / ACS_D, 1)
 # [L-7 DAYS SALE-Q] = [L-7 DAYS SALE-Q] * LW_ACT_SL_GR_DGR (default 1 if null/0)
@@ -845,15 +965,20 @@ def _calculate_grid_columns(conn, out_table: str) -> List[str]:
         _ensure_output_col(conn, out_table, "MBQ")
         try:
             # Step 1: Calculate raw MBQ
+            # Hard rule: DISP_Q = 0 / NULL ⇒ MBQ = 0 (no display fixture ⇒
+            # no minimum buy, regardless of SAL_PD contribution).
             _run(conn, f"""
-                UPDATE [{out_table}] SET [MBQ] = ROUND(
-                    (ISNULL(TRY_CAST([SAL_PD] AS FLOAT), 0)
-                     * CASE WHEN ISNULL(TRY_CAST([BGT_SL_GR_DGR] AS FLOAT), 0) = 0 THEN 1
-                            ELSE TRY_CAST([BGT_SL_GR_DGR] AS FLOAT) END)
-                    * ISNULL(TRY_CAST([{_alc_col}] AS FLOAT), 0)
-                    + (ISNULL(TRY_CAST([DISP_Q] AS FLOAT), 0)
-                       * CASE WHEN ISNULL(TRY_CAST([DISP_GR_DGR] AS FLOAT), 0) = 0 THEN 1
-                              ELSE TRY_CAST([DISP_GR_DGR] AS FLOAT) END), 0)
+                UPDATE [{out_table}] SET [MBQ] =
+                    CASE WHEN ISNULL(TRY_CAST([DISP_Q] AS FLOAT), 0) = 0 THEN 0
+                         ELSE ROUND(
+                            (ISNULL(TRY_CAST([SAL_PD] AS FLOAT), 0)
+                             * CASE WHEN ISNULL(TRY_CAST([BGT_SL_GR_DGR] AS FLOAT), 0) = 0 THEN 1
+                                    ELSE TRY_CAST([BGT_SL_GR_DGR] AS FLOAT) END)
+                            * ISNULL(TRY_CAST([{_alc_col}] AS FLOAT), 0)
+                            + (TRY_CAST([DISP_Q] AS FLOAT)
+                               * CASE WHEN ISNULL(TRY_CAST([DISP_GR_DGR] AS FLOAT), 0) = 0 THEN 1
+                                      ELSE TRY_CAST([DISP_GR_DGR] AS FLOAT) END), 0)
+                    END
             """)
             # Step 2: MBQ = ROUND(MBQ * CONT, 0) — if CONT is 0 or NULL, MBQ = 0
             if _col_exists_in(conn, out_table, "CONT"):
@@ -1348,6 +1473,42 @@ GROUP BY {hier_cols_sql};
             except Exception as e:
                 logger.warning(f"[grid {grid.get('id')}] could not drop {stage_table}: {e}")
 
+        # ── 5.5. Post-pivot synthetic-row injection ─────────────────────
+        # Fill (WERKS, MAJ_CAT) pairs that exist in the intended-dispatch
+        # universe (ARS_MSA_TOTAL × Master_ALC_INPUT_ST_MASTER) but are
+        # missing from the just-built grid because ET_STORE_STOCK had no
+        # rows for them yet. Handles new-MAJ_CAT and new-store cases in one
+        # pass. Cheap because NOT EXISTS hits the grid table, not the
+        # 100M-row stock table. Runs BEFORE post-lookups so LISTING / CONT
+        # / MBQ / OPT_CNT calculations apply to synthetic rows identically.
+        #
+        # Skipped for pivot_only grids: ARS_MSA_TOTAL is at MAJ_CAT grain,
+        # so it can't produce meaningful article-grain rows for
+        # GEN_ART / VAR_ART pivots — it would only inject (NA, NA)
+        # placeholders that pollute the output.
+        if grid.get("pivot_only"):
+            logger.info(
+                f"[grid {grid.get('id')}] pivot_only — skipping synthetic-row "
+                f"injection (MSA universe is at MAJ_CAT grain)"
+            )
+        else:
+            try:
+                t_syn = time.time()
+                synthetic_n = _insert_missing_msa_rows(
+                    conn, out_table, hier_cols, slocs,
+                    numeric_hier, mp_cols_upper, _merge_case_cache,
+                )
+                if synthetic_n:
+                    logger.info(
+                        f"[grid {grid.get('id')}] post-pivot synthetic rows: "
+                        f"{synthetic_n} added in {time.time() - t_syn:.1f}s "
+                        f"(MSA × ST_MASTER for missing (WERKS, MAJ_CAT) pairs)"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[grid {grid.get('id')}] synthetic-row INSERT skipped: {e}"
+                )
+
         # ── 6. Post-pivot lookups & 7. MBQ/OPT_CNT ──────────────────────
         # GEN_ART and VAR_ART grids: skip CONT lookup + MBQ/OPT_CNT
         # (article-level grids only need LISTING filter + calc columns)
@@ -1801,14 +1962,98 @@ def _run_single_grid(grid: dict) -> dict:
             "rows": n_rows, "error": err_msg, "warnings": warn_list, "duration": duration}
 
 
+def _do_run_all_background(active_grids: List[dict], workers: int) -> None:
+    """
+    Heavy work for Run All — executed on a daemon thread so the HTTP handler
+    can return immediately. Updates _run_all_state as it progresses; the UI
+    polls /run-all/status (and /grids for per-grid detail).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    de = get_data_engine()
+    try:
+        # Calc table ONCE before all grids
+        calc_warns, calc_duration = _build_calc_table_once()
+        logger.info(f"Calc table built once for {len(active_grids)} grids (took {calc_duration}s)")
+        with _run_all_lock:
+            _run_all_state["calc_duration"] = calc_duration
+
+        # Parallel grid run
+        results: List[dict] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run_single_grid, g): g for g in active_grids}
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    g = futures[future]
+                    results.append({"grid_name": g["grid_name"], "status": "Failed",
+                                    "rows": 0, "error": str(e), "warnings": []})
+
+        name_order = {g["grid_name"]: i for i, g in enumerate(active_grids)}
+        results.sort(key=lambda r: name_order.get(r["grid_name"], 999))
+
+        # MSA sync — keeps ARS_MSA_TOTAL/VAR_ART/GEN_ART consistent with
+        # current ARS_PEND_ALC after the heavy rebuild.
+        msa_sync: dict = {}
+        try:
+            from app.services.pend_alc_service import bootstrap_msa_pend_sync
+            with de.connect() as _conn:
+                msa_sync = bootstrap_msa_pend_sync(_conn)
+            logger.info(
+                f"Post-grid MSA bootstrap: total={msa_sync.get('msa_total', 0)} "
+                f"var={msa_sync.get('msa_var_art', 0)} gen={msa_sync.get('msa_gen_art', 0)}"
+            )
+        except Exception as e:
+            logger.warning(f"Post-grid bootstrap_msa_pend_sync failed (non-fatal): {e}")
+
+        # NOTE: routine DBCC SHRINKFILE was removed here — it is an
+        # anti-pattern in SQL Server (causes index fragmentation, and the
+        # log just regrows on the next Run All). Size the log file once in
+        # SQL config and let it stay sized. Run shrink manually only if a
+        # one-off space crunch demands it.
+
+        with _run_all_lock:
+            _run_all_state["results"]  = results
+            _run_all_state["msa_sync"] = msa_sync
+        ok = sum(1 for r in results if r["status"] == "Success")
+        logger.info(f"Run All background complete: {ok}/{len(results)} grids succeeded.")
+    except Exception as e:
+        logger.error(f"Run All background failed: {e}", exc_info=True)
+        with _run_all_lock:
+            _run_all_state["error"] = str(e)
+    finally:
+        with _run_all_lock:
+            _run_all_state["running"]      = False
+            _run_all_state["completed_at"] = time.time()
+
+
 @router.post("/run-all", response_model=APIResponse)
 def run_all_active(
     parallelism: Optional[int] = None,
     current_user: User = Depends(get_current_user),
 ):
-    """Run every active grid. `parallelism` query param (1..GRID_RUN_PARALLELISM_MAX)
-    overrides the configured default for this single invocation."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """
+    Spawn a Run All in the background. Returns immediately (202-ish) so the
+    HTTP request finishes well within Cloudflare's 120s proxy timeout. The UI
+    polls /run-all/status and /grids to watch progress.
+
+    `parallelism` (1..GRID_RUN_PARALLELISM_MAX) overrides the configured
+    default for this invocation.
+    """
+    # Reject duplicate triggers — a previous Run All is still in progress.
+    with _run_all_lock:
+        if _run_all_state["running"]:
+            elapsed = int(time.time() - (_run_all_state["started_at"] or time.time()))
+            return APIResponse(
+                success=False,
+                message=(f"Run All already in progress ({elapsed}s elapsed, "
+                         f"{_run_all_state.get('total_grids', 0)} grids). "
+                         f"Wait for it to finish before triggering again."),
+                data={"running": True, "elapsed_sec": elapsed,
+                      "started_at": _run_all_state.get("started_at"),
+                      "started_by": _run_all_state.get("started_by")},
+            )
 
     de = get_data_engine()
     _ensure_grid_table(de)
@@ -1824,66 +2069,109 @@ def run_all_active(
 
     active_grids = [_row_to_dict(r) for r in rows]
     if not active_grids:
-        return APIResponse(success=True, message="No Active grids to run.", data={"results": []})
+        return APIResponse(success=True, message="No Active grids to run.",
+                           data={"running": False, "results": []})
 
-    # Build calc table ONCE before all grids
-    calc_warns, calc_duration = _build_calc_table_once()
-    logger.info(f"Calc table built once for {len(active_grids)} grids")
-
-    # Parallelism. Each grid INSERTs into its own output table and reads with
-    # NOLOCK, so there is no row contention between threads. Earlier code
-    # forced 1 worker because LOG_BACKUP wait could fill the log on parallel
-    # heavy INSERTs — that's now auto-resolved by the post-job cleanup.
     cfg_default = max(1, int(getattr(_settings, "GRID_RUN_PARALLELISM", 4)))
     cap         = max(1, int(getattr(_settings, "GRID_RUN_PARALLELISM_MAX", 16)))
     requested   = parallelism if parallelism is not None else cfg_default
-    workers = max(1, min(int(requested), cap, len(active_grids)))
+    workers     = max(1, min(int(requested), cap, len(active_grids)))
+
+    username = getattr(current_user, "username", None) or getattr(current_user, "email", None) or "unknown"
+
+    # Claim the lock and stash the new run's metadata BEFORE spawning the
+    # thread, otherwise a second Run All click could slip through.
+    with _run_all_lock:
+        _run_all_state.update({
+            "running":       True,
+            "started_at":    time.time(),
+            "started_by":    username,
+            "completed_at":  None,
+            "total_grids":   len(active_grids),
+            "workers":       workers,
+            "results":       [],
+            "msa_sync":      {},
+            "error":         None,
+            "calc_duration": None,
+        })
+
+    threading.Thread(
+        target=_do_run_all_background,
+        args=(active_grids, workers),
+        daemon=True,
+        name=f"run-all-grids-{int(time.time())}",
+    ).start()
+
     logger.info(
-        f"Run All Active: {len(active_grids)} grids, parallelism={workers} "
-        f"(requested={requested}, default={cfg_default}, cap={cap})"
+        f"Run All Active: launched in background — {len(active_grids)} grids, "
+        f"parallelism={workers} (requested={requested}, default={cfg_default}, "
+        f"cap={cap}), user={username}"
     )
 
-    results = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_run_single_grid, grid): grid for grid in active_grids}
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                grid = futures[future]
-                results.append({"grid_name": grid["grid_name"], "status": "Failed",
-                                "rows": 0, "error": str(e), "warnings": []})
+    return APIResponse(
+        success=True,
+        message=(f"Run All started in background — {len(active_grids)} grids queued "
+                 f"with {workers} parallel workers. Watch the table for per-grid status."),
+        data={
+            "running":      True,
+            "total_grids":  len(active_grids),
+            "workers":      workers,
+            "started_at":   _run_all_state["started_at"],
+            "started_by":   username,
+            "poll_endpoint": "/api/v1/grid-builder/run-all/status",
+        },
+    )
 
-    # Sort results by original sequence order
-    name_order = {g["grid_name"]: i for i, g in enumerate(active_grids)}
-    results.sort(key=lambda r: name_order.get(r["grid_name"], 999))
 
-    success_count = sum(1 for r in results if r["status"] == "Success")
+@router.get("/run-all/status", response_model=APIResponse)
+def run_all_active_status(current_user: User = Depends(get_current_user)):
+    """
+    Definitive "is a Run All in progress?" check. Frontend polls this to know
+    when to stop its grid-status poll loop. Returns the same shape whether the
+    background thread is mid-run, completed, or never started this session.
+    """
+    with _run_all_lock:
+        state = dict(_run_all_state)
 
-    # Sync MSA tables to current open ARS_PEND_ALC. Grid TRUNCATE+INSERT
-    # restores PEND_ALC/STK_TTL on grids from the source, but MSA tables
-    # (ARS_MSA_TOTAL/_VAR_ART/_GEN_ART) are written by a separate flow and
-    # can drift if not refreshed. Running bootstrap here means every grid
-    # rebuild keeps MSA's PEND_QTY/FNL_Q consistent with the same source —
-    # the user's mental model: "rebuild = everything matches".
-    msa_sync = {}
-    try:
-        from app.services.pend_alc_service import bootstrap_msa_pend_sync
-        with de.connect() as _conn:
-            msa_sync = bootstrap_msa_pend_sync(_conn)
-        logger.info(
-            f"Post-grid MSA bootstrap: total={msa_sync.get('msa_total',0)} "
-            f"var={msa_sync.get('msa_var_art',0)} gen={msa_sync.get('msa_gen_art',0)}"
+    now      = time.time()
+    started  = state.get("started_at")
+    finished = state.get("completed_at")
+
+    if state.get("running"):
+        elapsed = int(now - (started or now))
+        return APIResponse(
+            success=True,
+            message=f"Run All in progress: {elapsed}s elapsed",
+            data={
+                "running":       True,
+                "elapsed_sec":   elapsed,
+                "started_at":    started,
+                "started_by":    state.get("started_by"),
+                "total_grids":   state.get("total_grids", 0),
+                "workers":       state.get("workers", 0),
+                "calc_duration": state.get("calc_duration"),
+            },
         )
-    except Exception as e:
-        logger.warning(f"Post-grid bootstrap_msa_pend_sync failed (non-fatal): {e}")
 
-    # Reclaim space after heavy TRUNCATE + INSERT cycle
-    _shrink_db_files(de)
+    last_duration = int(finished - started) if (started and finished) else None
+    results       = state.get("results") or []
+    ok            = sum(1 for r in results if r.get("status") == "Success")
+    msg = ("No Run All currently in progress." if not finished
+           else f"Last Run All completed: {ok}/{len(results)} grids in {last_duration}s")
 
-    return APIResponse(success=True,
-        message=f"Run All complete: {success_count}/{len(results)} grids succeeded.",
-        data={"results": results, "msa_sync": msa_sync})
+    return APIResponse(
+        success=True,
+        message=msg,
+        data={
+            "running":           False,
+            "last_started_at":   started,
+            "last_completed_at": finished,
+            "last_duration_sec": last_duration,
+            "last_results":      results,
+            "last_msa_sync":     state.get("msa_sync") or {},
+            "last_error":        state.get("error"),
+        },
+    )
 
 
 # ===========================================================================
@@ -2079,3 +2367,111 @@ def get_hierarchy_gaps(current_user: User = Depends(get_current_user)):
             "msa_exists": True,
         },
     )
+
+
+@router.post("/hierarchy/compact", response_model=APIResponse)
+def compact_hierarchy(
+    dry_run: bool = True,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Explicit prune: drop ARS_GRID_HIERARCHY columns that no longer correspond
+    to an Active grid. Use this after deleting / deactivating grids when you
+    want to reclaim the column (and its data) from the hierarchy table.
+
+    Routine grid CRUD does NOT call this — orphan columns are kept by default
+    so deletes / deactivations are reversible. Operators must run /compact
+    deliberately to drop a column for good.
+
+    Args:
+        dry_run: if True (default), report what WOULD be dropped without
+                 actually altering the table. Pass dry_run=false to execute.
+
+    Returns:
+        kept:    columns still in use by Active grids
+        orphans: columns that would be / were dropped
+        dropped: columns actually dropped (empty unless dry_run=false)
+    """
+    from app.services import derived_masters as dm
+
+    de = get_data_engine()
+    _ensure_grid_table(de)
+
+    with de.connect() as conn:
+        tbl_exists = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = :t"
+        ), {"t": GRID_HIER_TABLE}).scalar() > 0
+        if not tbl_exists:
+            return APIResponse(success=True,
+                message=f"{GRID_HIER_TABLE} does not exist — nothing to compact",
+                data={"kept": [], "orphans": [], "dropped": [], "dry_run": dry_run})
+
+        # Build expected column set from Active grids (same rules as
+        # _ensure_hierarchy_table).
+        grids = conn.execute(text(f"""
+            SELECT hierarchy_columns FROM {GRID_TABLE}
+            WHERE UPPER(status) = 'ACTIVE'
+        """)).fetchall()
+        expected = {"MAJ_CAT"}
+        for (hj,) in grids:
+            try:
+                h = json.loads(hj) if isinstance(hj, str) else hj
+            except Exception:
+                continue
+            if not h or len(h) < 2:
+                continue
+            if any(str(c).upper() in _ARTICLE_LEVEL_COLS for c in h):
+                continue
+            last = str(h[-1]).upper()
+            if last in ("WERKS", "MAJ_CAT"):
+                continue
+            expected.add(last)
+
+        existing = [r[0] for r in conn.execute(text(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = :t ORDER BY ORDINAL_POSITION"
+        ), {"t": GRID_HIER_TABLE}).fetchall()]
+
+        # A MERGE_<X> column is an orphan when X itself is not in expected.
+        orphans = []
+        kept = []
+        for col in existing:
+            cu = col.upper()
+            if cu == "MAJ_CAT":
+                kept.append(col)
+                continue
+            if cu.startswith(dm.MERGE_COL_PREFIX):
+                parent = cu[len(dm.MERGE_COL_PREFIX):]
+                if parent in expected:
+                    kept.append(col)
+                else:
+                    orphans.append(col)
+            else:
+                if cu in expected:
+                    kept.append(col)
+                else:
+                    orphans.append(col)
+
+        dropped = []
+        if not dry_run and orphans:
+            for col in orphans:
+                try:
+                    _run(conn, f'ALTER TABLE [{GRID_HIER_TABLE}] DROP COLUMN [{col}]')
+                    dropped.append(col)
+                except Exception as e:
+                    logger.warning(f"compact: could not drop [{col}]: {e}")
+            logger.info(
+                f"{GRID_HIER_TABLE}: compacted — dropped {len(dropped)} orphan "
+                f"column(s) {dropped}"
+            )
+
+    msg = (
+        f"{len(orphans)} orphan column(s) — dry-run (pass dry_run=false to execute)"
+        if dry_run else f"dropped {len(dropped)} orphan column(s)"
+    )
+    return APIResponse(success=True, message=msg, data={
+        "kept": kept,
+        "orphans": orphans,
+        "dropped": dropped,
+        "dry_run": dry_run,
+    })

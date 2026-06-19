@@ -2,11 +2,37 @@
 MSA Stock Calculation Service
 Handles filtering, calculating, and pivoting MSA data
 """
+import json
 import pandas as pd
 import numpy as np
 from sqlalchemy import text, MetaData, Table as SQLTable
 from typing import Dict, List, Any, Optional, Tuple
 from loguru import logger
+
+
+def _df_to_native_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Convert a DataFrame to list-of-dicts with **pure Python** scalar types.
+
+    Why this exists: pandas' ``to_dict('records')`` keeps the underlying
+    numpy scalars (``numpy.int64``, ``numpy.float64``, ``numpy.bool_``,
+    ``pandas.Timestamp``) in the dict values. FastAPI's response_model
+    serialization (Pydantic v2 + pydantic_core in Rust) walks the
+    ``Optional[Any]`` payload and on certain code paths calls
+    ``PyNumber_Index`` on the scalars; Python ``float`` has no
+    ``__index__`` so the whole HTTP response 500s with
+    ``'float' object cannot be interpreted as an integer`` even though
+    the MSA calculation itself succeeded and the rows were already
+    persisted to ARS_MSA_*.
+
+    The fastest reliable way to strip numpy/pandas types is a JSON
+    round-trip: ``to_json`` knows how to serialize every numpy/pandas
+    scalar, and ``json.loads`` deserializes back into pure
+    ``int`` / ``float`` / ``str`` / ``bool`` / ``None``. NaN / NaT
+    become ``None``. Timestamps become ISO-8601 strings.
+    """
+    if df is None or df.empty:
+        return []
+    return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
 class MSAService:
@@ -26,6 +52,11 @@ class MSAService:
         self.hold_table = "ARS_NL_TBL_HOLD_TRACKING"
         self.st_master_table = "Master_ALC_INPUT_ST_MASTER"
         self._rls_categories = rls_categories or []
+        # Soft-failure surface: any step that can't complete but isn't
+        # fatal (e.g. Step 7.5 master-variant backfill skipped because the
+        # SQL connection dropped) appends a user-readable string here.
+        # calculate() returns this list so the UI can toast each one.
+        self.warnings: List[str] = []
 
     # ------------------------------------------------------------------
     # Open-hold loader (used by Step 6 to deduct reserved units from STK)
@@ -106,6 +137,275 @@ class MSAService:
         except Exception as e:
             logger.warning(f"_load_open_holds failed (skipping hold deduction): {e}")
             return pd.DataFrame(columns=["RDC", "ARTICLE_NUMBER", "HOLD_QTY"])
+
+    # ------------------------------------------------------------------
+    # Universe discovery (Step 0 — drives variant backfill in Step 6)
+    # ------------------------------------------------------------------
+    def _load_universe(
+        self,
+        slocs: Optional[List[str]],
+        date_filter: Optional[str],
+    ) -> pd.DataFrame:
+        """Compute the (RDC, GEN_ART_NUMBER) universe that should appear in MSA.
+
+        Three sources, UNION-ed:
+          A. Stock universe — products with stock in the SELECTED SLOCs only.
+             If `slocs` is empty or None, all SLOCs participate. STK_Q magnitude
+             is irrelevant — any positive stock qualifies the GEN_ART.
+          B. Pend universe — products with any open ARS_PEND_ALC row (IS_CLOSED=0,
+             PEND_QTY > 0). RDC and GEN_ART_NUMBER are read directly from the
+             pending row.
+          C. Hold universe — products with any open ARS_NL_TBL_HOLD_TRACKING
+             row (IS_CLOSED=0, HOLD_REM > 0). WERKS is mapped to RDC via the
+             store master; VAR_ART is mapped to GEN_ART_NUMBER via
+             vw_master_product.
+
+        The result drives the Step 6 backfill so that every (RDC, GEN_ART) with
+        any real signal (stock-in-scope, PEND, or HOLD) has all its master
+        variants present in msa_pivot — guaranteeing PEND/HOLD obligations
+        always have a row to land on in Steps 7-8.
+
+        Returns a DataFrame with columns [RDC, GEN_ART_NUMBER] as clean strings.
+        Empty DataFrame if every source fails or returns nothing.
+        """
+        parts: List[pd.DataFrame] = []
+
+        # --- Source A: stock in selected SLOCs ----------------------------
+        if date_filter:
+            try:
+                params: Dict[str, Any] = {"d": date_filter}
+                sloc_clause = ""
+                if slocs:
+                    placeholders = ",".join(f":s{i}" for i in range(len(slocs)))
+                    sloc_clause = f" AND SLOC IN ({placeholders})"
+                    for i, s in enumerate(slocs):
+                        params[f"s{i}"] = s
+                sql_a = f"""
+                    SELECT DISTINCT
+                        CAST(ST_CD AS NVARCHAR(50))           AS RDC,
+                        CAST(GEN_ART_NUMBER AS NVARCHAR(50))  AS GEN_ART_NUMBER
+                    FROM {self.main_table}
+                    WHERE CAST([DATE] AS DATE) = :d
+                      AND SEG IN ('APP','GM')
+                      AND ISNULL(STK_Q, 0) > 0
+                      AND GEN_ART_NUMBER IS NOT NULL
+                      {sloc_clause}
+                """
+                df_a = pd.read_sql(text(sql_a), self.db.bind, params=params)
+                parts.append(df_a)
+                logger.info(
+                    f"[universe] A (stock@SLOCs={slocs or 'ALL'}): {len(df_a)} keys"
+                )
+            except Exception as e:
+                logger.warning(f"[universe] source A (stock) failed: {e}")
+
+        # --- Source B: open PEND ------------------------------------------
+        try:
+            df_b = pd.read_sql(text("""
+                SELECT DISTINCT
+                    CAST(RDC AS NVARCHAR(50))            AS RDC,
+                    CAST(GEN_ART_NUMBER AS NVARCHAR(50)) AS GEN_ART_NUMBER
+                FROM ARS_PEND_ALC WITH (NOLOCK)
+                WHERE IS_CLOSED = 0
+                  AND ISNULL(PEND_QTY, 0) > 0
+                  AND GEN_ART_NUMBER IS NOT NULL
+            """), self.db.bind)
+            parts.append(df_b)
+            logger.info(f"[universe] B (open PEND): {len(df_b)} keys")
+        except Exception as e:
+            logger.warning(f"[universe] source B (pend) failed: {e}")
+
+        # --- Source C: open HOLD (WERKS->RDC, VAR_ART->GEN via master) ---
+        try:
+            df_c = pd.read_sql(text("""
+                SELECT DISTINCT
+                    CAST(SM.RDC AS NVARCHAR(50))            AS RDC,
+                    CAST(MP.GEN_ART_NUMBER AS NVARCHAR(50)) AS GEN_ART_NUMBER
+                FROM ARS_NL_TBL_HOLD_TRACKING H WITH (NOLOCK)
+                INNER JOIN Master_ALC_INPUT_ST_MASTER SM
+                    ON SM.ST_CD = H.WERKS
+                INNER JOIN vw_master_product MP
+                    ON CAST(MP.ARTICLE_NUMBER AS NVARCHAR(30))
+                     = CAST(H.VAR_ART AS NVARCHAR(30))
+                WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                  AND ISNULL(H.HOLD_REM, 0) > 0
+                  AND MP.GEN_ART_NUMBER IS NOT NULL
+            """), self.db.bind)
+            parts.append(df_c)
+            logger.info(f"[universe] C (open HOLD): {len(df_c)} keys")
+        except Exception as e:
+            logger.warning(f"[universe] source C (hold) failed: {e}")
+
+        if not parts:
+            return pd.DataFrame(columns=["RDC", "GEN_ART_NUMBER"])
+
+        universe = pd.concat(parts, ignore_index=True).drop_duplicates()
+        universe["RDC"] = universe["RDC"].astype(str).str.strip()
+        universe["GEN_ART_NUMBER"] = (
+            universe["GEN_ART_NUMBER"].astype(str).str.strip()
+        )
+        universe = universe[
+            (universe["GEN_ART_NUMBER"].str.len() > 0)
+            & (universe["GEN_ART_NUMBER"].str.lower() != "nan")
+            & (universe["RDC"].str.len() > 0)
+        ].reset_index(drop=True)
+        logger.info(
+            f"[universe] union total: {len(universe)} distinct "
+            f"(RDC, GEN_ART_NUMBER) keys"
+        )
+        return universe
+
+    # ------------------------------------------------------------------
+    # Master variant loader (used by Step 6 to backfill universe variants)
+    # ------------------------------------------------------------------
+    def _load_master_variants(self, gen_arts: List[str]) -> pd.DataFrame:
+        """Load all VAR_ART rows from vw_master_product for the given GEN_ART_NUMBERs.
+
+        ET_MSA_STK only carries rows for variants that had a stock record on
+        the run date, so a (MAJ_CAT, GEN_ART_NUMBER, CLR) group with five
+        master-defined VAR_ARTs can surface in MSA with just the stocked one.
+        Step 7.5 uses this loader to find the missing variants and seed them
+        as zero-stock placeholder rows. Returns an empty DataFrame on any
+        error so the caller can skip backfill without breaking the run.
+        """
+        if not gen_arts:
+            return pd.DataFrame()
+        try:
+            cleaned = [
+                str(g).strip() for g in gen_arts
+                if g is not None
+                and str(g).strip()
+                and str(g).strip().lower() != "nan"
+            ]
+            if not cleaned:
+                return pd.DataFrame()
+
+            # Probe schema — vw_master_product column set varies by env.
+            want = [
+                "ARTICLE_NUMBER", "GEN_ART_NUMBER", "MAJ_CAT", "CLR", "SZ",
+                "SEG", "M_VND_NM", "M_VND_CD", "MACRO_MVGR", "MICRO_MVGR",
+                "FAB", "MVGR_MATRIX", "SSN", "SUB_DIV", "DIV", "MRP", "RSP",
+            ]
+            cols_result = self.db.execute(text(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = 'vw_master_product'"
+            ))
+            available = {str(r[0]).upper() for r in cols_result.fetchall()}
+            select_cols = [c for c in want if c.upper() in available]
+            if (
+                "ARTICLE_NUMBER" not in select_cols
+                or "GEN_ART_NUMBER" not in select_cols
+            ):
+                logger.warning(
+                    "[msa] _load_master_variants: vw_master_product missing "
+                    "ARTICLE_NUMBER or GEN_ART_NUMBER — cannot backfill"
+                )
+                return pd.DataFrame()
+            col_list = ", ".join(f"mp.[{c}]" for c in select_cols)
+
+            # Bulk-load gen_arts into a session-local #tmp and JOIN.
+            # vw_master_product is a slow VIEW — hitting it once with all
+            # gen_arts already server-side beats N chunked IN(...) round-
+            # trips. Also sidesteps the SQL Server 2100-parameter cap that
+            # made earlier IN(...) builds fail with pyodbc 07002. Temp
+            # table is connection-scoped, so CREATE/INSERT/SELECT/DROP
+            # must share one Connection.
+            #
+            # Hardening for the on-prem SQL Server we run against (one
+            # giant 27K-row fast_executemany batch fired pyodbc 10054
+            # "connection forcibly closed" under MSA-calc load on
+            # 2026-06-11 — local SQL Server killed the session, not
+            # Azure):
+            #   - INSERT chunked at 5000 rows/batch so each
+            #     fast_executemany TDS RPC stays a small write.
+            #   - Retry on transient connect-drop errors
+            #     (10054 / 10053 / 08S01 / "Communication link") so a
+            #     one-shot socket reset doesn't strand the build.
+            import uuid as _uuid
+            import time as _time
+            unique_arts = list({v for v in cleaned})
+            INSERT_BATCH = 5000
+            MAX_ATTEMPTS = 3
+
+            def _is_transient(err: Exception) -> bool:
+                s = str(err)
+                return any(code in s for code in
+                           ("10054", "10053", "08S01", "Communication link"))
+
+            df = pd.DataFrame()
+            last_err: Optional[Exception] = None
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                tmp = f"#ga_{_uuid.uuid4().hex[:8]}"
+                try:
+                    with self.db.bind.connect() as conn:
+                        conn.execute(text(
+                            f"CREATE TABLE {tmp} ("
+                            f"gen_art NVARCHAR(50) COLLATE DATABASE_DEFAULT "
+                            f"NOT NULL PRIMARY KEY)"
+                        ))
+                        try:
+                            raw_cur = conn.connection.cursor()
+                            try:
+                                try:
+                                    raw_cur.fast_executemany = True
+                                except Exception:
+                                    pass
+                                for i in range(0, len(unique_arts), INSERT_BATCH):
+                                    batch = unique_arts[i:i + INSERT_BATCH]
+                                    raw_cur.executemany(
+                                        f"INSERT INTO {tmp} (gen_art) "
+                                        f"VALUES (?)",
+                                        [(v,) for v in batch],
+                                    )
+                            finally:
+                                raw_cur.close()
+
+                            df = pd.read_sql(text(f"""
+                                SELECT DISTINCT {col_list}
+                                FROM dbo.vw_master_product mp WITH (NOLOCK)
+                                INNER JOIN {tmp} t
+                                  ON t.gen_art = mp.GEN_ART_NUMBER
+                            """), conn)
+                        finally:
+                            try:
+                                conn.execute(text(f"DROP TABLE {tmp}"))
+                            except Exception:
+                                pass
+                    break  # success
+                except Exception as e:
+                    last_err = e
+                    if attempt < MAX_ATTEMPTS and _is_transient(e):
+                        sleep_s = 0.5 * (2 ** (attempt - 1))
+                        logger.warning(
+                            f"[msa] _load_master_variants transient error on "
+                            f"attempt {attempt}/{MAX_ATTEMPTS} "
+                            f"({type(e).__name__}); retrying in {sleep_s}s"
+                        )
+                        _time.sleep(sleep_s)
+                        continue
+                    raise
+
+            # Coerce join keys to clean strings — same defensive pattern as
+            # ARS_PEND / HOLD merges, prevents int64/object dtype-mismatch
+            # silent misses.
+            for k in ("ARTICLE_NUMBER", "GEN_ART_NUMBER", "MAJ_CAT", "CLR"):
+                if k in df.columns:
+                    df[k] = df[k].astype(str).str.strip()
+
+            logger.info(
+                f"[msa] _load_master_variants: pulled {len(df)} variant rows "
+                f"for {len(cleaned)} GEN_ART_NUMBERs"
+            )
+            return df
+        except Exception as e:
+            logger.warning(f"[msa] _load_master_variants failed: {e}")
+            self.warnings.append(
+                "Step 7.5: could not load master variants from "
+                f"vw_master_product — backfill skipped. "
+                f"Missing zero-stock variants will not appear in this run. "
+                f"Cause: {type(e).__name__}: {str(e)[:200]}"
+            )
+            return pd.DataFrame()
 
     # ========================================================================
     # Data Discovery Methods
@@ -448,7 +748,8 @@ class MSAService:
                     "msa": [],
                     "msa_gen_clr": [],
                     "msa_gen_clr_var": [],
-                    "row_counts": {"msa": 0, "msa_gen_clr": 0, "msa_gen_clr_var": 0}
+                    "row_counts": {"msa": 0, "msa_gen_clr": 0, "msa_gen_clr_var": 0},
+                    "warnings": list(self.warnings),
                 }
 
             msa = df.copy()
@@ -554,168 +855,401 @@ class MSAService:
             msa_pivot["STK_QTY"] = msa_pivot[sloc_cols].sum(axis=1)
             logger.info(f"Pivoted table: {len(msa_pivot)} rows, {len(sloc_cols)} SLOCs")
 
-            # ============ STEP 6: DEDUCT ARS PENDING (ARS_PEND_ALC) ============
-            # Units approved in an ARS run but whose SAP Delivery Orders have
-            # not yet been created.  PEND_QTY = ALLOC_QTY − DO_QTY (only what
-            # SAP has NOT yet committed). Prevents double-allocation of WH stock
-            # before the DO is issued.  IS_CLOSED=1 rows are excluded — those
-            # units are already deducted in SAP via DO.
+            # Rename ST_CD → RDC right after the pivot. All downstream steps
+            # (universe backfill, PEND/HOLD merges, threshold filter,
+            # aggregation) operate on the canonical warehouse axis name.
+            if "ST_CD" in msa_pivot.columns:
+                msa_pivot.rename(columns={"ST_CD": "RDC"}, inplace=True)
+
+            # Seed obligation columns to zero. Step 6 adds zero-stock
+            # placeholder rows for universe expansion; Steps 7-8 stamp the
+            # real PEND/HOLD values onto every (existing + backfilled) row.
             msa_pivot["PEND_QTY"] = 0.0
-            # NOTE: do NOT pre-create ARS_PEND here. The merge below brings in
-            # an ARS_PEND column from _load_ars_pending(); a pre-existing
-            # column of the same name causes pandas to rename them to
-            # ARS_PEND_x / ARS_PEND_y, breaks the fillna access by name, and
-            # leaves duplicate columns on the pivot which downstream
-            # serialisation/storage steps mishandle.
-            # pend_merged_cols tracks which columns were added by the PEND merge
-            # so the column-classifier below (Step 9) can aggregate them, not use
-            # them as hierarchy keys.
+            # ARS_PEND is brought in by the Step 7 merge — pre-creating it
+            # would force pandas to emit ARS_PEND_x / ARS_PEND_y on merge.
             pend_merged_cols: List[str] = []
+
+            # ============ STEP 6: UNIVERSE BACKFILL ============
+            # Discover the (RDC, GEN_ART_NUMBER) universe via _load_universe
+            # — union of three sources:
+            #   A. Stock in the SELECTED SLOCs only (anchors stocked GEN_ARTs)
+            #   B. Open ARS_PEND_ALC rows  (anchors pend-only GEN_ARTs)
+            #   C. Open ARS_NL_TBL_HOLD_TRACKING rows (anchors hold-only)
+            # For every (RDC, GEN_ART) in that union, fetch every master
+            # VAR_ART from vw_master_product and insert any variant missing
+            # from msa_pivot as a zero-stock placeholder row. Run BEFORE
+            # the PEND/HOLD merges so the backfilled rows pick up their
+            # real PEND/HOLD values automatically — no special-casing.
+            #
+            # The universe is NOT "every article anywhere". Stock contribution
+            # stays scoped to the user's SLOC selection. It only expands when
+            # a real obligation (PEND or HOLD) exists for the (RDC, GEN_ART).
+            try:
+                date_filter_for_universe: Optional[str] = None
+                if "DATE" in msa_pivot.columns:
+                    try:
+                        _d = pd.to_datetime(
+                            msa_pivot["DATE"], errors="coerce"
+                        ).max()
+                        if pd.notna(_d):
+                            date_filter_for_universe = _d.date().isoformat()
+                    except Exception:
+                        date_filter_for_universe = None
+
+                universe = self._load_universe(slocs, date_filter_for_universe)
+
+                if (
+                    not universe.empty
+                    and "GEN_ART_NUMBER" in msa_pivot.columns
+                    and "ARTICLE_NUMBER" in msa_pivot.columns
+                ):
+                    # Coerce join keys before any merge
+                    msa_pivot["RDC"] = (
+                        msa_pivot["RDC"].astype(str).str.strip()
+                    )
+                    msa_pivot["GEN_ART_NUMBER"] = (
+                        msa_pivot["GEN_ART_NUMBER"].astype(str).str.strip()
+                    )
+                    msa_pivot["ARTICLE_NUMBER"] = (
+                        msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    )
+
+                    gen_arts_in_universe = (
+                        universe["GEN_ART_NUMBER"].unique().tolist()
+                    )
+                    master_df = self._load_master_variants(gen_arts_in_universe)
+
+                    if not master_df.empty:
+                        # Clean dtypes on master join keys
+                        for k in ("ARTICLE_NUMBER", "GEN_ART_NUMBER",
+                                  "MAJ_CAT", "CLR"):
+                            if k in master_df.columns:
+                                master_df[k] = (
+                                    master_df[k].astype(str).str.strip()
+                                )
+
+                        # expanded = every (RDC × GEN_ART × master variants)
+                        expanded = universe.merge(
+                            master_df, on="GEN_ART_NUMBER", how="left"
+                        )
+                        # Drop universe rows where master returned nothing
+                        # (GEN_ART truly absent from vw_master_product)
+                        expanded = expanded[
+                            expanded["ARTICLE_NUMBER"].notna()
+                        ]
+
+                        if not expanded.empty:
+                            # Anti-join: keep only rows not already in pivot
+                            existing = (
+                                msa_pivot[["RDC", "ARTICLE_NUMBER"]]
+                                .drop_duplicates()
+                            )
+                            anti = expanded.merge(
+                                existing.assign(_present=1),
+                                on=["RDC", "ARTICLE_NUMBER"],
+                                how="left",
+                            )
+                            missing = anti[anti["_present"].isna()].drop(
+                                columns=["_present"]
+                            )
+
+                            if not missing.empty:
+                                # Columns on pivot but not on master need
+                                # defaults:
+                                #   numeric (SLOC qty + quantity columns)
+                                #     → 0
+                                #   non-numeric (DATE, SEG, MRP, …)
+                                #     → copy from sibling row at the same
+                                #       (RDC, GEN_ART_NUMBER); NaN if none.
+                                pivot_only_cols = [
+                                    c for c in msa_pivot.columns
+                                    if c not in missing.columns
+                                ]
+
+                                sibling = (
+                                    msa_pivot
+                                    .drop_duplicates(
+                                        subset=["RDC", "GEN_ART_NUMBER"]
+                                    )
+                                    .set_index(["RDC", "GEN_ART_NUMBER"])
+                                )
+
+                                missing_idx = missing.set_index(
+                                    ["RDC", "GEN_ART_NUMBER"]
+                                )
+                                for c in pivot_only_cols:
+                                    if pd.api.types.is_numeric_dtype(
+                                        msa_pivot[c]
+                                    ):
+                                        missing_idx[c] = 0
+                                    elif c in sibling.columns:
+                                        missing_idx[c] = sibling[c]
+                                    else:
+                                        missing_idx[c] = pd.NA
+                                missing = missing_idx.reset_index()
+
+                                # Quantity cols MUST start at zero; the
+                                # Step 7-8 merges below will stamp the real
+                                # PEND / HOLD on top of these rows.
+                                for c in (
+                                    "STK_QTY", "PEND_QTY", "HOLD_QTY",
+                                    "FNL_Q", "ARS_PEND",
+                                ):
+                                    if c in msa_pivot.columns:
+                                        missing[c] = 0
+
+                                # Align column order to msa_pivot
+                                missing = missing[msa_pivot.columns]
+
+                                msa_pivot = pd.concat(
+                                    [msa_pivot, missing], ignore_index=True
+                                )
+                                logger.info(
+                                    f"[msa] Step 6 universe-backfill: "
+                                    f"+{len(missing)} variant rows from "
+                                    f"vw_master_product across "
+                                    f"{len(universe)} (RDC, GEN_ART) keys"
+                                )
+                            else:
+                                logger.info(
+                                    "[msa] Step 6 universe-backfill: "
+                                    "no missing variants — pivot already "
+                                    "covers the universe"
+                                )
+                        else:
+                            logger.info(
+                                "[msa] Step 6 universe-backfill: master "
+                                "returned no rows for universe GEN_ARTs "
+                                "— skipping backfill"
+                            )
+                            if not any(
+                                "Step 6" in w for w in self.warnings
+                            ):
+                                self.warnings.append(
+                                    "Step 6: vw_master_product had no rows"
+                                    " for the universe GEN_ART_NUMBERs — "
+                                    "backfill skipped."
+                                )
+                    else:
+                        logger.info(
+                            "[msa] Step 6 universe-backfill: master loader"
+                            " returned empty — skipping backfill"
+                        )
+                else:
+                    logger.info(
+                        "[msa] Step 6 universe-backfill: empty universe "
+                        "(or pivot missing key cols) — skipping"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[msa] Step 6 universe-backfill failed (skipping): "
+                    f"{e}", exc_info=True
+                )
+                self.warnings.append(
+                    f"Step 6 universe-backfill raised "
+                    f"{type(e).__name__}: {str(e)[:200]}"
+                )
+
+            # ============ STEP 7: MERGE ARS_PEND_ALC → PEND_QTY ============
+            # Stamp PEND onto every row (existing + universe-backfilled)
+            # by joining ARS_PEND_ALC on (RDC, ARTICLE_NUMBER). Every
+            # open pending obligation now has a row to land on, so
+            # SUM(TOTAL.PEND_QTY) reconciles to SUM(ARS_PEND_ALC.PEND_QTY).
             ars_pend_loaded = False
             try:
                 ars_pend = self._load_ars_pending()
-                if not ars_pend.empty and "ARTICLE_NUMBER" in msa_pivot.columns:
+                if (
+                    not ars_pend.empty
+                    and "ARTICLE_NUMBER" in msa_pivot.columns
+                ):
                     pend_merged_cols = [
                         c for c in ars_pend.columns
                         if c not in ("RDC", "ARTICLE_NUMBER")
                     ]
-                    # Force both join keys to str — pandas merge silently produces
-                    # all-NaN matches when dtypes differ (int64 vs object). MSA
-                    # pivot may infer ST_CD as int64 if all store codes are numeric;
-                    # ARS_PEND_ALC.RDC comes from NVARCHAR → object. Without this
-                    # cast, no rows match → fillna(0) → PEND_QTY = 0 → FNL_Q
-                    # over-states pool by every store's actual pending qty.
-                    msa_pivot["ST_CD"] = msa_pivot["ST_CD"].astype(str).str.strip()
-                    msa_pivot["ARTICLE_NUMBER"] = msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
-                    ars_pend["RDC"] = ars_pend["RDC"].astype(str).str.strip()
-                    ars_pend["ARTICLE_NUMBER"] = ars_pend["ARTICLE_NUMBER"].astype(str).str.strip()
+                    # dtype safety — same pattern as the original code
+                    msa_pivot["RDC"] = (
+                        msa_pivot["RDC"].astype(str).str.strip()
+                    )
+                    msa_pivot["ARTICLE_NUMBER"] = (
+                        msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    )
+                    ars_pend["RDC"] = (
+                        ars_pend["RDC"].astype(str).str.strip()
+                    )
+                    ars_pend["ARTICLE_NUMBER"] = (
+                        ars_pend["ARTICLE_NUMBER"].astype(str).str.strip()
+                    )
 
                     msa_pivot = msa_pivot.merge(
                         ars_pend,
-                        left_on=["ST_CD", "ARTICLE_NUMBER"],
-                        right_on=["RDC", "ARTICLE_NUMBER"],
+                        on=["RDC", "ARTICLE_NUMBER"],
                         how="left",
                     )
                     msa_pivot["ARS_PEND"] = msa_pivot["ARS_PEND"].fillna(0)
-                    msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
                     msa_pivot["PEND_QTY"] = msa_pivot["ARS_PEND"]
                     ars_pend_loaded = True
 
                     matched_pend = float(msa_pivot["ARS_PEND"].sum())
                     expected_pend = float(ars_pend["ARS_PEND"].sum())
                     logger.info(
-                        f"Merged ARS pending: {len(ars_pend)} (RDC,ARTICLE) rows, "
-                        f"total ARS_PEND={expected_pend:.0f}, "
-                        f"matched into pivot={matched_pend:.0f}"
+                        f"[msa] Step 7 PEND merge: "
+                        f"expected={expected_pend:.0f} "
+                        f"matched={matched_pend:.0f} across "
+                        f"{len(ars_pend)} (RDC,ARTICLE) keys"
                     )
-                    if expected_pend > 0 and matched_pend < expected_pend * 0.99:
+                    if (
+                        expected_pend > 0
+                        and matched_pend < expected_pend * 0.99
+                    ):
                         logger.warning(
-                            f"[msa] PEND merge mismatch — expected {expected_pend:.0f} "
-                            f"but only {matched_pend:.0f} landed on pivot rows. "
-                            f"Likely ST_CD/RDC value mismatch (whitespace, leading "
-                            f"zeros, or unmapped warehouse keys)."
+                            f"[msa] PEND merge mismatch — expected "
+                            f"{expected_pend:.0f} but only "
+                            f"{matched_pend:.0f} landed on pivot. Check "
+                            f"Step 6 universe coverage."
                         )
                 else:
-                    logger.info("ARS_PEND_ALC: no open pending rows — PEND_QTY = 0")
+                    logger.info(
+                        "[msa] Step 7 PEND merge: no open pending rows"
+                    )
             except Exception as ars_err:
-                logger.warning(f"Could not load ARS pending: {ars_err}")
+                logger.warning(
+                    f"[msa] Step 7 PEND merge failed: {ars_err}"
+                )
 
-            # Default ARS_PEND to 0 when the merge above didn't run (or failed)
-            # so downstream code that expects the column still works. Done
-            # AFTER the merge so we never collide with the merged column.
             if not ars_pend_loaded and "ARS_PEND" not in msa_pivot.columns:
                 msa_pivot["ARS_PEND"] = 0.0
 
-            # ============ STEP 6.5: DEDUCT OPEN HOLDS (NL/TBL reservations) ====
+            # ============ STEP 8: MERGE HOLD_TRACKING → HOLD_QTY ============
             # Held units physically sit at the RDC but are reserved for a
-            # specific store from a previous TBL/NL allocation. They must not
-            # be re-offered to a different store on this run. Same shape as
-            # the PEND merge above so downstream classification logic picks
-            # HOLD_QTY up automatically.
+            # specific store from a prior TBL/NL allocation. Subtracting
+            # HOLD_QTY in Step 9 prevents double-allocation of physically-
+            # shared warehouse stock.
             try:
                 holds_pivot = self._load_open_holds()
                 if (
                     not holds_pivot.empty
                     and "ARTICLE_NUMBER" in msa_pivot.columns
                 ):
-                    # Same dtype-coercion as the PEND merge above. Without this,
-                    # holds silently fail to attach → HOLD_QTY = 0 → MSA reports
-                    # reserved stock as available.
-                    msa_pivot["ST_CD"] = msa_pivot["ST_CD"].astype(str).str.strip()
-                    msa_pivot["ARTICLE_NUMBER"] = msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
-                    holds_pivot["RDC"] = holds_pivot["RDC"].astype(str).str.strip()
-                    holds_pivot["ARTICLE_NUMBER"] = holds_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    msa_pivot["RDC"] = (
+                        msa_pivot["RDC"].astype(str).str.strip()
+                    )
+                    msa_pivot["ARTICLE_NUMBER"] = (
+                        msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    )
+                    holds_pivot["RDC"] = (
+                        holds_pivot["RDC"].astype(str).str.strip()
+                    )
+                    holds_pivot["ARTICLE_NUMBER"] = (
+                        holds_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    )
 
                     msa_pivot = msa_pivot.merge(
                         holds_pivot,
-                        left_on=["ST_CD", "ARTICLE_NUMBER"],
-                        right_on=["RDC", "ARTICLE_NUMBER"],
+                        on=["RDC", "ARTICLE_NUMBER"],
                         how="left",
                     )
                     msa_pivot["HOLD_QTY"] = msa_pivot["HOLD_QTY"].fillna(0)
-                    msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
 
                     matched_hold = float(msa_pivot["HOLD_QTY"].sum())
                     expected_hold = float(holds_pivot["HOLD_QTY"].sum())
                     logger.info(
-                        f"Merged open holds: {len(holds_pivot)} (RDC,ARTICLE) rows, "
-                        f"total HOLD_QTY={expected_hold:.0f}, "
-                        f"matched into pivot={matched_hold:.0f}"
+                        f"[msa] Step 8 HOLD merge: "
+                        f"expected={expected_hold:.0f} "
+                        f"matched={matched_hold:.0f} across "
+                        f"{len(holds_pivot)} (RDC,ARTICLE) keys"
                     )
-                    if expected_hold > 0 and matched_hold < expected_hold * 0.99:
+                    if (
+                        expected_hold > 0
+                        and matched_hold < expected_hold * 0.99
+                    ):
                         logger.warning(
-                            f"[msa] HOLD merge mismatch — expected {expected_hold:.0f} "
-                            f"but only {matched_hold:.0f} landed on pivot rows. "
-                            f"Check ST_CD/RDC value consistency."
+                            f"[msa] HOLD merge mismatch — expected "
+                            f"{expected_hold:.0f} but only "
+                            f"{matched_hold:.0f} landed on pivot."
                         )
                 else:
                     msa_pivot["HOLD_QTY"] = 0
-                    logger.info("No open holds to merge")
+                    logger.info(
+                        "[msa] Step 8 HOLD merge: no open holds"
+                    )
             except Exception as hold_err:
-                logger.warning(f"Could not load open holds: {hold_err}")
-                msa_pivot["HOLD_QTY"] = 0
+                logger.warning(
+                    f"[msa] Step 8 HOLD merge failed: {hold_err}"
+                )
+                if "HOLD_QTY" not in msa_pivot.columns:
+                    msa_pivot["HOLD_QTY"] = 0
 
-            # ============ STEP 7: CALCULATE FINAL QUANTITY ============
+            # ============ STEP 9: COMPUTE FNL_Q ============
             # FNL_Q = max(STK − PEND − HOLD, 0)
-            # PEND  = units approved in ARS (ARS_PEND_ALC) but DO not yet issued
-            # HOLD  = units reserved for specific stores from prior TBL/NL runs
-            #         (ARS_NL_TBL_HOLD_TRACKING). Subtracting both prevents
-            #         double-allocation of physically-shared warehouse stock.
             msa_pivot["FNL_Q"] = np.maximum(
-                msa_pivot["STK_QTY"] - msa_pivot["PEND_QTY"] - msa_pivot["HOLD_QTY"], 0
+                msa_pivot["STK_QTY"]
+                - msa_pivot["PEND_QTY"]
+                - msa_pivot["HOLD_QTY"],
+                0,
             )
+            logger.info("[msa] Step 9 FNL_Q computed")
 
-
-            logger.info(f"Calculated FNL_Q (after PEND + HOLD deduction)")
-
-           
-            
-
-            # ============ STEP 8: GENERATE COLOR VARIANTS (ROW LEVEL) ============
-            grp_cols = ["ST_CD","MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
+            # ============ STEP 10: THRESHOLD FILTER (RELAXED) ============
+            # Keep a (RDC, MAJ_CAT, GEN_ART_NUMBER, CLR) group if its
+            # total ENGAGEMENT is meaningful, where
+            #     engagement = sum(FNL_Q) + sum(PEND_QTY) + sum(HOLD_QTY).
+            # Previously sum(FNL_Q) alone determined survival, which
+            # dropped groups with zero free stock but real PEND/HOLD
+            # obligations from VAR_ART/GEN_ART. With the universe-anchored
+            # backfill in Step 6, pend-only and hold-only groups now have
+            # rows in TOTAL; the relaxed threshold lets them survive into
+            # VAR_ART/GEN_ART too.
+            grp_cols = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
             grp_cols = [c for c in grp_cols if c in msa_pivot.columns]
 
             if grp_cols:
-                msa_gen_clr_var = msa_pivot[
-                    msa_pivot.groupby(grp_cols)["FNL_Q"]
-                    .transform("sum") > threshold
-                ].copy()
-                logger.info(f"Generated color variants: {len(msa_gen_clr_var)} rows (threshold={threshold})")
+                engagement = (
+                    msa_pivot.groupby(grp_cols, dropna=False)
+                    .agg(
+                        _stk=("FNL_Q", "sum"),
+                        _pnd=("PEND_QTY", "sum"),
+                        _hld=("HOLD_QTY", "sum"),
+                    )
+                    .reset_index()
+                )
+                engagement["_eng"] = (
+                    engagement["_stk"].astype(float)
+                    + engagement["_pnd"].astype(float)
+                    + engagement["_hld"].astype(float)
+                )
+                passing_keys = engagement[
+                    engagement["_eng"] > threshold
+                ][grp_cols].drop_duplicates()
+                msa_gen_clr_var = msa_pivot.merge(
+                    passing_keys, on=grp_cols, how="inner"
+                )
+                logger.info(
+                    f"[msa] Step 10 threshold (relaxed, >{threshold}): "
+                    f"{len(passing_keys)}/{len(engagement)} groups pass; "
+                    f"{len(msa_gen_clr_var)} variant rows kept"
+                )
             else:
                 msa_gen_clr_var = msa_pivot.copy()
-                logger.warning("Could not determine hierarchy columns, using all rows")
+                logger.warning(
+                    "[msa] Step 10 threshold: grp_cols empty — passing "
+                    "all rows"
+                )
 
-            # ============ STEP 9: GENERATED COLORS (AGGREGATED) ============
-            exclude_from_hierarchy = {
-                "ARTICLE_NUMBER",
-                "ARTICLE_DESC",
-                "SZ"
-            }
+            # ============ STEP 11: GENERATED COLORS (AGGREGATED) ============
+            # Pin hierarchy to the canonical OPT grain. The previous dynamic
+            # classifier inherited pivot_keys which silently admitted SZ-varying
+            # numeric master-data columns (AVG_DENSITY, PAK_SZ, MRP, V02_FRESH, …)
+            # into hierarchy_cols, splitting each color into 2-3 rows. The
+            # downstream bootstrap UPDATE then stamped the full OPT FNL_Q onto
+            # every duplicate row, inflating SUM(FNL_Q) per OPT by 2-3×.
+            hierarchy_keys = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
+            hierarchy_cols = [c for c in hierarchy_keys if c in msa_gen_clr_var.columns]
 
-            hierarchy_cols = []
-            aggregate_cols = []
+            exclude_from_hierarchy = {"ARTICLE_NUMBER", "ARTICLE_DESC", "SZ"}
 
-            # Identify aggregate columns (SLOC columns + MOA columns + calculated columns)
+            # Stock-like cols sum across SZ; SZ-varying numeric master-data uses
+            # max (so zero-stock SZ rows don't override the meaningful value);
+            # descriptive strings (invariant within a color) take first.
             sloc_cols_list = [c for c in msa_pivot.columns
                 if c not in pivot_keys + ["STK_QTY", "PEND_QTY", "HOLD_QTY", "FNL_Q", "RDC"]
                 and pd.api.types.is_numeric_dtype(msa_gen_clr_var[c])]
@@ -723,24 +1257,25 @@ class MSAService:
                 if c not in ["ARTICLE_NUMBER", "RDC"]
                 and c in msa_gen_clr_var.columns
                 and pd.api.types.is_numeric_dtype(msa_gen_clr_var[c])]
-            calculated_cols = ["STK_QTY", "PEND_QTY", "HOLD_QTY", "FNL_Q"]
+            sum_cols = set(sloc_cols_list) | set(moa_cols_list) | {
+                "STK_QTY", "PEND_QTY", "HOLD_QTY", "FNL_Q"
+            }
 
-            # Classify each column
+            agg_map: Dict[str, str] = {}
             for col in msa_gen_clr_var.columns:
-                if col in exclude_from_hierarchy:
+                if col in hierarchy_cols or col in exclude_from_hierarchy:
                     continue
-                
-                if col in sloc_cols_list or col in moa_cols_list or col in calculated_cols:
-                    aggregate_cols.append(col)
+                if col in sum_cols:
+                    agg_map[col] = "sum"
+                elif pd.api.types.is_numeric_dtype(msa_gen_clr_var[col]):
+                    agg_map[col] = "max"
                 else:
-                    hierarchy_cols.append(col)
+                    agg_map[col] = "first"
 
-            logger.info(f"🔹 Hierarchy columns ({len(hierarchy_cols)}): {sorted(hierarchy_cols)}")
-            logger.info(f"🔹 Aggregate columns ({len(aggregate_cols)}): {sorted(aggregate_cols)}")
+            logger.info(f"🔹 Hierarchy columns ({len(hierarchy_cols)}): {hierarchy_cols}")
+            logger.info(f"🔹 Aggregate columns ({len(agg_map)}): {sorted(agg_map.keys())}")
 
-            # Aggregate by hierarchy dimensions
-            if hierarchy_cols and aggregate_cols:
-                agg_map = {c: "sum" for c in aggregate_cols}
+            if hierarchy_cols and agg_map:
                 msa_gen_clr = (
                     msa_gen_clr_var
                     .groupby(hierarchy_cols, as_index=False, dropna=False)
@@ -752,19 +1287,15 @@ class MSAService:
                 msa_gen_clr = pd.DataFrame()
                 logger.warning("Could not aggregate - using empty DataFrame")
 
-            # ============ RENAME ST_CD → RDC IN OUTPUT ============
-            rename_map = {"ST_CD": "RDC"}
-            msa_pivot.rename(columns=rename_map, inplace=True)
-            if not msa_gen_clr.empty:
-                msa_gen_clr.rename(columns=rename_map, inplace=True)
-            msa_gen_clr_var.rename(columns=rename_map, inplace=True)
-
             # ============ CONVERT TO DICTS AND RETURN ============
-            msa_dict = msa_pivot.where(pd.notna(msa_pivot), None).to_dict("records")
+            # _df_to_native_records strips numpy/pandas scalar types via a
+            # JSON round-trip so the FastAPI response can serialize cleanly
+            # under Pydantic v2 — see the helper's docstring for details.
+            msa_dict = _df_to_native_records(msa_pivot)
 
-            gen_clr_dict = msa_gen_clr.where(pd.notna(msa_gen_clr), None).to_dict("records") if not msa_gen_clr.empty else []
+            gen_clr_dict = _df_to_native_records(msa_gen_clr)
 
-            var_dict = msa_gen_clr_var.where(pd.notna(msa_gen_clr_var), None).to_dict("records")
+            var_dict = _df_to_native_records(msa_gen_clr_var)
              # Debug: save color variant dict data
 
             logger.info(f"✅ MSA calculation complete:")
@@ -780,7 +1311,12 @@ class MSAService:
                     "msa": len(msa_dict),
                     "msa_gen_clr": len(gen_clr_dict),
                     "msa_gen_clr_var": len(var_dict)
-                }
+                },
+                # Soft-failure messages from non-fatal steps (e.g. Step 7.5
+                # backfill skipped). The endpoint passes this through and
+                # the UI toasts each one so the user knows something didn't
+                # complete cleanly even though the run "succeeded".
+                "warnings": list(self.warnings),
             }
 
         except Exception as e:
@@ -850,14 +1386,13 @@ class MSAService:
                 pivot_df.columns = ['_'.join(filter(None, map(str, col))).strip('_')
                                     for col in pivot_df.columns.values]
 
-            # Replace NaN with None
-            pivot_df = pivot_df.where(pd.notna(pivot_df), None)
-
             logger.info(f"Pivot generated: {len(pivot_df)} rows x {len(pivot_df.columns)} columns")
 
             return {
                 "columns": pivot_df.columns.tolist(),
-                "data": pivot_df.to_dict("records"),
+                # Use _df_to_native_records for the same reason as calculate():
+                # avoids numpy scalars in the response that trip pydantic_core.
+                "data": _df_to_native_records(pivot_df),
                 "row_count": len(pivot_df)
             }
 

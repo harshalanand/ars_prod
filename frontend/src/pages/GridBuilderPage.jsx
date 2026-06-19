@@ -498,6 +498,18 @@ export default function GridBuilderPage() {
     } catch {}
   }
 
+  /* inline sec-cap toggle / % edit (optimistic update) */
+  const handleSecCapPatch = async (grid, patch) => {
+    setGrids(prev => prev.map(g => g.id === grid.id ? { ...g, ...patch } : g))
+    try {
+      await gridBuilderAPI.updateGrid(grid.id, patch)
+    } catch {
+      // rollback on failure
+      setGrids(prev => prev.map(g => g.id === grid.id ? grid : g))
+      toast.error('Failed to update sec-cap')
+    }
+  }
+
   /* delete */
   const handleDelete = async (id) => {
     try {
@@ -546,17 +558,47 @@ export default function GridBuilderPage() {
     finally { setBuildingCalc(false) }
   }
 
-  /* run all */
+  /* run all — backend now spawns the work in a background thread and returns
+     in ~1s (so it fits inside Cloudflare's 120s proxy timeout). We poll
+     /run-all/status until the server reports running:false, refreshing the
+     grid table on every tick so per-grid progress is live. */
   const handleRunAll = async () => {
     setRunningAll(true)
     setGrids(prev => prev.map(g => g.status === 'Active' ? { ...g, last_run_status: 'Running' } : g))
-    const stopPoll = pollGrids()
     try {
       const { data } = await gridBuilderAPI.runAll()
-      toast.success(data.message)
-      setRunResults(data.data.results || [])
+      // Backend rejects with success=false if a previous run is still going
+      if (data.success === false) {
+        toast.error(data.message || 'Run All already in progress')
+        setRunningAll(false)
+        return
+      }
+      toast.success(data.message || 'Run All started')
+
+      // Poll loop — refresh grids every 3s; stop when server says not running
+      const POLL_MS  = 3000
+      const MAX_TIME = 30 * 60 * 1000   // 30-minute safety cap
+      const start    = Date.now()
+      while (Date.now() - start < MAX_TIME) {
+        await new Promise(r => setTimeout(r, POLL_MS))
+        try {
+          const [gridsRes, statusRes] = await Promise.all([
+            gridBuilderAPI.listGrids(),
+            gridBuilderAPI.runAllStatus(),
+          ])
+          setGrids(gridsRes.data.data.grids || [])
+          if (statusRes.data.data?.running === false) {
+            const last = statusRes.data.data?.last_results || []
+            setRunResults(last)
+            const ok = last.filter(r => r.status === 'Success').length
+            toast.success(`Run All complete: ${ok}/${last.length} grids succeeded`)
+            break
+          }
+        } catch {/* transient — keep polling */}
+      }
       await load()
-    } catch {} finally { stopPoll(); setRunningAll(false) }
+    } catch { toast.error('Run All failed to start') }
+    finally { setRunningAll(false) }
   }
 
   const activeCount = grids.filter(g => g.status === 'Active').length
@@ -649,7 +691,7 @@ export default function GridBuilderPage() {
             <table style={{ width:'100%', borderCollapse:'collapse', fontSize:10, minWidth:700 }}>
               <thead>
                 <tr style={{ background:'#f1f5f9', borderBottom:`2px solid ${C.cardBorder}` }}>
-                  {['#','Grid Name','Output Table','Hierarchy','KPI','Group','Sec-Cap','Wt',
+                  {['#','Grid Name','Output Table','KPI','Group','Sec-Cap','Wt',
                     'Last Run','Status','Rows','Time','Alerts','Actions'].map(h => (
                     <th key={h} style={{ padding:'5px 8px', textAlign:'left',
                       fontSize:9, fontWeight:700, color:C.textSub,
@@ -698,17 +740,6 @@ export default function GridBuilderPage() {
                         </code>
                       </td>
 
-                      {/* Hierarchy cols */}
-                      <td style={{ padding:'4px 8px' }}>
-                        <div style={{ display:'flex', flexWrap:'wrap', gap:2 }}>
-                          {(g.hierarchy_columns.length ? g.hierarchy_columns : ['MATNR','WERKS']).map(c => (
-                            <span key={c} style={{ fontSize:8, fontWeight:600, color:C.textSub,
-                              background:C.grayBg, border:`1px solid ${C.grayBd}`,
-                              padding:'0px 4px', borderRadius:3, fontFamily:'monospace' }}>{c}</span>
-                          ))}
-                        </div>
-                      </td>
-
                       {/* KPI filter */}
                       <td style={{ padding:'4px 8px' }}>
                         <div style={{ display:'flex', gap:3, alignItems:'center' }}>
@@ -741,25 +772,55 @@ export default function GridBuilderPage() {
                         )}
                       </td>
 
-                      {/* Sec-Cap (applicable + per-grid %) */}
+                      {/* Sec-Cap (click toggle + editable %) */}
                       <td style={{ padding:'4px 8px', textAlign:'center', whiteSpace:'nowrap' }}>
                         {(g.grid_group !== 'Secondary' || g.pivot_only) ? (
-                          <span style={{ fontSize:9, color:C.textMuted }}>—</span>
-                        ) : g.sec_cap_applicable ? (
-                          <span style={{ fontSize:9, fontWeight:700,
-                            color:C.green, background:C.greenBg,
-                            border:`1px solid ${C.greenBd}`,
-                            padding:'1px 5px', borderRadius:3 }}
-                            title="Allocation will cap this grid">
-                            ON {g.sec_cap_pct != null ? `@${g.sec_cap_pct}%` : '@130%'}
-                          </span>
+                          <span style={{ fontSize:9, color:C.textMuted }}
+                            title="Only non-pivot Secondary grids support sec-cap">—</span>
                         ) : (
-                          <span style={{ fontSize:9, fontWeight:600,
-                            color:C.textSub, background:C.grayBg,
-                            border:`1px solid ${C.grayBd}`,
-                            padding:'1px 5px', borderRadius:3 }}>
-                            OFF
-                          </span>
+                          <div style={{ display:'inline-flex', alignItems:'center', gap:4 }}>
+                            <button
+                              onClick={() => handleSecCapPatch(g, { sec_cap_applicable: !g.sec_cap_applicable })}
+                              title={g.sec_cap_applicable ? 'Click to turn OFF' : 'Click to turn ON'}
+                              style={{
+                                display:'inline-flex', alignItems:'center', gap:4,
+                                padding:'2px 7px', borderRadius:10, fontSize:9, fontWeight:700,
+                                cursor:'pointer', border:'none',
+                                background: g.sec_cap_applicable ? C.greenBg : C.grayBg,
+                                color:      g.sec_cap_applicable ? C.green   : C.textSub }}>
+                              <span style={{ width:20, height:10, borderRadius:5, position:'relative',
+                                display:'inline-block', flexShrink:0,
+                                background: g.sec_cap_applicable ? '#10b981' : '#e2e8f0' }}>
+                                <span style={{ position:'absolute', top:1, width:8, height:8,
+                                  borderRadius:'50%', background:'#fff',
+                                  boxShadow:'0 1px 2px rgba(0,0,0,.3)',
+                                  left: g.sec_cap_applicable ? 10 : 2 }}/>
+                              </span>
+                              {g.sec_cap_applicable ? 'ON' : 'OFF'}
+                            </button>
+                            {g.sec_cap_applicable && (
+                              <span style={{ display:'inline-flex', alignItems:'center', gap:1 }}>
+                                <input
+                                  className="sec-cap-pct"
+                                  type="number" min="0" max="500" step="1"
+                                  defaultValue={g.sec_cap_pct ?? ''}
+                                  placeholder="130"
+                                  title="Per-grid cap %. Blank = global default (130%)."
+                                  onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
+                                  onBlur={e => {
+                                    const raw = e.target.value
+                                    const next = raw === '' ? null : parseFloat(raw)
+                                    const cur  = g.sec_cap_pct ?? null
+                                    if (next !== cur) handleSecCapPatch(g, { sec_cap_pct: next })
+                                  }}
+                                  style={{ width:58, padding:'2px 6px', fontSize:10, fontWeight:600,
+                                    textAlign:'right', borderRadius:4, border:`1px solid ${C.inputBd}`,
+                                    background:C.inputBg, color:C.text, outline:'none',
+                                    MozAppearance:'textfield' }} />
+                                <span style={{ fontSize:9, fontWeight:600, color:C.textSub }}>%</span>
+                              </span>
+                            )}
+                          </div>
                         )}
                       </td>
 
@@ -940,7 +1001,11 @@ export default function GridBuilderPage() {
         </div>
       )}
 
-      <style>{`@keyframes spin{to{transform:rotate(360deg);}}`}</style>
+      <style>{`
+        @keyframes spin{to{transform:rotate(360deg);}}
+        input.sec-cap-pct::-webkit-outer-spin-button,
+        input.sec-cap-pct::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+      `}</style>
     </div>
   )
 }
