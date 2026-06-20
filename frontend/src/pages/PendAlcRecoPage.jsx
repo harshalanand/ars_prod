@@ -275,8 +275,38 @@ export default function PendAlcRecoPage() {
   // and calls this fetcher whenever any of those change. The top-bar filters
   // (date range, RDC, etc.) are merged in here and changes bump `refreshKey`
   // so the grid re-fetches.
+  // Autocomplete adapter — called by each text-filter column's `suggester`.
+  // Returns up to 20 distinct values containing `q`; backend filters by
+  // case-insensitive LIKE %q%.
+  const suggestCol = useCallback(async (col, q) => {
+    try {
+      const { data } = await pendAlcAPI.recoSuggest(col, q || '', 20)
+      return data?.values || []
+    } catch { return [] }
+  }, [])
+
+  // Per-column DataGrid filter keys → backend query-param names.
+  // The grid uses the column key (e.g. `rdc`) as the param; the backend
+  // expects `f_rdc` (multi) or `q_article` (contains). Without this map
+  // the header filter funnels were no-ops.
+  const GRID_FILTER_MAP = {
+    rdc:            'f_rdc',
+    st_cd:          'f_st_cd',
+    maj_cat:        'f_maj_cat',
+    alloc_mode:     'f_alloc_mode',
+    bdc_status:     'f_bdc_status',
+    aging_band:     'f_aging_band',
+    article_number: 'q_article',
+    clr:            'q_clr',
+    do_number:      'q_do_number',
+    bdc_alloc_no:   'q_bdc_alloc_no',
+  }
+
   const fetchReco = useCallback(async (gridParams) => {
-    const params = { ...gridParams }
+    const params = {}
+    Object.entries(gridParams || {}).forEach(([k, v]) => {
+      params[GRID_FILTER_MAP[k] || k] = v
+    })
     if (fDateFrom) params.date_from  = fDateFrom
     if (fDateTo)   params.date_to    = fDateTo
     if (fRdc)      params.rdc        = fRdc
@@ -1217,12 +1247,16 @@ export default function PendAlcRecoPage() {
             filterOptions:['DH24','DH26','DW01'],
             render:r => <span style={{fontWeight:600}}>{r.rdc}</span> },
           { key:'st_cd', label:'ST_CD', sortable:true, filterType:'text',
+            suggester: q => suggestCol('st_cd', q),
             render:r => <span style={{color:C.textSub}}>{r.st_cd || '—'}</span> },
           { key:'article_number', label:'ARTICLE', sortable:true, filterType:'text',
+            suggester: q => suggestCol('article_number', q),
             render:r => <span style={{fontFamily:'monospace', fontSize:9}}>{r.article_number}</span> },
           { key:'maj_cat', label:'MAJ_CAT', sortable:true, filterType:'text',
+            suggester: q => suggestCol('maj_cat', q),
             render:r => r.maj_cat || '—' },
-          { key:'clr', label:'CLR', sortable:true,
+          { key:'clr', label:'CLR', sortable:true, filterType:'text',
+            suggester: q => suggestCol('clr', q),
             render:r => <span style={{color:C.textSub}}>{r.clr || '—'}</span> },
           { key:'alloc_mode', label:'MODE', sortable:true, filterType:'multi',
             filterOptions:['AUTO','MANUAL','RL','TBL','NL'],
@@ -1243,6 +1277,7 @@ export default function PendAlcRecoPage() {
             render:r => <span style={{fontWeight:700, color:r.pend_qty>0?C.amber:C.green}}>
               {fmt(r.pend_qty)}</span> },
           { key:'bdc_alloc_no', label:'BDC ALLOC #', sortable:true, filterType:'text',
+            suggester: q => suggestCol('bdc_alloc_no', q),
             render:r => r.bdc_alloc_no
               ? <span style={{fontFamily:'monospace', fontSize:9, color:C.primary}}>{r.bdc_alloc_no}</span>
               : <span style={{color:C.textMuted}}>—</span> },
@@ -1261,7 +1296,8 @@ export default function PendAlcRecoPage() {
                                    borderRadius:3, background:accent+'22', color:accent}}>
                 {r.aging_band} ({r.aging_days}d)</span>
             }},
-          { key:'do_number', label:'DO NUMBER', sortable:true,
+          { key:'do_number', label:'DO NUMBER', sortable:true, filterType:'text',
+            suggester: q => suggestCol('do_number', q),
             render:r => <span style={{fontFamily:'monospace', fontSize:9, color:C.textSub}}>
               {r.do_number || '—'}</span> },
           { key:'approved_at', label:'APPROVED', sortable:true,

@@ -2705,7 +2705,10 @@ def pend_alc_reco(
         description="OPEN, PARTIAL, CONFIRMED, NEVER_SENT (csv)"),
     f_aging_band: Optional[str] = Query(None),
     # Free-text contains-match
-    q_article:    Optional[str] = Query(None),
+    q_article:      Optional[str] = Query(None),
+    q_clr:          Optional[str] = Query(None),
+    q_do_number:    Optional[str] = Query(None),
+    q_bdc_alloc_no: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
     """Paged reco view with sort, per-column filter, and BDC history join.
@@ -2752,6 +2755,15 @@ def pend_alc_reco(
         if q_article:
             filters.append("P.ARTICLE_NUMBER LIKE :qart")
             params["qart"] = f"%{q_article}%"
+        if q_clr:
+            filters.append("P.CLR LIKE :qclr")
+            params["qclr"] = f"%{q_clr}%"
+        if q_do_number:
+            filters.append("P.DO_NUMBER LIKE :qdon")
+            params["qdon"] = f"%{q_do_number}%"
+        if q_bdc_alloc_no:
+            filters.append("B.ALLOCATION_NUMBER LIKE :qban")
+            params["qban"] = f"%{q_bdc_alloc_no}%"
 
         # Aging band filter
         aging_vals = _parse_csv_filter(f_aging_band)
@@ -2914,7 +2926,10 @@ def pend_alc_reco_export(
     f_source:     Optional[str]  = Query(None),
     f_bdc_status: Optional[str]  = Query(None),
     f_aging_band: Optional[str]  = Query(None),
-    q_article:    Optional[str]  = Query(None),
+    q_article:      Optional[str] = Query(None),
+    q_clr:          Optional[str] = Query(None),
+    q_do_number:    Optional[str] = Query(None),
+    q_bdc_alloc_no: Optional[str] = Query(None),
     limit:        int            = Query(200000, ge=1, le=1_000_000),
     current_user: User = Depends(get_current_user),
 ):
@@ -2954,6 +2969,15 @@ def pend_alc_reco_export(
         if q_article:
             filters.append("P.ARTICLE_NUMBER LIKE :qart")
             params["qart"] = f"%{q_article}%"
+        if q_clr:
+            filters.append("P.CLR LIKE :qclr")
+            params["qclr"] = f"%{q_clr}%"
+        if q_do_number:
+            filters.append("P.DO_NUMBER LIKE :qdon")
+            params["qdon"] = f"%{q_do_number}%"
+        if q_bdc_alloc_no:
+            filters.append("B.ALLOCATION_NUMBER LIKE :qban")
+            params["qban"] = f"%{q_bdc_alloc_no}%"
 
         aging_vals = _parse_csv_filter(f_aging_band)
         if aging_vals:
@@ -3070,6 +3094,55 @@ def pend_alc_reco_export(
         )
     except Exception as e:
         logger.exception(f"[pend_alc] reco-export failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /pend-alc/reco-suggest — autocomplete for /reco column text filters.
+# Returns up to `limit` distinct values from the chosen column that contain
+# the substring `q` (case-insensitive). Column key is safe-listed against
+# COL_MAP — never interpolated raw to keep this SQL-injection-proof.
+# ---------------------------------------------------------------------------
+@router.get("/reco-suggest")
+def pend_alc_reco_suggest(
+    col:   str = Query(..., description="article_number | st_cd | maj_cat | clr | do_number | bdc_alloc_no"),
+    q:     str = Query("",  description="Contains-match (case-insensitive)"),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+):
+    """Distinct-value autocomplete for a /reco filter column."""
+    COL_MAP = {
+        "article_number": ("P", "P.ARTICLE_NUMBER"),
+        "st_cd":          ("P", "P.ST_CD"),
+        "maj_cat":        ("P", "P.MAJ_CAT"),
+        "clr":            ("P", "P.CLR"),
+        "do_number":      ("P", "P.DO_NUMBER"),
+        "bdc_alloc_no":   ("B", "B.ALLOCATION_NUMBER"),
+    }
+    if col not in COL_MAP:
+        raise HTTPException(400, f"Unsupported column: {col}")
+    src, sql_col = COL_MAP[col]
+
+    # Only join BDC history when the requested column lives there.
+    from_clause = f"FROM {PEND_ALC_TABLE} P"
+    if src == "B":
+        from_clause += f"\nINNER JOIN {BDC_HISTORY_TABLE} B WITH (NOLOCK)\n" \
+                       "  ON B.RDC = P.RDC AND ISNULL(B.ST_CD,'') = ISNULL(P.ST_CD,'')\n" \
+                       "  AND B.ARTICLE_NUMBER = P.ARTICLE_NUMBER"
+
+    try:
+        with _engine().connect() as conn:
+            ensure_pend_alc_table(conn)
+            rows = conn.execute(text(f"""
+                SELECT DISTINCT TOP (:lim) {sql_col} AS V
+                {from_clause}
+                WHERE {sql_col} IS NOT NULL AND {sql_col} <> ''
+                  AND (:q = '' OR {sql_col} LIKE :pat)
+                ORDER BY {sql_col}
+            """), {"lim": limit, "q": q, "pat": f"%{q}%"}).fetchall()
+        return {"values": [r[0] for r in rows]}
+    except Exception as e:
+        logger.exception(f"[pend_alc] reco-suggest failed: {e}")
         raise HTTPException(500, str(e))
 
 

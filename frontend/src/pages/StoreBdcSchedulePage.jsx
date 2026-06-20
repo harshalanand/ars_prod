@@ -19,7 +19,7 @@ import toast from 'react-hot-toast'
 import {
   CalendarDays, Plus, Save, Trash2, RefreshCw, Search, X, Upload, Download,
   ChevronUp, ChevronDown, ChevronRight, AlertTriangle, AlertCircle, CheckCircle2,
-  History,
+  History, FileDown,
 } from 'lucide-react'
 
 const C = {
@@ -332,6 +332,36 @@ export default function StoreBdcSchedulePage() {
   }
   const closeHistory = () => { setHistoryFor(null); setHistoryData([]) }
 
+  // Export the current (filtered + sorted) view to CSV. Columns mirror the
+  // table so a user can re-import the file via the same CSV pipeline.
+  const exportCsv = () => {
+    if (filtered.length === 0) { toast.error('Nothing to export'); return }
+    const esc = (v) => {
+      if (v === null || v === undefined) return ''
+      const s = String(v)
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+    }
+    const header = ['ST_CD','ST_NAME','HUB','RDC','ST_STATUS','MASTER_STATUS','PATTERN',
+                    'MON','TUE','WED','THU','FRI','SAT','ACTIVE']
+    const lines = [header.join(',')]
+    filtered.forEach(r => {
+      lines.push([
+        esc(r.st_cd), esc(r.st_name), esc(r.hub), esc(r.rdc),
+        esc(r.st_status), esc(r.master_status), esc(patternOf(r)),
+        r.mon ? 1 : 0, r.tue ? 1 : 0, r.wed ? 1 : 0,
+        r.thu ? 1 : 0, r.fri ? 1 : 0, r.sat ? 1 : 0,
+        r.is_active === false ? 0 : 1,
+      ].join(','))
+    })
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type:'text/csv;charset=utf-8' }))
+    a.download = `BDC_Schedule_${today}.csv`
+    document.body.appendChild(a); a.click(); document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+    toast.success(`Exported ${filtered.length} row(s)`)
+  }
+
   const downloadTemplate = () => {
     const csv = 'ST_CD,ST_NAME,MON,TUE,WED,THU,FRI,SAT\n'
               + 'HB05,Sample Store 5,1,0,1,0,1,0\n'
@@ -459,6 +489,11 @@ export default function StoreBdcSchedulePage() {
         </select>
 
         <div style={{ flex:1 }}/>
+        <button onClick={exportCsv} disabled={filtered.length === 0}
+          style={btn(C.border, '#fff', C.textSub)}
+          title="Export current view to CSV">
+          <FileDown size={11}/> Export
+        </button>
         <button onClick={() => fileRef.current?.click()} style={btn(C.border, '#fff', C.textSub)}>
           <Upload size={11}/> Import
         </button>

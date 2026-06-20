@@ -235,7 +235,8 @@
       "Bash(ls -la \"/c/Users/ADMINI~1/AppData/Local/Temp/1/claude/d--projects-ars-prod/\" 2>&1 | head -20)",
       "Read(//c/Users/ADMINI~1/AppData/Local/Temp/1/claude/d--projects-ars-prod//**)",
       "Bash(PYTHONPATH=. ./venv/Scripts/python.exe -c ' *)",
-      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe -m py_compile d:/projects/ars_prod/backend/app/services/rule_engine_per_opt.py d:/projects/ars_prod/backend/app/services/rule_engine_pandas.py)"
+      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe -m py_compile d:/projects/ars_prod/backend/app/services/rule_engine_per_opt.py d:/projects/ars_prod/backend/app/services/rule_engine_pandas.py)",
+      "Bash(curl -s http://127.0.0.1:8000/api/v1/pend-alc/reco-suggest?col=clr -o /dev/null -w \"%{http_code}\\\\n\")"
     ]
   }
 }

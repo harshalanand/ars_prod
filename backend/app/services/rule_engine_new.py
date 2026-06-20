@@ -2914,6 +2914,22 @@ def _stage_d_reflect(conn, working_table, alloc_table):
     #   - Round-first so round-1 OPTs precede round-2 OPTs regardless of store.
     #   - ST_RANK within a round so ST_RANK=1 store is fully listed first.
     #   - OPT_PRIORITY_RANK as final tie-break within a store.
+
+    # DDL guard: ensure FROM_HOLD_QTY exists on working_table so the OPT-grain
+    # rollup below can record how much of ALLOC_QTY came from the warehouse
+    # hold pool (vs MSA pool). MSA-pool portion = ALLOC_QTY - FROM_HOLD_QTY.
+    try:
+        _run(conn, f"""
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns
+                WHERE object_id = OBJECT_ID('{working_table}')
+                  AND name = 'FROM_HOLD_QTY'
+            )
+            ALTER TABLE [{working_table}] ADD [FROM_HOLD_QTY] FLOAT NULL
+        """)
+    except Exception as e:
+        logger.warning(f"[D] FROM_HOLD_QTY column add on {working_table} failed: {e}")
+
     try:
         _run(conn, f"""
             ;WITH Agg AS (
@@ -2922,6 +2938,7 @@ def _stage_d_reflect(conn, working_table, alloc_table):
                 SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
                        SUM(ISNULL(SHIP_QTY, 0))  AS ship_q,
                        SUM(ISNULL(HOLD_QTY, 0))  AS hold_q,
+                       SUM(ISNULL(FROM_HOLD_QTY, 0)) AS from_hold_q,
                        COUNT(*)                   AS sz_rows,
                        SUM(CASE WHEN ISNULL(SHIP_QTY,0) + ISNULL(HOLD_QTY,0) > 0
                                 THEN 1 ELSE 0 END) AS filled_rows,
@@ -2943,7 +2960,7 @@ def _stage_d_reflect(conn, working_table, alloc_table):
                                ISNULL(W.ST_RANK, 999999),
                                ISNULL(W.OPT_PRIORITY_RANK, 999999)
                        ) AS seq,
-                       A.ship_q, A.hold_q, A.sz_rows, A.filled_rows
+                       A.ship_q, A.hold_q, A.from_hold_q, A.sz_rows, A.filled_rows
                 FROM [{working_table}] W
                 LEFT JOIN Agg A
                     ON  A.WERKS           = W.WERKS
@@ -2956,6 +2973,7 @@ def _stage_d_reflect(conn, working_table, alloc_table):
                 W.ALLOC_SEQ    = S.seq,
                 W.ALLOC_QTY    = ISNULL(S.ship_q, 0),
                 W.HOLD_QTY     = ISNULL(S.hold_q, 0),
+                W.FROM_HOLD_QTY = ISNULL(S.from_hold_q, 0),
                 W.ALLOC_STATUS = CASE
                     WHEN ISNULL(S.ship_q,0) + ISNULL(S.hold_q,0) = 0
                          THEN 'NOT_ALLOCATED'
