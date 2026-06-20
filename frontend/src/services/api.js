@@ -691,6 +691,11 @@ export const pendAlcAPI = {
     { timeout: 5 * 60 * 1000, quiet: true }),
   reco:        (params = {})    => api.get('/pend-alc/reco', { params }),
   recoSummary: ()               => api.get('/pend-alc/reco-summary'),
+  // Distinct-value autocomplete for /reco column text filters.
+  // Returns { values: [...] }. Safe-listed column keys: article_number,
+  // st_cd, maj_cat, clr, do_number, bdc_alloc_no.
+  recoSuggest: (col, q, limit = 20) =>
+    api.get('/pend-alc/reco-suggest', { params: { col, q, limit } }),
   // Excel export — same filter params as /reco. Used by the per-tile export
   // buttons on the Reconciliation page.
   recoExport:  (params = {})    => api.get('/pend-alc/reco-export',

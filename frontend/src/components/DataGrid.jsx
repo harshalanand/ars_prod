@@ -7,7 +7,12 @@
  * Props:
  *   columns: [
  *     { key, label, render?(row), align?, width?,
- *       sortable?, filterType?: 'multi' | 'text', filterOptions?: string[] }
+ *       sortable?, filterType?: 'multi' | 'text',
+ *       filterOptions?: string[],
+ *       // Optional autocomplete for 'text' filters. Called as the user types
+ *       // (debounced); should return an array of distinct values to show in
+ *       // a dropdown below the input.
+ *       suggester?: (q: string) => Promise<string[]> }
  *   ]
  *   fetcher: async (params) => ({data, total_rows, page, page_size, total_pages})
  *     // Receives {page, page_size, sort_by, sort_dir, ...filters}
@@ -26,7 +31,7 @@
  * synced — keeping it simple). External filter changes can force a refetch
  * via `refreshKey`.
  */
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { useState, useEffect, useMemo, useRef, useCallback, forwardRef } from 'react'
 import { ChevronUp, ChevronDown, Filter, X } from 'lucide-react'
 
 const C = {
@@ -310,29 +315,10 @@ function FilterPopover({ anchorEl, col, value, onChange, onClear, onClose }) {
 
   if (col.filterType === 'text') {
     return (
-      <div ref={ref}
-        style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 10,
-                 background: '#fff', border: `1px solid ${C.border}`,
-                 borderRadius: 5, boxShadow: '0 6px 20px rgba(0,0,0,.12)',
-                 padding: 10, width: 220 }}>
-        <div style={{ fontSize: 9, fontWeight: 700, color: C.textSub,
-                      letterSpacing: '.05em', marginBottom: 6 }}>
-          FILTER {col.label.toUpperCase()}
-        </div>
-        <input value={value || ''} autoFocus
-          placeholder="contains…"
-          onChange={e => onChange(e.target.value)}
-          style={{ width: '100%', fontSize: 11, padding: '5px 8px',
-                   borderRadius: 3, border: `1px solid ${C.border}`,
-                   outline: 'none', boxSizing: 'border-box' }}/>
-        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-          <button onClick={() => { onClear(); onClose() }}
-            style={popBtn(C.border, '#fff', C.textSub)}>Clear</button>
-          <div style={{ flex: 1 }}/>
-          <button onClick={onClose}
-            style={popBtn(C.primary, C.primary, '#fff')}>Done</button>
-        </div>
-      </div>
+      <TextFilterPopover
+        ref={ref} pos={pos} col={col}
+        value={value} onChange={onChange}
+        onClear={onClear} onClose={onClose}/>
     )
   }
 
@@ -392,6 +378,121 @@ function FilterPopover({ anchorEl, col, value, onChange, onClear, onClose }) {
           style={popBtn(C.primary, C.primary, '#fff')}>Done</button>
       </div>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// TextFilterPopover — input + (optional) typeahead dropdown from col.suggester
+// ---------------------------------------------------------------------------
+const TextFilterPopover = forwardRef(function TextFilterPopover(
+  { pos, col, value, onChange, onClear, onClose }, ref
+) {
+  const [draft, setDraft]           = useState(value || '')
+  const [suggestions, setSuggestions] = useState([])
+  const [sugLoading, setSugLoading]   = useState(false)
+  const [highlight,  setHighlight]    = useState(-1)
+  const [open,       setOpen]         = useState(true)
+  const debounceRef = useRef(null)
+  const reqIdRef    = useRef(0)
+
+  useEffect(() => {
+    if (!col.suggester) return
+    clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(async () => {
+      const myId = ++reqIdRef.current
+      setSugLoading(true)
+      try {
+        const vals = await col.suggester(draft)
+        if (myId === reqIdRef.current) {
+          setSuggestions(Array.isArray(vals) ? vals : [])
+          setHighlight(-1)
+        }
+      } catch { /* swallow — suggester errors aren't user-actionable */ }
+      finally { if (myId === reqIdRef.current) setSugLoading(false) }
+    }, 200)
+    return () => clearTimeout(debounceRef.current)
+  }, [draft, col.suggester])
+
+  const commit = (v) => { onChange(v); setDraft(v); setOpen(false) }
+  const handleKey = (e) => {
+    if (!open || suggestions.length === 0) {
+      if (e.key === 'Enter') { onChange(draft); onClose() }
+      return
+    }
+    if (e.key === 'ArrowDown') { e.preventDefault(); setHighlight(h => Math.min(h + 1, suggestions.length - 1)) }
+    else if (e.key === 'ArrowUp')  { e.preventDefault(); setHighlight(h => Math.max(h - 1, -1)) }
+    else if (e.key === 'Enter') {
+      e.preventDefault()
+      if (highlight >= 0) commit(suggestions[highlight])
+      else { onChange(draft); onClose() }
+    } else if (e.key === 'Escape') { setOpen(false) }
+  }
+
+  return (
+    <div ref={ref}
+      style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 10,
+               background: '#fff', border: `1px solid ${C.border}`,
+               borderRadius: 5, boxShadow: '0 6px 20px rgba(0,0,0,.12)',
+               padding: 10, width: 240 }}>
+      <div style={{ fontSize: 9, fontWeight: 700, color: C.textSub,
+                    letterSpacing: '.05em', marginBottom: 6 }}>
+        FILTER {col.label.toUpperCase()}
+      </div>
+      <input value={draft} autoFocus
+        placeholder="contains…"
+        onChange={e => { setDraft(e.target.value); setOpen(true); onChange(e.target.value) }}
+        onKeyDown={handleKey}
+        onFocus={() => setOpen(true)}
+        style={{ width: '100%', fontSize: 11, padding: '5px 8px',
+                 borderRadius: 3, border: `1px solid ${C.border}`,
+                 outline: 'none', boxSizing: 'border-box' }}/>
+
+      {/* Suggestions dropdown — only when a suggester is wired AND we have hits */}
+      {col.suggester && open && (suggestions.length > 0 || sugLoading) && (
+        <div style={{ marginTop: 4, maxHeight: 200, overflowY: 'auto',
+                      border: `1px solid ${C.border}`, borderRadius: 3,
+                      background: '#fff' }}>
+          {sugLoading && suggestions.length === 0 ? (
+            <div style={{ padding: '6px 8px', fontSize: 10, color: C.textMuted }}>
+              Searching…
+            </div>
+          ) : suggestions.map((s, i) => (
+            <div key={s + i}
+              onMouseDown={(e) => { e.preventDefault(); commit(s) }}
+              onMouseEnter={() => setHighlight(i)}
+              style={{ padding: '4px 8px', fontSize: 11, cursor: 'pointer',
+                       background: i === highlight ? C.bg : '#fff',
+                       fontFamily: 'monospace',
+                       color: C.text, whiteSpace: 'nowrap', overflow: 'hidden',
+                       textOverflow: 'ellipsis' }}>
+              {highlightMatch(String(s), draft)}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+        <button onClick={() => { onClear(); setDraft(''); onClose() }}
+          style={popBtn(C.border, '#fff', C.textSub)}>Clear</button>
+        <div style={{ flex: 1 }}/>
+        <button onClick={() => { onChange(draft); onClose() }}
+          style={popBtn(C.primary, C.primary, '#fff')}>Done</button>
+      </div>
+    </div>
+  )
+})
+
+// Bold the matched substring inside a suggestion so users see why it matched.
+function highlightMatch(text, q) {
+  if (!q) return text
+  const i = text.toLowerCase().indexOf(q.toLowerCase())
+  if (i < 0) return text
+  return (
+    <>
+      {text.slice(0, i)}
+      <b style={{ color: C.primary }}>{text.slice(i, i + q.length)}</b>
+      {text.slice(i + q.length)}
+    </>
   )
 }
 
