@@ -1343,8 +1343,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
         # ── PART 3.6: Populate GEN_ART_DESC + tag OPT_TYPE (4-way classification) ──
         # Rules (applies to ALL rows — both IS_NEW=0 and IS_NEW=1):
-        #   MIX(a): low stock + no MSA   (b): poor color fill (VAR ratio < threshold)
-        #   RL: adequate stock   TBC: low stock + MSA   TBL: zero stock + MSA
+        #   MIX: no MSA AND no prior hold (nothing to send — regardless of stock)
+        #   RL:  adequate stock (and MSA>0 or HOLD>0 implicitly)
+        #   TBL: zero stock + MSA (hold alone does NOT qualify)
+        #   TBC: low stock with MSA or hold available
         try:
             _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [GEN_ART_DESC] NVARCHAR(500) NULL")
         except Exception:
@@ -1363,46 +1365,31 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 logger.warning(f"Part 3.6: GEN_ART_DESC population failed: {str(e)[:150]}")
 
         # OPT_TYPE classification — evaluated top-to-bottom, first match wins.
-        # Order: MIX first (catch bad options early) → RL → TBC → TBL.
+        # Order: MIX → TBL → RL → TBC (ELSE).
         #
-        #   MIX (a): low stock + no MSA + no RL_HOLD_QTY (nothing to send)
-        #   MIX (b): poor color fill (VAR ratio < threshold)
-        #   RL:  (adequate stock OR RL_HOLD_QTY > 0) AND MSA_FNL_Q > 0
-        #        — RL requires fresh MSA supply to top up against; an open TBL
-        #          hold alone is no longer enough to land in RL.
-        #   TBC: low stock, MSA or NL hold available
-        #   TBL: zero stock, MSA or NL hold available
+        #   MIX: MSA_FNL_Q = 0 AND RL_HOLD_QTY = 0  (nothing to send, any stock)
+        #   TBL: STK <= 0 AND MSA_FNL_Q > 0          (hold alone does NOT qualify)
+        #   RL:  STK >= threshold * ACS_D            (MSA or hold guaranteed by rule 1)
+        #   TBC: ELSE                                (low stock with MSA or hold)
         threshold = req.stock_threshold_pct
         default_acs = float(req.default_acs_d or 18)
         def _classify_opt_type(label="OPT_TYPE"):
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
                 SET [OPT_TYPE] = CASE
-                    -- MIX (a): low stock + no MSA AND no prior-run NL hold — nothing to send
-                    WHEN ISNULL([STK_TTL], 0) < {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                     AND ISNULL([MSA_FNL_Q], 0)    = 0
-                     AND ISNULL([RL_HOLD_QTY], 0)  = 0
+                    -- MIX: no MSA AND no prior-run NL hold — nothing to send (any stock level)
+                    WHEN ISNULL([MSA_FNL_Q], 0)   = 0
+                     AND ISNULL([RL_HOLD_QTY], 0) = 0
                         THEN 'MIX'
-                    -- MIX (b): poor color fill {f'OR count < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else '(MinSz off)'}
-                    WHEN ISNULL([VAR_COUNT], 0) > 0
-                     AND (CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT] < {threshold}
-                          {f'OR ISNULL([VAR_FNL_COUNT], 0) < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else ''})
-                        THEN 'MIX'
-                    -- RL: (adequate stock OR prior-run NL hold) AND fresh MSA supply available
-                    WHEN (ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                          OR ISNULL([RL_HOLD_QTY], 0) > 0)
-                     AND ISNULL([MSA_FNL_Q], 0) > 0
-                        THEN 'RL'
-                    -- TBC: low stock but MSA or NL hold available
-                    WHEN ISNULL([STK_TTL], 0) > 0
-                     AND [STK_TTL] < {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                     AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)
-                        THEN 'TBC'
-                    -- TBL: zero/negative stock + MSA or NL hold available
+                    -- TBL: zero/negative stock + MSA (hold alone does NOT qualify for TBL)
                     WHEN ISNULL([STK_TTL], 0) <= 0
-                     AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)
+                     AND ISNULL([MSA_FNL_Q], 0) > 0
                         THEN 'TBL'
-                    ELSE 'MIX'
+                    -- RL: adequate stock (MSA>0 or HOLD>0 already guaranteed by the MIX rule above)
+                    WHEN ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
+                        THEN 'RL'
+                    -- TBC: everything else — low stock with MSA or hold available
+                    ELSE 'TBC'
                 END
             """)
 
@@ -1438,10 +1425,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             toc_count = 0
             logger.warning(f"Part 3.6: OPT_TYPE tagging failed: {str(e)[:150]}")
 
-        # VAR ratio override removed — MIX(b) now catches ALL rows (IS_NEW=0
-        # and IS_NEW=1) with poor color availability. The RL rule in the CASE
-        # statement naturally handles adequate-stock rows since MIX(b) fires
-        # first and only catches poor-ratio rows.
         t0 = _time_step("Part 3.6 (OPT_TYPE classification)", t0)
 
         # ── PART 3.7: MIX handling ─────────────────────────────────────────

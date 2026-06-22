@@ -236,7 +236,8 @@
       "Read(//c/Users/ADMINI~1/AppData/Local/Temp/1/claude/d--projects-ars-prod//**)",
       "Bash(PYTHONPATH=. ./venv/Scripts/python.exe -c ' *)",
       "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe -m py_compile d:/projects/ars_prod/backend/app/services/rule_engine_per_opt.py d:/projects/ars_prod/backend/app/services/rule_engine_pandas.py)",
-      "Bash(curl -s http://127.0.0.1:8000/api/v1/pend-alc/reco-suggest?col=clr -o /dev/null -w \"%{http_code}\\\\n\")"
+      "Bash(curl -s http://127.0.0.1:8000/api/v1/pend-alc/reco-suggest?col=clr -o /dev/null -w \"%{http_code}\\\\n\")",
+      "PowerShell($env:PYTHONPATH = \"D:\\\\ARS_PROD\\\\ars_prod\\\\backend\"; Set-Location D:\\\\ARS_PROD\\\\ars_prod\\\\backend; & python \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\46ef5f55-b3fd-497d-b683-71bef8f165eb\\\\scratchpad\\\\check_alc_from_hold.py\" 2>&1)"
     ]
   }
 }
