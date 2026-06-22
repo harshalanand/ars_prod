@@ -562,19 +562,28 @@ def _run_band_per_opt(
         #     Stage-A `R07_VAR_RATIO_TBL` (still AND on master MSA counts);
         #     deliberate — Stage A is structural (master data), this gate
         #     is real-time (live pool) and should be stricter.
+        # One-size short-circuit: for GEN_ARTs with total_sizes==1 the ratio
+        # is degenerate (1.0 with pool, 0.0 without). The "no pool" case is
+        # already caught downstream by NO_POOL_MSA / live-pool empty checks,
+        # and there is no partial-assortment risk to guard against. Without
+        # this guard, any one-size TBL OPT whose live pool was drained by
+        # earlier shipping OPTs gets stamped R07_SIZE_RATIO_LIVE(0/1) which
+        # misleadingly looks like a size-mix failure rather than "warehouse
+        # empty".
         if ot == 'TBL' and (size_threshold > 0 or min_size_count > 0):
-            sizes_with_pool = int(np.count_nonzero(live_pool > 0))
             total_sizes = len(opt_rows)
-            ratio = sizes_with_pool / total_sizes if total_sizes > 0 else 0.0
-            if (sizes_with_pool < min_size_count) or (ratio < size_threshold):
-                _mark_opt_skip(
-                    alloc_df, opt_idx,
-                    'R07_SIZE_RATIO_LIVE',
-                    f'sizes_with_pool={sizes_with_pool}/{total_sizes},'
-                    f'ratio={ratio:.2f},thr={size_threshold},min={min_size_count}',
-                )
-                skipped_r07 += 1
-                continue
+            if total_sizes > 1:
+                sizes_with_pool = int(np.count_nonzero(live_pool > 0))
+                ratio = sizes_with_pool / total_sizes
+                if (sizes_with_pool < min_size_count) or (ratio < size_threshold):
+                    _mark_opt_skip(
+                        alloc_df, opt_idx,
+                        'R07_SIZE_RATIO_LIVE',
+                        f'sizes_with_pool={sizes_with_pool}/{total_sizes},'
+                        f'ratio={ratio:.2f},thr={size_threshold},min={min_size_count}',
+                    )
+                    skipped_r07 += 1
+                    continue
 
         # 5b2) Pre-check 1.5: TBL MJ_REQ_GATE.
         #     Mirrors rule_engine_new._stage_c_apply_opt_mj_req_gate but applied
@@ -634,29 +643,40 @@ def _run_band_per_opt(
         scale = 1.0
         if total_need > 0:
             if ot == 'TBL':
-                # TBL admission: pass iff MJ_REQ_REM(WERKS) >= 0.5 × total_need.
-                # No cap_pct headroom — uses the raw live MJ_REQ_REM. On pass
-                # the OPT ships its full need (pool is the only ceiling); on
-                # fail the whole OPT skips. mj_req_rem_dict is clipped to 0 by
-                # the 5h2 decrement, so the next TBL OPT in the same WERKS
-                # naturally fails this admission and skips on its own.
+                # TBL admission: pass iff MJ_REQ_REM(WERKS) >= 0.5 × OPT_MBQ.
+                # OPT_MBQ = Σ SZ_MBQ = one store display set. Cap basis is
+                # OPT_MBQ (store display), NOT OPT_MBQ_WH (WH cumulative):
+                # on PASS the 5g SHIP/HOLD split caps SHIP at need_ship
+                # (≈ OPT_MBQ for r=1) and routes the WH-cumulative remainder
+                # to HOLD, and 5h2 decrements MJ_REQ_REM by SHIP only — so
+                # the admission threshold must align with what SHIP actually
+                # consumes from MJ_REQ, not the WH cumulative.
+                # mj_req_rem_dict is clipped to 0 by the 5h2 decrement, so
+                # the next TBL OPT in the same WERKS naturally fails the 5b2
+                # gate and skips on its own.
                 # If the upstream working_df doesn't carry MJ_REQ_REM at all
                 # (legacy deployments), mj_req_rem_dict is empty — fall through
                 # permissively rather than blocking every TBL OPT.
+                opt_mbq_sum = float(opt_rows['SZ_MBQ'].sum())
                 werks_key = str(werks_v)
-                if mj_req_rem_dict and werks_key in mj_req_rem_dict:
+                if (
+                    mj_req_rem_dict
+                    and werks_key in mj_req_rem_dict
+                    and opt_mbq_sum > 0
+                ):
                     mj_rem = float(mj_req_rem_dict[werks_key])
-                    if mj_rem < 0.5 * total_need:
+                    if mj_rem < 0.5 * opt_mbq_sum:
                         _mark_opt_skip(
                             alloc_df, opt_idx,
                             'MBQ_CAP_TBL',
-                            f'pre-check:need={int(total_need)},'
+                            f'pre-check:opt_mbq={int(opt_mbq_sum)},'
                             f'mj_req_rem={int(mj_rem)}<'
-                            f'0.5*need={int(0.5 * total_need)}',
+                            f'0.5*opt_mbq={int(0.5 * opt_mbq_sum)}',
                         )
                         skipped_cap += 1
                         continue
-                # PASS: opt_need is NOT clamped to mj_rem — full need ships.
+                # PASS: opt_need is NOT clamped to mj_rem. 5g caps SHIP at
+                # need_ship (≈ OPT_MBQ) and routes WH remainder to HOLD.
             elif mbq_budget is not None:
                 # RL / TBC: proportional-scale against mbq_budget, which still
                 # carries the rl/tbc_mbq_cap_pct headroom from _live_mbq_budget.
@@ -671,7 +691,11 @@ def _run_band_per_opt(
                         skipped_cap += 1
                         continue
                     scale = werks_cap / total_need
-                    opt_need = np.floor(opt_need * scale)
+                    # PAK-snap: budget shortage must produce full-pak ships or
+                    # zero — never a non-pak partial. Sizes whose scaled need
+                    # falls below one pak get gated to 0 (the OPT silently
+                    # skips that size for this round).
+                    opt_need = np.floor(opt_need * scale / pak) * pak
 
         # NOTE: by design, TBL is NOT clamped to remaining MJ_REQ_REM after
         # admission. If the admission test at 5b2 lets the OPT in, it ships
@@ -768,7 +792,42 @@ def _run_band_per_opt(
             round_hold = np.where(is_ship_met, round_hold, 0.0)
             pool_take_total = round_ship + round_hold
         else:
-            round_ship = take_pool + from_hold
+            # Two constraints on the RL/TBC ship:
+            #  1. PAK ceiling, not bare need_ship: ship may overshoot
+            #     need_ship by up to (pak-1) so a half-up pak round at R1
+            #     still ships a full pak. A bare need_ship clamp would
+            #     wipe out the pak round-up.
+            #  2. PAK alignment on the ship itself: snap down to a pak
+            #     multiple UNLESS combined supply (live_pool + from_hold)
+            #     is below one pak — that's genuine exhaustion and a
+            #     non-pak partial is acceptable.
+            # The ceiling also caps the cross-round from_hold drift: in
+            # later rounds POOL_CONSUMED is behind SHIP_QTY by prior
+            # from_hold, which inflates need_pool — the ceiling stops the
+            # extra units from shipping, and the refund below puts the
+            # over-take back into pool_dict.
+            ship_ceiling = np.ceil(need_ship_arr / pak) * pak
+            raw_ship = np.minimum(take_pool + from_hold, ship_ceiling)
+            combined_supply = live_pool + from_hold
+            supply_below_pak = combined_supply < pak
+            effective_ship = np.where(
+                supply_below_pak,
+                raw_ship,
+                np.floor(raw_ship / pak) * pak,
+            )
+            pool_used = np.maximum(effective_ship - from_hold, 0.0)
+            excess_pool = take_pool - pool_used
+            if excess_pool.any():
+                for _i, _k in enumerate(opt_pool_keys):
+                    if excess_pool[_i] > 0:
+                        pool_dict[_k] = pool_dict.get(_k, 0.0) + float(excess_pool[_i])
+                post_draw_pool = np.array(
+                    [float(pool_dict.get(_k, 0.0)) for _k in opt_pool_keys],
+                    dtype='float64',
+                )
+                alloc_df.loc[opt_idx, 'FNL_Q_REM'] = post_draw_pool
+                take_pool = pool_used
+            round_ship = effective_ship
             round_hold = np.zeros_like(take_pool)
             pool_take_total = take_pool  # FROM_HOLD_QTY accounted separately below
 
@@ -902,9 +961,20 @@ def _run_band_per_opt(
                     # Total units that left this row (pool + hold draws).
                     actual_out = float(take_pool[i]) + float(from_hold[i])
                     if actual_out + 1e-9 < rounded_i:
+                        # Disambiguate the short reason — the prior `short=stock`
+                        # label read as "pool ran out" even when the bind was
+                        # the MBQ_CAP scaling or the cross-round ceiling. Order
+                        # matters: cap is detected at opt_need (post-budget,
+                        # pre-pool), pool at take_pool+from_hold vs opt_need.
+                        if opt_need[i] + 1e-9 < pak_rounded_target[i]:
+                            short_label = 'cap'
+                        elif (take_pool[i] + from_hold[i]) + 1e-9 < opt_need[i]:
+                            short_label = 'pool'
+                        else:
+                            short_label = 'ceiling'
                         new_remarks += (
                             f' PAK_SZ_ROUND(from={raw_i},to={rounded_i},'
-                            f'pak={int(pak[i])},short=stock={int(actual_out)});'
+                            f'pak={int(pak[i])},short={short_label}={int(actual_out)});'
                         )
                     else:
                         new_remarks += (
