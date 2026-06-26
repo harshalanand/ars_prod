@@ -69,13 +69,28 @@ def _mark_opt_skip(
     idx: np.ndarray,
     reason: str,
     remark: str,
+    live_pool: Optional[np.ndarray] = None,
 ) -> None:
-    """Stamp every row of an OPT with SKIPPED status, SKIP_REASON, and a remark."""
+    """Stamp every row of an OPT with SKIPPED status, SKIP_REASON, and a remark.
+
+    When ``live_pool`` is supplied, also write the per-size live pool snapshot
+    to FNL_Q_REM so the audit row reflects the pool that was actually visible
+    at this OPT's turn (instead of the stale pre-allocation FNL_Q seed) — the
+    pre-pool-take skip sites bypass the post-draw FNL_Q_REM write at 5f.1.
+
+    SKIP_REASON is written only when currently empty, preserving whatever a
+    more specific upstream gate already stamped on the row.
+    """
     if len(idx) == 0:
         return
     alloc_df.loc[idx, 'ALLOC_STATUS'] = 'SKIPPED'
     prev = alloc_df.loc[idx, 'ALLOC_REMARKS'].fillna('').astype(str)
     alloc_df.loc[idx, 'ALLOC_REMARKS'] = prev + f' {reason}({remark});'
+    if 'SKIP_REASON' in alloc_df.columns:
+        cur = alloc_df.loc[idx, 'SKIP_REASON'].fillna('').astype(str)
+        alloc_df.loc[idx, 'SKIP_REASON'] = cur.where(cur != '', reason)
+    if live_pool is not None:
+        alloc_df.loc[idx, 'FNL_Q_REM'] = live_pool.astype('float64')
 
 
 def _mark_opt_skip_sec_cap(
@@ -572,6 +587,7 @@ def _run_band_per_opt(
                     'R07_SIZE_RATIO_LIVE',
                     f'sizes_with_pool={sizes_with_pool}/{total_sizes},'
                     f'ratio={ratio:.2f},thr={size_threshold},min={min_size_count}',
+                    live_pool=live_pool,
                 )
                 skipped_r07 += 1
                 continue
@@ -599,6 +615,7 @@ def _run_band_per_opt(
                     f'factor={mbq_gate_factor:g},'
                     f'threshold={int(gate_threshold)},'
                     f'allowance={int(cap_allowance)}',
+                    live_pool=live_pool,
                 )
                 skipped_mj_req_gate += 1
                 continue
@@ -653,6 +670,7 @@ def _run_band_per_opt(
                             f'pre-check:need={int(total_need)},'
                             f'mj_req_rem={int(mj_rem)}<'
                             f'0.5*need={int(0.5 * total_need)}',
+                            live_pool=live_pool,
                         )
                         skipped_cap += 1
                         continue
@@ -667,6 +685,7 @@ def _run_band_per_opt(
                             alloc_df, opt_idx,
                             f'MBQ_CAP_{ot}',
                             f'pre-check:cap_rem=0,need={int(total_need)}',
+                            live_pool=live_pool,
                         )
                         skipped_cap += 1
                         continue

@@ -235,7 +235,21 @@
       "Bash(ls -la \"/c/Users/ADMINI~1/AppData/Local/Temp/1/claude/d--projects-ars-prod/\" 2>&1 | head -20)",
       "Read(//c/Users/ADMINI~1/AppData/Local/Temp/1/claude/d--projects-ars-prod//**)",
       "Bash(PYTHONPATH=. ./venv/Scripts/python.exe -c ' *)",
-      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe -m py_compile d:/projects/ars_prod/backend/app/services/rule_engine_per_opt.py d:/projects/ars_prod/backend/app/services/rule_engine_pandas.py)"
+      "Bash(d:/projects/ars_prod/backend/venv/Scripts/python.exe -m py_compile d:/projects/ars_prod/backend/app/services/rule_engine_per_opt.py d:/projects/ars_prod/backend/app/services/rule_engine_pandas.py)",
+      "PowerShell(\"=== LISTENING SERVERS ===\"; & netstat -ano | findstr \"LISTENING\" | findstr \"127.0.0.1\\\\|0.0.0.0\" | Sort-Object | ForEach-Object { $line = $_ -split '\\\\s+' | Where-Object { $_ }; $port = \\($line[1] -split ':'\\)[-1]; $procPid = $line[-1]; $proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$procPid\" -ErrorAction SilentlyContinue; if \\($proc\\) { \"Port $port | PID $procPid | $\\($proc.Name\\) | $\\(if \\($proc.CommandLine\\) { $proc.CommandLine.Substring\\(0, [Math]::Min\\(120, $proc.CommandLine.Length\\)\\) }\\)\" } } | Sort-Object -Unique)",
+      "PowerShell($results = @\\(\\); $lines = & netstat -ano | Select-String \"LISTENING\"; foreach \\($line in $lines\\) { $parts = \\($line.ToString\\(\\) -split '\\\\s+'\\) | Where-Object { $_ }; $local = $parts[1]; $procPid = $parts[-1]; $port = \\($local -split ':'\\)[-1]; if \\($port -match '^\\\\d+$' -and [int]$port -lt 50000 -and [int]$port -gt 1024\\) { $proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$procPid\" -ErrorAction SilentlyContinue; $name = if \\($proc\\) { $proc.Name } else { '?' }; $results += \"$local | PID $procPid | $name\" } }; $results | Sort-Object -Unique)",
+      "PowerShell(\"=== ARS-RELATED PROCESSES ===\"; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'uvicorn|main:app|vite|ars_prod' -or \\($_.Name -match 'python|node' -and $_.CommandLine -match 'ars'\\) } | Select-Object ProcessId, Name, @{N='Cmd';E={if \\($_.CommandLine\\) { $_.CommandLine.Substring\\(0,[Math]::Min\\(140,$_.CommandLine.Length\\)\\) }}} | Format-Table -AutoSize -Wrap)",
+      "PowerShell(& \"d:\\\\projects\\\\ars_prod\\\\backend\\\\venv\\\\Scripts\\\\python.exe\" -c $code)",
+      "PowerShell(Get-PSDrive E | Select-Object Used,Free,@{n='UsedGB';e={[math]::Round\\($_.Used/1GB,1\\)}},@{n='FreeGB';e={[math]::Round\\($_.Free/1GB,1\\)}},@{n='TotalGB';e={[math]::Round\\(\\($_.Used+$_.Free\\)/1GB,1\\)}})",
+      "PowerShell(Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,@{n='SizeGB';e={[math]::Round\\($_.Size/1GB,1\\)}},@{n='FreeGB';e={[math]::Round\\($_.FreeSpace/1GB,1\\)}},VolumeName)",
+      "PowerShell(Get-CimInstance Win32_LogicalDisk | Format-Table DeviceID, @{n='SizeGB';e={[math]::Round\\($_.Size/1GB,1\\)}}, @{n='FreeGB';e={[math]::Round\\($_.FreeSpace/1GB,1\\)}}, VolumeName -AutoSize)",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='node.exe' OR Name='uvicorn.exe'\" | Select-Object ProcessId, Name, @{n='Memory_MB';e={[math]::Round\\($_.WorkingSetSize/1MB,0\\)}}, CreationDate, CommandLine | Sort-Object Name, ProcessId | Format-Table -AutoSize -Wrap)",
+      "PowerShell(Get-NetTCPConnection -State Listen -LocalPort 8000,8001,8080,5173,5174,3000,3001 -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, OwningProcess, @{n='ProcessName';e={\\(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue\\).ProcessName}} | Format-Table -AutoSize)",
+      "Read(//c/ProgramData/**)",
+      "Read(//c/Users/Administrator/**)",
+      "Read(//c/etc/**)",
+      "Read(//c/Program Files \\(x86\\)/cloudflared/**)",
+      "Read(//c/Program Files/**)"
     ]
   }
 }
