@@ -623,13 +623,20 @@ def _run_band_per_opt(
         # 5c) Pre-check 2: MJ_REQ_CAP per-WERKS budget.
         opt_need = opt_rows['need_pool'].to_numpy().astype('float64')
 
-        # 5c.5) PAK_SZ rounding moved INTO the per-OPT loop (was Stage D
-        #       finalize). Round the need half-up to a pak multiple; below
-        #       0.5*pak the row is gated to 0. The downstream pool draw
-        #       caps at live_pool, so SHIP may be non-pak-aligned when
-        #       stock is short (intentional: availability beats carton
-        #       alignment). raw_need_for_audit / gated_mask are stashed
-        #       for the per-size remarks block in 5j.
+        # 5c.5) PAK_SZ rounding. Split-basis for TBL (2026-06-26):
+        #       SHIP and HOLD are rounded INDEPENDENTLY to pak multiples,
+        #       each with its own 0.5*pak half-up gate. Ship basis =
+        #       need_ship (OPT_MBQ-derived); Hold basis = need_pool -
+        #       want_ship_pak (= the WH-buffer overhead). If SHIP gates
+        #       to 0, HOLD is forced to 0 (no orphan hold). The downstream
+        #       SHIP-first/HOLD-from-rem logic in 5e enforces:
+        #         - SHIP may be a non-pak last-balance sliver when live
+        #           pool < pak (intentional drain),
+        #         - HOLD is always a full pak EXCEPT when pool remaining
+        #           after SHIP is below one pak (last-sliver loose drain).
+        #       RL/TBC retain the legacy single-pass rounding on opt_need
+        #       (they never produce HOLD and the existing ship-ceiling /
+        #       refund logic at 5g already keeps SHIP pak-aligned).
         if 'PAK_SZ' in opt_rows.columns:
             pak = (
                 opt_rows['PAK_SZ']
@@ -639,12 +646,30 @@ def _run_band_per_opt(
         else:
             pak = np.ones(len(opt_rows), dtype='float64')
         raw_need_for_audit = opt_need.copy()
-        gated_mask = raw_need_for_audit < 0.5 * pak
-        opt_need = np.where(
-            gated_mask,
-            0.0,
-            np.floor((raw_need_for_audit + 0.5 * pak) / pak) * pak,
-        )
+        if ot == 'TBL':
+            ship_basis = opt_rows['need_ship'].to_numpy().astype('float64')
+            want_ship_pak = np.where(
+                ship_basis < 0.5 * pak,
+                0.0,
+                np.floor((ship_basis + 0.5 * pak) / pak) * pak,
+            )
+            hold_basis = np.maximum(opt_need - want_ship_pak, 0.0)
+            want_hold_pak = np.where(
+                (want_ship_pak == 0) | (hold_basis < 0.5 * pak),
+                0.0,
+                np.floor((hold_basis + 0.5 * pak) / pak) * pak,
+            )
+            opt_need = want_ship_pak + want_hold_pak
+            gated_mask = (want_ship_pak == 0) & (raw_need_for_audit > 0)
+        else:
+            want_ship_pak = None
+            want_hold_pak = None
+            gated_mask = raw_need_for_audit < 0.5 * pak
+            opt_need = np.where(
+                gated_mask,
+                0.0,
+                np.floor((raw_need_for_audit + 0.5 * pak) / pak) * pak,
+            )
 
         total_need = float(opt_need.sum())
 
@@ -757,20 +782,57 @@ def _run_band_per_opt(
 
         # 5d) Compute hold draw FIRST (RL/TBC only). Match _run_band step 1b
         #     semantics: hold consumed before pool, by (WERKS, VAR_ART, SZ) key.
+        #     PAK-aware (2026-06-26): when hold_rem >= pak, draw whole paks
+        #     only (floor). When hold_rem < pak, allow loose drain so the
+        #     buffer doesn't strand sub-pak residue forever.
         from_hold = np.zeros(len(opt_rows), dtype='float64')
         if ot in ('RL', 'TBC') and hold_dict:
             for i in range(len(opt_rows)):
+                if opt_need[i] <= 0:
+                    continue
                 hk = (str(werks_v), str(opt_rows.iloc[i]['VAR_ART']),
                       str(opt_rows.iloc[i]['SZ']))
                 hold_rem = float(hold_dict.get(hk, 0.0))
-                take_h = min(opt_need[i], hold_rem)
+                if hold_rem <= 0:
+                    continue
+                pak_i = float(pak[i])
+                if hold_rem >= pak_i:
+                    avail = np.floor(hold_rem / pak_i) * pak_i
+                    take_h = min(opt_need[i], avail)
+                else:
+                    take_h = min(opt_need[i], hold_rem)
                 if take_h > 0:
                     from_hold[i] = take_h
                     hold_dict[hk] = hold_rem - take_h
             opt_need = np.maximum(opt_need - from_hold, 0.0)
 
-        # 5e) Pool draw — take min(remaining_need, live_pool) per size.
-        take_pool = np.minimum(opt_need, live_pool)
+        # 5e) Pool draw.
+        #   - TBL (2026-06-26): SHIP-first / HOLD-from-remaining with pak rules.
+        #     SHIP takes from live_pool. If live_pool < want_ship_pak the
+        #     remainder ships loose (last-balance drain to store). HOLD takes
+        #     from pool_after_ship: full want_hold_pak when it fits, else 0,
+        #     except when pool_after_ship is below one pak in which case
+        #     the sliver drains loose to HOLD. take_pool here = round_ship +
+        #     round_hold so the pool_dict decrement at 5f reflects the
+        #     actual draw (not the inflated pak target).
+        #   - RL/TBC: legacy single-pass clamp; ship-ceiling refund is in 5g.
+        if ot == 'TBL':
+            ship_target = want_ship_pak.astype('float64') if want_ship_pak is not None else np.zeros_like(opt_need)
+            hold_target = want_hold_pak.astype('float64') if want_hold_pak is not None else np.zeros_like(opt_need)
+            round_ship = np.minimum(ship_target, live_pool)
+            pool_after_ship = np.maximum(live_pool - round_ship, 0.0)
+            full_pak_ok = (pool_after_ship >= hold_target) & (hold_target > 0)
+            sliver_loose = (pool_after_ship > 0) & (pool_after_ship < pak) & (hold_target > 0)
+            ship_done_mask = round_ship > 0
+            round_hold = np.where(
+                ~ship_done_mask, 0.0,
+                np.where(full_pak_ok, hold_target,
+                         np.where(sliver_loose, pool_after_ship, 0.0)),
+            )
+            take_pool = round_ship + round_hold
+        else:
+            take_pool = np.minimum(opt_need, live_pool)
+            # round_ship / round_hold computed in 5g (RL/TBC branch).
 
         # 5f) Update live pool_dict by mutating in place (so next OPT sees decrement).
         for i, k in enumerate(opt_pool_keys):
@@ -788,14 +850,12 @@ def _run_band_per_opt(
         )
         alloc_df.loc[opt_idx, 'FNL_Q_REM'] = post_draw_pool
 
-        # 5g) SHIP / HOLD split — mirror _run_band step 6.
+        # 5g) SHIP / HOLD split.
+        #     TBL: round_ship and round_hold already computed in 5e (new
+        #     SHIP-first/HOLD-from-rem logic). Just expose pool_take_total.
+        #     RL/TBC: legacy ship-ceiling + pak-floor + refund path below.
         need_ship_arr = opt_rows['need_ship'].to_numpy().astype('float64')
         if ot == 'TBL':
-            round_ship = np.minimum(take_pool, need_ship_arr)
-            round_hold = np.maximum(take_pool - need_ship_arr, 0.0)
-            # _run_band step 7 gate: no hold if ship demand wasn't met.
-            is_ship_met = take_pool >= need_ship_arr
-            round_hold = np.where(is_ship_met, round_hold, 0.0)
             pool_take_total = round_ship + round_hold
         else:
             # Two constraints on the RL/TBC ship:
@@ -956,9 +1016,55 @@ def _run_band_per_opt(
             # target). The Stage D safety-net at rule_engine_pandas.py:400-464
             # is guarded to skip rows already carrying a PAK_SZ_ marker, so
             # this row will not be re-rounded at finalize.
+            #
+            # TBL (2026-06-26) emits PAK_SZ_SHIP and PAK_SZ_HOLD as separate
+            # markers — SHIP and HOLD are now pak-rounded INDEPENDENTLY (see
+            # 5c.5 / 5e). RL/TBC keep the legacy PAK_SZ_GATE / PAK_SZ_ROUND.
             if pak[i] > 1:
                 raw_i = int(raw_need_for_audit[i])
-                if gated_mask[i] and raw_i > 0:
+                if ot == 'TBL' and want_ship_pak is not None:
+                    ship_basis_i = int(opt_rows.iloc[i]['need_ship'])
+                    ship_target_i = int(want_ship_pak[i])
+                    hold_target_i = int(want_hold_pak[i])
+                    ship_act_i = int(round_ship[i])
+                    hold_act_i = int(round_hold[i])
+                    if ship_basis_i > 0 and ship_target_i == 0:
+                        new_remarks += (
+                            f' PAK_SZ_GATE(ship={ship_basis_i},pak={int(pak[i])});'
+                        )
+                    elif ship_target_i > 0:
+                        if ship_act_i == ship_target_i:
+                            new_remarks += (
+                                f' PAK_SZ_SHIP(from={ship_basis_i},'
+                                f'to={ship_target_i},pak={int(pak[i])});'
+                            )
+                        elif 0 < ship_act_i < ship_target_i:
+                            new_remarks += (
+                                f' PAK_SZ_SHIP(want={ship_target_i},'
+                                f'act={ship_act_i},pak={int(pak[i])},loose);'
+                            )
+                        else:
+                            new_remarks += (
+                                f' PAK_SZ_SHIP(want={ship_target_i},'
+                                f'act={ship_act_i},pak={int(pak[i])},short);'
+                            )
+                    if hold_target_i > 0 or hold_act_i > 0:
+                        if hold_act_i == hold_target_i and hold_target_i > 0:
+                            new_remarks += (
+                                f' PAK_SZ_HOLD(want={hold_target_i},'
+                                f'pak={int(pak[i])});'
+                            )
+                        elif hold_act_i == 0:
+                            new_remarks += (
+                                f' PAK_SZ_HOLD(want={hold_target_i},act=0,'
+                                f'pak={int(pak[i])},gated);'
+                            )
+                        else:
+                            new_remarks += (
+                                f' PAK_SZ_HOLD(want={hold_target_i},'
+                                f'act={hold_act_i},pak={int(pak[i])},loose);'
+                            )
+                elif gated_mask[i] and raw_i > 0:
                     new_remarks += (
                         f' PAK_SZ_GATE(req={raw_i},pak={int(pak[i])});'
                     )
