@@ -129,6 +129,12 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     # _run_majcat_waterfall. Backwards-compatible: missing → None (post-pass
     # SQL gate handles it instead).
     sec_cap_grid_specs = _extras[2] if len(_extras) > 2 else None
+    # _extras[3], _extras[4] (19th, 20th elements) carry the per-OPT_TYPE
+    # dispatch mode for RL and TBC respectively. SCALED = round-then-shave
+    # partial OPT against werks_cap; COMPLETE = all-or-skip. Missing → both
+    # 'COMPLETE' (matches the new default).
+    rl_dispatch_mode  = str(_extras[3]) if len(_extras) > 3 else 'COMPLETE'
+    tbc_dispatch_mode = str(_extras[4]) if len(_extras) > 4 else 'COMPLETE'
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
@@ -202,6 +208,8 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
             opt_types=opt_types,
             tbl_mj_req_cap_pct=tbl_mj_req_cap_pct,
             sec_cap_grid_specs=sec_cap_grid_specs,
+            rl_dispatch_mode=rl_dispatch_mode,
+            tbc_dispatch_mode=tbc_dispatch_mode,
         )
         ship_mc = float(a_out['SHIP_QTY'].fillna(0).sum())
         hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
@@ -512,6 +520,11 @@ def run_listing_and_allocation_pandas(
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only
     use_writer_queue: Optional[bool] = None, # per-run override; None = fall back to .env
     apply_sec_cap_in_normal: bool = True,    # strict per-grid cap on opted-in grids
+    # Per-OPT_TYPE dispatch mode (per-OPT engine only). SCALED = proportional
+    # round-then-shave partial OPT; COMPLETE = all-or-skip, leave werks_cap
+    # for next OPT in band. Defaults match the new run-config defaults.
+    rl_dispatch_mode:  str = 'COMPLETE',
+    tbc_dispatch_mode: str = 'COMPLETE',
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -670,22 +683,41 @@ def run_listing_and_allocation_pandas(
             sec_cap_grid_specs = []
             skipped = []
             for g_name, meta in _all.items():
-                if not meta.get("sec_cap_applicable"):
+                grid_group = str(meta.get("group", "")).strip().lower()
+                is_primary = (grid_group == "primary")
+                # Primary grids (every group='Primary' row in ARS_GRID_BUILDER —
+                # today MJ and MJ_MERGE_RNG_SEG) are hard-capped regardless of
+                # the sec_cap_applicable flag. Secondary grids only participate
+                # when the operator opted them in via Grid Builder.
+                if not is_primary and not meta.get("sec_cap_applicable"):
                     skipped.append(g_name)
                     continue
                 grid_pct = meta.get("sec_cap_pct")
-                cap_pct = float(grid_pct) if grid_pct else float(rne.SEC_CAP_DEFAULT_PCT)
+                if grid_pct is not None:
+                    cap_pct = float(grid_pct)
+                elif is_primary:
+                    # Primary grids anchor to the UI run headroom
+                    # (mj_req_growth_pct). Secondary fallback keeps the legacy
+                    # SEC_CAP_DEFAULT_PCT baseline.
+                    cap_pct = float(mj_req_growth_pct)
+                else:
+                    cap_pct = float(rne.SEC_CAP_DEFAULT_PCT)
                 sec_cap_grid_specs.append((g_name, {
                     "prefix":     meta.get("prefix") or g_name,
                     "extras":     list(meta.get("extras") or []),
                     "cap_factor": cap_pct / 100.0,
                     "cap_pct":    cap_pct,
                     "gh_col":     meta.get("gh_col", ""),
+                    "is_primary": is_primary,
                 }))
+            # Primary first: when one OPT breaches both a Primary and a
+            # Secondary grid, the Primary block is the harder constraint
+            # (no override path) — the operator should see that SKIP_REASON.
+            sec_cap_grid_specs.sort(key=lambda kv: 0 if kv[1].get("is_primary") else 1)
             logger.info(
-                f"[C-pd] per-OPT sec-cap specs built — applicable grids: "
-                f"{[(g, s['cap_pct']) for g, s in sec_cap_grid_specs]} | "
-                f"skipped (sec_cap_applicable=0): {skipped}"
+                f"[C-pd] per-OPT sec-cap specs built — grids: "
+                f"{[(g, s['cap_pct'], 'P' if s.get('is_primary') else 'S') for g, s in sec_cap_grid_specs]} | "
+                f"skipped (non-Primary with sec_cap_applicable=0): {skipped}"
             )
         except Exception as _e:
             logger.warning(
@@ -737,6 +769,11 @@ def run_listing_and_allocation_pandas(
             # 18th element — per-OPT sec-cap grid specs. None disables
             # in-band sec-cap (post-pass SQL gate handles it instead).
             sec_cap_grid_specs,
+            # 19th, 20th elements — per-OPT_TYPE dispatch mode (RL, TBC).
+            # SCALED = proportional round-then-shave partial OPT;
+            # COMPLETE = all-or-skip with budget pass-through.
+            str(rl_dispatch_mode),
+            str(tbc_dispatch_mode),
         )
         for mc in alloc_groups
     ]
@@ -1527,6 +1564,14 @@ def _run_majcat_waterfall(
     # include_primary=True). Built once at the wrapper level via DB conn.
     # None or empty disables per-OPT sec-cap (legacy post-pass still runs).
     sec_cap_grid_specs: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
+    # Per-OPT engine only: dispatch mode for RL and TBC when an OPT's total
+    # need exceeds its werks_cap.
+    #   SCALED   — proportional round-then-shave, partial OPT ships.
+    #   COMPLETE — all-or-skip; budget passes to the next OPT in band.
+    # Defaults match the new run-config defaults; sequential mode ignores
+    # these (uses SQL-side floor logic).
+    rl_dispatch_mode: str = 'COMPLETE',
+    tbc_dispatch_mode: str = 'COMPLETE',
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run RL → TBC → TBL waterfall in pandas for one MAJ_CAT slice.
@@ -1722,7 +1767,9 @@ def _run_majcat_waterfall(
                                   min_size_count=min_size_count,
                                   mj_req_rem_dict=mj_req_rem_dict,
                                   tbl_mj_req_cap_pct=tbl_mj_req_cap_pct,
-                                  sec_cap_state=sec_cap_state)
+                                  sec_cap_state=sec_cap_state,
+                                  rl_dispatch_mode=rl_dispatch_mode,
+                                  tbc_dispatch_mode=tbc_dispatch_mode)
             else:
                 _run_band(alloc_df, pool_dict, ot, int(r),
                           mbq_budget=mbq_budget,

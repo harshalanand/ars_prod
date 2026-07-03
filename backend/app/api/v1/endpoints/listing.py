@@ -122,6 +122,18 @@ class GenerateRequest(BaseModel):
     rl_mbq_cap_pct:  float = 100.0
     tbc_mbq_cap_pct: float = 100.0
     tbl_mbq_cap_pct: float = 100.0
+    # Per-OPT_TYPE dispatch mode when an OPT's total_need exceeds its
+    # per-WERKS MBQ budget (the live `werks_cap` from _live_mbq_budget).
+    #   SCALED   — proportional round-then-shave; OPT ships partial up to
+    #              werks_cap. Recovers the units that the legacy floor-per-
+    #              size truncation silently lost when scale was just under 1.
+    #   COMPLETE — all-or-skip. Skip the entire OPT, leave werks_cap intact
+    #              for the next OPT in the band. Cleaner rod-completion at
+    #              the cost of possibly stranding budget when every OPT in
+    #              band exceeds the remaining cap.
+    # Per-OPT engine only; sequential mode ignores these.
+    rl_dispatch_mode:  str = "COMPLETE"
+    tbc_dispatch_mode: str = "COMPLETE"
     # MJ_MBQ growth headroom (Allocation Gate).  100 = strict (waterfall stops
     # at the MAJ_CAT target, current default).  >100 scales MJ_MBQ to a
     # SIBLING column MJ_MBQ_REV — the original MJ_MBQ is preserved untouched —
@@ -332,6 +344,8 @@ _SETTING_DEFAULTS = {
     "rl_mbq_cap_pct": "100.0",
     "tbc_mbq_cap_pct": "100.0",
     "tbl_mbq_cap_pct": "100.0",
+    "rl_dispatch_mode":  "COMPLETE",
+    "tbc_dispatch_mode": "COMPLETE",
     "mj_req_growth_pct": "100.0",
     "allow_multi_parked": "false",
 }
@@ -676,6 +690,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "rl_mbq_cap_pct":  str(req.rl_mbq_cap_pct),
                 "tbc_mbq_cap_pct": str(req.tbc_mbq_cap_pct),
                 "tbl_mbq_cap_pct": str(req.tbl_mbq_cap_pct),
+                "rl_dispatch_mode":  str(req.rl_dispatch_mode),
+                "tbc_dispatch_mode": str(req.tbc_dispatch_mode),
                 "mj_req_growth_pct": str(req.mj_req_growth_pct),
                 "allow_multi_parked": str(req.allow_multi_parked).lower(),
             })
@@ -714,6 +730,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             ("ALLOCATION", "rl_mbq_cap_pct",        str(req.rl_mbq_cap_pct)),
             ("ALLOCATION", "tbc_mbq_cap_pct",       str(req.tbc_mbq_cap_pct)),
             ("ALLOCATION", "tbl_mbq_cap_pct",       str(req.tbl_mbq_cap_pct)),
+            ("ALLOCATION", "rl_dispatch_mode",      str(req.rl_dispatch_mode)),
+            ("ALLOCATION", "tbc_dispatch_mode",     str(req.tbc_dispatch_mode)),
             ("ALLOCATION", "mj_req_growth_pct",     str(req.mj_req_growth_pct)),
             ("ALLOCATION", "opt_types",             json.dumps(req.opt_types)),
             # SEC_CAP
@@ -1366,13 +1384,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         # Order: MIX first (catch bad options early) → RL → TBC → TBL.
         #
         #   MIX (a): low stock + no MSA + no RL_HOLD_QTY (nothing to send)
-        #   MIX (b): poor color fill (VAR ratio < threshold)
+        #   MIX (b): poor color fill — gated by size_threshold (Size Cov %),
+        #            NOT stock_threshold_pct. This is a size-coverage test.
         #   RL:  (adequate stock OR RL_HOLD_QTY > 0) AND MSA_FNL_Q > 0
         #        — RL requires fresh MSA supply to top up against; an open TBL
         #          hold alone is no longer enough to land in RL.
         #   TBC: low stock, MSA or NL hold available
         #   TBL: zero stock, MSA or NL hold available
-        threshold = req.stock_threshold_pct
+        threshold = req.stock_threshold_pct         # STK vs ACS_D gate (MIX(a)/RL/TBC)
+        size_threshold = req.size_threshold         # VAR-ratio gate (MIX(b))
         default_acs = float(req.default_acs_d or 18)
         def _classify_opt_type(label="OPT_TYPE"):
             _run(conn, f"""
@@ -1385,7 +1405,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         THEN 'MIX'
                     -- MIX (b): poor color fill {f'OR count < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else '(MinSz off)'}
                     WHEN ISNULL([VAR_COUNT], 0) > 0
-                     AND (CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT] < {threshold}
+                     AND (CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT] < {size_threshold}
                           {f'OR ISNULL([VAR_FNL_COUNT], 0) < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else ''})
                         THEN 'MIX'
                     -- RL: (adequate stock OR prior-run NL hold) AND fresh MSA supply available
@@ -2693,6 +2713,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 opt_types=req.opt_types or ["RL", "TBC", "TBL"],
                 use_writer_queue=req.use_writer_queue,
                 apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
+                rl_dispatch_mode=req.rl_dispatch_mode,
+                tbc_dispatch_mode=req.tbc_dispatch_mode,
             )
         else:  # "sequential" — single-thread reference path
             from app.services.rule_engine_new import run_listing_and_allocation

@@ -2,6 +2,8 @@
 
 This directory is the single source of truth for ARS listing/allocation rules, invariants, and gotchas. The `ars_flow` subagent reads the relevant file(s) on every invocation and appends new rules as the user states them.
 
+> **Team-facing reviewer's doc:** [docs/RULE_MASTER.md](../../../docs/RULE_MASTER.md) — consolidated rule reference with decision tables and a per-stage reviewer's checklist. Built from the per-area files below; keep them in sync (the consolidated doc is read by humans, the per-area files are read by ars_flow).
+
 ## Files
 
 | Area | File | Owns |
@@ -17,7 +19,7 @@ This directory is the single source of truth for ARS listing/allocation rules, i
 
 1. OPT uniqueness
 2. Growth at MJ+grid only
-3. MBQ sparseness (0 = no constraint)
+3. ~~MBQ sparseness (0 = no constraint)~~ **Superseded 2026-06-30 (per-OPT mode)** — empty MBQ_ORIG (0 or NULL) and empty grid value ('NA'/NULL) now hard-block; see `merge_rules.md`
 4. Sec-cap grid extras must propagate
 5. ACS_D ≠ daily sale
 6. RNG_SEG = MRP tier

@@ -813,33 +813,41 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
 
 
 def _stage_b_fill_cont(conn, alloc_table, cont_table):
-    if _exists(conn, cont_table):
-        _run(conn, f"""
-            UPDATE A SET A.CONT = TRY_CAST(M.CONT AS FLOAT)
-            FROM [{alloc_table}] A
-            INNER JOIN [{cont_table}] M WITH (NOLOCK)
-                ON LTRIM(RTRIM(CAST(M.ST_CD   AS NVARCHAR(50))))  = LTRIM(RTRIM(CAST(A.WERKS AS NVARCHAR(50))))
-               AND LTRIM(RTRIM(CAST(M.MAJ_CAT AS NVARCHAR(200)))) = A.MAJ_CAT
-               AND LTRIM(RTRIM(CAST(M.SZ      AS NVARCHAR(200)))) = LTRIM(RTRIM(CAST(A.SZ AS NVARCHAR(200))))
-        """)
-        _run(conn, f"""
-            UPDATE A SET A.CONT = TRY_CAST(M.CONT AS FLOAT)
-            FROM [{alloc_table}] A
-            INNER JOIN [{cont_table}] M WITH (NOLOCK)
-                ON LTRIM(RTRIM(CAST(M.ST_CD AS NVARCHAR(50)))) = 'CO'
-               AND LTRIM(RTRIM(CAST(M.MAJ_CAT AS NVARCHAR(200)))) = A.MAJ_CAT
-               AND LTRIM(RTRIM(CAST(M.SZ AS NVARCHAR(200)))) = LTRIM(RTRIM(CAST(A.SZ AS NVARCHAR(200))))
-            WHERE A.CONT IS NULL
-        """)
-    # Uniform fallback
+    # 2-step CONT ladder (uniform 1/N fallback removed 2026-07-02):
+    #   Step 1 — Site row (per WERKS+MAJ_CAT+SZ).
+    #   Step 2 — 'CO' default, but ONLY for (WERKS, MAJ_CAT) groups whose site
+    #            curve is entirely missing/zero. If Step 1 wrote any non-zero
+    #            CONT for the group, Step 2 skips it. Sizes that don't match
+    #            anywhere keep CONT=0 → SZ_MBQ=0 → no allocation for that size.
+    if not _exists(conn, cont_table):
+        return
+
+    # Step 1 — Site row
     _run(conn, f"""
-        ;WITH SzCount AS (
-            SELECT WERKS, MAJ_CAT, COUNT(DISTINCT SZ) AS sz_cnt
-            FROM [{alloc_table}] GROUP BY WERKS, MAJ_CAT
-        )
-        UPDATE A SET A.CONT = ROUND(1.0 / NULLIF(C.sz_cnt, 0), 4)
+        UPDATE A SET A.CONT = TRY_CAST(M.CONT AS FLOAT)
         FROM [{alloc_table}] A
-        INNER JOIN SzCount C ON A.WERKS = C.WERKS AND A.MAJ_CAT = C.MAJ_CAT
+        INNER JOIN [{cont_table}] M WITH (NOLOCK)
+            ON LTRIM(RTRIM(CAST(M.ST_CD   AS NVARCHAR(50))))  = LTRIM(RTRIM(CAST(A.WERKS AS NVARCHAR(50))))
+           AND LTRIM(RTRIM(CAST(M.MAJ_CAT AS NVARCHAR(200)))) = A.MAJ_CAT
+           AND LTRIM(RTRIM(CAST(M.SZ      AS NVARCHAR(200)))) = LTRIM(RTRIM(CAST(A.SZ AS NVARCHAR(200))))
+    """)
+
+    # Step 2 — 'CO' default, group-gated by "site curve entirely empty".
+    _run(conn, f"""
+        ;WITH EmptyGroups AS (
+            SELECT WERKS, MAJ_CAT
+            FROM [{alloc_table}]
+            GROUP BY WERKS, MAJ_CAT
+            HAVING MAX(ISNULL(CONT, 0)) = 0
+        )
+        UPDATE A SET A.CONT = TRY_CAST(M.CONT AS FLOAT)
+        FROM [{alloc_table}] A
+        INNER JOIN EmptyGroups E
+            ON A.WERKS = E.WERKS AND A.MAJ_CAT = E.MAJ_CAT
+        INNER JOIN [{cont_table}] M WITH (NOLOCK)
+            ON LTRIM(RTRIM(CAST(M.ST_CD AS NVARCHAR(50))))    = 'CO'
+           AND LTRIM(RTRIM(CAST(M.MAJ_CAT AS NVARCHAR(200)))) = A.MAJ_CAT
+           AND LTRIM(RTRIM(CAST(M.SZ AS NVARCHAR(200))))      = LTRIM(RTRIM(CAST(A.SZ AS NVARCHAR(200))))
         WHERE ISNULL(A.CONT, 0) = 0
     """)
 
@@ -2914,14 +2922,31 @@ def _stage_d_reflect(conn, working_table, alloc_table):
     #   - Round-first so round-1 OPTs precede round-2 OPTs regardless of store.
     #   - ST_RANK within a round so ST_RANK=1 store is fully listed first.
     #   - OPT_PRIORITY_RANK as final tie-break within a store.
+
+    # Ensure FROM_HOLD_QTY exists on working_table so the OPT-grain rollup
+    # below can stamp how much of ALLOC_QTY came from the warehouse hold
+    # pool (vs MSA pool). MSA-pool portion = ALLOC_QTY - FROM_HOLD_QTY.
+    try:
+        _run(conn, f"""
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns
+                WHERE object_id = OBJECT_ID('{working_table}')
+                  AND name = 'FROM_HOLD_QTY'
+            )
+            ALTER TABLE [{working_table}] ADD [FROM_HOLD_QTY] FLOAT NULL
+        """)
+    except Exception as e:
+        logger.warning(f"[D] FROM_HOLD_QTY column add on {working_table} failed: {e}")
+
     try:
         _run(conn, f"""
             ;WITH Agg AS (
                 -- Aggregate alloc_table to OPT grain. MIN(ALLOC_ROUND) gives
                 -- the earliest round this OPT was allocated (0 when no alloc).
                 SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                       SUM(ISNULL(SHIP_QTY, 0))  AS ship_q,
-                       SUM(ISNULL(HOLD_QTY, 0))  AS hold_q,
+                       SUM(ISNULL(SHIP_QTY, 0))      AS ship_q,
+                       SUM(ISNULL(HOLD_QTY, 0))      AS hold_q,
+                       SUM(ISNULL(FROM_HOLD_QTY, 0)) AS from_hold_q,
                        COUNT(*)                   AS sz_rows,
                        SUM(CASE WHEN ISNULL(SHIP_QTY,0) + ISNULL(HOLD_QTY,0) > 0
                                 THEN 1 ELSE 0 END) AS filled_rows,
@@ -2943,7 +2968,8 @@ def _stage_d_reflect(conn, working_table, alloc_table):
                                ISNULL(W.ST_RANK, 999999),
                                ISNULL(W.OPT_PRIORITY_RANK, 999999)
                        ) AS seq,
-                       A.ship_q, A.hold_q, A.sz_rows, A.filled_rows
+                       A.ship_q, A.hold_q, A.from_hold_q,
+                       A.sz_rows, A.filled_rows
                 FROM [{working_table}] W
                 LEFT JOIN Agg A
                     ON  A.WERKS           = W.WERKS
@@ -2953,9 +2979,10 @@ def _stage_d_reflect(conn, working_table, alloc_table):
                 WHERE W.LISTED_FLAG = 1
             )
             UPDATE W SET
-                W.ALLOC_SEQ    = S.seq,
-                W.ALLOC_QTY    = ISNULL(S.ship_q, 0),
-                W.HOLD_QTY     = ISNULL(S.hold_q, 0),
+                W.ALLOC_SEQ     = S.seq,
+                W.ALLOC_QTY     = ISNULL(S.ship_q, 0),
+                W.HOLD_QTY      = ISNULL(S.hold_q, 0),
+                W.FROM_HOLD_QTY = ISNULL(S.from_hold_q, 0),
                 W.ALLOC_STATUS = CASE
                     WHEN ISNULL(S.ship_q,0) + ISNULL(S.hold_q,0) = 0
                          THEN 'NOT_ALLOCATED'
@@ -3063,12 +3090,13 @@ def _stage_d_reflect(conn, working_table, alloc_table):
     # demand-side issues (OPT_REQ=0 → store didn't need stock) from supply-side
     # issues (had demand, RDC pool was empty → MSA exhausted at OPT-grain).
     #
-    # SEC_CAP-aware: when an OPT was blocked by the sec-cap pre-gate (per-OPT
-    # OR post-pass), the alloc rows already carry SKIP_REASON='SEC_CAP_PRE_*'
-    # and a plain-English remark. In that case use the sec-cap reason on
-    # the working row (instead of appending the misleading NO_POOL_MSA tag)
-    # and replace the working-row remark with the clean sec-cap narrative so
-    # both alloc-grain and OPT-grain views agree.
+    # SEC_CAP / PRIMARY_CAP-aware: when an OPT was blocked by the sec-cap
+    # pre-gate (per-OPT OR post-pass), the alloc rows already carry
+    # SKIP_REASON='SEC_CAP_PRE_*' (Secondary) or 'PRIMARY_CAP_PRE_*' (Primary)
+    # and a plain-English remark. In that case use the cap reason on the
+    # working row (instead of appending the misleading NO_POOL_MSA tag) and
+    # replace the working-row remark with the clean cap narrative so both
+    # alloc-grain and OPT-grain views agree.
     _run(conn, f"""
         ;WITH sec_blocked AS (
             SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, ISNULL(CLR,'') AS CLR_J,
@@ -3076,6 +3104,7 @@ def _stage_d_reflect(conn, working_table, alloc_table):
                    MAX(ALLOC_REMARKS)  AS sec_remark
             FROM [{alloc_table}]
             WHERE SKIP_REASON LIKE 'SEC_CAP_PRE_%'
+               OR SKIP_REASON LIKE 'PRIMARY_CAP_PRE_%'
             GROUP BY WERKS, MAJ_CAT, GEN_ART_NUMBER, ISNULL(CLR,'')
         )
         UPDATE W SET
@@ -3373,12 +3402,19 @@ def _apply_sec_grid_cap_pre_gate(
     in full to the store or doesn't ship at all; no half-trimmed rows.
 
     Algorithm:
-      1. For each opted-in grid (ARS_GRID_BUILDER.sec_cap_applicable=1; MJ
-         participates when include_primary=True), precompute per-grain budget
+      1. For each participating grid, precompute per-grain budget
             budget = max(0, MBQ_ORIG_grain × cap_pct − STK_TTL_grain)
          using {prefix}_MBQ_ORIG and {prefix}_STK_TTL on the working table.
-         Per-grid cap_pct comes from ARS_GRID_BUILDER.sec_cap_pct (defaults
-         to max(SEC_CAP_DEFAULT_PCT, growth_pct) when NULL).
+         Two participation rules:
+           • Primary grids (ARS_GRID_BUILDER.grid_group='Primary' — today
+             MJ and MJ_MERGE_RNG_SEG): always in when include_primary=True.
+             Hard-blocked on breach (no override). cap_pct =
+             ARS_GRID_BUILDER.sec_cap_pct if set, else growth_pct (UI run
+             headroom — keeps per-OPT and post-pass layers in parity).
+           • Secondary grids (group='Secondary' AND sec_cap_applicable=1):
+             in. cap_pct = ARS_GRID_BUILDER.sec_cap_pct if set, else
+             max(SEC_CAP_DEFAULT_PCT, growth_pct). The override path
+             applies (rule_engine_per_opt._evaluate_sec_cap_per_opt).
       2. Aggregate alloc_table to OPT grain — one row per
          (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE) carrying
          SUM(SHIP_QTY) and every participating grid's extra column.
@@ -3416,21 +3452,15 @@ def _apply_sec_grid_cap_pre_gate(
     skipped_not_applicable: List[str] = []
     for g_name, meta in all_grids.items():
         grid_group = str(meta.get("group", "")).strip().lower()
-        # When include_primary=True, MJ (Primary) participates alongside the
-        # Secondary grids — the gate enforces the cap on the MAJ_CAT total
-        # too (Decision: cap on all grids when sec-cap toggle is on).  The
-        # MJ grid's hierarchy is just [MAJ_CAT] so it falls through the
-        # "no extras" guard below; we handle it as a special case.
-        is_primary_mj = (g_name.upper() == "MJ")
-        if grid_group != "secondary" and not (include_primary and is_primary_mj):
+        # When include_primary=True, every grid with group='Primary' in
+        # ARS_GRID_BUILDER participates (today: MJ and MJ_MERGE_RNG_SEG).
+        # Primary grids are hard-capped — no override path — and ignore
+        # the per-grid sec_cap_applicable flag. Secondary grids opt in
+        # via sec_cap_applicable and retain the override path.
+        is_primary = (grid_group == "primary")
+        if grid_group != "secondary" and not (include_primary and is_primary):
             continue
-        # Per-grid opt-in flag from ARS_GRID_BUILDER.sec_cap_applicable.
-        # Grids with the flag OFF are NOT iterated by the cap. Backfill on
-        # first deploy sets the flag OFF for every existing row, so this
-        # path becomes the default until operators opt in grid-by-grid.
-        # Exception: MJ always participates when include_primary=True
-        # (it is hardcoded sec_cap_applicable=False in _discover_all_active_grids).
-        if not meta.get("sec_cap_applicable") and not (include_primary and is_primary_mj):
+        if not meta.get("sec_cap_applicable") and not (include_primary and is_primary):
             skipped_not_applicable.append(g_name)
             continue
         mbq = meta.get("mbq_col", "") or ""
@@ -3440,18 +3470,29 @@ def _apply_sec_grid_cap_pre_gate(
             continue
         if mbq.upper() not in work_cols:
             continue
-        # MJ has no extras — its grain is just (WERKS, MAJ_CAT).  Other
+        # MJ has no extras — its grain is just (WERKS, MAJ_CAT). Other
         # grids need at least one extra column (FAB, MICRO_MVGR, …) to be
-        # meaningful — without extras the cap collapses to MJ.
-        if not is_primary_mj and not extras:
+        # meaningful — without extras the cap collapses to MJ. Primary
+        # grids are admitted even with no extras (MJ itself qualifies).
+        if not is_primary and not extras:
             continue
         grid_keys = ["WERKS", "MAJ_CAT"] + extras
         if not all(k.upper() in work_cols  for k in grid_keys): continue
         if not all(k.upper() in alloc_cols for k in grid_keys): continue
-        # Per-grid cap %: meta["sec_cap_pct"] if set, else fall back to the
-        # global cap_pct (max(SEC_CAP_DEFAULT_PCT, growth_pct)).
+        # Per-grid cap %:
+        #   - sec_cap_pct set in Grid Builder wins for any grid.
+        #   - Primary grids with NULL sec_cap_pct anchor to growth_pct (UI
+        #     run headroom) — matches the per-OPT layer's A1 fallback in
+        #     rule_engine_pandas.py.
+        #   - Secondary grids with NULL sec_cap_pct fall back to the legacy
+        #     max(SEC_CAP_DEFAULT_PCT, growth_pct) baseline.
         grid_pct = meta.get("sec_cap_pct")
-        grid_factor = (float(grid_pct) / 100.0) if grid_pct else cap_factor
+        if grid_pct is not None:
+            grid_factor = float(grid_pct) / 100.0
+        elif is_primary:
+            grid_factor = float(growth_pct or 100.0) / 100.0
+        else:
+            grid_factor = cap_factor
         # Anchor the cap to {prefix}_MBQ_ORIG (pre-growth) when present, so
         # the gate respects "growth replaces 130%, doesn't stack".  Engine
         # falls back to live MBQ on legacy deployments without ORIG.
@@ -3470,10 +3511,10 @@ def _apply_sec_grid_cap_pre_gate(
             "stk_ttl":    stk_col_eff,       # grain-level current stock (subtracted from cap)
             "prefix":     prefix,
             "extras":     extras,
-            "is_primary": is_primary_mj,
+            "is_primary": is_primary,
             "gh_col":     gh_col if gh_col.upper() in work_cols else None,
             "cap_factor": grid_factor,
-            "cap_pct":    float(grid_pct) if grid_pct else cap_pct,
+            "cap_pct":    grid_factor * 100.0,
         }))
 
     audit: Dict[str, Any] = {
@@ -3711,27 +3752,34 @@ def _apply_sec_grid_cap_pre_gate(
         """)
         _run(conn, """
             ALTER TABLE #sec_cap_pre_decisions ADD
-                blocking_grid NVARCHAR(100) NULL,
-                running_val   FLOAT         NULL,
-                intended_val  FLOAT         NULL,
-                budget_val    FLOAT         NULL,
-                cap_pct_val   FLOAT         NULL,
-                stk_val       FLOAT         NULL,
-                mbq_orig_val  FLOAT         NULL,
-                ceiling_val   FLOAT         NULL
+                blocking_grid  NVARCHAR(100) NULL,
+                running_val    FLOAT         NULL,
+                intended_val   FLOAT         NULL,
+                budget_val     FLOAT         NULL,
+                cap_pct_val    FLOAT         NULL,
+                stk_val        FLOAT         NULL,
+                mbq_orig_val   FLOAT         NULL,
+                ceiling_val    FLOAT         NULL,
+                is_primary_val BIT           NOT NULL DEFAULT 0
         """)
 
         insert_sql = text("""
             INSERT INTO #sec_cap_pre_decisions
                 (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE,
                  blocking_grid, running_val, intended_val, budget_val,
-                 cap_pct_val, stk_val, mbq_orig_val, ceiling_val)
+                 cap_pct_val, stk_val, mbq_orig_val, ceiling_val,
+                 is_primary_val)
             VALUES (:w, :m, :g, :c, :o, :grid, :run, :int_v, :bud, :cap,
-                    :stk, :mbq, :ceil)
+                    :stk, :mbq, :ceil, :is_p)
         """)
         params: List[Dict[str, Any]] = []
         # Resolve per-grid cap_pct so REMARKS can say e.g. "cap=130%".
         cap_pct_by_grid = audit.get("cap_pct_by_grid", {}) or {}
+        # Resolve per-grid is_primary so SKIP_REASON / remarks can be tagged
+        # PRIMARY_CAP_PRE_<grid> / "SKIPPED by primary-cap" for Primary grids
+        # (today MJ and MJ_MERGE_RNG_SEG) and SEC_CAP_PRE_<grid> /
+        # "SKIPPED by sec-cap" for Secondary grids.
+        is_primary_by_grid = {n: bool(m.get("is_primary")) for n, m in sec_grids}
         for (w, mj, gn, cv, ov, grid, rv, iv, bv, sv, mv, ce) in blocked:
             params.append({
                 "w": w, "m": mj, "g": int(gn) if gn is not None else None,
@@ -3740,6 +3788,7 @@ def _apply_sec_grid_cap_pre_gate(
                 "run": float(rv), "int_v": float(iv), "bud": float(bv),
                 "cap": float(cap_pct_by_grid.get(grid, cap_pct)),
                 "stk": float(sv), "mbq": float(mv), "ceil": float(ce),
+                "is_p": 1 if is_primary_by_grid.get(grid) else 0,
             })
         if params:
             conn.execute(insert_sql, params)
@@ -3765,14 +3814,18 @@ def _apply_sec_grid_cap_pre_gate(
                     A.ALLOC_STATUS = 'SKIPPED',
                     A.SKIP_REASON  = CASE
                         WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
-                             THEN 'SEC_CAP_PRE_' + B.blocking_grid
+                             THEN CASE WHEN B.is_primary_val = 1
+                                       THEN 'PRIMARY_CAP_PRE_' ELSE 'SEC_CAP_PRE_' END
+                                  + B.blocking_grid
                                   + '(cap=' + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%)'
                         ELSE A.SKIP_REASON END,
                     A.ALLOC_REMARKS = CASE
                         WHEN ISNULL(A.SHIP_QTY, 0) > 0 THEN
                             CASE
                               WHEN B.budget_val <= 0 THEN
-                                  'SKIPPED by sec-cap | grid=' + B.blocking_grid
+                                  'SKIPPED by '
+                                + CASE WHEN B.is_primary_val = 1 THEN 'primary-cap' ELSE 'sec-cap' END
+                                + ' | grid=' + B.blocking_grid
                                 + ' | grain already at stock ' + CAST(CAST(B.stk_val AS INT) AS NVARCHAR(20))
                                 + ' which meets/exceeds ceiling '
                                 + CAST(CAST(B.ceiling_val AS INT) AS NVARCHAR(20))
@@ -3782,7 +3835,9 @@ def _apply_sec_grid_cap_pre_gate(
                                 + ' | waterfall_intended=' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20))
                                 + ' -> final_ship=0'
                               ELSE
-                                  'SKIPPED by sec-cap | grid=' + B.blocking_grid
+                                  'SKIPPED by '
+                                + CASE WHEN B.is_primary_val = 1 THEN 'primary-cap' ELSE 'sec-cap' END
+                                + ' | grid=' + B.blocking_grid
                                 + ' | stock ' + CAST(CAST(B.stk_val AS INT) AS NVARCHAR(20))
                                 + ' + already_shipped_this_run ' + CAST(CAST(B.running_val AS INT) AS NVARCHAR(20))
                                 + ' + this_OPT ' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20))

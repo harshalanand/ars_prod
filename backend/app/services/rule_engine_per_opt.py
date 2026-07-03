@@ -105,13 +105,25 @@ def _mark_opt_skip_sec_cap(
     intended_ship: float,
     budget: float,
     configured: bool = True,
+    is_primary: bool = False,
+    hard_block_reasons: Optional[List[str]] = None,
+    grain: Optional[tuple] = None,
 ) -> None:
-    """Sec-cap block (per-OPT, pre-pool-take). REPLACES ALLOC_REMARKS (the
-    waterfall never stamped a 'B[…] ship=N' prefix for this OPT) and sets
-    SKIP_REASON to the canonical SEC_CAP_PRE_<grid>(cap=N%) form so dashboards
-    keep working.
+    """Sec-cap / primary-cap block (per-OPT, pre-pool-take). REPLACES
+    ALLOC_REMARKS (the waterfall never stamped a 'B[…] ship=N' prefix for
+    this OPT) and sets SKIP_REASON to the canonical
+        - PRIMARY_CAP_PRE_<grid>(cap=N%)  when the offending grid is Primary
+        - SEC_CAP_PRE_<grid>(cap=N%)      when it is Secondary
+        - <reason1>,<reason2>             when hard_block_reasons is set
+    so dashboards can tell the two apart at a glance.
 
-    Three remark branches:
+    Hard-block branch (new, 2026-06-30): when `hard_block_reasons` is set,
+    SKIP_REASON is the comma-joined tag list (e.g.
+    "SEC_CAP_GRID_NULL[MJ_M_YARN_02],SEC_CAP_MBQ_ZERO[MJ_M_YARN_02]") and
+    ALLOC_REMARKS narrates which of the three empty-data conditions tripped.
+    See docs/superpowers/specs/2026-06-30-sec-cap-empty-grid-hard-block-design.md.
+
+    Three remark branches (when not hard-block):
       configured=False  → grain has no MBQ_ORIG configured (NULL); strict
                           mode blocks any dispatch into this grain.
       budget <= 0       → grain already at/over the cap ceiling; no room.
@@ -123,11 +135,29 @@ def _mark_opt_skip_sec_cap(
     """
     if len(idx) == 0:
         return
+    if hard_block_reasons:
+        skip_reason = ",".join(hard_block_reasons)
+        grain_str = f"({','.join(str(g) for g in grain)})" if grain else "(?)"
+        remark = (
+            f"SKIPPED by sec-cap hard-block | grid={grid_name}"
+            f" | reasons={skip_reason}"
+            f" | grain={grain_str}"
+            f" | intended_ship={_safe_int(intended_ship)} -> final_ship=0"
+            f" | pool_untouched=true"
+        )
+        alloc_df.loc[idx, 'ALLOC_STATUS'] = 'SKIPPED'
+        if 'SKIP_REASON' in alloc_df.columns:
+            cur = alloc_df.loc[idx, 'SKIP_REASON'].fillna('').astype(str)
+            alloc_df.loc[idx, 'SKIP_REASON'] = cur.where(cur != '', skip_reason)
+        alloc_df.loc[idx, 'ALLOC_REMARKS'] = remark
+        return
     cap_str = f"{_safe_int(cap_pct)}%"
-    skip_reason = f"SEC_CAP_PRE_{grid_name}(cap={cap_str})"
+    prefix = "PRIMARY_CAP_PRE_" if is_primary else "SEC_CAP_PRE_"
+    label  = "primary-cap" if is_primary else "sec-cap"
+    skip_reason = f"{prefix}{grid_name}(cap={cap_str})"
     if not configured:
         remark = (
-            f"SKIPPED by sec-cap | grid={grid_name}"
+            f"SKIPPED by {label} | grid={grid_name}"
             f" | MBQ_ORIG IS NULL at this grain (no cap configured)"
             f" | strict mode = block any dispatch"
             f" | intended_ship={_safe_int(intended_ship)} -> final_ship=0"
@@ -135,7 +165,7 @@ def _mark_opt_skip_sec_cap(
         )
     elif budget <= 0:
         remark = (
-            f"SKIPPED by sec-cap | grid={grid_name}"
+            f"SKIPPED by {label} | grid={grid_name}"
             f" | grain already at stock {_safe_int(stk_val)} which meets/exceeds ceiling "
             f"{_safe_int(ceiling_val)}"
             f" (= MBQ_ORIG {_safe_int(mbq_orig_val)} x {cap_str})"
@@ -146,7 +176,7 @@ def _mark_opt_skip_sec_cap(
     else:
         total_after = _safe_int(stk_val + run_before + intended_ship)
         remark = (
-            f"SKIPPED by sec-cap | grid={grid_name}"
+            f"SKIPPED by {label} | grid={grid_name}"
             f" | stock {_safe_int(stk_val)} + already_shipped_this_run {_safe_int(run_before)}"
             f" + this_OPT {_safe_int(intended_ship)} = {total_after}"
             f" would exceed ceiling {_safe_int(ceiling_val)}"
@@ -173,8 +203,8 @@ def _stamp_sec_cap_override(
 ) -> None:
     """APPEND a SEC_CAP_OVERRIDE narrative to ALLOC_REMARKS — the natural
     waterfall trace stays intact, the override info is added so reviewers
-    can see this OPT shipped INTO a capped grain because MAJ_CAT-level
-    demand was still meaningful (MJ_REQ_REM >= ½ × OPT_MBQ).
+    can see this OPT shipped INTO a capped grain because the grid still
+    had enough headroom to cover ≥ ½ × OPT_MBQ (Rule B).
 
     Status / SKIP_REASON are NOT touched — the OPT remains ALLOCATED /
     PARTIAL based on what actually shipped."""
@@ -182,7 +212,7 @@ def _stamp_sec_cap_override(
         return
     grid       = str(info.get("grid", ""))
     cap_pct_i  = _safe_int(info.get("cap_pct", 0))
-    mj_rem_i   = _safe_int(info.get("mj_req_rem", 0))
+    headroom_i = _safe_int(info.get("headroom", 0))
     opt_mbq_i  = _safe_int(info.get("opt_mbq", 0))
     threshold  = _safe_int(info.get("threshold", 0))
     ceiling_i  = _safe_int(info.get("ceiling", 0))
@@ -191,7 +221,7 @@ def _stamp_sec_cap_override(
     intended_i = _safe_int(info.get("intended_ship", 0))
     note = (
         f" SEC_CAP_OVERRIDE(grid={grid}, cap={cap_pct_i}%"
-        f", reason=MJ_REQ_REM({mj_rem_i}) >= 0.5xOPT_MBQ({opt_mbq_i})={threshold}"
+        f", reason=headroom({headroom_i}) >= 0.5xOPT_MBQ({opt_mbq_i})={threshold}"
         f", grain_stk={stk_i}, grain_ceiling={ceiling_i}"
         f", running_before={runb_i}, this_OPT_intended={intended_i}"
         f", would_have_blocked=true);"
@@ -227,8 +257,11 @@ def build_sec_cap_state(
 
     Distinction between NULL and explicit-zero MBQ matters: a NULL MBQ_ORIG
     is a data gap and is treated by the gate as a strict block (the
-    `configured` flag goes False); an explicit MBQ_ORIG=0 is invariant 3
-    ("no constraint at this grain") and the gate skips it.
+    `configured` flag goes False); an explicit MBQ_ORIG=0 was invariant 3
+    ("no constraint at this grain"). As of 2026-06-30 (per design spec
+    docs/superpowers/specs/2026-06-30-sec-cap-empty-grid-hard-block-design.md)
+    both NULL and explicit-zero MBQ — plus a NULL/'NA' grid-extra value — are
+    hard-blocked through the `hard_block` dict.
     """
     state: Dict[str, Any] = {
         "grids":      grid_specs,
@@ -237,6 +270,7 @@ def build_sec_cap_state(
         "stks":       {},
         "mbqs":       {},
         "configured": {},
+        "hard_block": {},
         "running":    {g_name: defaultdict(float) for g_name, _ in grid_specs},
         "gh_applies": {},
     }
@@ -283,6 +317,11 @@ def build_sec_cap_state(
         smap: Dict[tuple, float] = {}
         mmap: Dict[tuple, float] = {}
         fmap: Dict[tuple, bool]  = {}
+        hbmap: Dict[tuple, List[str]] = {}
+        # Positions 0/1 in grain are WERKS/MAJ_CAT (always real). Positions
+        # 2+ are extras (M_YARN_02, M_DESIGN_02, …) — those are the ones we
+        # check for empty/'NA'/null.
+        extras_start = 2
         for grain_idx, row in agg.iterrows():
             grain = grain_idx if isinstance(grain_idx, tuple) else (grain_idx,)
             grain = tuple(str(g) if g is not None else '' for g in grain)
@@ -303,11 +342,29 @@ def build_sec_cap_state(
             smap[grain] = stk_val
             mmap[grain] = mbq_val
             fmap[grain] = not mbq_null
+            # Hard-block reasons (per design spec 2026-06-30):
+            #   1) grid extra value is empty / 'NA' / 'NONE'
+            #   2) explicit MBQ_ORIG = 0
+            #   3) MBQ_ORIG IS NULL
+            # All three are independent and may co-occur on the same grain.
+            reasons: List[str] = []
+            if extras:
+                for ev in grain[extras_start:]:
+                    if ev is None or str(ev).upper().strip() in ('', 'NA', 'NONE', 'NAN'):
+                        reasons.append(f"SEC_CAP_GRID_NULL[{g_name}]")
+                        break  # one tag per grid is enough
+            if not mbq_null and mbq_val == 0.0:
+                reasons.append(f"SEC_CAP_MBQ_ZERO[{g_name}]")
+            elif mbq_null:
+                reasons.append(f"SEC_CAP_NULL[{g_name}]")
+            if reasons:
+                hbmap[grain] = reasons
         state["budgets"][g_name]    = bmap
         state["ceilings"][g_name]   = cmap
         state["stks"][g_name]       = smap
         state["mbqs"][g_name]       = mmap
         state["configured"][g_name] = fmap
+        state["hard_block"][g_name] = hbmap
 
         # GH_<HC> applicability map per MAJ_CAT
         if gh_col:
@@ -345,14 +402,25 @@ def _evaluate_sec_cap_per_opt(
             participating: list of (grid_name, grain_tuple) for grids the OPT
                 touches — used to advance `running` after admission.
 
-    Override rule (rule #3 from operator):
-        On breach, check MJ_REQ_REM(werks) >= mbq_gate_factor × OPT_MBQ.
-        Same formula as the TBL_MJ_REQ_GATE Primary check, so any OPT that
-        passed Primary admission is automatically eligible.
-        - True  → action="override" (admit the OPT into the capped grain).
-        - False → action="block"    (today's strict skip).
-        NULL-MBQ grains (`configured=False`) cannot be overridden — strict
-        block remains for data-gap detection.
+    Override rule:
+        Two cases based on the grid's group in ARS_GRID_BUILDER:
+        - Primary grids (group='Primary' — today MJ and MJ_MERGE_RNG_SEG):
+          hard-block on any breach. No override path. The "primary never
+          excess" invariant is enforced literally. breach_info carries
+          primary_block=True so SKIP_REASON formatters can tell this
+          apart from a Secondary block.
+        - Secondary grids (Rule B): on breach, check
+            headroom = max(0, budget − running_before)
+            headroom >= mbq_gate_factor × OPT_MBQ
+          i.e. admit when the grid still has enough room to cover at
+          least ½ × OPT_MBQ. This lets healthy grains breathe a little
+          past the strict cap while overstocked grains (budget=0,
+          headroom=0) still hard-block.
+            True  → action="override" (admit into the capped grain).
+            False → action="block"    (strict skip).
+          NULL-MBQ grains (`configured=False`) stay strict-block for
+          data-gap detection. MJ_REQ_REM is no longer consulted here —
+          MAJ_CAT total enforcement lives on the MJ Primary grid.
     """
     participating: List[Tuple[str, tuple]] = []
     if intended_ship <= 0 or not sec_cap_state.get("grids"):
@@ -365,6 +433,31 @@ def _evaluate_sec_cap_per_opt(
             continue
         extras = list(g_meta.get("extras") or [])
         grain = tuple([str(werks_v), maj_cat] + [str(row0.get(e, "")) for e in extras])
+        # Hard-block (per design spec 2026-06-30): empty grid value, MBQ_ORIG
+        # explicit 0, or MBQ_ORIG NULL — any of the three triggers a strict
+        # block with a canonical SKIP_REASON tag list. This runs BEFORE the
+        # legacy `configured/ceiling<=0` skip so the new tags take precedence
+        # over the old SEC_CAP_PRE_<grid>(cap=N%) label.
+        hb_reasons = sec_cap_state.get("hard_block", {}).get(g_name, {}).get(grain)
+        if hb_reasons:
+            participating.append((g_name, grain))
+            return {
+                "action":             "block",
+                "grid":               g_name,
+                "grain":              grain,
+                "budget":             sec_cap_state["budgets"].get(g_name, {}).get(grain, 0.0),
+                "ceiling":            sec_cap_state["ceilings"].get(g_name, {}).get(grain, 0.0),
+                "stk":                sec_cap_state["stks"].get(g_name, {}).get(grain, 0.0),
+                "mbq":                sec_cap_state["mbqs"].get(g_name, {}).get(grain, 0.0),
+                "cap_pct":            float(g_meta.get("cap_pct") or 100.0),
+                "run_before":         sec_cap_state["running"][g_name].get(grain, 0.0),
+                "configured":         sec_cap_state.get("configured", {}).get(g_name, {}).get(grain, True),
+                "mj_req_rem":         float((mj_req_rem_dict or {}).get(str(werks_v), 0.0)),
+                "opt_mbq":            0.0,
+                "threshold":          0.0,
+                "intended_ship":      intended_ship,
+                "hard_block_reasons": list(hb_reasons),
+            }, participating
         # `configured` is False ONLY when MBQ_ORIG was NULL at this grain.
         # Default True so legacy callers that don't populate the map still
         # behave as before. The flag lets us distinguish NULL (strict block)
@@ -378,12 +471,38 @@ def _evaluate_sec_cap_per_opt(
         participating.append((g_name, grain))
         breach_now = (not configured) or (run_before + intended_ship > budget)
         if breach_now:
-            # Override decision (rule #3): admit despite the grain breach
-            # when MJ_REQ_REM(werks) >= factor × OPT_MBQ. Same formula as
-            # the TBL Primary check, so a TBL OPT that already passed
-            # admission will always pass this too. For RL/TBC there is no
-            # standalone Primary gate today — they get gated here only.
-            # NULL-MBQ grains stay strict-block (data gap signal).
+            # Primary grids (ARS_GRID_BUILDER.grid_group='Primary' — today
+            # MJ and MJ_MERGE_RNG_SEG) are hard-blocked on breach. They
+            # never enter the MJ_REQ_REM override path: "primary never
+            # excess" is enforced literally. Secondary grids retain the
+            # override below.
+            if bool(g_meta.get("is_primary", False)):
+                return {
+                    "action":        "block",
+                    "grid":          g_name,
+                    "grain":         grain,
+                    "budget":        budget,
+                    "ceiling":       ceiling if configured else 0.0,
+                    "stk":           sec_cap_state["stks"].get(g_name, {}).get(grain, 0.0),
+                    "mbq":           sec_cap_state["mbqs"].get(g_name, {}).get(grain, 0.0),
+                    "cap_pct":       float(g_meta.get("cap_pct") or 100.0),
+                    "run_before":    run_before,
+                    "configured":    configured,
+                    "mj_req_rem":    float((mj_req_rem_dict or {}).get(str(werks_v), 0.0)),
+                    "opt_mbq":       0.0,
+                    "threshold":     0.0,
+                    "intended_ship": intended_ship,
+                    "primary_block": True,
+                }, participating
+            # Override decision (Secondary only — Rule B): admit despite
+            # the grain breach when the grid's remaining headroom can
+            # cover at least factor × OPT_MBQ. Headroom is the unused
+            # share of the cap budget (ceiling − stock − already_shipped).
+            # This replaces the older MJ_REQ_REM-based override — the
+            # MAJ_CAT total cap is now enforced at the MJ Primary grid
+            # (hard-block), so Secondary doesn't need to lean on
+            # MJ_REQ_REM. NULL-MBQ grains stay strict-block (data gap
+            # signal).
             try:
                 opt_mbq_val = (
                     float(opt_rows['OPT_MBQ'].iloc[0])
@@ -395,11 +514,12 @@ def _evaluate_sec_cap_per_opt(
             if math.isnan(opt_mbq_val):
                 opt_mbq_val = 0.0
             mj_rem_val = float((mj_req_rem_dict or {}).get(str(werks_v), 0.0))
+            headroom   = max(0.0, budget - run_before)
             threshold  = mbq_gate_factor * opt_mbq_val
             override_eligible = (
                 configured                       # never override a NULL-MBQ block
                 and opt_mbq_val > 0              # zero-MBQ OPTs cannot override
-                and mj_rem_val >= threshold      # Primary check formula
+                and headroom >= threshold        # grid headroom covers ≥ ½ × OPT_MBQ
             )
             action = "override" if override_eligible else "block"
             return {
@@ -414,6 +534,7 @@ def _evaluate_sec_cap_per_opt(
                 "run_before":    run_before,
                 "configured":    configured,
                 "mj_req_rem":    mj_rem_val,
+                "headroom":      headroom,
                 "opt_mbq":       opt_mbq_val,
                 "threshold":     threshold,
                 "intended_ship": intended_ship,
@@ -434,6 +555,8 @@ def _run_band_per_opt(
     tbl_mj_req_cap_pct: float = 100.0,
     mbq_gate_factor: float = 0.5,
     sec_cap_state: Optional[Dict[str, Any]] = None,
+    rl_dispatch_mode: str = 'COMPLETE',
+    tbc_dispatch_mode: str = 'COMPLETE',
 ) -> None:
     """
     Per-OPT replacement for rule_engine_pandas._run_band.
@@ -705,8 +828,15 @@ def _run_band_per_opt(
                         continue
                 # PASS: opt_need is NOT clamped to mj_rem — full need ships.
             elif mbq_budget is not None:
-                # RL / TBC: proportional-scale against mbq_budget, which still
-                # carries the rl/tbc_mbq_cap_pct headroom from _live_mbq_budget.
+                # RL / TBC: cap against mbq_budget, which still carries the
+                # rl/tbc_mbq_cap_pct headroom from _live_mbq_budget.
+                # Dispatch mode (per OPT_TYPE, from ARS run config):
+                #   SCALED   — proportional round-then-shave; OPT ships
+                #              partial, up to werks_cap. Recovers the units
+                #              lost to the legacy floor-per-size truncation.
+                #   COMPLETE — all-or-skip. Ship full need if budget covers,
+                #              else skip whole OPT and leave the budget for
+                #              the next OPT in the band.
                 werks_cap = float(mbq_budget.get(str(werks_v), 0.0))
                 if total_need > werks_cap:
                     if werks_cap <= 0:
@@ -718,15 +848,63 @@ def _run_band_per_opt(
                         )
                         skipped_cap += 1
                         continue
+                    mode = (rl_dispatch_mode if ot == 'RL'
+                            else tbc_dispatch_mode).upper()
+                    if mode == 'COMPLETE':
+                        # All-or-skip: leave werks_cap intact for the next OPT.
+                        _mark_opt_skip(
+                            alloc_df, opt_idx,
+                            f'MBQ_CAP_{ot}',
+                            f'complete-mode:need={int(total_need)},'
+                            f'cap_rem={int(werks_cap)}',
+                            live_pool=live_pool,
+                        )
+                        skipped_cap += 1
+                        continue
+                    # SCALED: round-then-shave. np.round (nearest int) instead
+                    # of floor recovers the per-size "1-less-than-SZ_MBQ" loss
+                    # that floor produces when scale is just under 1.0; the
+                    # shave pass below guarantees sum(opt_need) <= werks_cap
+                    # so the MBQ budget invariant still holds.
                     scale = werks_cap / total_need
-                    # PAK-snap the budget-scaled need: MBQ_CAP is a HARD ceiling,
-                    # so the scale-down MUST land on a pak floor. A bare
-                    # np.floor(need * scale) produces non-pak partials (e.g.
-                    # floor(96 * 0.71875) = 69, which is not a multiple of
-                    # pak=48) and Step 5g then ships that broken qty. Sizes
-                    # whose scaled need falls below one pak get gated to 0 —
-                    # that size silently skips this round.
-                    opt_need = np.floor(opt_need * scale / pak) * pak
+                    ideal = opt_need * scale
+                    opt_need = np.round(ideal / pak) * pak
+                    over_units = float(opt_need.sum()) - werks_cap
+                    if over_units > 1e-9:
+                        # Shave whole paks from rows that were rounded UP
+                        # (frac >= 0.5); pick the row with frac closest to
+                        # 0.5 first — that round-up was the weakest signal,
+                        # so reverting it costs the least vs. ideal.
+                        frac = (ideal / np.where(pak > 0, pak, 1.0))
+                        frac = frac - np.floor(frac)
+                        iter_safety = int(len(opt_need)) * 2 + 4
+                        while over_units > 1e-9 and iter_safety > 0:
+                            iter_safety -= 1
+                            score = np.where(
+                                (frac >= 0.5) & (opt_need > 0),
+                                frac, np.inf,
+                            )
+                            idx_s = int(np.argmin(score))
+                            if not np.isfinite(score[idx_s]):
+                                # No rounded-up rows left — fall back to
+                                # shaving the largest positive row.
+                                positive = np.where(opt_need > 0)[0]
+                                if len(positive) == 0:
+                                    break
+                                idx_s = int(positive[np.argmax(opt_need[positive])])
+                            opt_need[idx_s] = max(0.0, opt_need[idx_s] - pak[idx_s])
+                            frac[idx_s] = -np.inf  # don't reselect as "rounded up"
+                            over_units = float(opt_need.sum()) - werks_cap
+                    # Audit stamp on every row of this OPT so reviewers see
+                    # why each size landed where it did (was previously silent
+                    # for PAK_SZ=1 rows). Reads alongside the existing
+                    # B[ot.rN.rkK] trace.
+                    note = (
+                        f' MBQ_CAP_SCALE({ot},need={int(total_need)},'
+                        f'cap={int(werks_cap)},scale={scale:.3f});'
+                    )
+                    prev_r = alloc_df.loc[opt_idx, 'ALLOC_REMARKS'].fillna('').astype(str)
+                    alloc_df.loc[opt_idx, 'ALLOC_REMARKS'] = prev_r + note
 
         # NOTE: by design, TBL is NOT clamped to remaining MJ_REQ_REM after
         # admission. If the admission test at 5b2 lets the OPT in, it ships
@@ -747,7 +925,14 @@ def _run_band_per_opt(
         #       formula as the TBL Primary check.
         sec_cap_override_info: Optional[Dict[str, Any]] = None
         if sec_cap_state is not None and sec_cap_state.get("grids"):
-            intended_ship_sc = float(opt_need.sum())
+            # Cap validations are MBQ-only. For TBL, opt_need = want_ship_pak
+            # + want_hold_pak; the want_hold_pak portion is the SZ_MBQ_WH
+            # excess (RDC-hold buffer on first dispatch) and must NOT enter
+            # cap arithmetic. RL/TBC opt_need is already MBQ-only.
+            if ot == 'TBL' and want_ship_pak is not None:
+                intended_ship_sc = float(want_ship_pak.sum())
+            else:
+                intended_ship_sc = float(opt_need.sum())
             breach, participating_grids = _evaluate_sec_cap_per_opt(
                 sec_cap_state, opt_rows, werks_v, intended_ship_sc,
                 mj_req_rem_dict=mj_req_rem_dict,
@@ -765,6 +950,9 @@ def _run_band_per_opt(
                     intended_ship=intended_ship_sc,
                     budget=breach["budget"],
                     configured=breach.get("configured", True),
+                    is_primary=bool(breach.get("primary_block", False)),
+                    hard_block_reasons=breach.get("hard_block_reasons"),
+                    grain=breach.get("grain"),
                 )
                 skipped_cap += 1
                 continue  # do NOT touch pool_dict / hold_dict — units stay live
@@ -897,16 +1085,19 @@ def _run_band_per_opt(
             round_hold = np.zeros_like(take_pool)
             pool_take_total = take_pool  # FROM_HOLD_QTY accounted separately below
 
-        # 5g.1) Advance sec-cap `running` totals by what ACTUALLY shipped
-        #       (round_ship + from_hold for RL/TBC, round_ship + round_hold
-        #       for TBL — i.e. all units that moved into stores under this
-        #       OPT). HOLD units sit in the warehouse so opinions differ on
-        #       whether they should count against the cap; we count them
-        #       because they reduce future dispatch headroom in the grain.
+        # 5g.1) Advance sec-cap `running` totals by what ACTUALLY shipped to
+        #       MBQ (display). Cap arithmetic is MBQ-only — the SZ_MBQ_WH
+        #       excess (TBL round_hold = RDC-hold buffer on first dispatch)
+        #       must NOT enter the running counter, otherwise later OPTs at
+        #       the same grain see an inflated `already_shipped_this_run`
+        #       and get skipped against a ceiling they shouldn't be measured
+        #       against. RL/TBC round_ship already includes the from_hold
+        #       contribution (raw_ship = min(take_pool + from_hold,
+        #       ship_ceiling) in 5g), so it stands on its own; TBL round_ship
+        #       is the want_ship_pak draw, also MBQ-only. round_hold (TBL
+        #       only) is intentionally dropped.
         if sec_cap_state is not None and participating_grids:
-            actual_moved = float(round_ship.sum()) + (
-                float(round_hold.sum()) if ot == 'TBL' else float(from_hold.sum())
-            )
+            actual_moved = float(round_ship.sum())
             if actual_moved > 0:
                 for g_name, grain in participating_grids:
                     sec_cap_state["running"][g_name][grain] = (
