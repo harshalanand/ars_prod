@@ -18,7 +18,7 @@
  *     documented in backend/app/docs/processes/fallback_archived.md §4.
  *
  * How to run:
- *   sqlcmd -S HOPC560 -d Rep_data -E -i 2026_05_17_drop_fb_columns.sql
+ *   sqlcmd -S HOPC866 -d Rep_data -E -i 2026_05_17_drop_fb_columns.sql
  *   (or open in SSMS and execute against Rep_data)
  *
  * Verify after:

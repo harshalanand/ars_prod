@@ -88,7 +88,7 @@ sequenceDiagram
   participant API as listing.py
   participant LST as listing_allocator
   participant RUL as rule_engine_pandas
-  participant DB as SQL Server (HOPC560)
+  participant DB as SQL Server (HOPC866)
 
   UI->>API: POST /listing/run<br/>(cap%, growth%, mode=pandas)
   API->>DB: read MSA + Cont_presets + MBQ

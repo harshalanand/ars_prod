@@ -1,6 +1,6 @@
 ---
 name: rule_ars
-description: ARS rule-engine specialist for V2 Retail Auto Replenishment. Use for reviewing, debugging, explaining, or editing the rule engine (rule_engine_new.py, rule_engine_pandas.py, rule_engine_parallel_sql.py, rule_engine_parallel_python.py), listing_allocator.py, parked_history.py, and related allocation logic. Also use to validate rule outputs against the local HOPC560 SQL Server using the project's SQLAlchemy engine. Invoke proactively when the user mentions rule engine, allocation, OPT_TYPE, MSA, sec-cap, MBQ, growth %, or fallback logic.
+description: ARS rule-engine specialist for V2 Retail Auto Replenishment. Use for reviewing, debugging, explaining, or editing the rule engine (rule_engine_new.py, rule_engine_pandas.py, rule_engine_parallel_sql.py, rule_engine_parallel_python.py), listing_allocator.py, parked_history.py, and related allocation logic. Also use to validate rule outputs against the local HOPC866 SQL Server using the project's SQLAlchemy engine. Invoke proactively when the user mentions rule engine, allocation, OPT_TYPE, MSA, sec-cap, MBQ, growth %, or fallback logic.
 model: inherit
 ---
 

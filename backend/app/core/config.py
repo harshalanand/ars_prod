@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     # System Database (RBAC, RLS, Audit, Table Metadata)
-    DB_SERVER: str = "HOPC560"
+    DB_SERVER: str = "HOPC866"
     DB_NAME: str = "Claude"
     DB_USERNAME: str = "sa"
     DB_PASSWORD: str = "vrl@55555"           # Override via .env in production

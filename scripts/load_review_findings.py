@@ -12,7 +12,7 @@ import pyodbc
 from datetime import date, datetime
 
 CONN_STR = (
-    "DRIVER={ODBC Driver 18 for SQL Server};SERVER=hopc560;DATABASE=Rep_data;"
+    "DRIVER={ODBC Driver 18 for SQL Server};SERVER=hopc866;DATABASE=Rep_data;"
     "UID=sa;PWD=vrl@55555;TrustServerCertificate=yes;Encrypt=no"
 )
 ACTOR = "santosh"

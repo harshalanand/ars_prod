@@ -216,7 +216,7 @@ def build() -> None:
     add_heading(doc, "Listing + Allocation — Developer Process Reference", level=1)
     add_para(
         doc,
-        f"Generated {date.today().isoformat()}  •  DB: HOPC560 / Rep_Data  •  "
+        f"Generated {date.today().isoformat()}  •  DB: HOPC866 / Rep_Data  •  "
         f"Audience: backend developers",
         italic=True, color=C_MUTED, size=9,
     )

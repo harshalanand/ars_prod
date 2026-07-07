@@ -4,7 +4,7 @@
 
 **Code:** `backend/app/api/v1/endpoints/listing.py`, `_generate_listing_impl` (line 506), parts spanning lines ~700–2042.
 
-**Carried worked example** (a real `ARS_LISTING` row from local HOPC560):
+**Carried worked example** (a real `ARS_LISTING` row from local HOPC866):
 
 | Field | Value |
 |---|---|

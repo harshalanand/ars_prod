@@ -67,7 +67,7 @@ Run the schema script on your SQL Server:
 
 ```sql
 -- Open SQL Server Management Studio
--- Connect to HOPC560
+-- Connect to HOPC866
 -- Execute: scripts/001_create_schema.sql
 ```
 

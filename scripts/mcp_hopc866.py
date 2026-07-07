@@ -1,5 +1,5 @@
 """
-mcp_hopc560.py — Minimal stdio MCP server for HOPC560 / rep_data SQL Server.
+mcp_hopc866.py — Minimal stdio MCP server for HOPC866 / rep_data SQL Server.
 
 Exposes one tool:
     sql_query(sql, db?)  — run any SELECT against rep_data (or another DB on
@@ -9,22 +9,22 @@ Transport: stdio JSON-RPC 2.0  (Claude Desktop / VSCode MCP)
 
 Connection: uses ODBC Driver 17 for SQL Server.
   • By default: Windows Authentication (Trusted_Connection=yes)
-  • Override with env vars: HOPC560_USER and HOPC560_PASS for SQL auth
+  • Override with env vars: HOPC866_USER and HOPC866_PASS for SQL auth
 
 Add to Claude Desktop config  (%APPDATA%\\Claude\\claude_desktop_config.json):
 {
   "mcpServers": {
-    "hopc560": {
+    "hopc866": {
       "command": "E:\\\\ARS\\\\backend\\\\venv\\\\Scripts\\\\python.exe",
-      "args":    ["E:\\\\ARS\\\\scripts\\\\mcp_hopc560.py"],
+      "args":    ["E:\\\\ARS\\\\scripts\\\\mcp_hopc866.py"],
       "env":     {}
     }
   }
 }
 
 For SQL auth add to "env":
-  "HOPC560_USER": "your_login",
-  "HOPC560_PASS": "your_password"
+  "HOPC866_USER": "your_login",
+  "HOPC866_PASS": "your_password"
 """
 from __future__ import annotations
 
@@ -37,10 +37,10 @@ from typing import Any, Dict, List, Optional
 import pyodbc
 
 # ── Connection ───────────────────────────────────────────────────────────────
-SERVER   = os.getenv("HOPC560_SERVER", "HOPC560")
-DEFAULT_DB = os.getenv("HOPC560_DB",  "rep_data")
-USER     = os.getenv("HOPC560_USER", "")
-PASS     = os.getenv("HOPC560_PASS", "")
+SERVER   = os.getenv("HOPC866_SERVER", "HOPC866")
+DEFAULT_DB = os.getenv("HOPC866_DB",  "rep_data")
+USER     = os.getenv("HOPC866_USER", "")
+PASS     = os.getenv("HOPC866_PASS", "")
 DRIVER   = "ODBC Driver 17 for SQL Server"
 
 
@@ -99,7 +99,7 @@ def _run_query(sql: str, db: str = DEFAULT_DB, max_rows: int = 200) -> str:
 TOOL_DEF = {
     "name": "sql_query",
     "description": (
-        "Run a SQL SELECT query against HOPC560 / rep_data (ARS tables: "
+        "Run a SQL SELECT query against HOPC866 / rep_data (ARS tables: "
         "ARS_LISTING_WORKING, ARS_ALLOC_WORKING, ARS_MSA_TOTAL, etc.). "
         "Returns a text table of results."
     ),
@@ -112,7 +112,7 @@ TOOL_DEF = {
             },
             "db": {
                 "type": "string",
-                "description": f"Database name on HOPC560 (default: {DEFAULT_DB})."
+                "description": f"Database name on HOPC866 (default: {DEFAULT_DB})."
             },
         },
         "required": ["sql"],
@@ -122,7 +122,7 @@ TOOL_DEF = {
 CAPABILITIES = {
     "protocolVersion": "2024-11-05",
     "capabilities": {"tools": {}},
-    "serverInfo": {"name": "hopc560-mcp", "version": "1.0.0"},
+    "serverInfo": {"name": "hopc866-mcp", "version": "1.0.0"},
 }
 
 
