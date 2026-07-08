@@ -201,27 +201,27 @@ def _stamp_sec_cap_override(
     idx: np.ndarray,
     info: Dict[str, Any],
 ) -> None:
-    """APPEND a SEC_CAP_OVERRIDE narrative to ALLOC_REMARKS — the natural
-    waterfall trace stays intact, the override info is added so reviewers
-    can see this OPT shipped INTO a capped grain because the grid still
-    had enough headroom to cover ≥ ½ × OPT_MBQ (Rule B).
+    """APPEND a SEC_CAP_OVERSHOOT narrative to ALLOC_REMARKS — the
+    natural waterfall trace stays intact, the admit info is added so
+    reviewers can see this OPT shipped INTO a capped grain because the
+    breach was <= 0.5 × intended_ship (unified overshoot rule,
+    2026-07-04). Applies to both Primary and Secondary grids.
 
     Status / SKIP_REASON are NOT touched — the OPT remains ALLOCATED /
     PARTIAL based on what actually shipped."""
     if len(idx) == 0:
         return
-    grid       = str(info.get("grid", ""))
-    cap_pct_i  = _safe_int(info.get("cap_pct", 0))
-    headroom_i = _safe_int(info.get("headroom", 0))
-    opt_mbq_i  = _safe_int(info.get("opt_mbq", 0))
-    threshold  = _safe_int(info.get("threshold", 0))
-    ceiling_i  = _safe_int(info.get("ceiling", 0))
-    stk_i      = _safe_int(info.get("stk", 0))
-    runb_i     = _safe_int(info.get("run_before", 0))
-    intended_i = _safe_int(info.get("intended_ship", 0))
+    grid        = str(info.get("grid", ""))
+    cap_pct_i   = _safe_int(info.get("cap_pct", 0))
+    threshold_i = _safe_int(info.get("threshold", 0))
+    ceiling_i   = _safe_int(info.get("ceiling", 0))
+    stk_i       = _safe_int(info.get("stk", 0))
+    runb_i      = _safe_int(info.get("run_before", 0))
+    intended_i  = _safe_int(info.get("intended_ship", 0))
+    overshoot_i = _safe_int(info.get("overshoot", 0))
     note = (
-        f" SEC_CAP_OVERRIDE(grid={grid}, cap={cap_pct_i}%"
-        f", reason=headroom({headroom_i}) >= 0.5xOPT_MBQ({opt_mbq_i})={threshold}"
+        f" SEC_CAP_OVERSHOOT(grid={grid}, cap={cap_pct_i}%"
+        f", reason=overshoot({overshoot_i}) <= 0.5xintended({intended_i})={threshold_i}"
         f", grain_stk={stk_i}, grain_ceiling={ceiling_i}"
         f", running_before={runb_i}, this_OPT_intended={intended_i}"
         f", would_have_blocked=true);"
@@ -402,25 +402,20 @@ def _evaluate_sec_cap_per_opt(
             participating: list of (grid_name, grain_tuple) for grids the OPT
                 touches — used to advance `running` after admission.
 
-    Override rule:
-        Two cases based on the grid's group in ARS_GRID_BUILDER:
-        - Primary grids (group='Primary' — today MJ and MJ_MERGE_RNG_SEG):
-          hard-block on any breach. No override path. The "primary never
-          excess" invariant is enforced literally. breach_info carries
-          primary_block=True so SKIP_REASON formatters can tell this
-          apart from a Secondary block.
-        - Secondary grids (Rule B): on breach, check
-            headroom = max(0, budget − running_before)
-            headroom >= mbq_gate_factor × OPT_MBQ
-          i.e. admit when the grid still has enough room to cover at
-          least ½ × OPT_MBQ. This lets healthy grains breathe a little
-          past the strict cap while overstocked grains (budget=0,
-          headroom=0) still hard-block.
-            True  → action="override" (admit into the capped grain).
-            False → action="block"    (strict skip).
-          NULL-MBQ grains (`configured=False`) stay strict-block for
-          data-gap detection. MJ_REQ_REM is no longer consulted here —
-          MAJ_CAT total enforcement lives on the MJ Primary grid.
+    Override rule (unified 2026-07-04 across Primary and Secondary grids):
+        On breach (`run_before + intended_ship > budget`) compute
+            overshoot = run_before + intended_ship − budget
+        Admit when
+            configured  AND  overshoot > 0  AND  overshoot <= 0.5 × intended_ship
+        i.e. one boundary OPT per grain per band may breach by up to
+        ½ × its own intended ship. After admission the 5g.1 `running`
+        advance pushes the grain past budget, so the next OPT's
+        overshoot inevitably exceeds ½ × its intended and hard-blocks.
+        NULL-MBQ grains (`configured=False`) stay strict-block for
+        data-gap detection. Primary grids (group='Primary' — today MJ
+        and MJ_MERGE_RNG_SEG) use the same rule as Secondary; the only
+        difference is the SKIP_REASON label carries `primary_block=True`
+        when the block path is taken (kept for reporting continuity).
     """
     participating: List[Tuple[str, tuple]] = []
     if intended_ship <= 0 or not sec_cap_state.get("grids"):
@@ -472,13 +467,27 @@ def _evaluate_sec_cap_per_opt(
         breach_now = (not configured) or (run_before + intended_ship > budget)
         if breach_now:
             # Primary grids (ARS_GRID_BUILDER.grid_group='Primary' — today
-            # MJ and MJ_MERGE_RNG_SEG) are hard-blocked on breach. They
-            # never enter the MJ_REQ_REM override path: "primary never
-            # excess" is enforced literally. Secondary grids retain the
-            # override below.
+            # MJ and MJ_MERGE_RNG_SEG) hard-block on breach EXCEPT for the
+            # 2026-07-04 overshoot allowance: when the excess is small
+            # relative to the boundary OPT (overshoot <= 0.5 × intended),
+            # admit the OPT via action="override". The 5g.1 running
+            # advance then pushes the grain past budget, so the next OPT
+            # in this grain naturally fails the same 0.5 × intended check
+            # and hard-blocks. Bounded to one OPT per grain per band.
+            # NULL-MBQ grains (configured=False) stay strict-block for
+            # data-gap detection. Secondary grids continue to use the
+            # headroom-based override path below.
             if bool(g_meta.get("is_primary", False)):
-                return {
-                    "action":        "block",
+                overshoot = float(run_before + intended_ship - budget)
+                primary_threshold = 0.5 * intended_ship
+                overshoot_admit_ok = (
+                    configured
+                    and overshoot > 0
+                    and overshoot <= primary_threshold
+                )
+                action = "override" if overshoot_admit_ok else "block"
+                info = {
+                    "action":        action,
                     "grid":          g_name,
                     "grain":         grain,
                     "budget":        budget,
@@ -490,39 +499,29 @@ def _evaluate_sec_cap_per_opt(
                     "configured":    configured,
                     "mj_req_rem":    float((mj_req_rem_dict or {}).get(str(werks_v), 0.0)),
                     "opt_mbq":       0.0,
-                    "threshold":     0.0,
+                    "threshold":     primary_threshold,
                     "intended_ship": intended_ship,
-                    "primary_block": True,
-                }, participating
-            # Override decision (Secondary only — Rule B): admit despite
-            # the grain breach when the grid's remaining headroom can
-            # cover at least factor × OPT_MBQ. Headroom is the unused
-            # share of the cap budget (ceiling − stock − already_shipped).
-            # This replaces the older MJ_REQ_REM-based override — the
-            # MAJ_CAT total cap is now enforced at the MJ Primary grid
-            # (hard-block), so Secondary doesn't need to lean on
-            # MJ_REQ_REM. NULL-MBQ grains stay strict-block (data gap
-            # signal).
-            try:
-                opt_mbq_val = (
-                    float(opt_rows['OPT_MBQ'].iloc[0])
-                    if 'OPT_MBQ' in opt_rows.columns and len(opt_rows) > 0
-                    else 0.0
-                )
-            except Exception:
-                opt_mbq_val = 0.0
-            if math.isnan(opt_mbq_val):
-                opt_mbq_val = 0.0
-            mj_rem_val = float((mj_req_rem_dict or {}).get(str(werks_v), 0.0))
-            headroom   = max(0.0, budget - run_before)
-            threshold  = mbq_gate_factor * opt_mbq_val
+                    "overshoot":     overshoot,
+                }
+                if action == "block":
+                    info["primary_block"] = True
+                else:
+                    info["overshoot_admit"] = True
+                return info, participating
+            # Override decision (Secondary) — unified overshoot rule
+            # (2026-07-04): admit when breach <= 0.5 × intended_ship.
+            # Same shape as sec-cap Primary and primary MBQ_CAP so cap
+            # semantics are consistent across all gates and OPT_TYPEs.
+            # NULL-MBQ grains stay strict-block for data-gap detection.
+            overshoot = float(run_before + intended_ship - budget)
+            threshold = 0.5 * intended_ship
             override_eligible = (
                 configured                       # never override a NULL-MBQ block
-                and opt_mbq_val > 0              # zero-MBQ OPTs cannot override
-                and headroom >= threshold        # grid headroom covers ≥ ½ × OPT_MBQ
+                and overshoot > 0
+                and overshoot <= threshold
             )
             action = "override" if override_eligible else "block"
-            return {
+            info = {
                 "action":        action,
                 "grid":          g_name,
                 "grain":         grain,
@@ -533,12 +532,15 @@ def _evaluate_sec_cap_per_opt(
                 "cap_pct":       float(g_meta.get("cap_pct") or 130.0),
                 "run_before":    run_before,
                 "configured":    configured,
-                "mj_req_rem":    mj_rem_val,
-                "headroom":      headroom,
-                "opt_mbq":       opt_mbq_val,
+                "mj_req_rem":    float((mj_req_rem_dict or {}).get(str(werks_v), 0.0)),
+                "opt_mbq":       0.0,
                 "threshold":     threshold,
                 "intended_ship": intended_ship,
-            }, participating
+                "overshoot":     overshoot,
+            }
+            if action == "override":
+                info["overshoot_admit"] = True
+            return info, participating
     return None, participating
 
 
@@ -799,34 +801,55 @@ def _run_band_per_opt(
         scale = 1.0
         if total_need > 0:
             if ot == 'TBL':
-                # TBL admission: pass iff MJ_REQ_REM(WERKS) >= 0.5 × OPT_MBQ.
-                # Anchored on OPT_MBQ (the base "complete set" size), NOT on
-                # total_need (which is SZ_MBQ_WH-derived and inflated when
-                # OPT_MBQ_WH > OPT_MBQ). Matches the canonical Stage-C gate in
-                # rule_engine_new.py and the sibling pre-check 1.5 above.
-                # On pass the OPT ships its full need (pool is the only
-                # ceiling); on fail the whole OPT skips. mj_req_rem_dict is
-                # clipped to 0 by the 5h2 decrement, so the next TBL OPT in the
-                # same WERKS naturally fails this admission and skips on its own.
-                # If the upstream working_df doesn't carry MJ_REQ_REM at all
-                # (legacy deployments), mj_req_rem_dict is empty — fall through
-                # permissively rather than blocking every TBL OPT.
+                # TBL admission — unified overshoot rule (2026-07-04):
+                # intended (MBQ-only, = want_ship_pak.sum()) vs remaining
+                # MJ_REQ headroom. Breach = intended − mj_rem. Admit when
+                # overshoot <= 0.5 × intended (same shape as primary
+                # MBQ_CAP COMPLETE and sec-cap Primary/Secondary). One
+                # TBL OPT per WERKS can overshoot: 5h2 decrements
+                # mj_req_rem_dict WITHOUT a max(0,…) floor, so the next
+                # TBL OPT sees negative/zero remainder and its overshoot
+                # exceeds 0.5 × intended → skip.
+                # intended is MBQ-only per project_cap_validation_mbq_only
+                # — want_hold_pak (RDC-hold buffer) is invisible.
+                # Legacy deployments with empty mj_req_rem_dict fall
+                # through permissively.
                 werks_key = str(werks_v)
                 if mj_req_rem_dict and werks_key in mj_req_rem_dict:
                     mj_rem = float(mj_req_rem_dict[werks_key])
-                    opt_mbq_val = float(opt_rows['OPT_MBQ'].iloc[0] or 0.0)
-                    if opt_mbq_val > 0 and mj_rem < 0.5 * opt_mbq_val:
-                        _mark_opt_skip(
-                            alloc_df, opt_idx,
-                            'MBQ_CAP_TBL',
-                            f'pre-check:opt_mbq={int(opt_mbq_val)},'
-                            f'mj_req_rem={int(mj_rem)}<'
-                            f'0.5*opt_mbq={int(0.5 * opt_mbq_val)}',
-                            live_pool=live_pool,
+                    intended_tbl = (
+                        float(want_ship_pak.sum())
+                        if want_ship_pak is not None
+                        else float(opt_need.sum())
+                    )
+                    if intended_tbl > 0 and mj_rem < intended_tbl:
+                        overshoot = intended_tbl - mj_rem
+                        threshold = 0.5 * intended_tbl
+                        if overshoot > threshold:
+                            _mark_opt_skip(
+                                alloc_df, opt_idx,
+                                'MBQ_CAP_TBL',
+                                f'pre-check:intended={int(intended_tbl)},'
+                                f'mj_req_rem={int(mj_rem)},'
+                                f'overshoot={int(overshoot)}>'
+                                f'0.5*intended={int(threshold)}',
+                                live_pool=live_pool,
+                            )
+                            skipped_cap += 1
+                            continue
+                        # ADMIT with overshoot: audit stamp.
+                        note = (
+                            f' MBQ_CAP_OVERSHOOT(TBL,'
+                            f'intended={int(intended_tbl)},'
+                            f'mj_req_rem={int(mj_rem)},'
+                            f'overshoot={int(overshoot)});'
                         )
-                        skipped_cap += 1
-                        continue
-                # PASS: opt_need is NOT clamped to mj_rem — full need ships.
+                        prev_r = (
+                            alloc_df.loc[opt_idx, 'ALLOC_REMARKS']
+                            .fillna('').astype(str)
+                        )
+                        alloc_df.loc[opt_idx, 'ALLOC_REMARKS'] = prev_r + note
+                # PASS or overshoot-admit: full need ships.
             elif mbq_budget is not None:
                 # RL / TBC: cap against mbq_budget, which still carries the
                 # rl/tbc_mbq_cap_pct headroom from _live_mbq_budget.
@@ -851,16 +874,38 @@ def _run_band_per_opt(
                     mode = (rl_dispatch_mode if ot == 'RL'
                             else tbc_dispatch_mode).upper()
                     if mode == 'COMPLETE':
-                        # All-or-skip: leave werks_cap intact for the next OPT.
-                        _mark_opt_skip(
-                            alloc_df, opt_idx,
-                            f'MBQ_CAP_{ot}',
-                            f'complete-mode:need={int(total_need)},'
-                            f'cap_rem={int(werks_cap)}',
-                            live_pool=live_pool,
-                        )
-                        skipped_cap += 1
-                        continue
+                        # COMPLETE with overshoot allowance: if the remaining
+                        # cap covers >= half of total_need, ship the full need
+                        # even though it exceeds werks_cap. The 5h decrement
+                        # then drives mbq_budget[werks] negative, and every
+                        # subsequent OPT in the same WERKS hits the
+                        # `werks_cap <= 0` hard-skip branch above.
+                        # Overshoot per OPT is bounded to <= 0.5 x total_need.
+                        if werks_cap >= 0.5 * total_need:
+                            note = (
+                                f' MBQ_CAP_OVERSHOOT({ot},'
+                                f'need={int(total_need)},'
+                                f'cap={int(werks_cap)},'
+                                f'overshoot={int(total_need - werks_cap)});'
+                            )
+                            prev_r = (
+                                alloc_df.loc[opt_idx, 'ALLOC_REMARKS']
+                                .fillna('').astype(str)
+                            )
+                            alloc_df.loc[opt_idx, 'ALLOC_REMARKS'] = prev_r + note
+                            # opt_need untouched — full ship. Fall through.
+                        else:
+                            _mark_opt_skip(
+                                alloc_df, opt_idx,
+                                f'MBQ_CAP_{ot}',
+                                f'complete-mode:need={int(total_need)},'
+                                f'cap_rem={int(werks_cap)},'
+                                f'overshoot={int(total_need - werks_cap)}>'
+                                f'0.5*need={int(0.5 * total_need)}',
+                                live_pool=live_pool,
+                            )
+                            skipped_cap += 1
+                            continue
                     # SCALED: round-then-shave. np.round (nearest int) instead
                     # of floor recovers the per-size "1-less-than-SZ_MBQ" loss
                     # that floor produces when scale is just under 1.0; the
@@ -1107,22 +1152,29 @@ def _run_band_per_opt(
         # 5h) Update mbq_budget so the next OPT in the same WERKS sees the
         #     post-allocation budget. Match _run_band step 5a's per-WERKS
         #     cumulative deduction semantics.
+        #     No max(0.0, …) floor: when a COMPLETE-mode OPT overshoots
+        #     (ships need > cap because cap >= 0.5 × need), the cap must be
+        #     allowed to go negative so every subsequent RL/TBC OPT in the
+        #     same WERKS hits the `werks_cap <= 0` hard-skip branch at 5b2.
         if mbq_budget is not None:
             consumed = float(pool_take_total.sum())
             if ot in ('RL', 'TBC'):
                 consumed += float(from_hold.sum())
-            mbq_budget[str(werks_v)] = max(
-                0.0, float(mbq_budget.get(str(werks_v), 0.0)) - consumed
+            mbq_budget[str(werks_v)] = (
+                float(mbq_budget.get(str(werks_v), 0.0)) - consumed
             )
 
         # 5h2) For TBL, also decrement the MJ_REQ_REM running total so the
         #      next TBL OPT in the same WERKS evaluates the gate against the
         #      updated cap. Counts SHIP_QTY only (hold doesn't consume req).
+        #      No max(0,…) floor: after a TBL overshoot admission the
+        #      remainder can go negative so the next TBL OPT's overshoot
+        #      exceeds 0.5 × intended and hard-skips (2026-07-04 unified rule).
         if ot == 'TBL' and mj_req_rem_dict is not None:
             shipped = float(round_ship.sum())
             if shipped > 0:
-                mj_req_rem_dict[str(werks_v)] = max(
-                    0.0, float(mj_req_rem_dict.get(str(werks_v), 0.0)) - shipped
+                mj_req_rem_dict[str(werks_v)] = (
+                    float(mj_req_rem_dict.get(str(werks_v), 0.0)) - shipped
                 )
 
         # 5i) Write back to alloc_df. Same column updates as _run_band step 7.

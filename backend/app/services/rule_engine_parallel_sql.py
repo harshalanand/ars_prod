@@ -298,6 +298,7 @@ def run_listing_and_allocation_sql_parallel(
     tbl_trivial_factor: float = 0.5,
     pri_ct_check_rl:  bool = True,
     pri_ct_check_tbc: bool = True,
+    cont_fallback_mode: str = "P4_UNIFORM",  # P4_UNIFORM (default) | P3_FNL_Q | STRICT (deprecated)
 ) -> Dict:
     t0 = time.time()
     n_workers = max(MIN_WORKERS, min(MAX_WORKERS, int(n_workers or DEFAULT_WORKERS)))
@@ -358,7 +359,7 @@ def run_listing_and_allocation_sql_parallel(
             if base_rows == 0:
                 result["duration_sec"] = round(time.time() - t0, 1)
                 return result
-            rne._stage_b_fill_cont(conn, alloc_table, cont_table)
+            rne._stage_b_fill_cont(conn, alloc_table, cont_table, mode=cont_fallback_mode)
             rne._stage_b_fill_targets(conn, alloc_table, var_grid_table)
             rne._stage_b_indexes(conn, alloc_table)
 

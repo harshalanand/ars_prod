@@ -144,11 +144,13 @@ class GenerateRequest(BaseModel):
     # change.  Original MJ_REQ value is kept in MJ_REQ_ORIG for audit.
     mj_req_growth_pct: float = 100.0
     # Allocation mode:
-    #   pandas      – vectorized cumulative-window race (today, default)
-    #   per_opt     – one-OPT-at-a-time sequential engine; flips ARS_PER_OPT_MODE=1
-    #                 and dispatches through pandas path. See rule_engine_per_opt.py.
+    #   pandas      – vectorized cumulative-window race
+    #   per_opt     – one-OPT-at-a-time sequential engine (default); flips
+    #                 ARS_PER_OPT_MODE=1 and dispatches through pandas path.
+    #                 Pool draw is pre-validated per gate — no post-pass zeroing
+    #                 leaves stranded POOL_CONSUMED. See rule_engine_per_opt.py.
     #   sequential  – single-thread SQL fallback
-    allocation_mode:  str = "pandas"  # "sequential" | "pandas" | "per_opt"
+    allocation_mode:  str = "per_opt"  # "sequential" | "pandas" | "per_opt"
     # Execution order for per_opt mode. opt_type_first = RL all rounds → TBC all
     # rounds → TBL all rounds (Order A, today's nesting). round_first = R1 across
     # all OPT_TYPEs → R2 across all → R3 (Order B, fairer to TBL). Engine wiring
@@ -170,6 +172,15 @@ class GenerateRequest(BaseModel):
     # the pending-parked guard is bypassed so several parked snapshots can
     # coexist and be reviewed independently from the Parked Runs page.
     allow_multi_parked: bool = False
+    # CONT fallback for SZ_APPLICABLE='N' MAJ_CATs (see rule_engine_new
+    # _stage_b_fill_cont docstring). ALWAYS fills so Σ CONT = 1 per OPT —
+    # size-agnostic categories never leave 100% unallocated. Applied after
+    # the Site → CO ladder. SZ_APPLICABLE='Y' MAJ_CATs are untouched.
+    #   'P4_UNIFORM' — CONT = 1 / COUNT(DISTINCT SZ) per OPT (default)
+    #   'P3_FNL_Q'   — CONT = FNL_Q / SUM(FNL_Q) per OPT
+    #   'STRICT'     — deprecated (still handled backend-side for API back-
+    #                  compat); UI no longer exposes this
+    cont_fallback_mode: str = "P4_UNIFORM"
 
 
 # ── Helpers — delegating to shared db_helpers ───────────────────────────────
@@ -348,6 +359,7 @@ _SETTING_DEFAULTS = {
     "tbc_dispatch_mode": "COMPLETE",
     "mj_req_growth_pct": "100.0",
     "allow_multi_parked": "false",
+    "cont_fallback_mode": "P4_UNIFORM",  # P4_UNIFORM (default) | P3_FNL_Q
 }
 _SETTING_PREFIX = "listing."
 
@@ -694,6 +706,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "tbc_dispatch_mode": str(req.tbc_dispatch_mode),
                 "mj_req_growth_pct": str(req.mj_req_growth_pct),
                 "allow_multi_parked": str(req.allow_multi_parked).lower(),
+                "cont_fallback_mode": str(req.cont_fallback_mode).upper(),
             })
     except Exception as e:
         logger.error(f"[generate] failed to persist listing settings: {e}")
@@ -734,6 +747,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             ("ALLOCATION", "tbc_dispatch_mode",     str(req.tbc_dispatch_mode)),
             ("ALLOCATION", "mj_req_growth_pct",     str(req.mj_req_growth_pct)),
             ("ALLOCATION", "opt_types",             json.dumps(req.opt_types)),
+            ("ALLOCATION", "cont_fallback_mode",    str(req.cont_fallback_mode).upper()),
             # SEC_CAP
             ("SEC_CAP",    "apply_sec_cap_in_normal", str(req.apply_sec_cap_in_normal).lower()),
             # FLAGS
@@ -2482,6 +2496,12 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 #   Add new column H_{name} = (1 if {name}_REQ > 0 else 0) × hierarchy value
                 # Existing REQ columns are NOT modified — H_ columns are added alongside.
                 HIER_TABLE = "ARS_GRID_HIERARCHY"
+                # Info-only master-data cols sitting inside ARS_GRID_HIERARCHY
+                # (Y/N labels, not 1/0 grid flags). Skipped by the GH_/H_
+                # generators; copied verbatim into the working table so
+                # downstream consumers can read the label without joining
+                # the hierarchy table.
+                _HIER_INFO_ONLY_COLS = {"SZ_APPLICABLE"}
                 if _table_exists(wc, HIER_TABLE):
                     hier_cols = _get_columns(wc, HIER_TABLE)
                     work_cols_upper = {c.upper() for c in _get_columns(wc, FINAL_TABLE)}
@@ -2540,6 +2560,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     for hc in hier_cols:
                         if hc.upper() == "MAJ_CAT":
                             continue
+                        if hc.upper() in _HIER_INFO_ONLY_COLS:
+                            continue  # info label (Y/N), not a grid flag
                         col = f"GH_{hc.upper()}"
                         if col not in work_cols_upper:
                             try: _run(wc, f"ALTER TABLE [{FINAL_TABLE}] ADD [{col}] INT NULL DEFAULT 0")
@@ -2570,6 +2592,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     for hc in hier_cols:
                         if hc.upper() == "MAJ_CAT":
                             continue
+                        if hc.upper() in _HIER_INFO_ONLY_COLS:
+                            continue  # info label (Y/N), not a grid flag
                         col = f"H_{hc.upper()}"
                         req_col = f"{hc.upper()}_REQ"
                         if col not in work_cols_upper:
@@ -2588,6 +2612,20 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         grp = grid_groups.get(hc.upper(), "None")
                         if grp == "Primary": pri_h.append(col)
                         elif grp == "Secondary": sec_h.append(col)
+
+                    # ── Copy info-only hierarchy cols (SZ_APPLICABLE etc.) ─
+                    # Not flags — just copy the Y/N value verbatim into the
+                    # working table for downstream consumers. NULL when the
+                    # MAJ_CAT is missing from the hierarchy table.
+                    hier_cols_upper = {c.upper() for c in hier_cols}
+                    for info_col in _HIER_INFO_ONLY_COLS:
+                        if info_col not in hier_cols_upper:
+                            continue  # column not yet present in hierarchy
+                        if info_col not in work_cols_upper:
+                            try: _run(wc, f"ALTER TABLE [{FINAL_TABLE}] ADD [{info_col}] NVARCHAR(10) NULL")
+                            except Exception: pass
+                        set_parts.append(f"W.[{info_col}] = H.[{info_col}]")
+                        add_cols.append(info_col)
 
                     # ── UPDATE 1: Set all GH_ and H_ columns ──────────────
                     if set_parts:
@@ -2715,6 +2753,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
                 rl_dispatch_mode=req.rl_dispatch_mode,
                 tbc_dispatch_mode=req.tbc_dispatch_mode,
+                cont_fallback_mode=req.cont_fallback_mode,
             )
         else:  # "sequential" — single-thread reference path
             from app.services.rule_engine_new import run_listing_and_allocation
@@ -2737,6 +2776,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     mj_req_growth_pct=_growth,
                     opt_types=req.opt_types or ["RL", "TBC", "TBL"],
                     apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
+                    cont_fallback_mode=req.cont_fallback_mode,
                 )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")
@@ -3057,7 +3097,7 @@ def alloc_progress(batch_id: str,
 
 class RetryFailedRequest(BaseModel):
     batch_id:         str
-    allocation_mode:  str = "pandas"  # "sequential" | "pandas" | "per_opt"
+    allocation_mode:  str = "per_opt"  # "sequential" | "pandas" | "per_opt"
     exec_order:       str = "opt_type_first"  # "opt_type_first" | "round_first"
     parallel_workers: int = 8
 

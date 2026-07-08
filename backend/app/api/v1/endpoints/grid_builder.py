@@ -66,6 +66,13 @@ _run_all_state: Dict[str, Any] = {
 # Grids whose hierarchy contains these are article-level → skip for hierarchy table
 _ARTICLE_LEVEL_COLS = {"GEN_ART_NUMBER", "ARTICLE_NUMBER", "GEN_ART", "VAR_ART"}
 
+# Manual master-data columns living inside ARS_GRID_HIERARCHY that are NOT
+# derived from grid definitions. Protected from /hierarchy/compact drop and
+# ensured to exist on fresh table creation. Value semantics stay column-
+# specific (e.g. SZ_APPLICABLE is Y/N, not 1/0), so downstream code that
+# treats hierarchy cols as numeric flags must skip these explicitly.
+_PROTECTED_MANUAL_COLS = {"SZ_APPLICABLE": "NVARCHAR(1)"}
+
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -336,16 +343,23 @@ def _ensure_hierarchy_table(engine):
 
         if not tbl_exists:
             # Create with MAJ_CAT as base + all derived columns (in seq order)
+            # + protected manual master-data cols (SZ_APPLICABLE etc.).
             col_defs = "[MAJ_CAT] NVARCHAR(100) NOT NULL"
             for col_name, gname, seq in hier_cols:
                 col_defs += f", [{col_name}] NVARCHAR(200) NULL"
+            for pcol, ptype in _PROTECTED_MANUAL_COLS.items():
+                col_defs += f", [{pcol}] {ptype} NULL"
             _run(conn, f"""
                 CREATE TABLE [{GRID_HIER_TABLE}] (
                     {col_defs},
                     CONSTRAINT PK_{GRID_HIER_TABLE} PRIMARY KEY ([MAJ_CAT])
                 )
             """)
-            logger.info(f"Created {GRID_HIER_TABLE} with columns: MAJ_CAT, {', '.join(c[0] for c in hier_cols)}")
+            logger.info(
+                f"Created {GRID_HIER_TABLE} with columns: MAJ_CAT, "
+                f"{', '.join(c[0] for c in hier_cols)}, "
+                f"{', '.join(_PROTECTED_MANUAL_COLS.keys())}"
+            )
             return
 
         # Table exists — ADD missing columns only. Never DROP, never rebuild.
@@ -360,6 +374,13 @@ def _ensure_hierarchy_table(engine):
             _run(conn, f'ALTER TABLE [{GRID_HIER_TABLE}] ADD [{col_name}] NVARCHAR(200) NULL')
             existing_upper.add(col_name.upper())
             added.append(col_name)
+        # Also self-heal protected manual cols if a live table is missing them.
+        for pcol, ptype in _PROTECTED_MANUAL_COLS.items():
+            if pcol.upper() in existing_upper:
+                continue
+            _run(conn, f'ALTER TABLE [{GRID_HIER_TABLE}] ADD [{pcol}] {ptype} NULL')
+            existing_upper.add(pcol.upper())
+            added.append(pcol)
         if added:
             logger.info(f"{GRID_HIER_TABLE}: added column(s) {added} (existing data preserved)")
 
@@ -2438,6 +2459,12 @@ def compact_hierarchy(
         for col in existing:
             cu = col.upper()
             if cu == "MAJ_CAT":
+                kept.append(col)
+                continue
+            # Protected manual master-data cols (SZ_APPLICABLE etc.) live
+            # inside the hierarchy table but aren't backed by an Active grid.
+            # Compact must never drop them.
+            if cu in {p.upper() for p in _PROTECTED_MANUAL_COLS}:
                 kept.append(col)
                 continue
             if cu.startswith(dm.MERGE_COL_PREFIX):

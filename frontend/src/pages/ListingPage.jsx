@@ -624,6 +624,14 @@ export default function ListingPage() {
   //   SCALED   — round-then-shave; OPT ships partial up to werks_cap.
   //   COMPLETE — all-or-skip; werks_cap passes to next OPT in band.
   const [dispatchMode, setDispatchMode] = useState('COMPLETE')
+  // CONT fallback for SZ_APPLICABLE='N' MAJ_CATs. Always fills so Σ CONT = 1
+  // per OPT (never leave 100% unallocated). Two options exposed in the UI:
+  //   P3_FNL_Q   — 'Based on Stock' — CONT proportional to FNL_Q per size
+  //   P4_UNIFORM — 'Uniform 1/N'    — CONT equal across sizes (default)
+  // Both renormalize to Σ=1 per OPT. Only affects MAJ_CATs where
+  // ARS_GRID_HIERARCHY.SZ_APPLICABLE='N'. Y MAJ_CATs are never touched
+  // (2026-07-02 spec still holds — missing sizes stay at 0).
+  const [contFallbackMode, setContFallbackMode] = useState('P4_UNIFORM')
   // MJ_MBQ growth headroom (Allocation Gate).  Slider value applies only
   // when mbqGrowthUseDefault is OFF.  Checked = force 100% (strict cap).
   // Unchecked = scale MJ_MBQ → MJ_MBQ_REV by this %, then MJ_REQ_REV is
@@ -742,10 +750,10 @@ export default function ListingPage() {
   }
 
   // ── Parallel allocation (Part 8) ─────────────────────────────────────
-  // 'pandas'   – legacy cumulative-window race (default, today's behaviour)
-  // 'per_opt'  – one-OPT-at-a-time sequential engine with pre-validated gates
+  // 'pandas'   – legacy cumulative-window race
+  // 'per_opt'  – one-OPT-at-a-time sequential engine with pre-validated gates (default)
   // 'sequential' – single-thread SQL fallback
-  const [allocationMode, setAllocationMode] = useState('pandas')
+  const [allocationMode, setAllocationMode] = useState('per_opt')
   // Execution order for per_opt mode. opt_type_first matches today's loop nesting
   // (RL all rounds → TBC all rounds → TBL all rounds). round_first reorders to
   // round outermost (everyone gets 1× MBQ before anyone gets 2×). Backend wiring
@@ -866,6 +874,12 @@ export default function ListingPage() {
         }
         if (s.allow_multi_parked !== undefined)
           setAllowMultiParked(s.allow_multi_parked === 'true' || s.allow_multi_parked === true)
+        if (s.cont_fallback_mode !== undefined) {
+          const v = String(s.cont_fallback_mode).toUpperCase()
+          // Legacy 'STRICT' persisted from earlier deploys is silently upgraded
+          // to the new default so the UI never renders an un-selectable value.
+          setContFallbackMode(v === 'P3_FNL_Q' ? 'P3_FNL_Q' : 'P4_UNIFORM')
+        }
       }
     } catch {
       // Only toast for foreground (user-initiated) calls — the api.js
@@ -1153,6 +1167,7 @@ export default function ListingPage() {
         ssn_values: selectedSsn,
         opt_types: ({ all: ['RL','TBC','TBL'], rl: ['RL'], rl_tbc: ['RL','TBC'] })[allocOtFilter] || ['RL','TBC','TBL'],
         allow_multi_parked: !!allowMultiParked,
+        cont_fallback_mode: contFallbackMode,
       }
       if (rdcMode === 'own') {
         payload.rdc_values = autoRdcs
@@ -2564,6 +2579,27 @@ export default function ListingPage() {
               <ToggleRow checked={applySecCapInNormal} setChecked={setApplySecCapInNormal}
                 label="Sec-grid Cap" color={C.primary}
                 hint="Per-grid cap: max(0, MBQ_ORIG × cap% − STK_TTL); breach = block. Per-grid % set in Grid Builder."/>
+              <div style={{ display: 'grid', gridTemplateColumns: '78px 1fr', alignItems: 'center', gap: 4 }}
+                   title="CONT fallback for SZ_APPLICABLE='N' MAJ_CATs. Always fills so Σ=1 per OPT — one-size categories will never leave 100% unallocated. Applied AFTER the Site + CO ladder. SZ_APPLICABLE='Y' MAJ_CATs are untouched — Rule 3 of the 2026-07-02 spec still holds.">
+                <span style={{ fontSize: 10, color: C.textSub }}>SZ='N' fill</span>
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                  {[
+                    { value: 'P4_UNIFORM', label: 'Uniform 1/N' },
+                    { value: 'P3_FNL_Q',   label: 'Based on Stock' },
+                  ].map(opt => (
+                    <label key={opt.value}
+                           style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
+                                    cursor: 'pointer', color: contFallbackMode === opt.value ? C.primary : C.textSub,
+                                    fontWeight: contFallbackMode === opt.value ? 700 : 500 }}>
+                      <input type="radio" name="cont_fallback_mode"
+                             checked={contFallbackMode === opt.value}
+                             onChange={() => setContFallbackMode(opt.value)}
+                             style={{ margin: 0, cursor: 'pointer', accentColor: C.primary }}/>
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
             </ParamGroup>
 
             <ParamGroup title="Season (SSN)" color="#0891b2">

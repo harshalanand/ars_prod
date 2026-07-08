@@ -132,6 +132,7 @@ def run_listing_and_allocation_python_parallel(
     tbl_trivial_factor: float = 0.5,
     pri_ct_check_rl:  bool = True,
     pri_ct_check_tbc: bool = True,
+    cont_fallback_mode: str = "P4_UNIFORM",  # P4_UNIFORM (default) | P3_FNL_Q | STRICT (deprecated)
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -195,7 +196,7 @@ def run_listing_and_allocation_python_parallel(
             if base_rows == 0:
                 result["duration_sec"] = round(time.time() - t0, 1)
                 return result
-            rne._stage_b_fill_cont(conn, alloc_table, cont_table)
+            rne._stage_b_fill_cont(conn, alloc_table, cont_table, mode=cont_fallback_mode)
             rne._stage_b_fill_targets(conn, alloc_table, var_grid_table)
             rne._stage_b_indexes(conn, alloc_table)
 

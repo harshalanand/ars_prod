@@ -525,6 +525,10 @@ def run_listing_and_allocation_pandas(
     # for next OPT in band. Defaults match the new run-config defaults.
     rl_dispatch_mode:  str = 'COMPLETE',
     tbc_dispatch_mode: str = 'COMPLETE',
+    # CONT fallback for SZ_APPLICABLE='N' MAJ_CATs (see rule_engine_new).
+    # Default P4_UNIFORM = always fill with 1/N (Σ=1 per OPT, never leave
+    # size-agnostic MAJ_CATs unallocated).
+    cont_fallback_mode: str = "P4_UNIFORM",
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -595,7 +599,7 @@ def run_listing_and_allocation_pandas(
             if base_rows == 0:
                 result["duration_sec"] = round(time.time() - t0, 1)
                 return result
-            rne._stage_b_fill_cont(conn, alloc_table, cont_table)
+            rne._stage_b_fill_cont(conn, alloc_table, cont_table, mode=cont_fallback_mode)
             rne._stage_b_fill_targets(conn, alloc_table, var_grid_table)
             rne._stage_b_indexes(conn, alloc_table)
 

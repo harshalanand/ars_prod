@@ -85,6 +85,16 @@ def run_listing_and_allocation(
     mj_req_growth_pct:  float = 100.0,
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only (default = all)
     apply_sec_cap_in_normal: bool = True,    # strict per-grid cap on Secondary + opted-in Primary grids
+    # CONT fallback for SZ_APPLICABLE='N' MAJ_CATs after the Site+CO ladder.
+    # Always fills so Σ CONT = 1 per OPT — size-agnostic categories never
+    # leave 100% unallocated.
+    #   'P4_UNIFORM' — CONT = 1 / COUNT(DISTINCT SZ) per OPT (default)
+    #   'P3_FNL_Q'   — CONT = FNL_Q / SUM(FNL_Q) per OPT
+    #   'STRICT'     — deprecated; leaves rows at 0. Handled here for API
+    #                  back-compat; UI no longer exposes this option.
+    # Renormalized to Σ=1 per OPT after fill; SZ_APPLICABLE='Y' MAJ_CATs
+    # are never touched (2026-07-02 spec Rule 3 still holds for them).
+    cont_fallback_mode: str = "P4_UNIFORM",
 ) -> Dict:
     """
     Orchestrates Stages A–D. See docs/NEW_RULE_ENGINE_SPEC.md.
@@ -156,7 +166,7 @@ def run_listing_and_allocation(
         result["duration_sec"] = round(time.time() - t0, 1)
         return result
 
-    _stage_b_fill_cont(conn, alloc_table, cont_table)
+    _stage_b_fill_cont(conn, alloc_table, cont_table, mode=cont_fallback_mode)
     _stage_b_fill_targets(conn, alloc_table, var_grid_table)
     _stage_b_indexes(conn, alloc_table)
 
@@ -812,13 +822,22 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
     return int(cnt or 0)
 
 
-def _stage_b_fill_cont(conn, alloc_table, cont_table):
-    # 2-step CONT ladder (uniform 1/N fallback removed 2026-07-02):
-    #   Step 1 — Site row (per WERKS+MAJ_CAT+SZ).
-    #   Step 2 — 'CO' default, but ONLY for (WERKS, MAJ_CAT) groups whose site
-    #            curve is entirely missing/zero. If Step 1 wrote any non-zero
-    #            CONT for the group, Step 2 skips it. Sizes that don't match
-    #            anywhere keep CONT=0 → SZ_MBQ=0 → no allocation for that size.
+def _stage_b_fill_cont(conn, alloc_table, cont_table, mode: str = "P4_UNIFORM"):
+    # CONT ladder:
+    #   Step 1 — Site row (WERKS+MAJ_CAT+SZ). Always runs.
+    #   Step 2 — 'CO' default, group-gated: only for (WERKS, MAJ_CAT) groups
+    #            whose site curve is entirely missing/zero. Always runs.
+    #   Step 3/4 — Fallback for SZ_APPLICABLE='N' MAJ_CATs (from
+    #              ARS_GRID_HIERARCHY), controlled by `mode`:
+    #                'P4_UNIFORM' — CONT = 1 / COUNT(DISTINCT SZ) per OPT (default)
+    #                'P3_FNL_Q'   — CONT = FNL_Q / SUM(FNL_Q) per OPT
+    #                'STRICT'     — deprecated; skip P3/P4 entirely. Handled
+    #                               here for API back-compat only; UI does
+    #                               not offer this option any more.
+    #              Fills only rows still at CONT=0. SZ_APPLICABLE='Y' MAJ_CATs
+    #              are never touched — Rule 3 of the 2026-07-02 spec holds.
+    #   Renormalize — For SZ_APPLICABLE='N' OPT groups where a fill fired,
+    #                 scale every CONT so Σ = 1.0. Never overshoot.
     if not _exists(conn, cont_table):
         return
 
@@ -850,6 +869,86 @@ def _stage_b_fill_cont(conn, alloc_table, cont_table):
            AND LTRIM(RTRIM(CAST(M.SZ AS NVARCHAR(200))))      = LTRIM(RTRIM(CAST(A.SZ AS NVARCHAR(200))))
         WHERE ISNULL(A.CONT, 0) = 0
     """)
+
+    mode_up = (mode or "STRICT").upper()
+    if mode_up not in ("P3_FNL_Q", "P4_UNIFORM"):
+        return  # STRICT — no fallback, no renormalize (2026-07-02 behaviour)
+
+    # Bail out cleanly if ARS_GRID_HIERARCHY doesn't exist yet (fresh envs).
+    if not _exists(conn, "ARS_GRID_HIERARCHY"):
+        logger.warning(
+            f"[cont fallback] ARS_GRID_HIERARCHY missing — mode={mode_up} "
+            f"cannot resolve SZ_APPLICABLE; skipping P3/P4 fallback"
+        )
+        return
+
+    # Step 3/4 — Fill remaining CONT=0 rows, ONLY for SZ_APPLICABLE='N' MAJ_CATs.
+    # NULL SZ_APPLICABLE (MAJ_CAT missing from ARS_GRID_HIERARCHY) is treated as
+    # 'Y' by ISNULL fallback, so those rows are left alone (strict).
+    if mode_up == "P3_FNL_Q":
+        _run(conn, f"""
+            ;WITH OptPool AS (
+                SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
+                       SUM(ISNULL(A.FNL_Q, 0)) AS total_fnl
+                FROM [{alloc_table}] A
+                GROUP BY A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR
+            )
+            UPDATE A
+               SET A.CONT = ROUND(ISNULL(A.FNL_Q, 0) / OP.total_fnl, 4)
+            FROM [{alloc_table}] A
+            LEFT JOIN [ARS_GRID_HIERARCHY] GH WITH (NOLOCK)
+                ON GH.MAJ_CAT = A.MAJ_CAT
+            INNER JOIN OptPool OP
+                ON  A.WERKS = OP.WERKS AND A.MAJ_CAT = OP.MAJ_CAT
+                AND A.GEN_ART_NUMBER = OP.GEN_ART_NUMBER AND A.CLR = OP.CLR
+            WHERE ISNULL(A.CONT, 0) = 0
+              AND OP.total_fnl > 0
+              AND ISNULL(GH.SZ_APPLICABLE, 'Y') = 'N'
+        """)
+    elif mode_up == "P4_UNIFORM":
+        _run(conn, f"""
+            ;WITH SizeCount AS (
+                SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
+                       COUNT(DISTINCT A.SZ) AS n_sizes
+                FROM [{alloc_table}] A
+                GROUP BY A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR
+            )
+            UPDATE A
+               SET A.CONT = ROUND(1.0 / NULLIF(SC.n_sizes, 0), 4)
+            FROM [{alloc_table}] A
+            LEFT JOIN [ARS_GRID_HIERARCHY] GH WITH (NOLOCK)
+                ON GH.MAJ_CAT = A.MAJ_CAT
+            INNER JOIN SizeCount SC
+                ON  A.WERKS = SC.WERKS AND A.MAJ_CAT = SC.MAJ_CAT
+                AND A.GEN_ART_NUMBER = SC.GEN_ART_NUMBER AND A.CLR = SC.CLR
+            WHERE ISNULL(A.CONT, 0) = 0
+              AND SC.n_sizes > 0
+              AND ISNULL(GH.SZ_APPLICABLE, 'Y') = 'N'
+        """)
+
+    # Renormalize — for SZ_APPLICABLE='N' OPT groups whose Σ CONT ≠ 1.0 after
+    # the P3/P4 fill, scale so Σ = 1.00. Guarantees no overshoot. Y groups are
+    # never touched (identified via LEFT JOIN + ISNULL('Y')).
+    _run(conn, f"""
+        ;WITH OptSum AS (
+            SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
+                   SUM(ISNULL(A.CONT, 0)) AS cont_sum
+            FROM [{alloc_table}] A
+            LEFT JOIN [ARS_GRID_HIERARCHY] GH WITH (NOLOCK)
+                ON GH.MAJ_CAT = A.MAJ_CAT
+            WHERE ISNULL(GH.SZ_APPLICABLE, 'Y') = 'N'
+            GROUP BY A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR
+            HAVING SUM(ISNULL(A.CONT, 0)) > 0
+               AND ABS(SUM(ISNULL(A.CONT, 0)) - 1.0) > 0.0001
+        )
+        UPDATE A
+           SET A.CONT = ROUND(ISNULL(A.CONT, 0) / OS.cont_sum, 4)
+        FROM [{alloc_table}] A
+        INNER JOIN OptSum OS
+            ON  A.WERKS = OS.WERKS AND A.MAJ_CAT = OS.MAJ_CAT
+            AND A.GEN_ART_NUMBER = OS.GEN_ART_NUMBER AND A.CLR = OS.CLR
+    """)
+    logger.info(f"[cont fallback] mode={mode_up} applied to SZ_APPLICABLE='N' groups (renormalized to Σ=1)")
 
 
 def _stage_b_fill_targets(conn, alloc_table, var_grid_table):
@@ -3423,9 +3522,17 @@ def _apply_sec_grid_cap_pre_gate(
          totals. A grid is skipped for an OPT when GH_<HC>=0 or the grain has
          no MBQ configured. On surviving grids, breach = (running + opt_ship
          > budget). First breaching grid wins the SKIP_REASON.
-      4. Strict: breach = block. No high-demand override. Blocked OPTs get
-         SHIP_QTY=0, ALLOC_STATUS='SKIPPED', SKIP_REASON='SEC_CAP_PRE_<grid>',
-         and a diagnostic ALLOC_REMARKS narrative with all the numbers.
+      4. Unified overshoot rule (2026-07-04): on breach, admit when
+         (run_before + opt_ship − budget) <= 0.5 × opt_ship. Admitted
+         OPTs keep SHIP_QTY and get a SEC_CAP_OVERSHOOT audit remark
+         appended. Otherwise strict block: SHIP_QTY=0,
+         ALLOC_STATUS='SKIPPED', SKIP_REASON='SEC_CAP_PRE_<grid>' (or
+         'PRIMARY_CAP_PRE_<grid>' when the blocking grid is Primary), and
+         a diagnostic ALLOC_REMARKS narrative with all the numbers.
+         Running totals advance on both admit and overshoot-admit, so
+         only one OPT per grain per band can overshoot — the next OPT at
+         the same grain sees run_before past budget and its overshoot
+         inevitably exceeds 0.5 × ship.
 
     Pool restore is not needed: the SHIP_QTY=0 alloc rows leave the
     waterfall-deducted #nre_pool units available; downstream rebuild reads
@@ -3659,6 +3766,9 @@ def _apply_sec_grid_cap_pre_gate(
     running: Dict[tuple, float] = {}  # (g_name, grain) -> running ship
     blocked: List[tuple] = []
     # (WERKS, MAJ_CAT, GEN_ART, CLR, OPT_TYPE, blocking_grid, running, intended, budget)
+    overshoot_admits: List[tuple] = []
+    # (WERKS, MAJ_CAT, GEN_ART, CLR, OPT_TYPE, admitted_grid, running, intended,
+    #  budget, stk, mbq_orig, ceiling, overshoot, threshold)
 
     for r in opts:
         werks   = r[col_index["WERKS"]]
@@ -3672,6 +3782,7 @@ def _apply_sec_grid_cap_pre_gate(
 
         per_grid: List[tuple] = []  # (g_name, grain, run_before, budget)
         breach: Optional[tuple] = None
+        overshoot_grid: Optional[tuple] = None  # first grid where breach ≤ 0.5 × ship
         for g_name, m in sec_grids:
             grain_vals = [werks, majc] + [r[col_index[e]] for e in m["extras"]]
             grain = tuple(grain_vals)
@@ -3701,15 +3812,26 @@ def _apply_sec_grid_cap_pre_gate(
 
             per_grid.append((g_name, grain, run_before, budget))
             if breach is None and run_before + ship > budget:
-                breach = (g_name, grain, run_before, budget)
+                # Unified overshoot rule (2026-07-04): admit when the
+                # excess above budget is <= 0.5 × opt_ship. Matches
+                # rule_engine_per_opt._evaluate_sec_cap_per_opt so both
+                # engines produce the same admit/skip decision at the
+                # sec-cap layer. First breaching grid wins the outcome.
+                overshoot = float(run_before + ship - budget)
+                threshold = 0.5 * ship
+                if overshoot > 0 and overshoot <= threshold:
+                    overshoot_grid = (g_name, grain, run_before, budget,
+                                      overshoot, threshold)
+                else:
+                    breach = (g_name, grain, run_before, budget)
                 # Don't break — finish gathering per_grid so we know every
                 # grid this OPT touches for diagnostic purposes (only the
                 # first breaching grid wins SKIP_REASON).
 
         if breach is not None:
             g_name, grain, run_before, budget = breach
-            # Strict semantics: breach = block, no exceptions.
-            # Carry stk / mbq_orig / ceiling for the user-facing remark.
+            # Strict block: overshoot > 0.5 × ship. Carry stk / mbq_orig /
+            # ceiling for the user-facing remark.
             stk_val = stk_grain.get(g_name, {}).get(grain, 0.0)
             mbq_orig_val = mbq_grain.get(g_name, {}).get(grain, 0.0)
             ceiling_val = budgets_pre_stk.get(g_name, {}).get(grain, 0.0)
@@ -3722,8 +3844,26 @@ def _apply_sec_grid_cap_pre_gate(
             continue
 
         # Admit — advance running on every grid this OPT belongs to.
+        # Includes overshoot admits: their running advances past budget so
+        # subsequent OPTs at the same grain fail the same 0.5 × ship check.
         for g_name, grain, run_before, _ in per_grid:
             running[(g_name, grain)] = run_before + ship
+
+        if overshoot_grid is not None:
+            g_name, grain, run_before, budget, overshoot, threshold = overshoot_grid
+            stk_val      = stk_grain.get(g_name, {}).get(grain, 0.0)
+            mbq_orig_val = mbq_grain.get(g_name, {}).get(grain, 0.0)
+            ceiling_val  = budgets_pre_stk.get(g_name, {}).get(grain, 0.0)
+            overshoot_admits.append((werks, majc, gen, clr, otype,
+                                     g_name, run_before, ship, budget,
+                                     stk_val, mbq_orig_val, ceiling_val,
+                                     overshoot, threshold))
+            audit.setdefault("overshoot_admits_count", 0)
+            audit["overshoot_admits_count"] += 1
+            audit.setdefault("overshoot_admits_by_grid", {})
+            audit["overshoot_admits_by_grid"][g_name] = (
+                audit["overshoot_admits_by_grid"].get(g_name, 0) + 1
+            )
 
     if not blocked:
         logger.info(
@@ -3870,16 +4010,98 @@ def _apply_sec_grid_cap_pre_gate(
             pass
         return audit
 
+    # ── Step 4b: audit stamp for overshoot admits (2026-07-04) ──────────
+    # OPTs that would have breached the cap but were admitted because
+    # (run_before + opt_ship - budget) <= 0.5 × opt_ship. SHIP_QTY / HOLD /
+    # POOL_CONSUMED are LEFT ALONE — this pass appends a SEC_CAP_OVERSHOOT
+    # narrative to ALLOC_REMARKS so reviewers can see this OPT shipped INTO
+    # a capped grain and why.
+    if overshoot_admits:
+        try:
+            _run(conn, "IF OBJECT_ID('tempdb..#sec_cap_overshoot') IS NOT NULL DROP TABLE #sec_cap_overshoot")
+            _run(conn, f"""
+                SELECT TOP 0
+                    A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR, A.OPT_TYPE
+                INTO #sec_cap_overshoot
+                FROM [{alloc_table}] A
+            """)
+            _run(conn, """
+                ALTER TABLE #sec_cap_overshoot ADD
+                    admitted_grid  NVARCHAR(100) NULL,
+                    running_val    FLOAT         NULL,
+                    intended_val   FLOAT         NULL,
+                    budget_val     FLOAT         NULL,
+                    cap_pct_val    FLOAT         NULL,
+                    stk_val        FLOAT         NULL,
+                    mbq_orig_val   FLOAT         NULL,
+                    ceiling_val    FLOAT         NULL,
+                    overshoot_val  FLOAT         NULL,
+                    threshold_val  FLOAT         NULL
+            """)
+            insert_ov_sql = text("""
+                INSERT INTO #sec_cap_overshoot
+                    (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, OPT_TYPE,
+                     admitted_grid, running_val, intended_val, budget_val,
+                     cap_pct_val, stk_val, mbq_orig_val, ceiling_val,
+                     overshoot_val, threshold_val)
+                VALUES (:w, :m, :g, :c, :o, :grid, :run, :int_v, :bud, :cap,
+                        :stk, :mbq, :ceil, :ov, :th)
+            """)
+            ov_params: List[Dict[str, Any]] = []
+            for (w, mj, gn, cv, ov, grid, rv, iv, bv, sv, mv, ce, ovs, th) in overshoot_admits:
+                ov_params.append({
+                    "w": w, "m": mj, "g": int(gn) if gn is not None else None,
+                    "c": cv, "o": ov,
+                    "grid": grid,
+                    "run": float(rv), "int_v": float(iv), "bud": float(bv),
+                    "cap": float(cap_pct_by_grid.get(grid, cap_pct)),
+                    "stk": float(sv), "mbq": float(mv), "ceil": float(ce),
+                    "ov": float(ovs), "th": float(th),
+                })
+            if ov_params:
+                conn.execute(insert_ov_sql, ov_params)
+            _run(conn, f"""
+                UPDATE A SET
+                    A.ALLOC_REMARKS = ISNULL(A.ALLOC_REMARKS, '')
+                        + ' SEC_CAP_OVERSHOOT(grid=' + B.admitted_grid
+                        + ', cap=' + CAST(CAST(B.cap_pct_val AS INT) AS NVARCHAR(8)) + '%'
+                        + ', reason=overshoot(' + CAST(CAST(B.overshoot_val AS INT) AS NVARCHAR(20)) + ')'
+                        + ' <= 0.5xintended(' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20)) + ')'
+                        + '=' + CAST(CAST(B.threshold_val AS INT) AS NVARCHAR(20))
+                        + ', grain_stk=' + CAST(CAST(B.stk_val AS INT) AS NVARCHAR(20))
+                        + ', grain_ceiling=' + CAST(CAST(B.ceiling_val AS INT) AS NVARCHAR(20))
+                        + ', running_before=' + CAST(CAST(B.running_val AS INT) AS NVARCHAR(20))
+                        + ', this_OPT_intended=' + CAST(CAST(B.intended_val AS INT) AS NVARCHAR(20))
+                        + ', would_have_blocked=true);'
+                FROM [{alloc_table}] A
+                INNER JOIN #sec_cap_overshoot B
+                    ON  A.WERKS = B.WERKS
+                    AND A.MAJ_CAT = B.MAJ_CAT
+                    AND A.GEN_ART_NUMBER = B.GEN_ART_NUMBER
+                    AND ISNULL(A.CLR, '') = ISNULL(B.CLR, '')
+                    AND A.OPT_TYPE = B.OPT_TYPE
+                WHERE ISNULL(A.SHIP_QTY, 0) > 0
+            """)
+            _run(conn, "IF OBJECT_ID('tempdb..#sec_cap_overshoot') IS NOT NULL DROP TABLE #sec_cap_overshoot")
+        except Exception as e:
+            logger.warning(f"[sec_cap_pre] overshoot stamp failed: {str(e)[:300]}")
+            try:
+                _run(conn, "IF OBJECT_ID('tempdb..#sec_cap_overshoot') IS NOT NULL DROP TABLE #sec_cap_overshoot")
+            except Exception:
+                pass
+
     # Render per-grid caps inline (e.g. "FAB@150 MICRO_MVGR@130"). Skipped
     # grids (sec_cap_applicable=0) are listed separately so operators can see
     # what was NOT capped.
     pct_str = " ".join(f"{n}@{m['cap_pct']:.0f}" for n, m in sec_grids)
     skip_str = (f" skipped(applicable=0)={skipped_not_applicable}"
                 if skipped_not_applicable else "")
+    ov_count = audit.get("overshoot_admits_count", 0)
+    ov_extra = f" overshoot_admits={ov_count}" if ov_count else ""
     logger.info(
         f"[sec_cap_pre] caps={{{pct_str}}}{skip_str}: "
         f"blocked={audit['opts_blocked']} OPTs ({audit['units_blocked']:.0f}u) "
-        f"by_grid_block={audit['blocks_by_grid']}"
+        f"by_grid_block={audit['blocks_by_grid']}{ov_extra}"
     )
     return audit
 
