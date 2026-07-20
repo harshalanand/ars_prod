@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -47,6 +48,7 @@ from app.services.pend_alc_service import (
     apply_pend_alc_delta_by_session,
     bootstrap_msa_hold_sync,
     log_operation,
+    OPERATIONS_TABLE,
 )
 
 
@@ -393,18 +395,36 @@ def snapshot_session_to_parked(session_id: str) -> Dict[str, Any]:
     total = 0
     any_error = False
     any_parked = False
+    empty_targets: List[str] = []
     for tgt in _SNAPSHOT_TARGETS:
         r = _snapshot_one_target(session_id, tgt)
         by_table[tgt["label"]] = r
-        total += int(r.get("parked_rows", 0) or 0)
+        rows = int(r.get("parked_rows", 0) or 0)
+        total += rows
         if r.get("error"):
             any_error = True
-        if (not r.get("skipped")) and int(r.get("parked_rows", 0) or 0) > 0:
+        if (not r.get("skipped")) and rows > 0:
             any_parked = True
+        # Expected-but-empty: the source table existed and we weren't
+        # skipping (already-parked), yet it held 0 rows. This is how MSA_TOTAL
+        # silently missed history on session 20260713_164356_383 — a
+        # concurrent MSA rebuild had emptied ARS_MSA_TOTAL mid-run, so park
+        # captured nothing and Approve promoted nothing. Surface it so the
+        # caller can warn instead of reporting a clean success.
+        if (not r.get("skipped")) and not r.get("error") and rows == 0:
+            empty_targets.append(tgt["label"])
+    if empty_targets:
+        logger.warning(
+            f"[parked_history] session {session_id}: expected snapshot "
+            f"target(s) parked 0 rows — {empty_targets}. These will NOT "
+            f"appear in *_HISTORY on Approve. Source table(s) were empty at "
+            f"park time (check for a concurrent MSA rebuild / reset)."
+        )
     return {"by_table": by_table,
             "total_parked_rows": total,
             "any_error": any_error,
-            "any_parked": any_parked}
+            "any_parked": any_parked,
+            "empty_targets": empty_targets}
 
 
 # Backward-compatible wrapper for the old single-target call site.
@@ -613,6 +633,58 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 _ensure_parked_table(conn, tgt)
                 _ensure_history_table(conn, tgt)
 
+        # 1b. DURABLE ONCE-ONLY GUARD — a session may be approved exactly once.
+        #     The authoritative record of "this session is approved" is an
+        #     active (non-reverted) APPROVE row in ARS_PEND_ALC_OPERATIONS,
+        #     NOT the per-table history counts. Running INSIDE the applock, a
+        #     serialized second POST sees the first approve's committed op row
+        #     and bails here — no second promotion, no duplicate op row.
+        #
+        #     This replaces the fragile count-based check below as the primary
+        #     gate. That check only concluded "already approved" when EVERY
+        #     target had history rows; when a target was parked empty (e.g.
+        #     ARS_MSA_TOTAL on a FRESH run) it never did, so a duplicate
+        #     approve fell through and logged a second APPROVE op — the exact
+        #     inconsistency observed on session 20260713_164356_383 (two
+        #     APPROVE rows 35s apart, only one reverted, history then empty).
+        with engine.connect() as conn:
+            prior = conn.execute(text(f"""
+                SELECT TOP 1 CREATED_BY, OP_DATE
+                  FROM {OPERATIONS_TABLE}
+                 WHERE OP_TYPE = 'APPROVE'
+                   AND OP_KEY  = :sid
+                   AND REVERTED_AT IS NULL
+                 ORDER BY OP_DATE ASC
+            """), {"sid": session_id}).fetchone()
+            if prior:
+                approver    = prior[0] or "another user"
+                approved_at = prior[1].isoformat() if prior[1] else None
+                by_table_existing: Dict[str, int] = {}
+                for tgt in _SNAPSHOT_TARGETS:
+                    cnt = conn.execute(text(
+                        f"SELECT COUNT(*) FROM {tgt['history']} "
+                        f"WHERE SESSION_ID = :sid"
+                    ), {"sid": session_id}).scalar() or 0
+                    if cnt:
+                        by_table_existing[tgt["label"]] = int(cnt)
+                logger.info(
+                    f"[approve] session {session_id} already approved by "
+                    f"{approver} at {approved_at} — refusing duplicate approve"
+                )
+                return {
+                    "approved_rows":    sum(by_table_existing.values()),
+                    "by_table":         by_table_existing,
+                    "already_approved": True,
+                    "approved_by":      approver,
+                    "approved_at":      approved_at,
+                    "message":          (
+                        f"Session already approved by {approver}"
+                        + (f" at {approved_at}" if approved_at else "")
+                        + ". Each session can be approved only once."
+                    ),
+                    "error":            None,
+                }
+
         # 2. Idempotency check across every target.
         already_in_history: Dict[str, int] = {}
         with engine.connect() as conn:
@@ -694,11 +766,12 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                             (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
                              VAR_ART, SZ, OPT_STATUS, LISTED_DATE,
                              HOLD_QTY_INITIAL, HOLD_REM,
-                             LAST_UPDATED, IS_CLOSED, CLOSED_DATE)
+                             LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ALLOC_TYPE)
                         SELECT :sid, H.WERKS, H.RDC, H.MAJ_CAT, H.GEN_ART_NUMBER, H.CLR,
                                H.VAR_ART, H.SZ, H.OPT_STATUS, H.LISTED_DATE,
                                H.HOLD_QTY_INITIAL, H.HOLD_REM,
-                               H.LAST_UPDATED, H.IS_CLOSED, H.CLOSED_DATE
+                               H.LAST_UPDATED, H.IS_CLOSED, H.CLOSED_DATE,
+                               ISNULL(H.ALLOC_TYPE, '')
                         FROM [ARS_NL_TBL_HOLD_TRACKING] H
                         INNER JOIN touched T
                             ON  T.WERKS   = H.WERKS
@@ -982,7 +1055,8 @@ def list_parked_runs(include_rejected: bool = False) -> List[Dict[str, Any]]:
                 s.STATUS                                        AS run_status,
                 s.ALLOC_ROWS                                    AS alloc_rows,
                 s.SHIP_QTY_TOTAL                                AS ship_qty_total,
-                s.HOLD_QTY_TOTAL                                AS hold_qty_total
+                s.HOLD_QTY_TOTAL                                AS hold_qty_total,
+                s.ALLOC_TYPE                                    AS alloc_type
             FROM alloc_p a
             FULL OUTER JOIN listing_p l ON a.SESSION_ID = l.SESSION_ID
             LEFT JOIN {SESSIONS_TABLE} s
@@ -1006,6 +1080,7 @@ def list_parked_runs(include_rejected: bool = False) -> List[Dict[str, Any]]:
             "alloc_rows":          int(r[9])  if r[9]  is not None else None,
             "ship_qty_total":      float(r[10]) if r[10] is not None else None,
             "hold_qty_total":      float(r[11]) if r[11] is not None else None,
+            "alloc_type":          r[12],
         }
         for r in rows
     ]
@@ -1323,8 +1398,10 @@ def _ensure_hold_snapshot_tables(conn) -> None:
             [LAST_UPDATED]     DATETIME      NULL,
             [IS_CLOSED]        BIT           NULL,
             [CLOSED_DATE]      DATETIME      NULL,
+            [ALLOC_TYPE]       NVARCHAR(10)  NOT NULL DEFAULT '',
             CONSTRAINT [PK_{_HOLD_SNAPSHOT_TABLE}]
-                PRIMARY KEY CLUSTERED ([SESSION_ID], [WERKS], [VAR_ART], [SZ])
+                PRIMARY KEY CLUSTERED ([SESSION_ID], [WERKS], [VAR_ART], [SZ],
+                                       [ALLOC_TYPE])
         )
     """))
     # Idempotent ALTER for older deployments that already have the snapshot
@@ -1336,6 +1413,17 @@ def _ensure_hold_snapshot_tables(conn) -> None:
               AND name = 'RDC'
         )
         ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}] ADD [RDC] NVARCHAR(20) NULL
+    """))
+    # Idempotent ALTER for older deployments without the typed-pool column
+    # (Fresh/GRT approve chain, Jul 2026). '' = legacy/untyped row.
+    conn.execute(text(f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.columns
+            WHERE object_id = OBJECT_ID('{_HOLD_SNAPSHOT_TABLE}')
+              AND name = 'ALLOC_TYPE'
+        )
+        ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}]
+            ADD [ALLOC_TYPE] NVARCHAR(10) NOT NULL DEFAULT ''
     """))
     conn.execute(text(f"""
         IF OBJECT_ID('{_HOLD_SNAPSHOT_SESSIONS}','U') IS NULL
@@ -1373,10 +1461,10 @@ def snapshot_hold_tracking(session_id: str) -> None:
                 INSERT INTO [{_HOLD_SNAPSHOT_TABLE}]
                     (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
                      OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL, HOLD_REM,
-                     LAST_UPDATED, IS_CLOSED, CLOSED_DATE)
+                     LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ALLOC_TYPE)
                 SELECT :sid, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
                        OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL, HOLD_REM,
-                       LAST_UPDATED, IS_CLOSED, CLOSED_DATE
+                       LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ISNULL(ALLOC_TYPE, '')
                 FROM [ARS_NL_TBL_HOLD_TRACKING]
             """), {"sid": session_id})
             row_count = int(res.rowcount or 0)
@@ -1409,20 +1497,62 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
     Returns: {step_a_rows, step_b_rows, error}.
     """
     result: Dict[str, Any] = {"step_a_rows": 0, "step_b_rows": 0, "error": None}
+    tmp_a = f"#hold_step_a_{uuid.uuid4().hex[:8]}"
     try:
-        # STEP A — RL/TBC consumed warehouse hold
-        r_a = conn.execute(text("""
-            ;WITH RunHold AS (
+        # STEP A — RL/TBC consumed warehouse hold.
+        #
+        # Typed pools (Jul 2026): the tracking key is now (WERKS, VAR_ART,
+        # SZ, ALLOC_TYPE), so a 3-part key can carry BOTH a legacy row
+        # (ALLOC_TYPE='') and a typed row ('FRESH'/'GRT'). The consumed
+        # FROM_HOLD_QTY of a typed run drains LEGACY-FIRST: pass 1
+        # decrements the '' row up to the consumed qty; pass 2 applies the
+        # remainder (consumed − legacy absorbed) to the run-type row.
+        # One session = one type, so MAX(ALLOC_TYPE) per key is safe.
+        #
+        # Stage consumed qty + the legacy row's open HOLD_REM per key so
+        # the two set-based UPDATEs share consistent remainder math.
+        # NB: CREATE TABLE must be a separate, parameterless execute —
+        # a parameterised SELECT INTO runs under sp_prepexec and its
+        # #temp table is dropped when that inner scope exits.
+        conn.execute(text(f"""
+            CREATE TABLE {tmp_a} (
+                [WERKS]         NVARCHAR(50) COLLATE DATABASE_DEFAULT NULL,
+                [VAR_ART]       BIGINT       NULL,
+                [SZ]            NVARCHAR(50) COLLATE DATABASE_DEFAULT NULL,
+                [ALLOC_TYPE]    NVARCHAR(10) COLLATE DATABASE_DEFAULT NULL,
+                [from_hold_qty] FLOAT        NULL,
+                [legacy_open]   FLOAT        NULL
+            )
+        """))
+        conn.execute(text(f"""
+            INSERT INTO {tmp_a}
+                ([WERKS], [VAR_ART], [SZ], [ALLOC_TYPE],
+                 [from_hold_qty], [legacy_open])
+            SELECT R.[WERKS], R.[VAR_ART], R.[SZ], R.[ALLOC_TYPE],
+                   R.from_hold_qty,
+                   CAST(ISNULL(L.[HOLD_REM], 0) AS FLOAT) AS legacy_open
+            FROM (
                 SELECT A.[WERKS],
                        TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
                        A.[SZ],
+                       ISNULL(MAX(A.[ALLOC_TYPE]), '') AS ALLOC_TYPE,
                        SUM(ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0)) AS from_hold_qty
                 FROM [ARS_ALLOC_HISTORY] A
                 WHERE A.[SESSION_ID] = :sid
                   AND A.[OPT_TYPE] IN ('RL', 'TBC')
                   AND ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0) > 0
                 GROUP BY A.[WERKS], TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
-            )
+            ) R
+            LEFT JOIN [ARS_NL_TBL_HOLD_TRACKING] L
+                ON  L.[WERKS]   = R.[WERKS]
+                AND L.[VAR_ART] = R.[VAR_ART]
+                AND L.[SZ]      = R.[SZ]
+                AND ISNULL(L.[ALLOC_TYPE], '') = ''
+                AND L.[IS_CLOSED] = 0
+        """), {"sid": session_id})
+
+        # Pass 1 — drain the legacy ('') row up to the consumed qty.
+        r_a1 = conn.execute(text(f"""
             UPDATE T SET
                 T.[HOLD_REM] = CASE
                     WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 0
@@ -1438,13 +1568,49 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                 END,
                 T.[LAST_UPDATED] = GETDATE()
             FROM [ARS_NL_TBL_HOLD_TRACKING] T
-            INNER JOIN RunHold R
+            INNER JOIN {tmp_a} R
                 ON  T.[WERKS]   = R.[WERKS]
                 AND T.[VAR_ART] = R.[VAR_ART]
                 AND T.[SZ]      = R.[SZ]
+                AND ISNULL(T.[ALLOC_TYPE], '') = ''
             WHERE T.[IS_CLOSED] = 0
-        """), {"sid": session_id})
-        result["step_a_rows"] = int(r_a.rowcount or 0)
+        """))
+
+        # Pass 2 — apply the remainder (consumed − legacy absorbed) to the
+        # typed row of the run's own type. Skipped entirely for legacy runs
+        # (ALLOC_TYPE='') — pass 1 already handled those rows.
+        r_a2 = conn.execute(text(f"""
+            UPDATE T SET
+                T.[HOLD_REM] = CASE
+                    WHEN T.[HOLD_REM] - R.rem_qty <= 0 THEN 0
+                    ELSE T.[HOLD_REM] - R.rem_qty
+                END,
+                T.[IS_CLOSED] = CASE
+                    WHEN T.[HOLD_REM] - R.rem_qty <= 0 THEN 1
+                    ELSE 0
+                END,
+                T.[CLOSED_DATE] = CASE
+                    WHEN T.[HOLD_REM] - R.rem_qty <= 0 THEN GETDATE()
+                    ELSE NULL
+                END,
+                T.[LAST_UPDATED] = GETDATE()
+            FROM [ARS_NL_TBL_HOLD_TRACKING] T
+            INNER JOIN (
+                SELECT [WERKS], [VAR_ART], [SZ], [ALLOC_TYPE],
+                       CASE WHEN from_hold_qty - legacy_open > 0
+                            THEN from_hold_qty - legacy_open
+                            ELSE 0 END AS rem_qty
+                FROM {tmp_a}
+                WHERE [ALLOC_TYPE] <> ''
+            ) R
+                ON  T.[WERKS]   = R.[WERKS]
+                AND T.[VAR_ART] = R.[VAR_ART]
+                AND T.[SZ]      = R.[SZ]
+                AND ISNULL(T.[ALLOC_TYPE], '') = R.[ALLOC_TYPE]
+            WHERE T.[IS_CLOSED] = 0
+              AND R.rem_qty > 0
+        """))
+        result["step_a_rows"] = int(r_a1.rowcount or 0) + int(r_a2.rowcount or 0)
 
         # STEP B — TBL created new warehouse hold (with RDC populated from
         # store master so MSA hold sync can join directly later).
@@ -1455,6 +1621,7 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                        A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
                        TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
                        A.[SZ],
+                       ISNULL(MAX(A.[ALLOC_TYPE]), '') AS ALLOC_TYPE,
                        SUM(ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0)) AS hold_qty
                 FROM [ARS_ALLOC_HISTORY] A
                 LEFT JOIN [Master_ALC_INPUT_ST_MASTER] SM
@@ -1468,6 +1635,7 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                 ON T.[WERKS]   = R.[WERKS]
                AND T.[VAR_ART] = R.[VAR_ART]
                AND T.[SZ]      = R.[SZ]
+               AND ISNULL(T.[ALLOC_TYPE], '') = ISNULL(R.[ALLOC_TYPE], '')
             WHEN MATCHED THEN
                 UPDATE SET
                     T.[RDC] = ISNULL(T.[RDC], R.[RDC]),
@@ -1487,13 +1655,13 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                     [WERKS], [RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
                     [VAR_ART], [SZ], [OPT_STATUS],
                     [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM],
-                    [LAST_UPDATED], [IS_CLOSED]
+                    [LAST_UPDATED], [IS_CLOSED], [ALLOC_TYPE]
                 )
                 VALUES (
                     R.[WERKS], R.[RDC], R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
                     R.[VAR_ART], R.[SZ], 'TBL',
                     GETDATE(), R.hold_qty, R.hold_qty,
-                    GETDATE(), 0
+                    GETDATE(), 0, ISNULL(R.[ALLOC_TYPE], '')
                 );
         """), {"sid": session_id})
         result["step_b_rows"] = int(r_b.rowcount or 0)
@@ -1508,6 +1676,13 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
         logger.warning(f"[hold] _apply_hold_tracking_from_history failed: {e}")
         try: conn.rollback()
         except Exception: pass
+    finally:
+        try:
+            conn.execute(text(
+                f"IF OBJECT_ID('tempdb..{tmp_a}') IS NOT NULL DROP TABLE {tmp_a}"
+            ))
+        except Exception:
+            pass
     return result
 
 
@@ -1556,6 +1731,7 @@ def _revert_hold_tracking(conn, session_id: str) -> Dict[str, Any]:
                   AND S.WERKS   = T.WERKS
                   AND S.VAR_ART = T.VAR_ART
                   AND S.SZ      = T.SZ
+                  AND S.ALLOC_TYPE = ISNULL(T.ALLOC_TYPE, '')
             )
         """), {"sid": session_id})
         result["deleted_new"] = int(r_del.rowcount or 0)
@@ -1579,6 +1755,7 @@ def _revert_hold_tracking(conn, session_id: str) -> Dict[str, Any]:
                 ON S.WERKS   = T.WERKS
                AND S.VAR_ART = T.VAR_ART
                AND S.SZ      = T.SZ
+               AND S.ALLOC_TYPE = ISNULL(T.ALLOC_TYPE, '')
             WHERE S.SESSION_ID = :sid
         """), {"sid": session_id})
         result["restored"] = int(r_upd.rowcount or 0)

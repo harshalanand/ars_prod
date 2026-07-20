@@ -1,8 +1,10 @@
 # ars_flow knowledge base — index
 
-This directory is the single source of truth for ARS listing/allocation rules, invariants, and gotchas. The `ars_flow` subagent reads the relevant file(s) on every invocation and appends new rules as the user states them.
+> **⭐ CANONICAL SOURCE = the ARS Manual dossiers:** `frontend/public/docs/manual/<module>.md` (`msa, grid, merge, listing, review, hold, pendalc`). Those hold the full BRD + FSD (rules, formulas, validation gates) and render in-app at `/manual/*`. **Read the dossier first**; the terse per-area files here are the quick-rules extract. When they disagree, the dossier wins. New rules are appended to the dossier's `## Recorded rules` AND (optionally) mirrored here.
 
-> **Team-facing reviewer's doc:** [docs/RULE_MASTER.md](../../../docs/RULE_MASTER.md) — consolidated rule reference with decision tables and a per-stage reviewer's checklist. Built from the per-area files below; keep them in sync (the consolidated doc is read by humans, the per-area files are read by ars_flow).
+This directory holds the quick per-area rule extracts. The `ars_flow` subagent reads the relevant file(s) on every invocation and appends new rules as the user states them.
+
+> **Team-facing reviewer's doc:** [docs/RULE_MASTER.md](../../../docs/RULE_MASTER.md) — consolidated rule reference with decision tables and a per-stage reviewer's checklist. Built from the dossiers + per-area files; keep them in sync.
 
 ## Files
 

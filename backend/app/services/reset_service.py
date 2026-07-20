@@ -121,7 +121,7 @@ PROTECTED_EXACT: List[str] = [
     # Allocation engine config
     "alloc_score_config", "alloc_engine_settings",
     # Misc config
-    "ARS_SLOC_SETTINGS", "table_permissions",
+    "ARS_MSA_SLOC_SETTINGS", "table_permissions",
     "MASTER_GEN_ART_AGE", "MASTER_ALC_PEND",
     # Contribution presets (user-built scenarios)
     "Cont_presets", "Cont_mappings", "Cont_mapping_assignments",

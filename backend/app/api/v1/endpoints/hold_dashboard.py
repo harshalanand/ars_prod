@@ -68,22 +68,60 @@ def _empty(reason: str = "ARS_NL_TBL_HOLD_TRACKING is empty or missing"):
     return APIResponse(data={"items": [], "totals": {}, "note": reason})
 
 
+def _has_alloc_type_col(db: Session) -> bool:
+    """ALLOC_TYPE lands on the tracker via the Fresh/GRT migration; older
+    deployments may not have it yet, so typed queries guard on this."""
+    try:
+        n = db.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = :t AND COLUMN_NAME = 'ALLOC_TYPE'"
+        ), {"t": HOLD_TABLE}).scalar()
+        return bool(n)
+    except Exception:
+        return False
+
+
+def _alloc_type_filter(db: Session, alloc_type: Optional[str],
+                       col: str = "ALLOC_TYPE"):
+    """Build the optional ALLOC_TYPE WHERE condition.
+
+    alloc_type ∈ {FRESH, GRT, LEGACY} (case-insensitive); anything else →
+    no filter. LEGACY matches pre-Fresh/GRT rows (NULL or '' ALLOC_TYPE);
+    FRESH/GRT are exact matches. On a pre-migration DB (no ALLOC_TYPE
+    column) every row is legacy: LEGACY → match-all, FRESH/GRT → match-none.
+    Returns (condition_sql_or_None, params_dict).
+    """
+    at = (alloc_type or "").strip().upper()
+    if at not in ("FRESH", "GRT", "LEGACY"):
+        return None, {}
+    if not _has_alloc_type_col(db):
+        return ("1=1" if at == "LEGACY" else "1=0"), {}
+    if at == "LEGACY":
+        return f"ISNULL({col}, '') = ''", {}
+    return f"{col} = :p_alloc_type", {"p_alloc_type": at}
+
+
 # ---------------------------------------------------------------------------
 # 1. Summary KPIs
 # ---------------------------------------------------------------------------
 @router.get("/summary", response_model=APIResponse)
 def hold_summary(
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY — filter KPIs to one allocation type"),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
     """Top-of-page KPI cards.
 
     Returns counts and totals split by IS_CLOSED, plus the count of distinct
-    stores, articles, and the oldest open-hold age in days.
+    stores, articles, and the oldest open-hold age in days. `alloc_type`
+    (FRESH/GRT/LEGACY) filters the KPIs; `by_type` is always the full
+    unfiltered split of open rows/qty per allocation type.
     """
     if not _table_exists(db, HOLD_TABLE):
         return _empty()
 
+    at_cond, at_params = _alloc_type_filter(db, alloc_type)
+    at_where = f"WHERE {at_cond}" if at_cond else ""
     row = db.execute(text(f"""
         SELECT
             SUM(CASE WHEN ISNULL(IS_CLOSED,0)=0 THEN 1 ELSE 0 END)             AS open_rows,
@@ -101,12 +139,40 @@ def hold_summary(
                      THEN DATEDIFF(DAY, LISTED_DATE, GETDATE()) END)             AS oldest_open_days,
             MAX(LAST_UPDATED)                                                    AS last_updated
         FROM [{HOLD_TABLE}]
-    """)).fetchone()
+        {at_where}
+    """), at_params).fetchone()
 
     consumed_initial = float(row.closed_initial or 0)
     open_initial = float(row.open_initial or 0)
     open_qty = float(row.open_qty or 0)
     consumed_open = max(open_initial - open_qty, 0.0)
+
+    # Full FRESH / GRT / LEGACY split of the open book — intentionally NOT
+    # narrowed by the alloc_type filter (it IS the split the tiles show).
+    if _has_alloc_type_col(db):
+        type_rows = db.execute(text(f"""
+            SELECT
+                CASE WHEN ISNULL(ALLOC_TYPE,'')='' THEN 'LEGACY'
+                     ELSE ALLOC_TYPE END                                   AS alloc_type,
+                SUM(CASE WHEN ISNULL(IS_CLOSED,0)=0 THEN 1 ELSE 0 END)     AS open_rows,
+                ISNULL(SUM(CASE WHEN ISNULL(IS_CLOSED,0)=0
+                                THEN HOLD_REM ELSE 0 END), 0)              AS open_qty
+            FROM [{HOLD_TABLE}]
+            GROUP BY CASE WHEN ISNULL(ALLOC_TYPE,'')='' THEN 'LEGACY'
+                          ELSE ALLOC_TYPE END
+        """)).fetchall()
+        by_type = [{
+            "alloc_type": t.alloc_type,
+            "open_rows":  int(t.open_rows or 0),
+            "open_qty":   float(t.open_qty or 0),
+        } for t in type_rows]
+    else:
+        # Pre-migration DB: everything is legacy.
+        by_type = [{
+            "alloc_type": "LEGACY",
+            "open_rows":  int(row.open_rows or 0),
+            "open_qty":   open_qty,
+        }]
 
     return APIResponse(data={
         "open_rows":          int(row.open_rows or 0),
@@ -120,6 +186,8 @@ def hold_summary(
         "distinct_skus":      int(row.distinct_skus or 0),
         "oldest_open_days":   int(row.oldest_open_days) if row.oldest_open_days is not None else 0,
         "last_updated":       row.last_updated.isoformat() if row.last_updated else None,
+        "alloc_type_filter":  (alloc_type or "").strip().upper() or None,
+        "by_type":            by_type,
     })
 
 
@@ -130,13 +198,22 @@ def hold_summary(
 def hold_by_store(
     limit: int = Query(20, ge=1, le=200),
     only_open: bool = Query(True),
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
     """Top stores by open hold qty (or include closed if only_open=false)."""
     if not _table_exists(db, HOLD_TABLE):
         return _empty()
-    where = "WHERE ISNULL(IS_CLOSED,0)=0" if only_open else ""
+    conds = []
+    params = {"lim": limit}
+    if only_open:
+        conds.append("ISNULL(IS_CLOSED,0)=0")
+    at_cond, at_params = _alloc_type_filter(db, alloc_type)
+    if at_cond:
+        conds.append(at_cond)
+        params.update(at_params)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.execute(text(f"""
         SELECT TOP (:lim)
             WERKS,
@@ -148,7 +225,7 @@ def hold_by_store(
         {where}
         GROUP BY WERKS
         ORDER BY open_qty DESC, skus DESC
-    """), {"lim": limit}).fetchall()
+    """), params).fetchall()
     return APIResponse(data={"items": [
         {
             "werks":       r.WERKS,
@@ -166,6 +243,7 @@ def hold_by_store(
 @router.get("/by-rdc", response_model=APIResponse)
 def hold_by_rdc(
     only_open: bool = Query(True),
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -176,7 +254,15 @@ def hold_by_rdc(
     if not rdc_col:
         return APIResponse(data={"items": [], "note":
             f"No RDC column found on {ST_MASTER}; cannot map WERKS to RDC"})
-    where = "WHERE ISNULL(H.IS_CLOSED,0)=0" if only_open else ""
+    conds = []
+    params = {}
+    if only_open:
+        conds.append("ISNULL(H.IS_CLOSED,0)=0")
+    at_cond, at_params = _alloc_type_filter(db, alloc_type, col="H.ALLOC_TYPE")
+    if at_cond:
+        conds.append(at_cond)
+        params.update(at_params)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.execute(text(f"""
         SELECT
             S.[{rdc_col}]                          AS rdc,
@@ -189,7 +275,7 @@ def hold_by_rdc(
         {where}
         GROUP BY S.[{rdc_col}]
         ORDER BY open_qty DESC
-    """)).fetchall()
+    """), params).fetchall()
     return APIResponse(data={"items": [
         {
             "rdc":         r.rdc or "(unmapped)",
@@ -208,13 +294,22 @@ def hold_by_rdc(
 def hold_by_article(
     limit: int = Query(20, ge=1, le=200),
     only_open: bool = Query(True),
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
     """Top articles by open hold qty."""
     if not _table_exists(db, HOLD_TABLE):
         return _empty()
-    where = "WHERE ISNULL(IS_CLOSED,0)=0" if only_open else ""
+    conds = []
+    params = {"lim": limit}
+    if only_open:
+        conds.append("ISNULL(IS_CLOSED,0)=0")
+    at_cond, at_params = _alloc_type_filter(db, alloc_type)
+    if at_cond:
+        conds.append(at_cond)
+        params.update(at_params)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.execute(text(f"""
         SELECT TOP (:lim)
             GEN_ART_NUMBER,
@@ -227,7 +322,7 @@ def hold_by_article(
         {where}
         GROUP BY GEN_ART_NUMBER, MAJ_CAT
         ORDER BY open_qty DESC, stores DESC
-    """), {"lim": limit}).fetchall()
+    """), params).fetchall()
     return APIResponse(data={"items": [
         {
             "gen_art_number": int(r.GEN_ART_NUMBER) if r.GEN_ART_NUMBER is not None else None,
@@ -245,11 +340,14 @@ def hold_by_article(
 # ---------------------------------------------------------------------------
 @router.get("/by-status", response_model=APIResponse)
 def hold_by_status(
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
     if not _table_exists(db, HOLD_TABLE):
         return _empty()
+    at_cond, at_params = _alloc_type_filter(db, alloc_type)
+    at_where = f"WHERE {at_cond}" if at_cond else ""
     rows = db.execute(text(f"""
         SELECT
             ISNULL(NULLIF(LTRIM(RTRIM(OPT_STATUS)),''), '(unset)') AS status,
@@ -258,9 +356,10 @@ def hold_by_status(
             ISNULL(SUM(CASE WHEN ISNULL(IS_CLOSED,0)=0 THEN HOLD_REM ELSE 0 END), 0)
                                                                                AS open_qty
         FROM [{HOLD_TABLE}]
+        {at_where}
         GROUP BY ISNULL(NULLIF(LTRIM(RTRIM(OPT_STATUS)),''), '(unset)')
         ORDER BY open_qty DESC
-    """)).fetchall()
+    """), at_params).fetchall()
     return APIResponse(data={"items": [
         {
             "status":      r.status,
@@ -368,6 +467,7 @@ def hold_detail(
     rdc: Optional[str] = None,
     gen_art: Optional[int] = None,
     status: Optional[str] = None,
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     only_open: bool = Query(True),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
@@ -391,6 +491,10 @@ def hold_detail(
     if status:
         where.append("H.OPT_STATUS = :status")
         params["status"] = status
+    at_cond, at_params = _alloc_type_filter(db, alloc_type, col="H.ALLOC_TYPE")
+    if at_cond:
+        where.append(at_cond)
+        params.update(at_params)
     join = ""
     if rdc and rdc_col:
         join = f"INNER JOIN [{ST_MASTER}] S ON S.[ST_CD] = H.WERKS"
@@ -417,6 +521,13 @@ def hold_detail(
         else ", CAST(NULL AS NVARCHAR(500)) AS LAST_REMARKS, "
              "  CAST(NULL AS NVARCHAR(100)) AS LAST_UPDATED_BY"
     )
+    # ALLOC_TYPE arrives with the Fresh/GRT migration — guard like the
+    # audit columns so pre-migration DBs keep working.
+    type_select = (
+        ", ISNULL(H.ALLOC_TYPE, '') AS ALLOC_TYPE"
+        if _has_alloc_type_col(db)
+        else ", CAST('' AS NVARCHAR(10)) AS ALLOC_TYPE"
+    )
     rows = db.execute(text(f"""
         SELECT
             H.WERKS, H.MAJ_CAT, H.GEN_ART_NUMBER, H.CLR, H.VAR_ART, H.SZ,
@@ -424,6 +535,7 @@ def hold_detail(
             H.LAST_UPDATED, H.IS_CLOSED, H.CLOSED_DATE,
             DATEDIFF(DAY, H.LISTED_DATE, GETDATE()) AS age_days
             {audit_select}
+            {type_select}
         FROM [{HOLD_TABLE}] H
         {join}
         {where_clause}
@@ -453,6 +565,8 @@ def hold_detail(
                 "age_days":         int(r.age_days or 0),
                 "last_remarks":     r.LAST_REMARKS,
                 "last_updated_by":  r.LAST_UPDATED_BY,
+                # '' = legacy (pre-Fresh/GRT) row
+                "alloc_type":       (r.ALLOC_TYPE or "").strip() or "LEGACY",
             } for r in rows
         ]
     })
@@ -470,6 +584,7 @@ def hold_detail_export(
     rdc: Optional[str] = None,
     gen_art: Optional[int] = None,
     status: Optional[str] = None,
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     only_open: bool = Query(True),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
@@ -493,6 +608,10 @@ def hold_detail_export(
     if status:
         where.append("H.OPT_STATUS = :status")
         params["status"] = status
+    at_cond, at_params = _alloc_type_filter(db, alloc_type, col="H.ALLOC_TYPE")
+    if at_cond:
+        where.append(at_cond)
+        params.update(at_params)
     join = ""
     if rdc and rdc_col:
         join = f"INNER JOIN [{ST_MASTER}] S ON S.[ST_CD] = H.WERKS"
@@ -510,6 +629,11 @@ def hold_detail_export(
         else ", CAST(NULL AS NVARCHAR(500)) AS LAST_REMARKS, "
              "  CAST(NULL AS NVARCHAR(100)) AS LAST_UPDATED_BY"
     )
+    type_select = (
+        ", ISNULL(H.ALLOC_TYPE, '') AS ALLOC_TYPE"
+        if _has_alloc_type_col(db)
+        else ", CAST('' AS NVARCHAR(10)) AS ALLOC_TYPE"
+    )
 
     sql = text(f"""
         SELECT TOP ({EXPORT_MAX_ROWS})
@@ -518,6 +642,7 @@ def hold_detail_export(
             DATEDIFF(DAY, H.LISTED_DATE, GETDATE()) AS AGE_DAYS,
             H.IS_CLOSED, H.CLOSED_DATE, H.LAST_UPDATED
             {audit_select}
+            {type_select}
         FROM [{HOLD_TABLE}] H
         {join}
         {where_clause}
@@ -528,7 +653,7 @@ def hold_detail_export(
         "WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ",
         "OPT_STATUS", "LISTED_DATE", "HOLD_QTY_INITIAL", "HOLD_REM",
         "AGE_DAYS", "IS_CLOSED", "CLOSED_DATE", "LAST_UPDATED",
-        "LAST_REMARKS", "LAST_UPDATED_BY",
+        "LAST_REMARKS", "LAST_UPDATED_BY", "ALLOC_TYPE",
     ]
 
     def _iter_csv():
@@ -557,6 +682,7 @@ def hold_detail_export(
                 r.LAST_UPDATED.isoformat() if r.LAST_UPDATED else "",
                 (r.LAST_REMARKS or "") if hasattr(r, "LAST_REMARKS") else "",
                 (r.LAST_UPDATED_BY or "") if hasattr(r, "LAST_UPDATED_BY") else "",
+                (r.ALLOC_TYPE or "").strip() or "LEGACY",
             ])
             yield buf.getvalue(); buf.seek(0); buf.truncate(0)
 

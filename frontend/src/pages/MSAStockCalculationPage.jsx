@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Calculator, Filter, Calendar, Save, Plus, Trash2, Download, X, ChevronDown, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Calculator, Filter, Calendar, Save, Plus, Trash2, Download, X, ChevronDown, CheckCircle2, AlertTriangle, Warehouse, RefreshCw } from 'lucide-react';
 import { msaAPI } from '../services/api';
 import toast from 'react-hot-toast';
 import CascadingFilters from '../components/filters/CascadingFilters';
@@ -81,6 +81,12 @@ export default function MSAStockCalculationPage() {
   const [cascadingFilterSelection, setCascadingFilterSelection] = useState({});
   const [autoStoreResults, setAutoStoreResults] = useState(true); // Auto-store checkbox
   const [missingRdcs, setMissingRdcs] = useState([]); // RDCs with no data for chosen SLOCs
+
+  // Warehouse SLOC pool management (ARS_MSA_SLOC_SETTINGS — Fresh/GRT)
+  const [slocSettings, setSlocSettings] = useState([]);
+  const [slocDirty, setSlocDirty] = useState({});        // {sloc: true} — edited but unsaved
+  const [showSlocPanel, setShowSlocPanel] = useState(false);
+  const [slocPanelBusy, setSlocPanelBusy] = useState(false);
   
   // Ref to track if initialization is complete (prevents auto-load on mount)
   const isInitializedRef = useRef(false);
@@ -187,10 +193,64 @@ export default function MSAStockCalculationPage() {
     }
   }, [calculationResults, expandResults]);
 
+  // ---- Warehouse SLOC pool (Fresh/GRT) handlers ----
+  const loadSlocSettings = () => {
+    return msaAPI.slocSettings()
+      .then(res => {
+        setSlocSettings(res.data?.data?.settings || []);
+        setSlocDirty({});
+      })
+      .catch(err => console.warn('Could not load SLOC pool settings:', err));
+  };
+
+  const handleSlocFieldChange = (sloc, patch) => {
+    setSlocSettings(prev => prev.map(s => (s.sloc === sloc ? { ...s, ...patch } : s)));
+    setSlocDirty(prev => ({ ...prev, [sloc]: true }));
+  };
+
+  const handleSaveSlocSettings = () => {
+    const dirtyRows = slocSettings
+      .filter(s => slocDirty[s.sloc])
+      .map(s => ({ sloc: s.sloc, sloc_type: s.sloc_type, is_active: s.is_active }));
+    if (dirtyRows.length === 0) {
+      toast('No pool changes to save');
+      return;
+    }
+    setSlocPanelBusy(true);
+    msaAPI.bulkSlocSettings(dirtyRows)
+      .then(res => {
+        toast.success(res.data?.message || `Saved ${dirtyRows.length} SLOC pool change(s)`);
+        return loadSlocSettings();
+      })
+      .catch(err => toast.error(`Error saving pools: ${err.response?.data?.detail || err.message}`))
+      .finally(() => setSlocPanelBusy(false));
+  };
+
+  const handleSyncSlocSettings = () => {
+    setSlocPanelBusy(true);
+    msaAPI.syncSlocSettings()
+      .then(res => {
+        toast.success(res.data?.message || 'SLOC pools synced');
+        return loadSlocSettings();
+      })
+      .catch(err => toast.error(`Error syncing: ${err.response?.data?.detail || err.message}`))
+      .finally(() => setSlocPanelBusy(false));
+  };
+
   // Initialize: Load columns and dates from MSA view + Load presets from localStorage
   useEffect(() => {
     console.log('🚀 Initializing MSA page...');
-    
+
+    // Load stored sequences on page open (previously only loaded after a
+    // calc succeeded, so the panel showed "No stored sequences yet" even
+    // when sequences existed).
+    msaAPI.getStoredSequences(10)
+      .then(seqRes => setSequencesList(seqRes.data?.data?.sequences || []))
+      .catch(err => console.warn('Could not load sequences list:', err));
+
+    // Load warehouse SLOC pool settings (Fresh/GRT panel)
+    loadSlocSettings();
+
     // Load filter configs from API
     msaAPI.getColumns()
       .then(res => {
@@ -641,10 +701,17 @@ export default function MSAStockCalculationPage() {
     })
       .then(res => {
         console.log('✅ MSA Calculated:', res.data);
-        const result = res.data.data;
-        setCalculationResults(result); // Store for export
+        const result = res.data?.data;
+        // Defensive: if the response body could not be parsed as the expected
+        // JSON envelope (e.g. an oversized/truncated payload), fail with a
+        // clear message instead of a TypeError deep in the handler.
+        if (!result || typeof result !== 'object') {
+          const size = typeof res.data === 'string' ? ` (~${Math.round(res.data.length / 1048576)} MB raw)` : '';
+          throw new Error(`Calculation finished on the server but the response could not be parsed${size}. Check the Stored Calculation Sequences list — the sequence is likely saved.`);
+        }
+        setCalculationResults(result); // Store for export (preview when auto-saved)
         setExpandResults(true); // Auto-expand results wrapper
-        
+
         // Extract and display sequence ID (if auto-store enabled)
         const seqId = result.sequence_id;
         
@@ -659,7 +726,10 @@ export default function MSAStockCalculationPage() {
           }
           
           console.log(`📦 Auto-stored with sequence ID: ${seqId}`);
-          toast.success(`✅ Auto-saved! (Sequence: ${seqId}) - Storage in progress...`, { duration: 4000 });
+          const previewNote = result.preview
+            ? ` Showing first ${result.preview_rows} rows per table — full data is in the database.`
+            : '';
+          toast.success(`✅ Auto-saved! (Sequence: ${seqId}) - Storage in progress...${previewNote}`, { duration: 5000 });
           
           // Load the latest sequences list
           msaAPI.getStoredSequences(10)
@@ -963,6 +1033,119 @@ export default function MSAStockCalculationPage() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Warehouse SLOC Pools (Fresh / GRT) — ARS_MSA_SLOC_SETTINGS management */}
+      <div className="card">
+        <div
+          className="card-header flex items-center justify-between cursor-pointer hover:bg-gray-50 transition-colors"
+          onClick={() => setShowSlocPanel(!showSlocPanel)}
+        >
+          <div className="flex items-center gap-2">
+            <Warehouse size={16} className="text-primary-600" />
+            <h2 className="font-semibold text-[13px] text-gray-900">Warehouse SLOC Pools (Fresh / GRT)</h2>
+            <span className="text-[10px] text-gray-500">
+              {slocSettings.length} SLOCs · {slocSettings.filter(s => String(s.sloc_type).toUpperCase() === 'GRT').length} GRT
+            </span>
+            {Object.keys(slocDirty).length > 0 && (
+              <span className="text-[9px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-300">
+                {Object.keys(slocDirty).length} unsaved
+              </span>
+            )}
+          </div>
+          <ChevronDown size={16} className={`text-gray-500 transition-transform ${showSlocPanel ? 'rotate-180' : ''}`} />
+        </div>
+
+        {showSlocPanel && (
+          <div className="card-body space-y-3">
+            <div className="p-2.5 bg-blue-50 border-l-4 border-blue-400 rounded text-[10px] text-blue-800">
+              <strong>Pool changes apply from the NEXT MSA generation</strong> — existing MSA rows are not rewritten.
+              Each SLOC belongs to exactly one pool: FRESH (default) or GRT (growth).
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                className="btn-secondary btn-sm"
+                onClick={handleSyncSlocSettings}
+                disabled={slocPanelBusy}
+                type="button"
+                title="Add any SLOC present in the MSA stock view but missing here (as FRESH/active)"
+              >
+                <RefreshCw size={12} /> Sync from Stock View
+              </button>
+              <button
+                className="btn-primary btn-sm"
+                onClick={handleSaveSlocSettings}
+                disabled={slocPanelBusy || Object.keys(slocDirty).length === 0}
+                type="button"
+              >
+                <Save size={12} /> Save Changes {Object.keys(slocDirty).length > 0 ? `(${Object.keys(slocDirty).length})` : ''}
+              </button>
+            </div>
+
+            {slocSettings.length === 0 ? (
+              <div className="p-4 text-center text-gray-400 text-[11px]">
+                No SLOC pool settings found — run migration 019 or click "Sync from Stock View".
+              </div>
+            ) : (
+              <div className="overflow-x-auto border border-gray-200 rounded-lg max-h-80 overflow-y-auto">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-gray-50 border-b-2 border-gray-200 sticky top-0">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-semibold text-gray-700">SLOC</th>
+                      <th className="px-3 py-2 text-left font-semibold text-gray-700">Pool</th>
+                      <th className="px-3 py-2 text-center font-semibold text-gray-700">Active</th>
+                      <th className="px-3 py-2 text-left font-semibold text-gray-700">Last Changed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {slocSettings.map((s, idx) => (
+                      <tr
+                        key={s.sloc}
+                        className={`border-b border-gray-100 transition-colors ${slocDirty[s.sloc] ? 'bg-amber-50' : idx % 2 === 0 ? 'bg-white' : 'bg-gray-50/30'}`}
+                      >
+                        <td className="px-3 py-1.5 font-mono font-medium text-gray-800">{s.sloc}</td>
+                        <td className="px-3 py-1.5">
+                          <div className="inline-flex rounded-full border border-gray-200 overflow-hidden">
+                            {['FRESH', 'GRT'].map(t => (
+                              <button
+                                key={t}
+                                type="button"
+                                onClick={() => handleSlocFieldChange(s.sloc, { sloc_type: t })}
+                                className={`px-2.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                                  String(s.sloc_type).toUpperCase() === t
+                                    ? t === 'GRT'
+                                      ? 'bg-amber-500 text-white'
+                                      : 'bg-emerald-500 text-white'
+                                    : 'bg-white text-gray-500 hover:bg-gray-100'
+                                }`}
+                              >
+                                {t}
+                              </button>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-3 py-1.5 text-center">
+                          <input
+                            type="checkbox"
+                            checked={!!s.is_active}
+                            onChange={e => handleSlocFieldChange(s.sloc, { is_active: e.target.checked })}
+                            className="w-3.5 h-3.5 cursor-pointer"
+                          />
+                        </td>
+                        <td className="px-3 py-1.5 text-gray-500 text-[10px]">
+                          {s.type_changed_at
+                            ? `${s.updated_by || 'unknown'} · ${new Date(s.type_changed_at).toLocaleString()}`
+                            : s.updated_by || '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Date, Threshold & Presets Grid */}
@@ -1300,6 +1483,32 @@ export default function MSAStockCalculationPage() {
                     </div>
                   )}
                 </div>
+
+                {/* Per-pool (FRESH / GRT) tiles — counts by ALLOC_TYPE on the MSA rows.
+                    When the response is a preview slice, counts reflect the preview only. */}
+                {calculationResults.msa && calculationResults.msa.length > 0 && (() => {
+                  const rows = calculationResults.msa;
+                  const typeOf = r => String(r.ALLOC_TYPE ?? r.alloc_type ?? 'FRESH').trim().toUpperCase();
+                  const grtCount = rows.filter(r => typeOf(r) === 'GRT').length;
+                  const freshCount = rows.length - grtCount;
+                  const scopeNote = calculationResults.preview
+                    ? `of first ${rows.length.toLocaleString()} preview rows`
+                    : `of ${rows.length.toLocaleString()} MSA rows`;
+                  return (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="p-3 bg-white rounded-lg border border-emerald-200">
+                        <div className="text-[10px] font-semibold text-gray-600 uppercase">FRESH Pool Rows</div>
+                        <div className="text-[16px] font-bold text-emerald-600 mt-1">{freshCount.toLocaleString()}</div>
+                        <p className="text-[10px] text-gray-500 mt-1">{scopeNote}</p>
+                      </div>
+                      <div className="p-3 bg-white rounded-lg border border-amber-200">
+                        <div className="text-[10px] font-semibold text-gray-600 uppercase">GRT Pool Rows</div>
+                        <div className="text-[16px] font-bold text-amber-600 mt-1">{grtCount.toLocaleString()}</div>
+                        <p className="text-[10px] text-gray-500 mt-1">{scopeNote}</p>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           </div>

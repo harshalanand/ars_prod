@@ -40,7 +40,7 @@ const C = {
 
 const EMPTY_ROW = {
   rdc: '', st_cd: '', article_number: '',
-  do_qty: '', do_number: '', allocation_number: '',
+  do_qty: '', do_number: '', allocation_number: '', alloc_type: '',
 }
 
 function parseCsv(text) {
@@ -53,9 +53,13 @@ function parseCsv(text) {
   const qtyIdx   = hdr.findIndex(h => ['do_qty','do qty','qty','quantity'].includes(h))
   const doIdx    = hdr.findIndex(h => ['do_number','do number','delivery order','do no'].includes(h))
   const allocIdx = hdr.findIndex(h => ['allocation_number','allocation number','allocation no','alloc_no','alloc no','alloc number'].includes(h))
+  const atIdx    = hdr.findIndex(h => ['alloc_type','alloc type','alloctype','allocation_type','allocation type','type'].includes(h))
   if (rdcIdx < 0 || artIdx < 0 || qtyIdx < 0) return null
   return lines.slice(1).map(l => {
     const cols = l.split(',')
+    // Optional Alloc_Type — FRESH/GRT scopes the FIFO deduction to matching
+    // typed PEND rows; anything else (or absent) keeps type-agnostic FIFO.
+    const rawType = atIdx >= 0 ? (cols[atIdx] || '').trim().toUpperCase() : ''
     return {
       rdc:               (cols[rdcIdx]  || '').trim(),
       st_cd:             stIdx >= 0    ? (cols[stIdx]    || '').trim() : '',
@@ -63,6 +67,7 @@ function parseCsv(text) {
       do_qty:            (cols[qtyIdx]  || '').trim(),
       do_number:         doIdx >= 0    ? (cols[doIdx]    || '').trim() : '',
       allocation_number: allocIdx >= 0 ? (cols[allocIdx] || '').trim() : '',
+      alloc_type:        ['FRESH','GRT'].includes(rawType) ? rawType : '',
     }
   // DO_QTY = 0 is allowed and means "cancel the matching open BDC" — the
   // backend flips ARS_BDC_HISTORY.STATUS to CANCELLED so the row drops out
@@ -89,6 +94,36 @@ export default function PendingDeliveryOrderPage() {
   const [bulkCount, setBulkCount]   = useState(0)
   const [bulkPreview, setBulkPreview] = useState([])
   const fileRef = useRef()
+  // FS-12 — session-wise deduction. deductionMethod controls how the backend
+  // drains open PEND_ALC rows; non-FIFO methods require a target allocation
+  // session (NOT the upload session_id above — that's the ops-log key).
+  const [deductionMethod, setDeductionMethod] = useState('FIFO')
+  const [targetSessionId, setTargetSessionId] = useState('')
+  const [sessionOptions, setSessionOptions]   = useState(null) // null = not loaded
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+
+  // Load open pend-alc sessions the first time a non-FIFO method is picked.
+  useEffect(() => {
+    if (deductionMethod === 'FIFO' || sessionOptions !== null || sessionsLoading) return
+    setSessionsLoading(true)
+    pendAlcAPI.sessions()
+      .then(({ data }) => {
+        // /pend-alc/sessions groups by (SESSION_ID, SOURCE) — dedupe to one
+        // option per SESSION_ID, summing open pend qty across sources.
+        const bySession = new Map()
+        for (const s of (data?.data || [])) {
+          const prev = bySession.get(s.session_id)
+          if (prev) prev.pend_qty = (prev.pend_qty || 0) + (s.pend_qty || 0)
+          else bySession.set(s.session_id, { ...s })
+        }
+        setSessionOptions([...bySession.values()])
+      })
+      .catch(() => {
+        setSessionOptions([])
+        toast.error('Could not load pending sessions for targeting')
+      })
+      .finally(() => setSessionsLoading(false))
+  }, [deductionMethod, sessionOptions, sessionsLoading])
 
   const loadHistory = useCallback(async () => {
     setHistLoading(true)
@@ -153,6 +188,7 @@ export default function PendingDeliveryOrderPage() {
     ...(r.st_cd?.trim()             ? { st_cd:             r.st_cd.trim() }             : {}),
     ...(r.do_number?.trim()         ? { do_number:         r.do_number.trim() }         : {}),
     ...(r.allocation_number?.trim() ? { allocation_number: r.allocation_number.trim() } : {}),
+    ...(r.alloc_type?.trim()        ? { alloc_type:        r.alloc_type.trim().toUpperCase() } : {}),
   })
 
   const handleSubmit = async () => {
@@ -166,6 +202,11 @@ export default function PendingDeliveryOrderPage() {
     })
     if (!valid.length) {
       toast.error('No valid rows to submit (check RDC, Article Number, and DO QTY ≥ 0)')
+      return
+    }
+    // FS-12: non-FIFO deduction must name a target session (backend 400s too).
+    if (deductionMethod !== 'FIFO' && !targetSessionId) {
+      toast.error('Select a target session for the chosen deduction method')
       return
     }
     setSubmitting(true)
@@ -182,10 +223,12 @@ export default function PendingDeliveryOrderPage() {
     if (totalRows <= SYNC_FAST_LANE_MAX) {
       try {
         const payload = {
-          rows:           valid.map(buildPayload),
-          session_id:     sessionId,
-          is_first_chunk: true,
-          is_last_chunk:  true,
+          rows:             valid.map(buildPayload),
+          session_id:       sessionId,
+          is_first_chunk:   true,
+          is_last_chunk:    true,
+          deduction_method: deductionMethod,
+          ...(deductionMethod !== 'FIFO' ? { target_session_id: targetSessionId } : {}),
         }
         const resp = await pendAlcAPI.doUpdate(payload)
         totalUpdated = resp.data?.updated_rows || 0
@@ -227,10 +270,12 @@ export default function PendingDeliveryOrderPage() {
 
       try {
         const payload = {
-          rows:           valid.map(buildPayload),
-          session_id:     sessionId,
-          is_first_chunk: true,
-          is_last_chunk:  true,
+          rows:             valid.map(buildPayload),
+          session_id:       sessionId,
+          is_first_chunk:   true,
+          is_last_chunk:    true,
+          deduction_method: deductionMethod,
+          ...(deductionMethod !== 'FIFO' ? { target_session_id: targetSessionId } : {}),
         }
         const startResp = await pendAlcAPI.doUpdateAsync(payload)
         const jobId = startResp.data?.job_id
@@ -299,7 +344,7 @@ export default function PendingDeliveryOrderPage() {
             IMPORT FROM CSV
           </div>
           <div style={{ fontSize: 9, color: C.textMuted }}>
-            Required: RDC, Article_Number, DO_QTY — optional: ST_CD (dest store), DO_Number, Allocation_Number (links DO back to its BDC)
+            Required: RDC, Article_Number, DO_QTY — optional: ST_CD (dest store), DO_Number, Allocation_Number (links DO back to its BDC), Alloc_Type (FRESH/GRT — scopes the deduction to matching typed pend rows)
           </div>
         </div>
         <div style={{ fontSize: 9, color: C.amber, marginTop: 4,
@@ -317,10 +362,10 @@ export default function PendingDeliveryOrderPage() {
           </button>
           <button onClick={() => {
             const csv = '﻿'
-              + 'RDC,ST_CD,Article_Number,DO_QTY,DO_Number,Allocation_Number\n'
-              + 'DW01,S001,1000000001,50,DO-2026-001,2526-001\n'
-              + 'DW01,S002,1000000001,30,DO-2026-001,2526-001\n'
-              + 'DW02,S003,1000000002,120,DO-2026-002,2526-002\n'
+              + 'RDC,ST_CD,Article_Number,DO_QTY,DO_Number,Allocation_Number,Alloc_Type\n'
+              + 'DW01,S001,1000000001,50,DO-2026-001,2526-001,FRESH\n'
+              + 'DW01,S002,1000000001,30,DO-2026-001,2526-001,GRT\n'
+              + 'DW02,S003,1000000002,120,DO-2026-002,2526-002,\n'
             const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
             const url = URL.createObjectURL(blob)
             const a = document.createElement('a')
@@ -342,6 +387,39 @@ export default function PendingDeliveryOrderPage() {
           )}
           <input ref={fileRef} type="file" accept=".csv" onChange={handleFile}
             style={{ display: 'none' }}/>
+          {/* FS-12 — deduction method + target session picker */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto' }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: C.textSub }}>Deduction:</span>
+            <select value={deductionMethod}
+              onChange={e => setDeductionMethod(e.target.value)}
+              disabled={submitting}
+              style={{ fontSize: 10, padding: '4px 6px', borderRadius: 4,
+                       border: `1px solid ${C.border}`, background: '#fff',
+                       color: C.text, outline: 'none' }}>
+              <option value="FIFO">FIFO (default)</option>
+              <option value="SESSION_FIRST">Target session first</option>
+              <option value="SESSION_ONLY">Target session only</option>
+            </select>
+            {deductionMethod !== 'FIFO' && (
+              <select value={targetSessionId}
+                onChange={e => setTargetSessionId(e.target.value)}
+                disabled={submitting || sessionsLoading}
+                style={{ fontSize: 10, padding: '4px 6px', borderRadius: 4,
+                         border: `1px solid ${targetSessionId ? C.border : C.amber}`,
+                         background: '#fff', color: C.text, outline: 'none',
+                         maxWidth: 260 }}>
+                <option value="">
+                  {sessionsLoading ? 'Loading sessions…' : '— select target session —'}
+                </option>
+                {(sessionOptions || []).map(s => (
+                  <option key={s.session_id} value={s.session_id}>
+                    {s.session_id} — pend {Math.round(s.pend_qty || 0).toLocaleString()}
+                    {s.approved_at ? ` (${s.approved_at.slice(0, 10)})` : ''}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
         </div>
       </div>
 
@@ -377,7 +455,7 @@ export default function PendingDeliveryOrderPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead>
                 <tr style={{ background: C.bg }}>
-                  {['RDC','ST_CD','Article','DO Qty','DO Number','Alloc No'].map(h => (
+                  {['RDC','ST_CD','Article','DO Qty','DO Number','Alloc No','Type'].map(h => (
                     <th key={h} style={{ padding: '5px 8px', textAlign: 'left',
                                           fontSize: 9, fontWeight: 700, color: C.textSub,
                                           letterSpacing: '.05em',
@@ -396,6 +474,15 @@ export default function PendingDeliveryOrderPage() {
                     <td style={{ padding: '4px 8px', textAlign: 'right' }}>{r.do_qty}</td>
                     <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: C.textMuted }}>{r.do_number}</td>
                     <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: C.textMuted }}>{r.allocation_number}</td>
+                    <td style={{ padding: '4px 8px' }}>
+                      {r.alloc_type
+                        ? <span style={{ fontSize: 8, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
+                                         background: (r.alloc_type === 'GRT' ? C.amber : C.green) + '22',
+                                         color: r.alloc_type === 'GRT' ? C.amber : C.green }}>
+                            {r.alloc_type}
+                          </span>
+                        : <span style={{ color: C.textMuted }}>—</span>}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -464,7 +551,7 @@ export default function PendingDeliveryOrderPage() {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ background: C.bg }}>
-              {['RDC (Source WH)', 'ST_CD (Dest Store)', 'Article Number (VAR_ART)', 'DO Qty', 'DO Number (optional)', 'Allocation No. (optional)', ''].map((h, i) => (
+              {['RDC (Source WH)', 'ST_CD (Dest Store)', 'Article Number (VAR_ART)', 'DO Qty', 'DO Number (optional)', 'Allocation No. (optional)', 'Type (optional)', ''].map((h, i) => (
                 <th key={i} style={{ padding: '6px 8px', textAlign: 'left', fontSize: 9,
                                      fontWeight: 700, color: C.textSub, letterSpacing: '.05em',
                                      borderBottom: `1px solid ${C.border}` }}>
@@ -501,6 +588,15 @@ export default function PendingDeliveryOrderPage() {
                 <td style={{ padding: '4px 6px', width: '13%' }}>
                   <input value={r.allocation_number || ''} onChange={e => setRow(i, 'allocation_number', e.target.value)}
                     placeholder="e.g. 2526-001" style={{ ..._inp, fontFamily: 'monospace', fontSize: 9 }}/>
+                </td>
+                <td style={{ padding: '4px 6px', width: '8%' }}>
+                  <select value={r.alloc_type || ''}
+                    onChange={e => setRow(i, 'alloc_type', e.target.value)}
+                    title="Blank = deduct from any type (FIFO as before)" style={_inp}>
+                    <option value="">Any</option>
+                    <option value="FRESH">FRESH</option>
+                    <option value="GRT">GRT</option>
+                  </select>
                 </td>
                 <td style={{ padding: '4px 6px', textAlign: 'center' }}>
                   {rows.length > 1 && (

@@ -242,6 +242,16 @@ def _worker_loop():
                     
                     logger.info(f"✅ MSA storage job {job_id} completed in {duration_ms}ms")
                     logger.info(f"📊 Total inserted: MSA={inserted_msa}, Colors={inserted_colors}, Variants={inserted_variants}")
+
+                    # Fire report-generation event — reports subscribed to
+                    # 'msa.completed' run in the background, keyed to this job.
+                    try:
+                        from app.services.report_scheduler_service import (
+                            emit_event, EVENT_MSA_COMPLETED,
+                        )
+                        emit_event(EVENT_MSA_COMPLETED, session_id=str(job_id))
+                    except Exception as _e:
+                        logger.warning(f"[report-gen] emit msa.completed failed: {_e}")
                     
                 except Exception as e:
                     error_msg = str(e)

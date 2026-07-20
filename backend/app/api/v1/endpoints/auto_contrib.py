@@ -610,6 +610,16 @@ def _run_job(job_id: str) -> None:
         logger.info(f"[AutoCont job {job_id}] DONE in {total_dur}s — "
                     f"detail={detail_table} ({det_rows}), company={company_table} ({co_rows})")
 
+        # Fire report-generation event — reports subscribed to 'autocont.completed'
+        # run in the background, keyed to this job. Never blocks/​fails the job.
+        try:
+            from app.services.report_scheduler_service import (
+                emit_event, EVENT_AUTOCONT_COMPLETED,
+            )
+            emit_event(EVENT_AUTOCONT_COMPLETED, session_id=str(job_id))
+        except Exception as _e:
+            logger.warning(f"[report-gen] emit autocont.completed failed: {_e}")
+
     except Exception as e:
         logger.error(f"[AutoCont job {job_id}] FAILED: {e}")
         log.append({"step": "fatal", "error": str(e)[:1000]})

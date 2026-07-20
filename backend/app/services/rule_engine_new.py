@@ -95,6 +95,11 @@ def run_listing_and_allocation(
     # Renormalized to Σ=1 per OPT after fill; SZ_APPLICABLE='Y' MAJ_CATs
     # are never touched (2026-07-02 spec Rule 3 still holds for them).
     cont_fallback_mode: str = "P4_UNIFORM",
+    # Fresh/GRT typed warehouse pool (FSD_FRESH_GRT_HOLD_CONTROL FS-02).
+    # None = legacy total-based FNL_Q (exact pre-change SQL). 'FRESH'|'GRT'
+    # switches Stage B to FNL_Q_EFF = max(min(Σ SLOC-cols(type) − PEND_T
+    # − HOLD_T, FNL_Q), 0) and stamps ALLOC_TYPE on every alloc row (FS-07).
+    alloc_type: Optional[str] = None,
 ) -> Dict:
     """
     Orchestrates Stages A–D. See docs/NEW_RULE_ENGINE_SPEC.md.
@@ -160,7 +165,8 @@ def run_listing_and_allocation(
     base_rows = _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
                                   pri_ct_check_rl=pri_ct_check_rl,
                                   pri_ct_check_tbc=pri_ct_check_tbc,
-                                  opt_types=opt_types)
+                                  opt_types=opt_types,
+                                  alloc_type=alloc_type)
     logger.info(f"[B] alloc rows = {base_rows}")
     if base_rows == 0:
         result["duration_sec"] = round(time.time() - t0, 1)
@@ -735,7 +741,8 @@ def _stage_a_materialize_listed(conn, working_table, listed_table) -> int:
 def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
                      pri_ct_check_rl: bool = True,
                      pri_ct_check_tbc: bool = True,
-                     opt_types: Optional[List[str]] = None) -> int:
+                     opt_types: Optional[List[str]] = None,
+                     alloc_type: Optional[str] = None) -> int:
     # Build the OPT_TYPE list that must enforce PRI_CT%=100 — mirrors R06.
     enforced = ["'TBL'"]
     if pri_ct_check_rl:  enforced.append("'RL'")
@@ -756,6 +763,36 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
     mp_sel = ", ".join(f"L.[{c}]" for c in mp_cols)
     mp_sel = (mp_sel + ",") if mp_sel else ""
 
+    # ── Fresh/GRT typed MSA row (row-per-type MSA) ─────────────────────
+    # MSA is row-per-type: one row per (RDC, GEN_ART, CLR, SZ, ALLOC_TYPE),
+    # with STK/PEND/HOLD/FNL_Q already baked per pool (legacy folded into
+    # FRESH). alloc_type=None → legacy behaviour (no type filter, FNL_Q as-is).
+    # When set ('FRESH'|'GRT') we join ONLY the matching typed MSA row and read
+    # its baked FNL_Q directly — no runtime SLOC-column summing or live
+    # pend/hold math. The run's ALLOC_TYPE is stamped on every alloc row (FS-07).
+    fnl_expr = "TRY_CAST(V.[FNL_Q] AS FLOAT)"
+    type_join = ""
+    alloc_type_sel = ""
+    sql_params: Optional[Dict[str, Any]] = None
+    if alloc_type is not None:
+        at = str(alloc_type).strip().upper()
+        if at not in ("FRESH", "GRT"):
+            raise ValueError(f"_stage_b_explode: invalid alloc_type {alloc_type!r}")
+        # E-01 guard: the MSA var table must carry rows of the requested type.
+        # (Until an MSA is regenerated row-per-type, all rows default to FRESH,
+        #  so a GRT run correctly raises until a typed MSA exists.)
+        typed_rows = conn.execute(text(
+            f"SELECT COUNT(*) FROM [{msa_var_table}] "
+            f"WHERE ISNULL([ALLOC_TYPE],'FRESH') = :at"
+        ), {"at": at}).scalar() or 0
+        if typed_rows == 0:
+            from app.services.alloc_pool import NoPoolColumnsError
+            raise NoPoolColumnsError(at)
+        logger.info(f"[B] typed MSA rows for {at} on {msa_var_table}: {typed_rows}")
+        type_join = " AND ISNULL(V.[ALLOC_TYPE],'FRESH') = :at_pool"
+        alloc_type_sel = f",\n            CAST('{at}' AS NVARCHAR(10)) AS ALLOC_TYPE"
+        sql_params = {"at_pool": at}
+
     _run(conn, f"IF OBJECT_ID('{alloc_table}','U') IS NOT NULL DROP TABLE [{alloc_table}]")
     _run(conn, f"""
         SELECT
@@ -771,8 +808,8 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
             L.[PRI_CT%], L.[SEC_CT%],
             {mp_sel}
 
-            TRY_CAST(V.[FNL_Q] AS FLOAT) AS FNL_Q,
-            TRY_CAST(V.[FNL_Q] AS FLOAT) AS FNL_Q_REM,
+            {fnl_expr} AS FNL_Q,
+            {fnl_expr} AS FNL_Q_REM,
             CAST(NULL AS FLOAT) AS CONT,
             CAST(NULL AS FLOAT) AS SZ_MBQ,
             CAST(NULL AS FLOAT) AS SZ_MBQ_WH,
@@ -790,7 +827,7 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
             CAST(0 AS INT)              AS ALLOC_ROUND,
             CAST('PENDING' AS NVARCHAR(50)) AS ALLOC_STATUS,
             CAST(NULL AS NVARCHAR(500)) AS SKIP_REASON,
-            CAST(NULL AS INT)           AS ALLOC_SEQ
+            CAST(NULL AS INT)           AS ALLOC_SEQ{alloc_type_sel}
         INTO [{alloc_table}]
         FROM [{listed_table}] L
         INNER JOIN [{msa_var_table}] V WITH (NOLOCK)
@@ -801,8 +838,8 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
             AND LTRIM(RTRIM(CAST(L.CLR AS NVARCHAR(200))))
                = LTRIM(RTRIM(CAST(V.[CLR] AS NVARCHAR(200))))
             AND LTRIM(RTRIM(CAST(L.RDC AS NVARCHAR(50))))
-               = LTRIM(RTRIM(CAST(V.[RDC] AS NVARCHAR(50))))
-        WHERE TRY_CAST(V.[FNL_Q] AS FLOAT) > 0
+               = LTRIM(RTRIM(CAST(V.[RDC] AS NVARCHAR(50)))){type_join}
+        WHERE {fnl_expr} > 0
           -- PRI_CT%=100 gate mirrors R06: TBL always enforces; RL/TBC only when
           -- their pri_ct_check flag is True.  Rows whose OPT_TYPE is not in the
           -- enforced list pass through regardless of PRI_CT%.
@@ -817,7 +854,7 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
           AND ISNULL(TRY_CAST(L.[MJ_REQ] AS FLOAT), 0)
               >= 0.5 * ISNULL(NULLIF(TRY_CAST(L.[ACS_D] AS FLOAT), 0), 18.0)
           {ot_filter}
-    """)
+    """, sql_params)
     cnt = conn.execute(text(f"SELECT COUNT(*) FROM [{alloc_table}]")).scalar()
     return int(cnt or 0)
 

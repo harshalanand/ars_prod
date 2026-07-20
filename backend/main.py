@@ -133,12 +133,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"TempDB cleanup service failed to start: {e}")
 
+    # Start Report Generation scheduler (time-based + event-triggered reports)
+    try:
+        from app.services.report_scheduler_service import report_scheduler
+        report_scheduler.start()
+        logger.info("✅ Report scheduler started")
+    except Exception as e:
+        logger.warning(f"Report scheduler failed to start: {e}")
+
     yield
     logger.warning(f"Shutting down {settings.APP_NAME}...")
 
     # Stop TempDB cleanup service
     try:
         tempdb_cleaner.stop()
+    except Exception:
+        pass
+
+    # Stop Report Generation scheduler
+    try:
+        from app.services.report_scheduler_service import report_scheduler
+        report_scheduler.stop()
     except Exception:
         pass
 

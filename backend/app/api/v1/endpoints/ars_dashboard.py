@@ -1180,15 +1180,19 @@ def list_review_sessions(
         date_filter = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
         rows = conn.execute(text(f"""
-            SELECT SESSION_ID, MAX(ts) AS ts, MAX(src) AS src
-            FROM ({' UNION ALL '.join(parts)}) u {date_filter}
-            GROUP BY SESSION_ID
-            ORDER BY MAX(ts) DESC
+            SELECT u.SESSION_ID, MAX(u.ts) AS ts, MAX(u.src) AS src,
+                   MAX(s.ALLOC_TYPE) AS alloc_type
+            FROM ({' UNION ALL '.join(parts)}) u
+            LEFT JOIN ARS_LISTING_SESSIONS s ON s.SESSION_ID = u.SESSION_ID
+            {date_filter}
+            GROUP BY u.SESSION_ID
+            ORDER BY MAX(u.ts) DESC
         """), params).mappings().all()
         items = [{
             "session_id": r["SESSION_ID"],
             "ts":         r["ts"].isoformat() if r["ts"] else None,
             "src":        r["src"],
+            "alloc_type": r["alloc_type"],
             # Format a friendly label for the dropdown
             "label":      f"{r['SESSION_ID']} · {r['src'].upper()}",
         } for r in rows]

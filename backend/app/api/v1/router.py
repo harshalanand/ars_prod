@@ -35,6 +35,7 @@ from app.api.v1.endpoints.settings import router as settings_router
 from app.api.v1.endpoints.sloc_validation import router as store_stock_router
 from app.api.v1.endpoints.grid_builder import router as grid_builder_router
 from app.api.v1.endpoints.merge_rules import router as merge_rules_router
+from app.api.v1.endpoints.data_dictionary import router as data_dictionary_router
 
 # Phase 7: Lookup Art Master
 from app.api.v1.endpoints.lookup_art_master import router as lookup_art_master_router
@@ -47,6 +48,9 @@ from app.api.v1.endpoints.trends import router as trends_router
 
 # Reports
 from app.api.v1.endpoints.reports import router as reports_router
+
+# Report Generation hub — scheduled/manual/event-triggered report runs
+from app.api.v1.endpoints.report_gen import router as report_gen_router
 
 # Maintenance
 from app.api.v1.endpoints.maintenance import router as maintenance_router
@@ -100,6 +104,7 @@ api_router.include_router(settings_router)
 api_router.include_router(store_stock_router)
 api_router.include_router(grid_builder_router)
 api_router.include_router(merge_rules_router)
+api_router.include_router(data_dictionary_router)
 
 # Phase 7: Lookup Art Master
 api_router.include_router(lookup_art_master_router)
@@ -120,6 +125,9 @@ api_router.include_router(trends_router)
 # Reports
 api_router.include_router(reports_router)
 
+# Report Generation hub
+api_router.include_router(report_gen_router)
+
 # Listing
 from app.api.v1.endpoints.listing import router as listing_router
 api_router.include_router(listing_router)
@@ -138,3 +146,7 @@ api_router.include_router(alloc_engine_router)
 # Project Tracker — hierarchical projects, status/priority/phase, dashboard
 from app.api.v1.endpoints.project_tracker import router as project_tracker_router
 api_router.include_router(project_tracker_router)
+
+# Daily Activity Log — audit_log rolled into review-ready daily pointers (superadmin)
+from app.api.v1.endpoints.activity_log import router as activity_log_router
+api_router.include_router(activity_log_router)

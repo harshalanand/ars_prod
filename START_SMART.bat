@@ -115,8 +115,8 @@ echo.
 :: Open browser after 3 seconds
 start /b cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:8000"
 
-:: Start the server
-venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+:: Start the server (--reload: hot-reload on code changes for local dev)
+venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app
 
 echo.
 echo Server stopped.

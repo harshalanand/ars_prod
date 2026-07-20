@@ -140,6 +140,17 @@ class Settings(BaseSettings):
     GRID_LOG_FULL_RETRY_DELAY_SEC: int = 60  # wait before retrying after 9002
     GRID_LOG_FULL_RETRY_COUNT: int = 1       # one retry, then surface error
 
+    # MSA calculation — article-category (ATT_TYP) allowlist.
+    # SAP article categories: 00 = single article, 01 = generic header
+    # (parent of a variant family — never allocated directly), 02 = variant
+    # article (the real sized SKUs), 11 = structured/prepack/display article.
+    # ARS replenishes only real sellable SKUs, so MSA keeps 00 + 02 and drops
+    # 01 headers and 11 structured articles. Applied at MSA generation, so
+    # Grid / Listing / Allocation all inherit the filter. Source: ATT_TYP on
+    # VW_MASTER_PRODUCT (looked up per-article in msa_service — the MSA source
+    # view VW_ET_MSA_STK_WITH_MASTER does not carry it).
+    MSA_ALLOWED_ATT_TYP: List[str] = ["00", "02"]
+
     # Pandas listing engine — single-writer-queue pattern.
     # When True, worker processes return computed DataFrames to the parent;
     # ONE dedicated writer thread in the parent drains a queue and does all
@@ -162,6 +173,15 @@ class Settings(BaseSettings):
     SUPER_ADMIN_USERNAME: str = "superadmin"
     SUPER_ADMIN_EMAIL: str = "admin@nubo.in"
     SUPER_ADMIN_PASSWORD: str = "Admin@12345"  # Override via .env in production
+
+    # SMTP — for emailed reports (Report Generation hub). Set via .env in prod.
+    # Sending is disabled until SMTP_HOST is provided.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""            # defaults to SMTP_USER if blank
+    SMTP_USE_TLS: bool = True      # STARTTLS on port 587; set False for 25
 
     # =========================================================================
     # Computed properties

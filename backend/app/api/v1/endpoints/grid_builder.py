@@ -2502,3 +2502,92 @@ def compact_hierarchy(
         "dropped": dropped,
         "dry_run": dry_run,
     })
+
+
+# ── Sec-cap growth matrix (spec 2026-07-08) ─────────────────────────────
+# Editable cont%-band table with a single global on/off toggle. Replaces
+# the per-grid flat sec_cap_pct at allocation time when enabled.
+
+@router.get("/growth-matrix", response_model=APIResponse)
+def get_growth_matrix(current_user: User = Depends(get_current_user)):
+    """Return the current toggle state and all bands ordered by seq."""
+    from app.services.sec_cap_growth_matrix import (
+        _ensure_growth_matrix_tables, BANDS_TABLE, CFG_TABLE,
+    )
+    de = get_data_engine()
+    _ensure_growth_matrix_tables(de)
+    with de.connect() as c:
+        enabled = c.execute(
+            text(f"SELECT is_enabled FROM {CFG_TABLE} WHERE id = 1")
+        ).scalar()
+        rows = c.execute(text(f"""
+            SELECT id, cont_pct_lo, cont_pct_hi, growth_pct, seq
+            FROM {BANDS_TABLE}
+            ORDER BY seq ASC, cont_pct_lo ASC
+        """)).fetchall()
+    bands = [
+        {"id": r[0], "lo": float(r[1]),
+         "hi": None if r[2] is None else float(r[2]),
+         "growth": float(r[3]), "seq": int(r[4])}
+        for r in rows
+    ]
+    return APIResponse(data={"enabled": bool(enabled), "bands": bands})
+
+
+@router.put("/growth-matrix", response_model=APIResponse)
+def save_growth_matrix(body: dict, current_user: User = Depends(get_current_user)):
+    """Full-replace the bands table and update the toggle atomically.
+
+    Body: {"enabled": bool, "bands": [{"lo": 0, "hi": 5, "growth": 300}, ...]}
+
+    Validator enforces contiguity, sort order, growth>=100, and exactly one
+    open-ended row at the end. Non-monotonic growth (small contributors NOT
+    getting a bigger stretch) is a warning, not an error.
+
+    Guard: enabling the matrix with an empty bands array is blocked at the
+    validator (bands must be non-empty).
+    """
+    from app.services.sec_cap_growth_matrix import (
+        _ensure_growth_matrix_tables, validate_bands, BANDS_TABLE, CFG_TABLE,
+    )
+    enabled_raw = body.get("enabled")
+    if not isinstance(enabled_raw, bool):
+        raise HTTPException(400, detail="'enabled' must be a boolean")
+    bands = body.get("bands") or []
+    if not isinstance(bands, list):
+        raise HTTPException(400, detail="'bands' must be a list")
+    errors, warnings = validate_bands(bands)
+    if errors:
+        raise HTTPException(400, detail={"errors": errors})
+
+    de = get_data_engine()
+    _ensure_growth_matrix_tables(de)
+    username = current_user.username if current_user else "unknown"
+    with de.begin() as c:
+        # Atomic replacement: DELETE + bulk INSERT inside the transaction so
+        # a validation-passing PUT is all-or-nothing.
+        c.execute(text(f"DELETE FROM {BANDS_TABLE}"))
+        for seq, b in enumerate(bands, start=1):
+            hi_val = None if b.get("hi") in (None, "") else float(b["hi"])
+            c.execute(
+                text(f"""
+                    INSERT INTO {BANDS_TABLE}
+                        (cont_pct_lo, cont_pct_hi, growth_pct, seq, updated_by)
+                    VALUES (:lo, :hi, :g, :seq, :by)
+                """),
+                {"lo": float(b["lo"]), "hi": hi_val,
+                 "g": float(b["growth"]), "seq": seq, "by": username},
+            )
+        c.execute(
+            text(f"""
+                UPDATE {CFG_TABLE}
+                SET is_enabled = :en, updated_at = GETDATE(), updated_by = :by
+                WHERE id = 1
+            """),
+            {"en": 1 if enabled_raw else 0, "by": username},
+        )
+    return APIResponse(
+        success=True,
+        message=f"growth matrix saved: {len(bands)} band(s), enabled={enabled_raw}",
+        data={"warnings": warnings},
+    )

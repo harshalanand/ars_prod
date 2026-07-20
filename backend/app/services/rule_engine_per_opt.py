@@ -64,6 +64,42 @@ POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
 OPT_KEYS = ["WERKS", "GEN_ART_NUMBER", "CLR"]
 
 
+def _hold_suppress_arr(
+    alloc_df: pd.DataFrame,
+    idx,
+    skip_hold_upc: bool = False,
+    apply_hold_seg_app: bool = True,
+    apply_hold_seg_gm: bool = True,
+) -> Optional[np.ndarray]:
+    """FS-06 hold-suppression predicate (FSD_FRESH_GRT_HOLD_CONTROL §7).
+
+    Duplicated from rule_engine_pandas (deliberately — pandas lazily imports
+    this module, so importing back at module level would risk a cycle).
+
+    suppress(row) =  (skip_hold_upc        AND ST_STATUS == 'UPC')
+                  OR (NOT apply_hold_seg_app AND SEG == 'APP')
+                  OR (NOT apply_hold_seg_gm  AND SEG == 'GM')
+
+    Returns None when every flag is at its default (no suppression active)
+    so callers keep the pre-change fast path byte-identical. NULL/NaN
+    ST_STATUS or SEG never suppresses (fillna('') before compare, E-04);
+    a missing column behaves the same as all-NULL.
+    """
+    if not skip_hold_upc and apply_hold_seg_app and apply_hold_seg_gm:
+        return None
+    suppress = np.zeros(len(idx), dtype=bool)
+    if skip_hold_upc and 'ST_STATUS' in alloc_df.columns:
+        st = alloc_df.loc[idx, 'ST_STATUS'].fillna('').astype(str).to_numpy()
+        suppress |= (st == 'UPC')
+    if (not apply_hold_seg_app or not apply_hold_seg_gm) and 'SEG' in alloc_df.columns:
+        seg = alloc_df.loc[idx, 'SEG'].fillna('').astype(str).to_numpy()
+        if not apply_hold_seg_app:
+            suppress |= (seg == 'APP')
+        if not apply_hold_seg_gm:
+            suppress |= (seg == 'GM')
+    return suppress
+
+
 def _mark_opt_skip(
     alloc_df: pd.DataFrame,
     idx: np.ndarray,
@@ -108,6 +144,9 @@ def _mark_opt_skip_sec_cap(
     is_primary: bool = False,
     hard_block_reasons: Optional[List[str]] = None,
     grain: Optional[tuple] = None,
+    cont_pct: Optional[float] = None,
+    band_matched: bool = True,
+    matrix_enabled: bool = False,
 ) -> None:
     """Sec-cap / primary-cap block (per-OPT, pre-pool-take). REPLACES
     ALLOC_REMARKS (the waterfall never stamped a 'B[…] ship=N' prefix for
@@ -154,7 +193,18 @@ def _mark_opt_skip_sec_cap(
     cap_str = f"{_safe_int(cap_pct)}%"
     prefix = "PRIMARY_CAP_PRE_" if is_primary else "SEC_CAP_PRE_"
     label  = "primary-cap" if is_primary else "sec-cap"
-    skip_reason = f"{prefix}{grid_name}(cap={cap_str})"
+    # Include cont% in the skip-reason label when the matrix path resolved
+    # a band for this grain. Format matches spec 2026-07-08 §4.3:
+    #   SEC_CAP_PRE_<grid>(cap=200%,cont=13%)
+    if matrix_enabled and cont_pct is not None and band_matched:
+        cont_str = f"{_safe_int(cont_pct)}%"
+        skip_reason = f"{prefix}{grid_name}(cap={cap_str},cont={cont_str})"
+    else:
+        skip_reason = f"{prefix}{grid_name}(cap={cap_str})"
+    # Matrix was enabled but no band matched this grain's cont% → operator
+    # sees SEC_CAP_MATRIX_GAP[<grid>] appended so the fallback is visible.
+    if matrix_enabled and not band_matched:
+        skip_reason = f"{skip_reason},SEC_CAP_MATRIX_GAP[{grid_name}]"
     if not configured:
         remark = (
             f"SKIPPED by {label} | grid={grid_name}"
@@ -211,21 +261,33 @@ def _stamp_sec_cap_override(
     PARTIAL based on what actually shipped."""
     if len(idx) == 0:
         return
-    grid        = str(info.get("grid", ""))
-    cap_pct_i   = _safe_int(info.get("cap_pct", 0))
-    threshold_i = _safe_int(info.get("threshold", 0))
-    ceiling_i   = _safe_int(info.get("ceiling", 0))
-    stk_i       = _safe_int(info.get("stk", 0))
-    runb_i      = _safe_int(info.get("run_before", 0))
-    intended_i  = _safe_int(info.get("intended_ship", 0))
-    overshoot_i = _safe_int(info.get("overshoot", 0))
+    grid            = str(info.get("grid", ""))
+    threshold_i     = _safe_int(info.get("threshold", 0))
+    ceiling_i       = _safe_int(info.get("ceiling", 0))
+    stk_i           = _safe_int(info.get("stk", 0))
+    runb_i          = _safe_int(info.get("run_before", 0))
+    intended_i      = _safe_int(info.get("intended_ship", 0))
+    overshoot_i     = _safe_int(info.get("overshoot", 0))
+    matrix_enabled  = bool(info.get("matrix_enabled", False))
+    band_matched    = bool(info.get("band_matched", True))
+    cont_pct        = info.get("cont_pct")
+    # Effective cap for the label: matrix path uses the resolved growth%;
+    # legacy path uses the grid's flat cap_pct.
+    cap_pct_i = _safe_int(
+        info.get("growth_pct") if (matrix_enabled and band_matched) else info.get("cap_pct", 0)
+    )
+    cap_clause = f"cap={cap_pct_i}%"
+    if matrix_enabled and band_matched and cont_pct is not None:
+        cap_clause += f",cont={_safe_int(cont_pct)}%"
     note = (
-        f" SEC_CAP_OVERSHOOT(grid={grid}, cap={cap_pct_i}%"
+        f" SEC_CAP_OVERSHOOT(grid={grid}, {cap_clause}"
         f", reason=overshoot({overshoot_i}) <= 0.5xintended({intended_i})={threshold_i}"
         f", grain_stk={stk_i}, grain_ceiling={ceiling_i}"
         f", running_before={runb_i}, this_OPT_intended={intended_i}"
         f", would_have_blocked=true);"
     )
+    if matrix_enabled and not band_matched:
+        note += f" SEC_CAP_MATRIX_GAP[{grid}];"
     prev = alloc_df.loc[idx, 'ALLOC_REMARKS'].fillna('').astype(str)
     alloc_df.loc[idx, 'ALLOC_REMARKS'] = prev + note
 
@@ -233,6 +295,8 @@ def _stamp_sec_cap_override(
 def build_sec_cap_state(
     working_df: pd.DataFrame,
     grid_specs: List[Tuple[str, Dict[str, Any]]],
+    matrix_enabled: bool = False,
+    matrix_bands: Optional[List[Tuple[float, Optional[float], float]]] = None,
 ) -> Dict[str, Any]:
     """Build per-OPT sec-cap state from the in-memory working_df slice.
 
@@ -243,16 +307,27 @@ def build_sec_cap_state(
         cap_pct      — sec_cap_pct (for remarks)
         gh_col       — GH_<HC> column name (or "" if none)
 
+    matrix_enabled / matrix_bands (spec 2026-07-08): when both are supplied and
+    enabled=True, each grain's ceiling is derived from a cont%-band lookup
+    (grain's MBQ share of MAJ_CAT total → growth%) INSTEAD of the flat
+    per-grid `cap_factor`. Small contributors get a bigger stretch; dominant
+    grains stay at their cap. When enabled=False (default) behavior is
+    byte-identical to the pre-matrix implementation.
+
     Returns:
         {
-            "grids":      grid_specs (passed through),
-            "budgets":    {grid_name: {grain_tuple: max(0, ceiling − stk)}},
-            "ceilings":   {grid_name: {grain_tuple: MBQ_ORIG × cap_factor}},
-            "stks":       {grid_name: {grain_tuple: STK_TTL}},
-            "mbqs":       {grid_name: {grain_tuple: MBQ_ORIG}},
-            "configured": {grid_name: {grain_tuple: bool}},   # False iff MBQ_ORIG was NULL
-            "running":    {grid_name: defaultdict(float)},    # mutated as OPTs ship
-            "gh_applies": {grid_name: {maj_cat: bool}},
+            "grids":            grid_specs (passed through),
+            "budgets":          {grid_name: {grain_tuple: max(0, ceiling − stk)}},
+            "ceilings":         {grid_name: {grain_tuple: MBQ_ORIG × cap_factor}},
+            "stks":             {grid_name: {grain_tuple: STK_TTL}},
+            "mbqs":             {grid_name: {grain_tuple: MBQ_ORIG}},
+            "configured":       {grid_name: {grain_tuple: bool}},   # False iff MBQ_ORIG was NULL
+            "running":          {grid_name: defaultdict(float)},    # mutated as OPTs ship
+            "gh_applies":       {grid_name: {maj_cat: bool}},
+            "cont_pcts":        {grid_name: {grain_tuple: cont%}},    # matrix path only
+            "resolved_growths": {grid_name: {grain_tuple: growth%}},  # matrix or grid-flat
+            "band_matched":     {grid_name: {grain_tuple: bool}},     # False → fell back
+            "matrix_enabled":   bool,
         }
 
     Distinction between NULL and explicit-zero MBQ matters: a NULL MBQ_ORIG
@@ -264,15 +339,19 @@ def build_sec_cap_state(
     hard-blocked through the `hard_block` dict.
     """
     state: Dict[str, Any] = {
-        "grids":      grid_specs,
-        "budgets":    {},
-        "ceilings":   {},
-        "stks":       {},
-        "mbqs":       {},
-        "configured": {},
-        "hard_block": {},
-        "running":    {g_name: defaultdict(float) for g_name, _ in grid_specs},
-        "gh_applies": {},
+        "grids":            grid_specs,
+        "budgets":          {},
+        "ceilings":         {},
+        "stks":             {},
+        "mbqs":             {},
+        "configured":       {},
+        "hard_block":       {},
+        "running":          {g_name: defaultdict(float) for g_name, _ in grid_specs},
+        "gh_applies":       {},
+        "cont_pcts":        {},
+        "resolved_growths": {},
+        "band_matched":     {},
+        "matrix_enabled":   bool(matrix_enabled and matrix_bands),
     }
     if working_df is None or working_df.empty:
         return state
@@ -282,10 +361,19 @@ def build_sec_cap_state(
     def _col(name: str) -> Optional[str]:
         return work_cols_upper.get(name.upper())
 
+    # Import here to avoid a hard import cycle on module load; the matrix
+    # module has no reverse dependency on rule_engine_per_opt but we keep
+    # the surface minimal.
+    if state["matrix_enabled"]:
+        from app.services.sec_cap_growth_matrix import resolve_growth
+    else:
+        resolve_growth = None  # type: ignore[assignment]
+
     for g_name, g_meta in grid_specs:
         prefix = g_meta.get("prefix") or g_name
         extras = list(g_meta.get("extras") or [])
         cap_factor = float(g_meta.get("cap_factor") or 1.30)
+        grid_default_pct = cap_factor * 100.0
         mbq_orig_col = _col(f"{prefix}_MBQ_ORIG")
         mbq_live_col = _col(f"{prefix}_MBQ")
         anchor_col = mbq_orig_col or mbq_live_col
@@ -312,12 +400,42 @@ def build_sec_cap_state(
         except Exception as e:
             logger.warning(f"[sec_cap_per_opt] state build failed for {g_name}: {e}")
             continue
+
+        # MAJ_CAT totals for cont% (matrix path only). Sum grain MBQs per
+        # (WERKS, MAJ_CAT). Cheap groupby on the already-aggregated frame.
+        # Handled once per grid — the total is grid-specific because each
+        # grid's grain granularity differs (MJ_FAB rolls into fewer grains
+        # per MAJ_CAT than MJ_M_YARN_02).
+        maj_total: Dict[Tuple[str, str], float] = {}
+        if state["matrix_enabled"]:
+            try:
+                mt = (agg[anchor_col]
+                      .groupby(level=[0, 1] if agg.index.nlevels >= 2 else [0])
+                      .sum())
+                # 1-level (WERKS-only) is unreachable in practice since grain
+                # always includes MAJ_CAT, but guard the branch anyway.
+                if agg.index.nlevels >= 2:
+                    for (w, mc), v in mt.items():
+                        maj_total[(str(w), str(mc))] = float(v)
+                else:
+                    for w, v in mt.items():
+                        maj_total[(str(w), "")] = float(v)
+            except Exception as _e:
+                logger.warning(
+                    f"[sec_cap_matrix] MAJ_CAT total roll-up failed for {g_name}: {_e}; "
+                    f"falling back to grid-flat cap for this grid"
+                )
+                maj_total = {}
+
         bmap: Dict[tuple, float] = {}
         cmap: Dict[tuple, float] = {}
         smap: Dict[tuple, float] = {}
         mmap: Dict[tuple, float] = {}
         fmap: Dict[tuple, bool]  = {}
         hbmap: Dict[tuple, List[str]] = {}
+        cpmap: Dict[tuple, float] = {}   # cont%
+        gpmap: Dict[tuple, float] = {}   # resolved growth%
+        gbmap: Dict[tuple, bool]  = {}   # band matched?
         # Positions 0/1 in grain are WERKS/MAJ_CAT (always real). Positions
         # 2+ are extras (M_YARN_02, M_DESIGN_02, …) — those are the ones we
         # check for empty/'NA'/null.
@@ -331,7 +449,26 @@ def build_sec_cap_state(
             _mbq_raw = row[anchor_col]
             mbq_null = pd.isna(_mbq_raw)
             mbq_val = 0.0 if mbq_null else float(_mbq_raw)
-            ceiling = mbq_val * cap_factor
+
+            # Resolve growth% — matrix (per-grain cont%) or grid-flat cap.
+            # Matrix path only fires when the toggle is on AND we have a
+            # valid MAJ_CAT total for this grain; otherwise we degrade to
+            # the pre-matrix flat cap so behaviour stays byte-identical
+            # with the toggle off.
+            cont_pct = 0.0
+            band_matched = True
+            if state["matrix_enabled"] and maj_total and not mbq_null:
+                total = maj_total.get((grain[0], grain[1]), 0.0)
+                cont_pct = (mbq_val / total * 100.0) if total > 0 else 0.0
+                growth_pct, band_matched = resolve_growth(
+                    cont_pct, matrix_bands or [], grid_default_pct
+                )
+                cap_factor_grain = growth_pct / 100.0
+            else:
+                growth_pct = grid_default_pct
+                cap_factor_grain = cap_factor
+
+            ceiling = mbq_val * cap_factor_grain
             if stk_col:
                 _stk_raw = row[stk_col]
                 stk_val = 0.0 if pd.isna(_stk_raw) else float(_stk_raw)
@@ -342,6 +479,9 @@ def build_sec_cap_state(
             smap[grain] = stk_val
             mmap[grain] = mbq_val
             fmap[grain] = not mbq_null
+            cpmap[grain] = cont_pct
+            gpmap[grain] = growth_pct
+            gbmap[grain] = band_matched
             # Hard-block reasons (per design spec 2026-06-30):
             #   1) grid extra value is empty / 'NA' / 'NONE'
             #   2) explicit MBQ_ORIG = 0
@@ -359,12 +499,15 @@ def build_sec_cap_state(
                 reasons.append(f"SEC_CAP_NULL[{g_name}]")
             if reasons:
                 hbmap[grain] = reasons
-        state["budgets"][g_name]    = bmap
-        state["ceilings"][g_name]   = cmap
-        state["stks"][g_name]       = smap
-        state["mbqs"][g_name]       = mmap
-        state["configured"][g_name] = fmap
-        state["hard_block"][g_name] = hbmap
+        state["budgets"][g_name]          = bmap
+        state["ceilings"][g_name]         = cmap
+        state["stks"][g_name]             = smap
+        state["mbqs"][g_name]             = mmap
+        state["configured"][g_name]       = fmap
+        state["hard_block"][g_name]       = hbmap
+        state["cont_pcts"][g_name]        = cpmap
+        state["resolved_growths"][g_name] = gpmap
+        state["band_matched"][g_name]     = gbmap
 
         # GH_<HC> applicability map per MAJ_CAT
         if gh_col:
@@ -402,57 +545,103 @@ def _evaluate_sec_cap_per_opt(
             participating: list of (grid_name, grain_tuple) for grids the OPT
                 touches — used to advance `running` after admission.
 
-    Override rule (unified 2026-07-04 across Primary and Secondary grids):
-        On breach (`run_before + intended_ship > budget`) compute
+    Two-pass evaluation (2026-07-13):
+
+    Pass 1 — veto scan (order-independent). Iterate every applicable grid
+        (same GH_<HC> applicability guard as Pass 2) and collect hard_block
+        reasons (2026-06-30 spec: empty grid extra, explicit MBQ_ORIG=0,
+        NULL MBQ_ORIG). If any grid vetoes, return action="block" with the
+        combined hard_block_reasons list; `participating` stays empty so
+        `running` is NOT advanced for any grid the OPT touched.
+
+    Pass 2 — breach scan (Primary-first, unchanged from 2026-07-04). Only
+        reached when Pass 1 finds no veto. On breach
+        (`run_before + intended_ship > budget`) compute
             overshoot = run_before + intended_ship − budget
-        Admit when
+        and admit when
             configured  AND  overshoot > 0  AND  overshoot <= 0.5 × intended_ship
         i.e. one boundary OPT per grain per band may breach by up to
         ½ × its own intended ship. After admission the 5g.1 `running`
-        advance pushes the grain past budget, so the next OPT's
-        overshoot inevitably exceeds ½ × its intended and hard-blocks.
-        NULL-MBQ grains (`configured=False`) stay strict-block for
-        data-gap detection. Primary grids (group='Primary' — today MJ
-        and MJ_MERGE_RNG_SEG) use the same rule as Secondary; the only
-        difference is the SKIP_REASON label carries `primary_block=True`
-        when the block path is taken (kept for reporting continuity).
+        advance pushes the grain past budget, so the next OPT's overshoot
+        inevitably exceeds ½ × its intended and hard-blocks. NULL-MBQ grains
+        (`configured=False`) stay strict-block for data-gap detection.
+        Primary grids (group='Primary' — today MJ and MJ_MERGE_RNG_SEG) use
+        the same rule as Secondary; the only difference is the SKIP_REASON
+        label carries `primary_block=True` when the block path is taken.
+
+    Invariant: veto > override. A hard-block on ANY applicable grid vetoes
+        the OPT regardless of what any other grid would admit via overshoot.
     """
     participating: List[Tuple[str, tuple]] = []
     if intended_ship <= 0 or not sec_cap_state.get("grids"):
         return None, participating
     row0 = opt_rows.iloc[0]
     maj_cat = str(row0.get("MAJ_CAT", ""))
+
+    # =========================================================================
+    # Pass 1 — veto scan (order-independent).
+    # Any applicable grid carrying a hard-block reason (2026-06-30 spec: empty
+    # grid extra, explicit MBQ_ORIG=0, NULL MBQ_ORIG) vetoes the OPT regardless
+    # of what an earlier grid would admit via the Primary overshoot allowance.
+    # Runs BEFORE Pass 2 so an overshoot admit can never shadow a downstream
+    # veto. The GH_<HC> applicability guard is re-applied here so a grid that
+    # does not apply to this MAJ_CAT (GH=0) cannot veto.
+    # Ref: docs/superpowers/specs/2026-07-13-sec-cap-hard-block-precedence-design.md
+    # =========================================================================
+    vetoing: List[Tuple[str, tuple, Dict[str, Any], List[str]]] = []
     for g_name, g_meta in sec_cap_state["grids"]:
         gh_map = sec_cap_state["gh_applies"].get(g_name, {})
         if gh_map and not gh_map.get(maj_cat, True):
             continue
         extras = list(g_meta.get("extras") or [])
         grain = tuple([str(werks_v), maj_cat] + [str(row0.get(e, "")) for e in extras])
-        # Hard-block (per design spec 2026-06-30): empty grid value, MBQ_ORIG
-        # explicit 0, or MBQ_ORIG NULL — any of the three triggers a strict
-        # block with a canonical SKIP_REASON tag list. This runs BEFORE the
-        # legacy `configured/ceiling<=0` skip so the new tags take precedence
-        # over the old SEC_CAP_PRE_<grid>(cap=N%) label.
         hb_reasons = sec_cap_state.get("hard_block", {}).get(g_name, {}).get(grain)
         if hb_reasons:
-            participating.append((g_name, grain))
-            return {
-                "action":             "block",
-                "grid":               g_name,
-                "grain":              grain,
-                "budget":             sec_cap_state["budgets"].get(g_name, {}).get(grain, 0.0),
-                "ceiling":            sec_cap_state["ceilings"].get(g_name, {}).get(grain, 0.0),
-                "stk":                sec_cap_state["stks"].get(g_name, {}).get(grain, 0.0),
-                "mbq":                sec_cap_state["mbqs"].get(g_name, {}).get(grain, 0.0),
-                "cap_pct":            float(g_meta.get("cap_pct") or 100.0),
-                "run_before":         sec_cap_state["running"][g_name].get(grain, 0.0),
-                "configured":         sec_cap_state.get("configured", {}).get(g_name, {}).get(grain, True),
-                "mj_req_rem":         float((mj_req_rem_dict or {}).get(str(werks_v), 0.0)),
-                "opt_mbq":            0.0,
-                "threshold":          0.0,
-                "intended_ship":      intended_ship,
-                "hard_block_reasons": list(hb_reasons),
-            }, participating
+            vetoing.append((g_name, grain, g_meta, list(hb_reasons)))
+
+    if vetoing:
+        v_grid, v_grain, v_meta, _ = vetoing[0]
+        combined_reasons: List[str] = []
+        for _, _, _, rs in vetoing:
+            for rsn in rs:
+                if rsn not in combined_reasons:
+                    combined_reasons.append(rsn)
+        info = {
+            "action":             "block",
+            "grid":               v_grid,
+            "grain":              v_grain,
+            "budget":             sec_cap_state["budgets"].get(v_grid, {}).get(v_grain, 0.0),
+            "ceiling":            sec_cap_state["ceilings"].get(v_grid, {}).get(v_grain, 0.0),
+            "stk":                sec_cap_state["stks"].get(v_grid, {}).get(v_grain, 0.0),
+            "mbq":                sec_cap_state["mbqs"].get(v_grid, {}).get(v_grain, 0.0),
+            "cap_pct":            float(v_meta.get("cap_pct") or 100.0),
+            "run_before":         sec_cap_state["running"][v_grid].get(v_grain, 0.0),
+            "configured":         sec_cap_state.get("configured", {}).get(v_grid, {}).get(v_grain, True),
+            "mj_req_rem":         float((mj_req_rem_dict or {}).get(str(werks_v), 0.0)),
+            "opt_mbq":            0.0,
+            "threshold":          0.0,
+            "intended_ship":      intended_ship,
+            "hard_block_reasons": combined_reasons,
+            # matrix keys preserved (added post-FSD; read by _stamp_* narrative)
+            "cont_pct":           sec_cap_state.get("cont_pcts", {}).get(v_grid, {}).get(v_grain, 0.0),
+            "growth_pct":         sec_cap_state.get("resolved_growths", {}).get(v_grid, {}).get(v_grain, float(v_meta.get("cap_pct") or 100.0)),
+            "band_matched":       sec_cap_state.get("band_matched", {}).get(v_grid, {}).get(v_grain, True),
+            "matrix_enabled":     bool(sec_cap_state.get("matrix_enabled", False)),
+        }
+        # participating stays empty — vetoed OPTs contribute no ship, so no
+        # `running` advance should happen for any grid they touched.
+        return info, participating
+
+    # =========================================================================
+    # Pass 2 — breach scan (Primary-first). Only reached when Pass 1 found no
+    # veto. Hard-block branch removed (handled above in Pass 1).
+    # =========================================================================
+    for g_name, g_meta in sec_cap_state["grids"]:
+        gh_map = sec_cap_state["gh_applies"].get(g_name, {})
+        if gh_map and not gh_map.get(maj_cat, True):
+            continue
+        extras = list(g_meta.get("extras") or [])
+        grain = tuple([str(werks_v), maj_cat] + [str(row0.get(e, "")) for e in extras])
         # `configured` is False ONLY when MBQ_ORIG was NULL at this grain.
         # Default True so legacy callers that don't populate the map still
         # behave as before. The flag lets us distinguish NULL (strict block)
@@ -502,6 +691,10 @@ def _evaluate_sec_cap_per_opt(
                     "threshold":     primary_threshold,
                     "intended_ship": intended_ship,
                     "overshoot":     overshoot,
+                    "cont_pct":      sec_cap_state.get("cont_pcts", {}).get(g_name, {}).get(grain, 0.0),
+                    "growth_pct":    sec_cap_state.get("resolved_growths", {}).get(g_name, {}).get(grain, float(g_meta.get("cap_pct") or 100.0)),
+                    "band_matched":  sec_cap_state.get("band_matched", {}).get(g_name, {}).get(grain, True),
+                    "matrix_enabled": bool(sec_cap_state.get("matrix_enabled", False)),
                 }
                 if action == "block":
                     info["primary_block"] = True
@@ -537,6 +730,10 @@ def _evaluate_sec_cap_per_opt(
                 "threshold":     threshold,
                 "intended_ship": intended_ship,
                 "overshoot":     overshoot,
+                "cont_pct":      sec_cap_state.get("cont_pcts", {}).get(g_name, {}).get(grain, 0.0),
+                "growth_pct":    sec_cap_state.get("resolved_growths", {}).get(g_name, {}).get(grain, float(g_meta.get("cap_pct") or 130.0)),
+                "band_matched":  sec_cap_state.get("band_matched", {}).get(g_name, {}).get(grain, True),
+                "matrix_enabled": bool(sec_cap_state.get("matrix_enabled", False)),
             }
             if action == "override":
                 info["overshoot_admit"] = True
@@ -559,6 +756,17 @@ def _run_band_per_opt(
     sec_cap_state: Optional[Dict[str, Any]] = None,
     rl_dispatch_mode: str = 'COMPLETE',
     tbc_dispatch_mode: str = 'COMPLETE',
+    # ── Fresh/GRT hold control (FSD_FRESH_GRT_HOLD_CONTROL) ──
+    # alloc_type is accepted for contract parity with the pandas engine;
+    # it is not read here — hold_dict already arrives filtered to
+    # (ALLOC_TYPE = run type OR legacy '') by the loader in
+    # rule_engine_pandas._pandas_run_one_majcat (FS-09). The three flags
+    # drive the FS-06 hold-suppression mask at the TBL SHIP/HOLD split
+    # (5c.5). Defaults keep behaviour byte-identical.
+    alloc_type: str = "FRESH",
+    skip_hold_upc: bool = False,
+    apply_hold_seg_app: bool = True,
+    apply_hold_seg_gm: bool = True,
 ) -> None:
     """
     Per-OPT replacement for rule_engine_pandas._run_band.
@@ -779,6 +987,22 @@ def _run_band_per_opt(
                 np.floor((ship_basis + 0.5 * pak) / pak) * pak,
             )
             hold_basis = np.maximum(opt_need - want_ship_pak, 0.0)
+            # FS-06 hold suppression (FSD_FRESH_GRT_HOLD_CONTROL §7 / IM-1):
+            # zero the HOLD basis for suppressed rows (UPC store / SEG
+            # toggle) BEFORE the half-up pak-alignment below, so rounding
+            # rounds the already-zeroed hold (0 stays 0) and can never
+            # re-inflate a suppressed hold. want_hold_pak → 0 also removes
+            # the hold from opt_need, so 5e's hold_target is 0 and the
+            # un-held qty stays in the live pool (BR-11). Ship-side pak
+            # alignment (want_ship_pak above) is untouched.
+            _sup = _hold_suppress_arr(
+                alloc_df, opt_idx,
+                skip_hold_upc=skip_hold_upc,
+                apply_hold_seg_app=apply_hold_seg_app,
+                apply_hold_seg_gm=apply_hold_seg_gm,
+            )
+            if _sup is not None:
+                hold_basis = np.where(_sup, 0.0, hold_basis)
             want_hold_pak = np.where(
                 (want_ship_pak == 0) | (hold_basis < 0.5 * pak),
                 0.0,
@@ -906,50 +1130,63 @@ def _run_band_per_opt(
                             )
                             skipped_cap += 1
                             continue
-                    # SCALED: round-then-shave. np.round (nearest int) instead
-                    # of floor recovers the per-size "1-less-than-SZ_MBQ" loss
-                    # that floor produces when scale is just under 1.0; the
-                    # shave pass below guarantees sum(opt_need) <= werks_cap
-                    # so the MBQ budget invariant still holds.
-                    scale = werks_cap / total_need
-                    ideal = opt_need * scale
-                    opt_need = np.round(ideal / pak) * pak
-                    over_units = float(opt_need.sum()) - werks_cap
-                    if over_units > 1e-9:
-                        # Shave whole paks from rows that were rounded UP
-                        # (frac >= 0.5); pick the row with frac closest to
-                        # 0.5 first — that round-up was the weakest signal,
-                        # so reverting it costs the least vs. ideal.
-                        frac = (ideal / np.where(pak > 0, pak, 1.0))
-                        frac = frac - np.floor(frac)
-                        iter_safety = int(len(opt_need)) * 2 + 4
-                        while over_units > 1e-9 and iter_safety > 0:
-                            iter_safety -= 1
-                            score = np.where(
-                                (frac >= 0.5) & (opt_need > 0),
-                                frac, np.inf,
-                            )
-                            idx_s = int(np.argmin(score))
-                            if not np.isfinite(score[idx_s]):
-                                # No rounded-up rows left — fall back to
-                                # shaving the largest positive row.
-                                positive = np.where(opt_need > 0)[0]
-                                if len(positive) == 0:
-                                    break
-                                idx_s = int(positive[np.argmax(opt_need[positive])])
-                            opt_need[idx_s] = max(0.0, opt_need[idx_s] - pak[idx_s])
-                            frac[idx_s] = -np.inf  # don't reselect as "rounded up"
-                            over_units = float(opt_need.sum()) - werks_cap
-                    # Audit stamp on every row of this OPT so reviewers see
-                    # why each size landed where it did (was previously silent
-                    # for PAK_SZ=1 rows). Reads alongside the existing
-                    # B[ot.rN.rkK] trace.
-                    note = (
-                        f' MBQ_CAP_SCALE({ot},need={int(total_need)},'
-                        f'cap={int(werks_cap)},scale={scale:.3f});'
-                    )
-                    prev_r = alloc_df.loc[opt_idx, 'ALLOC_REMARKS'].fillna('').astype(str)
-                    alloc_df.loc[opt_idx, 'ALLOC_REMARKS'] = prev_r + note
+                    elif mode == 'SCALED':
+                        # SCALED: round-then-shave. np.round (nearest int)
+                        # instead of floor recovers the per-size
+                        # "1-less-than-SZ_MBQ" loss that floor produces when
+                        # scale is just under 1.0; the shave pass below
+                        # guarantees sum(opt_need) <= werks_cap so the MBQ
+                        # budget invariant still holds.
+                        #
+                        # GUARD (2026-07-17): this block is reached ONLY when
+                        # mode == 'SCALED'. Previously it was an unguarded
+                        # fall-through after the COMPLETE block, so a
+                        # COMPLETE-mode overshoot-admit (which stamps
+                        # MBQ_CAP_OVERSHOOT and intends a FULL ship) fell
+                        # straight into here and got silently rescaled down to
+                        # the cap — producing a contradictory double stamp
+                        # (OVERSHOOT + SCALE) and shipping the scaled qty, not
+                        # the full need. The `elif` makes COMPLETE and SCALED
+                        # mutually exclusive.
+                        scale = werks_cap / total_need
+                        ideal = opt_need * scale
+                        opt_need = np.round(ideal / pak) * pak
+                        over_units = float(opt_need.sum()) - werks_cap
+                        if over_units > 1e-9:
+                            # Shave whole paks from rows that were rounded UP
+                            # (frac >= 0.5); pick the row with frac closest to
+                            # 0.5 first — that round-up was the weakest signal,
+                            # so reverting it costs the least vs. ideal.
+                            frac = (ideal / np.where(pak > 0, pak, 1.0))
+                            frac = frac - np.floor(frac)
+                            iter_safety = int(len(opt_need)) * 2 + 4
+                            while over_units > 1e-9 and iter_safety > 0:
+                                iter_safety -= 1
+                                score = np.where(
+                                    (frac >= 0.5) & (opt_need > 0),
+                                    frac, np.inf,
+                                )
+                                idx_s = int(np.argmin(score))
+                                if not np.isfinite(score[idx_s]):
+                                    # No rounded-up rows left — fall back to
+                                    # shaving the largest positive row.
+                                    positive = np.where(opt_need > 0)[0]
+                                    if len(positive) == 0:
+                                        break
+                                    idx_s = int(positive[np.argmax(opt_need[positive])])
+                                opt_need[idx_s] = max(0.0, opt_need[idx_s] - pak[idx_s])
+                                frac[idx_s] = -np.inf  # don't reselect as "rounded up"
+                                over_units = float(opt_need.sum()) - werks_cap
+                        # Audit stamp on every row of this OPT so reviewers see
+                        # why each size landed where it did (was previously
+                        # silent for PAK_SZ=1 rows). Reads alongside the
+                        # existing B[ot.rN.rkK] trace.
+                        note = (
+                            f' MBQ_CAP_SCALE({ot},need={int(total_need)},'
+                            f'cap={int(werks_cap)},scale={scale:.3f});'
+                        )
+                        prev_r = alloc_df.loc[opt_idx, 'ALLOC_REMARKS'].fillna('').astype(str)
+                        alloc_df.loc[opt_idx, 'ALLOC_REMARKS'] = prev_r + note
 
         # NOTE: by design, TBL is NOT clamped to remaining MJ_REQ_REM after
         # admission. If the admission test at 5b2 lets the OPT in, it ships
@@ -984,10 +1221,21 @@ def _run_band_per_opt(
                 mbq_gate_factor=mbq_gate_factor,
             )
             if breach is not None and breach.get("action") == "block":
+                # When the matrix path resolved a band, the effective cap
+                # on this grain is the resolved growth% (not the grid's
+                # flat cap). Fall back to the flat cap in every other case
+                # (matrix off, or matrix on with band gap).
+                _matrix_on   = bool(breach.get("matrix_enabled", False))
+                _band_ok     = bool(breach.get("band_matched", True))
+                _effective_cap = (
+                    float(breach.get("growth_pct", breach["cap_pct"]))
+                    if _matrix_on and _band_ok
+                    else float(breach["cap_pct"])
+                )
                 _mark_opt_skip_sec_cap(
                     alloc_df, opt_idx,
                     grid_name=breach["grid"],
-                    cap_pct=breach["cap_pct"],
+                    cap_pct=_effective_cap,
                     stk_val=breach["stk"],
                     ceiling_val=breach["ceiling"],
                     mbq_orig_val=breach["mbq"],
@@ -998,6 +1246,9 @@ def _run_band_per_opt(
                     is_primary=bool(breach.get("primary_block", False)),
                     hard_block_reasons=breach.get("hard_block_reasons"),
                     grain=breach.get("grain"),
+                    cont_pct=breach.get("cont_pct"),
+                    band_matched=_band_ok,
+                    matrix_enabled=_matrix_on,
                 )
                 skipped_cap += 1
                 continue  # do NOT touch pool_dict / hold_dict — units stay live

@@ -78,6 +78,7 @@ CREATE TABLE dbo.{PEND_ALC_TABLE} (
     CLR            NVARCHAR(20)   NULL,
     ALLOC_MODE     NVARCHAR(10)   NOT NULL DEFAULT 'AUTO',
     SOURCE         NVARCHAR(20)   NOT NULL DEFAULT 'AUTO',
+    ALLOC_TYPE     NVARCHAR(10)   NULL,
     ALLOC_QTY      FLOAT          NOT NULL DEFAULT 0,
     BDC_QTY        FLOAT          NOT NULL DEFAULT 0,
     DO_QTY         FLOAT          NOT NULL DEFAULT 0,
@@ -1619,6 +1620,18 @@ def _revert_approve(conn, payload: Dict) -> Dict:
         logger.warning(f"[revert] APPROVE hold-tracking revert skipped: {e}")
         result["hold_revert_error"] = str(e)
 
+    # 3b. Re-seed MSA HOLD_QTY/FNL_Q from the restored tracking rows
+    # (type-aware, session-scoped). Without this the hold-driven share of
+    # FNL_Q stayed deducted after a revert until the next sync/regeneration
+    # (observed 2026-07-10: ~1.3k residual on the FRESH pool after the E2E
+    # approve→revert round-trip). _skip_post_bootstrap only suppresses the
+    # heavy FULL bootstraps; this scoped re-sync is cheap and closes the gap.
+    try:
+        result["hold_resync"] = bootstrap_msa_hold_sync(conn, session_id=session_id)
+    except Exception as e:
+        logger.warning(f"[revert] APPROVE scoped hold re-sync skipped: {e}")
+        result["hold_resync_error"] = str(e)
+
     # 4. Demote HISTORY → PARKED for all six targets so the session
     #    reappears in the Parked Runs UI for re-review.
     try:
@@ -1628,6 +1641,29 @@ def _revert_approve(conn, payload: Dict) -> Dict:
     except Exception as e:
         logger.warning(f"[revert] APPROVE history→parked demote failed: {e}")
         result["demote_error"] = str(e)
+
+    # 5. Clear EVERY active (non-reverted) APPROVE op for this session, not
+    #    just the one clicked. The once-only guard in approve_parked now
+    #    keeps it to one op per session going forward, but this also heals
+    #    sessions double-approved before that guard existed (e.g.
+    #    20260713_164356_383, whose sibling OP stayed "active" after its twin
+    #    was reverted, blocking a legitimate re-approve). Idempotent — the
+    #    clicked op is re-stamped by revert_operation afterward, harmlessly.
+    try:
+        sib = conn.execute(text(f"""
+            UPDATE {OPERATIONS_TABLE}
+               SET REVERTED_AT = GETDATE(),
+                   REVERTED_BY = ISNULL(REVERTED_BY, 'system'),
+                   REVERT_NOTE = ISNULL(REVERT_NOTE,
+                       'auto-cleared: sibling APPROVE reverted for same session')
+             WHERE OP_TYPE = 'APPROVE'
+               AND OP_KEY  = :sid
+               AND REVERTED_AT IS NULL
+        """), {"sid": session_id})
+        result["sibling_approve_ops_cleared"] = int(sib.rowcount or 0)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[revert] APPROVE sibling-op cleanup skipped: {e}")
 
     logger.info(
         f"[revert] APPROVE session={session_id}: "
@@ -2125,6 +2161,7 @@ _ENSURE_COLS = [
     ("CLR",            "NVARCHAR(20)   NULL"),
     ("ALLOC_MODE",     "NVARCHAR(10)   NOT NULL DEFAULT 'AUTO'"),
     ("SOURCE",         "NVARCHAR(20)   NOT NULL DEFAULT 'AUTO'"),
+    ("ALLOC_TYPE",     "NVARCHAR(10)   NULL"),
     ("ALLOC_QTY",      "FLOAT          NOT NULL DEFAULT 0"),
     ("BDC_QTY",        "FLOAT          NOT NULL DEFAULT 0"),
     ("DO_QTY",         "FLOAT          NOT NULL DEFAULT 0"),
@@ -2281,29 +2318,32 @@ def write_pend_alc(conn, session_id: str) -> int:
         sql = f"""
             INSERT INTO {PEND_ALC_TABLE}
                 (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                 ALLOC_QTY, ALLOC_MODE, SOURCE)
+                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
             SELECT :sid, src.RDC, src.ST_CD, src.VAR_ART, src.MAJ_CAT,
-                   src.GEN_ART_NUMBER, src.CLR, src.ALLOC_QTY, src.ALLOC_MODE, 'AUTO'
+                   src.GEN_ART_NUMBER, src.CLR, src.ALLOC_QTY, src.ALLOC_MODE, 'AUTO',
+                   src.ALLOC_TYPE
             FROM (
                 SELECT {rdc_expr}                         AS RDC,
                        H.[WERKS]                          AS ST_CD,
                        H.[VAR_ART],
-                       MAX(H.[MAJ_CAT])                   AS MAJ_CAT,
+                       H.[MAJ_CAT]                        AS MAJ_CAT,
                        H.[GEN_ART_NUMBER],
                        MAX(H.[CLR])                       AS CLR,
                        SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0)) AS ALLOC_QTY,
-                       ISNULL(MAX(W.[OPT_TYPE]), 'AUTO')  AS ALLOC_MODE
+                       ISNULL(MAX(W.[OPT_TYPE]), 'AUTO')  AS ALLOC_MODE,
+                       MAX(H.[ALLOC_TYPE])                AS ALLOC_TYPE
                 FROM [ARS_ALLOC_HISTORY] H
                 {st_join}
                 LEFT JOIN [ARS_LISTING_WORKING_HISTORY] W
                     ON  W.[SESSION_ID]                = H.[SESSION_ID]
                     AND W.[WERKS]                     = H.[WERKS]
+                    AND ISNULL(W.[MAJ_CAT],'')        = ISNULL(H.[MAJ_CAT],'')
                     AND ISNULL(W.[GEN_ART_NUMBER],'') = ISNULL(H.[GEN_ART_NUMBER],'')
                     AND ISNULL(W.[CLR],'')             = ISNULL(H.[CLR],'')
                 WHERE H.[SESSION_ID] = :sid
                   AND ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0) > 0
-                GROUP BY {rdc_expr}, H.[WERKS], H.[VAR_ART], H.[GEN_ART_NUMBER],
-                         ISNULL(W.[OPT_TYPE], 'AUTO')
+                GROUP BY {rdc_expr}, H.[WERKS], H.[VAR_ART], H.[MAJ_CAT],
+                         H.[GEN_ART_NUMBER], ISNULL(W.[OPT_TYPE], 'AUTO')
             ) src
             WHERE NOT EXISTS (
                 SELECT 1 FROM {PEND_ALC_TABLE} P
@@ -2319,12 +2359,12 @@ def write_pend_alc(conn, session_id: str) -> int:
         sql = f"""
             INSERT INTO {PEND_ALC_TABLE}
                 (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                 ALLOC_QTY, ALLOC_MODE, SOURCE)
+                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
             SELECT :sid,
                    {rdc_expr}, H.[WERKS], H.[VAR_ART],
                    MAX(H.[MAJ_CAT]), MAX(H.[GEN_ART_NUMBER]), MAX(H.[CLR]),
                    SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0)),
-                   'AUTO', 'AUTO'
+                   'AUTO', 'AUTO', MAX(H.[ALLOC_TYPE])
             FROM [ARS_ALLOC_HISTORY] H
             {st_join}
             WHERE H.[SESSION_ID] = :sid
@@ -2347,6 +2387,20 @@ def write_pend_alc(conn, session_id: str) -> int:
     return inserted
 
 
+def _norm_alloc_type(v) -> Optional[str]:
+    """Normalize a caller-supplied alloc_type. None/'' → None (legacy row —
+    the typed MSA delta folds it into FRESH); 'FRESH'/'GRT' (any case, padded)
+    pass through. Anything else raises ValueError."""
+    if v is None:
+        return None
+    s = str(v).strip().upper()
+    if s == "":
+        return None
+    if s in ("FRESH", "GRT"):
+        return s
+    raise ValueError(f"Invalid alloc_type {v!r} — must be FRESH, GRT, or blank")
+
+
 def write_manual_pend_alc(
     conn,
     rows: List[Dict],
@@ -2361,6 +2415,10 @@ def write_manual_pend_alc(
 
     Args:
       rows:        list of row dicts (rdc, article_number, alloc_qty, ...).
+                   Optional per-row `alloc_type` ∈ {None,'','FRESH','GRT'}
+                   (normalized UPPER/TRIM; None/'' stored as NULL → the MSA
+                   delta folds it into the FRESH row; 'FRESH'/'GRT' stored
+                   as-is and deduct the matching typed MSA row).
       session_id:  if provided, all rows are tagged with this session_id
                    (multi-chunk uploads share one session_id and roll up to
                    one operations_log entry, which makes revert atomic).
@@ -2404,6 +2462,7 @@ def write_manual_pend_alc(
             r.get("clr") or None,
             float(r["alloc_qty"]),
             r.get("remarks") or None,
+            _norm_alloc_type(r.get("alloc_type")),
         )
         for r in valid
     ]
@@ -2422,8 +2481,8 @@ def write_manual_pend_alc(
         sql = (
             f"INSERT INTO {PEND_ALC_TABLE} "
             "(SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,"
-            " ALLOC_QTY, ALLOC_MODE, SOURCE, REMARKS) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 'MANUAL', ?)"
+            " ALLOC_QTY, ALLOC_MODE, SOURCE, REMARKS, ALLOC_TYPE) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 'MANUAL', ?, ?)"
         )
 
         # Internal chunk to keep the parameter array manageable in memory and
@@ -2487,11 +2546,15 @@ def write_manual_pend_alc(
                     "clr":            r[5] or "",
                     "alloc_qty":      float(r[6] or 0),
                     "do_qty":         float(r[7] or 0),
+                    # Typed pend: apply_pend_alc_delta folds None/'' → FRESH
+                    # so a typed manual row deducts the matching typed MSA
+                    # row and a legacy row keeps folding into FRESH.
+                    "alloc_type":     r[8],
                 }
                 for r in conn.execute(text(f"""
                     SELECT P.RDC, P.ST_CD, P.ARTICLE_NUMBER, P.MAJ_CAT,
                            P.GEN_ART_NUMBER, P.CLR,
-                           P.ALLOC_QTY, ISNULL(P.DO_QTY, 0)
+                           P.ALLOC_QTY, ISNULL(P.DO_QTY, 0), P.ALLOC_TYPE
                     FROM {PEND_ALC_TABLE} P
                     JOIN {tmp_ids} t ON t.id = P.ID
                 """)).fetchall()
@@ -3315,6 +3378,7 @@ def _revert_hold_clear(conn, payload: Dict) -> Dict:
             "  werks            NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  var_art          NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  sz               NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  alloc_type       NVARCHAR(10) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  old_hold_rem     FLOAT        NOT NULL,"
             "  old_is_closed    BIT          NOT NULL,"
             "  old_closed_date  DATETIME     NULL"
@@ -3333,12 +3397,14 @@ def _revert_hold_clear(conn, payload: Dict) -> Dict:
             try: cur.fast_executemany = True
             except Exception: pass
             cur.executemany(
-                f"INSERT INTO {tmp} (werks, var_art, sz, old_hold_rem, "
-                "                    old_is_closed, old_closed_date) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO {tmp} (werks, var_art, sz, alloc_type, "
+                "                    old_hold_rem, old_is_closed, "
+                "                    old_closed_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [(str(u.get("werks") or ""),
                   str(u.get("var_art") or ""),
                   str(u.get("sz") or ""),
+                  str(u.get("alloc_type") or ""),
                   float(u.get("old_hold_rem") or 0),
                   int(u.get("was_closed") or 0),
                   _parse_dt(u.get("old_closed_date")))
@@ -3358,6 +3424,7 @@ def _revert_hold_clear(conn, payload: Dict) -> Dict:
               ON  H.WERKS = u.werks
              AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
              AND ISNULL(H.SZ,'') = u.sz
+             AND ISNULL(H.ALLOC_TYPE,'') = u.alloc_type
         """))
         rows_reverted = int(res.rowcount or 0)
     finally:
@@ -3404,6 +3471,7 @@ def _revert_hold_revise(conn, payload: Dict) -> Dict:
             "  werks         NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  var_art       NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  sz            NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"
+            "  alloc_type    NVARCHAR(10) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  old_hold_rem  FLOAT        NOT NULL,"
             "  old_initial   FLOAT        NOT NULL,"
             "  was_closed    BIT          NOT NULL"
@@ -3414,12 +3482,13 @@ def _revert_hold_revise(conn, payload: Dict) -> Dict:
             try: cur.fast_executemany = True
             except Exception: pass
             cur.executemany(
-                f"INSERT INTO {tmp} (werks, var_art, sz, old_hold_rem, "
-                "                    old_initial, was_closed) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO {tmp} (werks, var_art, sz, alloc_type, "
+                "                    old_hold_rem, old_initial, was_closed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [(str(u.get("werks") or ""),
                   str(u.get("var_art") or ""),
                   str(u.get("sz") or ""),
+                  str(u.get("alloc_type") or ""),
                   float(u.get("old_hold_rem") or 0),
                   float(u.get("old_initial") or 0),
                   int(u.get("was_closed") or 0))
@@ -3442,6 +3511,7 @@ def _revert_hold_revise(conn, payload: Dict) -> Dict:
               ON  H.WERKS = u.werks
              AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
              AND ISNULL(H.SZ,'') = u.sz
+             AND ISNULL(H.ALLOC_TYPE,'') = u.alloc_type
         """))
         rows_reverted = int(res.rowcount or 0)
     finally:
@@ -3465,6 +3535,7 @@ def _revert_hold_revise(conn, payload: Dict) -> Dict:
 
 def stamp_bdc_qty(
     conn, article_rdc_pairs: Optional[List[Dict]] = None,
+    store_scoped: bool = False,
 ) -> List[Dict]:
     """Set BDC_QTY = current PEND_QTY and LAST_BDC_AT = now for open rows.
 
@@ -3478,6 +3549,14 @@ def stamp_bdc_qty(
         - If `st_cd` is provided, scoped to that exact destination store row.
         - If `st_cd` omitted, falls back to (RDC, ARTICLE) matching.
     If article_rdc_pairs is None, stamps ALL open rows globally.
+
+    store_scoped: pass True when the caller filtered by store (st_cd list
+        non-empty on the generate request). Drops the legacy `u.st_cd = ''`
+        wildcard branch so a pair whose pend row has an empty ST_CD can never
+        stamp EVERY store's rows for that (RDC, ARTICLE) — FS-13 defect #3.
+        With the wildcard dropped, `u.st_cd = ''` matches only pend rows whose
+        own ST_CD is empty (exact-key semantics). Default False preserves
+        legacy behaviour for callers without a store filter.
     """
     ensure_pend_alc_table(conn)
 
@@ -3500,6 +3579,13 @@ def stamp_bdc_qty(
                 "a": str(p["article_number"]),
             } for p in article_rdc_pairs]
         )
+        # store_scoped=True → exact ST_CD match only (empty matches empty);
+        # legacy default keeps the empty-st_cd wildcard for callers that pass
+        # pairs without store scoping and mean "any store".
+        st_pred = (
+            "ISNULL(P.ST_CD,'') = u.st_cd" if store_scoped
+            else "(u.st_cd = '' OR ISNULL(P.ST_CD,'') = u.st_cd)"
+        )
         rows = conn.execute(text(f"""
             UPDATE P
                SET P.BDC_QTY    = P.PEND_QTY,
@@ -3509,7 +3595,7 @@ def stamp_bdc_qty(
             JOIN {tmp} u
               ON P.RDC = u.rdc
              AND P.ARTICLE_NUMBER = u.art
-             AND (u.st_cd = '' OR ISNULL(P.ST_CD,'') = u.st_cd)
+             AND {st_pred}
             WHERE P.IS_CLOSED = 0 AND P.PEND_QTY > 0
         """)).fetchall()
         try:
@@ -3538,9 +3624,24 @@ def stamp_bdc_qty(
     ]
 
 
-def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
+def apply_do_deductions(conn, rows: List[Dict],
+                        deduction_method: str = "FIFO",
+                        target_session_id: Optional[str] = None) -> Dict:
     """Increment DO_QTY in ARS_PEND_ALC for each DO row using FIFO across
     multiple open session rows for the same (RDC, ST_CD, ARTICLE).
+
+    deduction_method (FS-12):
+      • 'FIFO' (default)   — byte-identical to the original behaviour:
+        open rows drain in APPROVED_AT ASC, ID ASC order.
+      • 'SESSION_FIRST'    — rows of `target_session_id` drain to zero
+        before any other session's oldest row is touched; the remainder
+        then follows plain FIFO.
+      • 'SESSION_ONLY'     — deduct exclusively from `target_session_id`
+        rows; DO qty exceeding that session's open capacity surfaces in
+        `overflow_rows` as unapplied.
+    target_session_id is REQUIRED when deduction_method != 'FIFO' — this is
+    the PEND_ALC SESSION_ID (allocation session), not the upload session_id
+    used as the ops-log key.
 
     Set-based implementation: input rows are bulk-loaded into a temp table,
     aggregated by (RDC, ST_CD, ARTICLE), then one UPDATE..JOIN uses a windowed
@@ -3560,7 +3661,16 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     revert can subtract those exact qtys from those exact rows.
 
     rows: list of dicts with keys rdc, article_number, do_qty.
-          Optional: st_cd, do_number, allocation_number.
+          Optional: st_cd, do_number, allocation_number, alloc_type.
+
+    Typed scoping (Package 3): a row carrying alloc_type ∈ {FRESH, GRT}
+    only drains PEND rows whose *folded* type matches — folded =
+    CASE WHEN ISNULL(ALLOC_TYPE,'')='' THEN 'FRESH' ELSE ALLOC_TYPE END,
+    i.e. legacy (NULL/'') pend rows count as FRESH. Rows without an
+    alloc_type behave exactly as before: when NO input row is typed the
+    SQL executed is byte-identical to the untyped implementation; in a
+    mixed upload the typed buckets drain first (within each st_cd scope),
+    then untyped input absorbs residual capacity across all types.
 
     FIFO and matching semantics:
       • Open rows ordered by APPROVED_AT ASC, ID ASC.
@@ -3586,6 +3696,25 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
     directly and will over-state held qty until a separate process releases
     the hold.
     """
+    method = (deduction_method or "FIFO").strip().upper()
+    if method not in ("FIFO", "SESSION_FIRST", "SESSION_ONLY"):
+        raise ValueError(f"Unknown deduction_method: {deduction_method!r}")
+    if method != "FIFO" and not (target_session_id or "").strip():
+        raise ValueError(
+            f"target_session_id is required when deduction_method={method}"
+        )
+    # SQL fragments injected into the windowed CTE below. Both are empty
+    # strings for FIFO so the default SQL stays byte-identical.
+    sess_order  = ""   # prefix for both window ORDER BYs (SESSION_FIRST)
+    sess_filter = ""   # extra open-rows WHERE predicate (SESSION_ONLY)
+    sess_params: Dict = {}
+    if method == "SESSION_FIRST":
+        sess_order  = "CASE WHEN P.SESSION_ID = :tsid THEN 0 ELSE 1 END, "
+        sess_params = {"tsid": str(target_session_id).strip()}
+    elif method == "SESSION_ONLY":
+        sess_filter = " AND P.SESSION_ID = :tsid"
+        sess_params = {"tsid": str(target_session_id).strip()}
+
     valid = [r for r in rows if float(r.get("do_qty", 0) or 0) > 0]
     if not valid:
         return {"touched": 0, "pend_updates": []}
@@ -3604,6 +3733,9 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             "alloc_no": (str(r.get("allocation_number") or "").strip() or ""),
             "qty":      float(r["do_qty"]),
             "do_num":   (str(r.get("do_number") or "").strip() or None),
+            # '' = untyped (today's behaviour); FRESH/GRT scopes the FIFO
+            # to PEND rows whose folded ALLOC_TYPE matches.
+            "alloc_type": _norm_alloc_type(r.get("alloc_type")) or "",
         })
 
     tmp_in   = f"#do_in_{uuid.uuid4().hex[:8]}"
@@ -3641,7 +3773,8 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             "  art      NVARCHAR(30) COLLATE DATABASE_DEFAULT NOT NULL,"
             "  alloc_no NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,"   # '' means no allocation match
             "  qty      FLOAT        NOT NULL,"
-            "  do_num   NVARCHAR(50) COLLATE DATABASE_DEFAULT NULL"
+            "  do_num   NVARCHAR(50) COLLATE DATABASE_DEFAULT NULL,"
+            "  alloc_type NVARCHAR(10) COLLATE DATABASE_DEFAULT NOT NULL"  # '' means no type scope
             ")"
         ))
         raw = conn.connection
@@ -3652,10 +3785,10 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             except Exception:
                 pass
             cur.executemany(
-                f"INSERT INTO {tmp_in} (seq, rdc, st_cd, art, alloc_no, qty, do_num) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO {tmp_in} (seq, rdc, st_cd, art, alloc_no, qty, do_num, alloc_type) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [(r["seq"], r["rdc"], r["st_cd"], r["art"], r["alloc_no"],
-                  r["qty"], r["do_num"])
+                  r["qty"], r["do_num"], r["alloc_type"])
                  for r in input_rows],
             )
         finally:
@@ -3700,6 +3833,24 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
             ")"
         ))
 
+        # Type buckets (Package 3). When no input row carries an alloc_type
+        # the single (None) bucket adds NO SQL fragments — the statements
+        # below are byte-identical to the untyped implementation. When typed
+        # rows exist, each typed bucket filters its input agg to that type
+        # AND restricts open_ranked to PEND rows whose folded ALLOC_TYPE
+        # matches (folded: NULL/'' → FRESH), so the FIFO running sums are
+        # computed within the type. The '' bucket (untyped input in a mixed
+        # upload) runs last within each scope and matches any type — exactly
+        # today's behaviour on whatever capacity the typed passes left.
+        typed_vals  = sorted({r["alloc_type"] for r in input_rows if r["alloc_type"]})
+        has_untyped = any(not r["alloc_type"] for r in input_rows)
+        if typed_vals:
+            type_buckets = [(t, True) for t in typed_vals]
+            if has_untyped:
+                type_buckets.append(("", True))
+        else:
+            type_buckets = [(None, False)]
+
         # One pass per scope-bucket. Scoped (st_cd != '') first so it claims
         # its targeted PEND_ALC rows before empty-st_cd input can absorb them
         # — preserves the original input-order behavior in mixed CSVs.
@@ -3711,71 +3862,94 @@ def apply_do_deductions(conn, rows: List[Dict]) -> Dict:
                 scope_pred = "agg.st_cd = ''"
                 join_pred  = "1 = 1"
 
-            # Aggregate input within the current scope by (rdc, st_cd, art).
-            # do_numbers preserves input order via STRING_AGG WITHIN GROUP.
-            sql = f"""
-            ;WITH agg AS (
-                SELECT rdc, st_cd, art,
-                       SUM(qty) AS qty,
-                       STRING_AGG(do_num, ', ') WITHIN GROUP (ORDER BY seq) AS do_numbers
-                FROM {tmp_in}
-                WHERE qty > 0
-                GROUP BY rdc, st_cd, art
-            ),
-            open_ranked AS (
-                SELECT P.ID,
-                       P.ALLOC_QTY,
-                       P.DO_QTY,
-                       (P.ALLOC_QTY - P.DO_QTY) AS need,
-                       SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
-                           PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
-                           ORDER BY P.APPROVED_AT, P.ID
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                       ) AS cum_after,
-                       ISNULL(SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
-                           PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
-                           ORDER BY P.APPROVED_AT, P.ID
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                       ), 0) AS cum_before,
-                       P.RDC, P.ST_CD, P.ARTICLE_NUMBER
+            # Typed buckets first (they pin their PEND rows), '' bucket last.
+            for dtype, type_aware in type_buckets:
+                if type_aware:
+                    agg_type_pred = " AND alloc_type = :dtype"
+                    # '' bucket = untyped input → no open-rows restriction.
+                    open_type_pred = (
+                        " AND (CASE WHEN ISNULL(P.ALLOC_TYPE,'') = '' "
+                        "THEN 'FRESH' ELSE P.ALLOC_TYPE END) = :dtype"
+                        if dtype else ""
+                    )
+                else:
+                    agg_type_pred  = ""
+                    open_type_pred = ""
+
+                # Aggregate input within the current scope by (rdc, st_cd, art).
+                # do_numbers preserves input order via STRING_AGG WITHIN GROUP.
+                sql = f"""
+                ;WITH agg AS (
+                    SELECT rdc, st_cd, art,
+                           SUM(qty) AS qty,
+                           STRING_AGG(do_num, ', ') WITHIN GROUP (ORDER BY seq) AS do_numbers
+                    FROM {tmp_in}
+                    WHERE qty > 0{agg_type_pred}
+                    GROUP BY rdc, st_cd, art
+                ),
+                open_ranked AS (
+                    SELECT P.ID,
+                           P.ALLOC_QTY,
+                           P.DO_QTY,
+                           (P.ALLOC_QTY - P.DO_QTY) AS need,
+                           SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
+                               PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                               ORDER BY {sess_order}P.APPROVED_AT, P.ID
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ) AS cum_after,
+                           ISNULL(SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
+                               PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                               ORDER BY {sess_order}P.APPROVED_AT, P.ID
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                           ), 0) AS cum_before,
+                           P.RDC, P.ST_CD, P.ARTICLE_NUMBER
+                    FROM {PEND_ALC_TABLE} P
+                    WHERE P.IS_CLOSED = 0 AND (P.ALLOC_QTY - P.DO_QTY) > 0{sess_filter}{open_type_pred}
+                ),
+                alloc_plan AS (
+                    SELECT o.ID,
+                           agg.do_numbers,
+                           CASE
+                               WHEN agg.qty <= o.cum_before THEN 0
+                               WHEN agg.qty >= o.cum_after  THEN o.need
+                               ELSE agg.qty - o.cum_before
+                           END AS apply_qty
+                    FROM open_ranked o
+                    JOIN agg
+                      ON agg.rdc = o.RDC
+                     AND agg.art = o.ARTICLE_NUMBER
+                     AND {join_pred}
+                    WHERE {scope_pred}
+                )
+                UPDATE P
+                   SET P.DO_QTY         = P.DO_QTY + alloc_plan.apply_qty,
+                       P.IS_CLOSED      = CASE WHEN P.DO_QTY + alloc_plan.apply_qty >= P.ALLOC_QTY THEN 1 ELSE 0 END,
+                       P.LAST_DO_AT     = GETDATE(),
+                       P.DO_UPLOADED_AT = GETDATE(),
+                       P.DO_NUMBER      = CASE
+                           WHEN alloc_plan.do_numbers IS NULL OR alloc_plan.do_numbers = '' THEN P.DO_NUMBER
+                           WHEN P.DO_NUMBER IS NULL OR P.DO_NUMBER = ''         THEN alloc_plan.do_numbers
+                           ELSE P.DO_NUMBER + ', ' + alloc_plan.do_numbers
+                       END
+                OUTPUT INSERTED.ID,
+                       INSERTED.DO_QTY - DELETED.DO_QTY AS qty_added,
+                       CASE WHEN INSERTED.IS_CLOSED = 1 AND DELETED.IS_CLOSED = 0 THEN 1 ELSE 0 END AS was_just_closed,
+                       DELETED.LAST_DO_AT AS prev_last_do_at
+                  INTO {tmp_out} (pend_alc_id, qty_added, was_just_closed, prev_last_do_at)
                 FROM {PEND_ALC_TABLE} P
-                WHERE P.IS_CLOSED = 0 AND (P.ALLOC_QTY - P.DO_QTY) > 0
-            ),
-            alloc_plan AS (
-                SELECT o.ID,
-                       agg.do_numbers,
-                       CASE
-                           WHEN agg.qty <= o.cum_before THEN 0
-                           WHEN agg.qty >= o.cum_after  THEN o.need
-                           ELSE agg.qty - o.cum_before
-                       END AS apply_qty
-                FROM open_ranked o
-                JOIN agg
-                  ON agg.rdc = o.RDC
-                 AND agg.art = o.ARTICLE_NUMBER
-                 AND {join_pred}
-                WHERE {scope_pred}
-            )
-            UPDATE P
-               SET P.DO_QTY         = P.DO_QTY + alloc_plan.apply_qty,
-                   P.IS_CLOSED      = CASE WHEN P.DO_QTY + alloc_plan.apply_qty >= P.ALLOC_QTY THEN 1 ELSE 0 END,
-                   P.LAST_DO_AT     = GETDATE(),
-                   P.DO_UPLOADED_AT = GETDATE(),
-                   P.DO_NUMBER      = CASE
-                       WHEN alloc_plan.do_numbers IS NULL OR alloc_plan.do_numbers = '' THEN P.DO_NUMBER
-                       WHEN P.DO_NUMBER IS NULL OR P.DO_NUMBER = ''         THEN alloc_plan.do_numbers
-                       ELSE P.DO_NUMBER + ', ' + alloc_plan.do_numbers
-                   END
-            OUTPUT INSERTED.ID,
-                   INSERTED.DO_QTY - DELETED.DO_QTY AS qty_added,
-                   CASE WHEN INSERTED.IS_CLOSED = 1 AND DELETED.IS_CLOSED = 0 THEN 1 ELSE 0 END AS was_just_closed,
-                   DELETED.LAST_DO_AT AS prev_last_do_at
-              INTO {tmp_out} (pend_alc_id, qty_added, was_just_closed, prev_last_do_at)
-            FROM {PEND_ALC_TABLE} P
-            JOIN alloc_plan ON P.ID = alloc_plan.ID
-            WHERE alloc_plan.apply_qty > 0
-            """
-            conn.execute(text(sql))
+                JOIN alloc_plan ON P.ID = alloc_plan.ID
+                WHERE alloc_plan.apply_qty > 0
+                """
+                # sess_params only exists for SESSION_FIRST / SESSION_ONLY;
+                # dtype only for type-aware buckets. Plain FIFO with untyped
+                # input executes the statement exactly as before.
+                exec_params = dict(sess_params)
+                if type_aware:
+                    exec_params["dtype"] = dtype
+                if exec_params:
+                    conn.execute(text(sql), exec_params)
+                else:
+                    conn.execute(text(sql))
 
         # Pull captured deltas for the audit payload.
         for r in conn.execute(text(
@@ -4243,43 +4417,68 @@ def apply_hold_clear(
         # PER-ROW release — so a release_qty=5 on a 3-size match releases
         # up to 5 from each size (capped at that size's HOLD_REM). For a
         # full close, the SZ=blank case closes every size at once.
+        #
+        # Typed pools (Jul 2026): the tracker key is (WERKS, VAR_ART, SZ,
+        # ALLOC_TYPE), so one actual size can carry a legacy ('') row plus
+        # 'FRESH'/'GRT' rows. The per-size release_qty drains ACROSS those
+        # rows as an ordered running total — legacy ('') first, then oldest
+        # LISTED_DATE — instead of granting each row the full qty.
         updates = conn.execute(text(f"""
-            UPDATE H
-               SET H.HOLD_REM = CASE
-                       WHEN u.release_qty IS NULL
-                            OR u.release_qty >= ISNULL(H.HOLD_REM, 0)
-                       THEN 0
-                       ELSE H.HOLD_REM - u.release_qty
+            ;WITH ordered AS (
+                SELECT H.WERKS, H.VAR_ART, H.SZ, H.RDC, H.ALLOC_TYPE,
+                       H.HOLD_REM, H.IS_CLOSED, H.CLOSED_DATE,
+                       H.LAST_UPDATED, H.LAST_REMARKS, H.LAST_UPDATED_BY,
+                       u.release_qty,
+                       SUM(ISNULL(H.HOLD_REM, 0)) OVER (
+                           PARTITION BY H.WERKS,
+                                        CAST(H.VAR_ART AS NVARCHAR(30)),
+                                        ISNULL(H.SZ,'')
+                           ORDER BY CASE WHEN ISNULL(H.ALLOC_TYPE,'') = ''
+                                         THEN 0 ELSE 1 END,
+                                    H.LISTED_DATE,
+                                    ISNULL(H.ALLOC_TYPE,'')
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                       ) AS prior_rem
+                FROM [{HOLD_TRACKING_TABLE}] H
+                JOIN {tmp_in} u
+                  ON  H.WERKS  = u.werks
+                 AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+                 AND (u.sz = '' OR ISNULL(H.SZ,'') = u.sz)
+                WHERE ISNULL(H.IS_CLOSED, 0) = 0
+                  AND ISNULL(H.HOLD_REM, 0)  > 0
+            ), calc AS (
+                SELECT *,
+                       CASE
+                           WHEN release_qty IS NULL THEN ISNULL(HOLD_REM, 0)
+                           WHEN release_qty - ISNULL(prior_rem, 0) <= 0 THEN 0
+                           WHEN release_qty - ISNULL(prior_rem, 0)
+                                >= ISNULL(HOLD_REM, 0) THEN ISNULL(HOLD_REM, 0)
+                           ELSE release_qty - ISNULL(prior_rem, 0)
+                       END AS apply_qty
+                FROM ordered
+            )
+            UPDATE calc
+               SET HOLD_REM = ISNULL(HOLD_REM, 0) - apply_qty,
+                   IS_CLOSED = CASE
+                       WHEN ISNULL(HOLD_REM, 0) - apply_qty <= 0 THEN 1
+                       ELSE IS_CLOSED
                    END,
-                   H.IS_CLOSED = CASE
-                       WHEN u.release_qty IS NULL
-                            OR u.release_qty >= ISNULL(H.HOLD_REM, 0)
-                       THEN 1
-                       ELSE H.IS_CLOSED
+                   CLOSED_DATE = CASE
+                       WHEN ISNULL(HOLD_REM, 0) - apply_qty <= 0 THEN GETDATE()
+                       ELSE CLOSED_DATE
                    END,
-                   H.CLOSED_DATE = CASE
-                       WHEN u.release_qty IS NULL
-                            OR u.release_qty >= ISNULL(H.HOLD_REM, 0)
-                       THEN GETDATE()
-                       ELSE H.CLOSED_DATE
-                   END,
-                   H.LAST_UPDATED    = GETDATE(),
-                   H.LAST_REMARKS    = :rmk,
-                   H.LAST_UPDATED_BY = :usr
+                   LAST_UPDATED    = GETDATE(),
+                   LAST_REMARKS    = :rmk,
+                   LAST_UPDATED_BY = :usr
             OUTPUT INSERTED.WERKS, INSERTED.VAR_ART, INSERTED.SZ,
                    INSERTED.RDC,
                    DELETED.HOLD_REM   AS OLD_HOLD_REM,
                    INSERTED.HOLD_REM  AS NEW_HOLD_REM,
                    DELETED.IS_CLOSED  AS OLD_IS_CLOSED,
                    INSERTED.IS_CLOSED AS NEW_IS_CLOSED,
-                   DELETED.CLOSED_DATE AS OLD_CLOSED_DATE
-            FROM [{HOLD_TRACKING_TABLE}] H
-            JOIN {tmp_in} u
-              ON  H.WERKS  = u.werks
-             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
-             AND (u.sz = '' OR ISNULL(H.SZ,'') = u.sz)
-            WHERE ISNULL(H.IS_CLOSED, 0) = 0
-              AND ISNULL(H.HOLD_REM, 0)  > 0
+                   DELETED.CLOSED_DATE AS OLD_CLOSED_DATE,
+                   INSERTED.ALLOC_TYPE AS ALLOC_TYPE
+            WHERE apply_qty > 0
         """), {"rmk": (f"CLEAR: {safe_reason}" if safe_reason else "CLEAR"),
                 "usr": safe_user or None}).fetchall()
 
@@ -4294,6 +4493,7 @@ def apply_hold_clear(
                 "was_closed":      bool(r[6]),
                 "is_closed_now":   bool(r[7]),
                 "old_closed_date": r[8].isoformat() if r[8] else None,
+                "alloc_type":      (r[9] or ""),
             })
         result["touched_hold"] = len(updates)
 
@@ -4548,33 +4748,58 @@ def apply_hold_revise(
         # Update HOLD_REM/HOLD_QTY_INITIAL with re-open semantics: if the
         # row was closed, treat add_qty as the new initial; otherwise
         # accumulate on top of the existing values.
+        #
+        # Typed pools (Jul 2026): the tracker key is (WERKS, VAR_ART, SZ,
+        # ALLOC_TYPE), so a size can carry a legacy ('') row plus typed
+        # rows. A revise (no explicit type) applies to exactly ONE row per
+        # actual size: the legacy row if one exists, else the typed row
+        # with the largest HOLD_REM (deterministic; ALLOC_TYPE breaks
+        # remaining ties).
         updates = conn.execute(text(f"""
-            UPDATE H
-               SET H.HOLD_QTY_INITIAL = CASE
-                       WHEN ISNULL(H.IS_CLOSED, 0) = 1 THEN u.add_qty
-                       ELSE ISNULL(H.HOLD_QTY_INITIAL, 0) + u.add_qty
+            ;WITH pick AS (
+                SELECT H.WERKS, H.VAR_ART, H.SZ, H.RDC, H.ALLOC_TYPE,
+                       H.HOLD_REM, H.HOLD_QTY_INITIAL, H.IS_CLOSED,
+                       H.CLOSED_DATE, H.LAST_UPDATED, H.LAST_REMARKS,
+                       H.LAST_UPDATED_BY,
+                       u.add_qty,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY H.WERKS,
+                                        CAST(H.VAR_ART AS NVARCHAR(30)),
+                                        ISNULL(H.SZ,'')
+                           ORDER BY CASE WHEN ISNULL(H.ALLOC_TYPE,'') = ''
+                                         THEN 0 ELSE 1 END,
+                                    ISNULL(H.HOLD_REM, 0) DESC,
+                                    ISNULL(H.ALLOC_TYPE,'')
+                       ) AS rn
+                FROM [{HOLD_TRACKING_TABLE}] H
+                JOIN {tmp_in} u
+                  ON  H.WERKS  = u.werks
+                 AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
+                 AND (u.sz = '' OR ISNULL(H.SZ,'') = u.sz)
+            )
+            UPDATE pick
+               SET HOLD_QTY_INITIAL = CASE
+                       WHEN ISNULL(IS_CLOSED, 0) = 1 THEN add_qty
+                       ELSE ISNULL(HOLD_QTY_INITIAL, 0) + add_qty
                    END,
-                   H.HOLD_REM = CASE
-                       WHEN ISNULL(H.IS_CLOSED, 0) = 1 THEN u.add_qty
-                       ELSE ISNULL(H.HOLD_REM, 0) + u.add_qty
+                   HOLD_REM = CASE
+                       WHEN ISNULL(IS_CLOSED, 0) = 1 THEN add_qty
+                       ELSE ISNULL(HOLD_REM, 0) + add_qty
                    END,
-                   H.IS_CLOSED      = 0,
-                   H.CLOSED_DATE    = NULL,
-                   H.LAST_UPDATED   = GETDATE(),
-                   H.LAST_REMARKS   = :rmk,
-                   H.LAST_UPDATED_BY = :usr
+                   IS_CLOSED      = 0,
+                   CLOSED_DATE    = NULL,
+                   LAST_UPDATED   = GETDATE(),
+                   LAST_REMARKS   = :rmk,
+                   LAST_UPDATED_BY = :usr
             OUTPUT INSERTED.WERKS, INSERTED.VAR_ART, INSERTED.SZ,
                    INSERTED.RDC,
                    DELETED.HOLD_REM         AS OLD_HOLD_REM,
                    INSERTED.HOLD_REM        AS NEW_HOLD_REM,
                    DELETED.HOLD_QTY_INITIAL AS OLD_INITIAL,
                    INSERTED.HOLD_QTY_INITIAL AS NEW_INITIAL,
-                   DELETED.IS_CLOSED        AS WAS_CLOSED
-            FROM [{HOLD_TRACKING_TABLE}] H
-            JOIN {tmp_in} u
-              ON  H.WERKS  = u.werks
-             AND CAST(H.VAR_ART AS NVARCHAR(30)) = u.var_art
-             AND (u.sz = '' OR ISNULL(H.SZ,'') = u.sz)
+                   DELETED.IS_CLOSED        AS WAS_CLOSED,
+                   INSERTED.ALLOC_TYPE      AS ALLOC_TYPE
+            WHERE rn = 1
         """), {"rmk": (f"REVISE: {safe_reason}" if safe_reason else "REVISE"),
                 "usr": safe_user or None}).fetchall()
 
@@ -4589,6 +4814,7 @@ def apply_hold_revise(
                 "old_initial":  float(r[6] or 0),
                 "new_initial":  float(r[7] or 0),
                 "was_closed":   bool(r[8]),
+                "alloc_type":   (r[9] or ""),
             })
         result["touched_hold"] = len(updates)
 
@@ -5277,8 +5503,9 @@ def apply_pend_alc_delta(
                 art      NVARCHAR(30)  COLLATE DATABASE_DEFAULT,
                 maj_cat  NVARCHAR(200) COLLATE DATABASE_DEFAULT,
                 gen_art  NVARCHAR(30)  COLLATE DATABASE_DEFAULT,
-                clr      NVARCHAR(50)  COLLATE DATABASE_DEFAULT,
-                qty      FLOAT
+                clr        NVARCHAR(50)  COLLATE DATABASE_DEFAULT,
+                alloc_type NVARCHAR(10)  COLLATE DATABASE_DEFAULT,
+                qty        FLOAT
             )
         """))
 
@@ -5287,13 +5514,17 @@ def apply_pend_alc_delta(
             # table, sign-applied. One round-trip, no Python loop. Empty
             # session is a no-op (zero rows inserted → all UPDATEs match 0).
             conn.execute(text(f"""
-                INSERT INTO {tmp} (rdc, st_cd, art, maj_cat, gen_art, clr, qty)
+                INSERT INTO {tmp} (rdc, st_cd, art, maj_cat, gen_art, clr, alloc_type, qty)
                 SELECT RDC,
                        ISNULL(ST_CD, ''),
                        ARTICLE_NUMBER,
                        ISNULL(MAJ_CAT, ''),
                        ISNULL(GEN_ART_NUMBER, ''),
                        ISNULL(CLR, ''),
+                       -- Folded type: legacy (NULL/'') pend rows fold into the
+                       -- FRESH MSA row; typed rows keep their own type.
+                       CASE WHEN ISNULL(ALLOC_TYPE, '') = '' THEN 'FRESH'
+                            ELSE ALLOC_TYPE END,
                        (ISNULL(ALLOC_QTY, 0) - ISNULL(DO_QTY, 0)) * :sign
                 FROM {PEND_ALC_TABLE}
                 WHERE SESSION_ID = :sid
@@ -5307,6 +5538,7 @@ def apply_pend_alc_delta(
                        - float(r.get("do_qty", 0) or 0)) * sign
                 if eff == 0:
                     continue
+                _at = r.get("alloc_type")
                 payload.append({
                     "r": str(r["rdc"]),
                     "s": str(r.get("st_cd") or ""),
@@ -5314,6 +5546,9 @@ def apply_pend_alc_delta(
                     "m": str(r.get("maj_cat") or ""),
                     "g": str(r.get("gen_art_number") or ""),
                     "c": str(r.get("clr") or ""),
+                    # Folded type: manual/legacy rows (ALLOC_TYPE None/'')
+                    # fold into FRESH; typed rows keep their own type.
+                    "t": "FRESH" if _at in (None, "") else str(_at),
                     "q": eff,
                 })
             if not payload:
@@ -5323,7 +5558,9 @@ def apply_pend_alc_delta(
                 ))
                 return result
             conn.execute(
-                text(f"INSERT INTO {tmp} VALUES (:r, :s, :a, :m, :g, :c, :q)"),
+                text(f"INSERT INTO {tmp} (rdc, st_cd, art, maj_cat, gen_art, "
+                     f"clr, alloc_type, qty) "
+                     f"VALUES (:r, :s, :a, :m, :g, :c, :t, :q)"),
                 payload,
             )
 
@@ -5336,6 +5573,32 @@ def apply_pend_alc_delta(
         grid_var_art    = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
         grid_var_gen    = _probe_col(conn, "ARS_GRID_MJ_VAR_ART", "GEN_ART_NUMBER", "GEN_ART")
         grid_gen_gen    = _probe_col(conn, "ARS_GRID_MJ_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
+
+        # ── Type-aware MSA fan-out ──────────────────────────────────────
+        # MSA tables became row-per-type (one row per
+        # (RDC, GEN_ART, CLR, SZ, ALLOC_TYPE)) in migration 017. Each delta
+        # row already carries its *folded* type in {tmp}.alloc_type (legacy
+        # NULL/'' pend rows folded to 'FRESH' at insert time above), so a
+        # FRESH/legacy delta lands on the FRESH MSA row and a GRT delta on
+        # the GRT MSA row. On pre-017 deployments the ALLOC_TYPE column is
+        # absent, so every fragment is blank → type-agnostic sums, i.e.
+        # unchanged behaviour (and no double-count: the delta is summed
+        # across types into one row).
+        msa_has_type = (conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'ARS_MSA_TOTAL' AND COLUMN_NAME = 'ALLOC_TYPE'"
+        )).scalar() or 0) > 0
+        # SQL fragments spliced into the three MSA statements below.
+        t_sel    = ", alloc_type"                      if msa_has_type else ""
+        t_grp    = ", alloc_type"                      if msa_has_type else ""
+        t_jn_td  = "AND T.ALLOC_TYPE = d.alloc_type"   if msa_has_type else ""
+        t_jn_tv  = "AND T.ALLOC_TYPE = V.ALLOC_TYPE"   if msa_has_type else ""
+        t_jn_dt  = "AND d.alloc_type = T.ALLOC_TYPE"   if msa_has_type else ""
+        g_sel    = ", T.ALLOC_TYPE AS alloc_type"      if msa_has_type else ""
+        g_grp    = ", T.ALLOC_TYPE"                    if msa_has_type else ""
+        g_asel   = ", alloc_type"                      if msa_has_type else ""
+        g_jn_ta  = "AND T.ALLOC_TYPE = a.alloc_type"   if msa_has_type else ""
+        g_jn_ga  = "AND G.ALLOC_TYPE = agg.alloc_type" if msa_has_type else ""
 
         # ── MSA: ARS_MSA_TOTAL — keyed on (RDC, <article>) ──────────────
         # PEND_QTY is incremented by d.qty.
@@ -5367,9 +5630,9 @@ def apply_pend_alc_delta(
                     END
                 FROM ARS_MSA_TOTAL T
                 JOIN (
-                    SELECT rdc, art, SUM(qty) AS qty
-                    FROM {tmp} GROUP BY rdc, art
-                ) d ON T.RDC = d.rdc AND T.[{msa_total_art}] = d.art
+                    SELECT rdc, art{t_sel}, SUM(qty) AS qty
+                    FROM {tmp} GROUP BY rdc, art{t_grp}
+                ) d ON T.RDC = d.rdc AND T.[{msa_total_art}] = d.art {t_jn_td}
             """))
             result["msa_total"] = int(r1.rowcount or 0)
         except Exception as e:
@@ -5390,11 +5653,13 @@ def apply_pend_alc_delta(
                 JOIN ARS_MSA_TOTAL T
                   ON T.RDC = V.RDC
                  AND T.[{msa_total_art}] = V.[{msa_var_art_col}]
+                 {t_jn_tv}
                 JOIN (
-                    SELECT DISTINCT rdc, art FROM {tmp}
+                    SELECT DISTINCT rdc, art{t_sel} FROM {tmp}
                 ) d
                   ON d.rdc = T.RDC
                  AND d.art = T.[{msa_total_art}]
+                 {t_jn_dt}
             """))
             result["msa_var_art"] = int(r2.rowcount or 0)
         except Exception as e:
@@ -5414,23 +5679,25 @@ def apply_pend_alc_delta(
                     G.FNL_Q    = agg.f
                 FROM ARS_MSA_GEN_ART G
                 JOIN (
-                    SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                    SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR{g_sel},
                            SUM(CAST(T.PEND_QTY AS FLOAT)) AS p,
                            SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
                     FROM ARS_MSA_TOTAL T
                     JOIN (
-                        SELECT DISTINCT rdc, maj_cat, gen_art, clr FROM {tmp}
+                        SELECT DISTINCT rdc, maj_cat, gen_art, clr{g_asel} FROM {tmp}
                     ) a
                       ON T.RDC = a.rdc
                      AND ISNULL(T.MAJ_CAT, '')             = ISNULL(a.maj_cat, '')
                      AND ISNULL(T.[{msa_gen_genc}], '')    = ISNULL(a.gen_art, '')
                      AND ISNULL(T.CLR, '')                 = ISNULL(a.clr, '')
-                    GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                     {g_jn_ta}
+                    GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR{g_grp}
                 ) agg
                   ON G.RDC = agg.RDC
                  AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
                  AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
                  AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                 {g_jn_ga}
             """))
             result["msa_gen_art"] = int(r3.rowcount or 0)
         except Exception as e:
@@ -5535,6 +5802,26 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         msa_var_art_col = _probe_col(conn, "ARS_MSA_VAR_ART", "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
         msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART", "GEN_ART_NUMBER", "GEN_ART")
 
+        # Type-aware reseed: after migration 017 the MSA family is
+        # row-per-type. Sum PEND per (RDC, ARTICLE, folded-type) and reseed
+        # the matching typed MSA row; legacy pend (ALLOC_TYPE NULL/'') folds
+        # into FRESH. Pre-017 (column absent) → blank fragments = the old
+        # type-agnostic reseed.
+        msa_has_type = (conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'ARS_MSA_TOTAL' AND COLUMN_NAME = 'ALLOC_TYPE'"
+        )).scalar() or 0) > 0
+        _folded = "CASE WHEN ISNULL(ALLOC_TYPE, '') = '' THEN 'FRESH' ELSE ALLOC_TYPE END"
+        p_sel = f", {_folded} AS alloc_type"        if msa_has_type else ""
+        p_grp = f", {_folded}"                      if msa_has_type else ""
+        p_jn  = "AND P.alloc_type = T.ALLOC_TYPE"   if msa_has_type else ""
+        v_sel = ", ALLOC_TYPE AS at"                if msa_has_type else ""
+        v_grp = ", ALLOC_TYPE"                      if msa_has_type else ""
+        v_jn  = "AND V.ALLOC_TYPE = agg.at"         if msa_has_type else ""
+        g_sel = ", ALLOC_TYPE AS at"                if msa_has_type else ""
+        g_grp = ", ALLOC_TYPE"                      if msa_has_type else ""
+        g_jn  = "AND G.ALLOC_TYPE = agg.at"         if msa_has_type else ""
+
         # 1a. Seed PEND_QTY into ARS_MSA_TOTAL from open pend_alc rows.
         # MSA tables are UPDATE-only by design (user requirement): only
         # (RDC, article) keys already in the MSA universe get adjusted.
@@ -5549,10 +5836,10 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         # predates the universe-anchored build.
         r1 = conn.execute(text(f"""
             ;WITH P AS (
-                SELECT RDC, ARTICLE_NUMBER, SUM(PEND_QTY) AS qty
+                SELECT RDC, ARTICLE_NUMBER{p_sel}, SUM(PEND_QTY) AS qty
                 FROM {PEND_ALC_TABLE}
                 WHERE IS_CLOSED = 0
-                GROUP BY RDC, ARTICLE_NUMBER
+                GROUP BY RDC, ARTICLE_NUMBER{p_grp}
             )
             UPDATE T
                SET T.PEND_QTY = ISNULL(P.qty, 0),
@@ -5563,7 +5850,7 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
                             - ISNULL(T.HOLD_QTY, 0)
                    END
             FROM ARS_MSA_TOTAL T
-            LEFT JOIN P ON P.RDC = T.RDC AND P.ARTICLE_NUMBER = T.[{msa_total_art}]
+            LEFT JOIN P ON P.RDC = T.RDC AND P.ARTICLE_NUMBER = T.[{msa_total_art}] {p_jn}
         """))
         result["msa_total"] = int(r1.rowcount or 0)
 
@@ -5573,17 +5860,18 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
                SET V.PEND_QTY = agg.p, V.FNL_Q = agg.f
             FROM ARS_MSA_VAR_ART V
             JOIN (
-                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{msa_total_art}] AS art,
+                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{msa_total_art}] AS art{v_sel},
                        SUM(CAST(PEND_QTY AS FLOAT)) AS p,
                        SUM(CAST(FNL_Q    AS FLOAT)) AS f
                 FROM ARS_MSA_TOTAL
-                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{msa_total_art}]
+                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{msa_total_art}]{v_grp}
             ) agg
               ON V.RDC = agg.RDC
              AND ISNULL(V.MAJ_CAT, '')        = ISNULL(agg.MAJ_CAT, '')
              AND ISNULL(V.GEN_ART_NUMBER, '') = ISNULL(agg.GEN_ART_NUMBER, '')
              AND ISNULL(V.CLR, '')            = ISNULL(agg.CLR, '')
              AND V.[{msa_var_art_col}]        = agg.art
+             {v_jn}
         """))
         result["msa_var_art"] = int(r2.rowcount or 0)
 
@@ -5593,16 +5881,17 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
                SET G.PEND_QTY = agg.p, G.FNL_Q = agg.f
             FROM ARS_MSA_GEN_ART G
             JOIN (
-                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR{g_sel},
                        SUM(CAST(PEND_QTY AS FLOAT)) AS p,
                        SUM(CAST(FNL_Q    AS FLOAT)) AS f
                 FROM ARS_MSA_TOTAL
-                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
+                GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR{g_grp}
             ) agg
               ON G.RDC = agg.RDC
              AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
              AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.GEN_ART_NUMBER, '')
              AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+             {g_jn}
         """))
         result["msa_gen_art"] = int(r3.rowcount or 0)
 
@@ -5658,6 +5947,25 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
         msa_gen_genc    = _probe_col(conn, "ARS_MSA_GEN_ART",
                                      "GEN_ART_NUMBER", "GEN_ART")
 
+        # Type-aware reseed: after migration 017 the MSA family is
+        # row-per-type. Sum HOLD_REM per (RDC, VAR_ART, folded-type) and
+        # reseed the matching typed MSA row; legacy holds (ALLOC_TYPE
+        # NULL/'') fold into the FRESH row. Pre-017 (column absent) → blank
+        # fragments = the old type-agnostic reseed.
+        msa_has_type = (conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'ARS_MSA_TOTAL' AND COLUMN_NAME = 'ALLOC_TYPE'"
+        )).scalar() or 0) > 0
+        _folded_h = ("CASE WHEN ISNULL(H.ALLOC_TYPE, '') = '' "
+                     "THEN 'FRESH' ELSE H.ALLOC_TYPE END")
+        h_sel = f", {_folded_h} AS alloc_type"      if msa_has_type else ""
+        h_grp = f", {_folded_h}"                    if msa_has_type else ""
+        h_jn  = "AND H.alloc_type = T.ALLOC_TYPE"   if msa_has_type else ""
+        tv_jn = "AND V.ALLOC_TYPE = T.ALLOC_TYPE"   if msa_has_type else ""
+        g_sel = ", T.ALLOC_TYPE AS at"              if msa_has_type else ""
+        g_grp = ", T.ALLOC_TYPE"                    if msa_has_type else ""
+        g_jn  = "AND G.ALLOC_TYPE = agg.at"         if msa_has_type else ""
+
         # Build a scope-filter CTE that resolves the (RDC, ARTICLE) keys
         # touched by this session — used to limit MSA_TOTAL row updates
         # below. Empty / null when running unscoped.
@@ -5692,27 +6000,27 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
         """)).scalar() or 0) > 0
 
         if has_rdc_col:
-            hold_cte_inner = """
+            hold_cte_inner = f"""
                 SELECT COALESCE(NULLIF(H.RDC, ''), SM.RDC) AS rdc,
-                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art{h_sel},
                        SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
                 FROM ARS_NL_TBL_HOLD_TRACKING H
                 LEFT JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
                 WHERE ISNULL(H.IS_CLOSED, 0) = 0
                   AND ISNULL(H.HOLD_REM, 0) > 0
                 GROUP BY COALESCE(NULLIF(H.RDC, ''), SM.RDC),
-                         CAST(H.VAR_ART AS NVARCHAR(30))
+                         CAST(H.VAR_ART AS NVARCHAR(30)){h_grp}
             """
         else:
-            hold_cte_inner = """
+            hold_cte_inner = f"""
                 SELECT SM.RDC AS rdc,
-                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art,
+                       CAST(H.VAR_ART AS NVARCHAR(30)) AS art{h_sel},
                        SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
                 FROM ARS_NL_TBL_HOLD_TRACKING H
                 INNER JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
                 WHERE ISNULL(H.IS_CLOSED, 0) = 0
                   AND ISNULL(H.HOLD_REM, 0) > 0
-                GROUP BY SM.RDC, CAST(H.VAR_ART AS NVARCHAR(30))
+                GROUP BY SM.RDC, CAST(H.VAR_ART AS NVARCHAR(30)){h_grp}
             """
 
         # 1. Reseed MSA_TOTAL.HOLD_QTY + recompute FNL_Q.  When session_id
@@ -5732,7 +6040,7 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
                     END
                 FROM ARS_MSA_TOTAL T
                 {scope_join}
-                LEFT JOIN H ON H.rdc = T.RDC AND H.art = T.[{msa_total_art}]
+                LEFT JOIN H ON H.rdc = T.RDC AND H.art = T.[{msa_total_art}] {h_jn}
             """), sql_params)
             result["msa_total"] = int(r1.rowcount or 0)
         except Exception as e:
@@ -5755,6 +6063,7 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
                 JOIN ARS_MSA_TOTAL T
                   ON T.RDC = V.RDC
                  AND T.[{msa_total_art}] = V.[{msa_var_art_col}]
+                 {tv_jn}
                 {var_scope_join}
             """), sql_params)
             result["msa_var_art"] = int(r2.rowcount or 0)
@@ -5787,32 +6096,34 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
                       AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(SK.gen, '')
                       AND ISNULL(G.CLR, '')                 = ISNULL(SK.CLR, '')
                     JOIN (
-                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR{g_sel},
                                SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
                                SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
                         FROM ARS_MSA_TOTAL T
-                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR{g_grp}
                     ) agg
                       ON G.RDC = agg.RDC
                      AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
                      AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
                      AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                     {g_jn}
                 """), sql_params)
             else:
                 r3 = conn.execute(text(f"""
                     UPDATE G SET G.HOLD_QTY = agg.h, G.FNL_Q = agg.f
                     FROM ARS_MSA_GEN_ART G
                     JOIN (
-                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR,
+                        SELECT T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}] AS gen, T.CLR{g_sel},
                                SUM(CAST(T.HOLD_QTY AS FLOAT)) AS h,
                                SUM(CAST(T.FNL_Q    AS FLOAT)) AS f
                         FROM ARS_MSA_TOTAL T
-                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR
+                        GROUP BY T.RDC, T.MAJ_CAT, T.[{msa_gen_genc}], T.CLR{g_grp}
                     ) agg
                       ON G.RDC = agg.RDC
                      AND ISNULL(G.MAJ_CAT, '')             = ISNULL(agg.MAJ_CAT, '')
                      AND ISNULL(G.[{msa_gen_genc}], '')    = ISNULL(agg.gen, '')
                      AND ISNULL(G.CLR, '')                 = ISNULL(agg.CLR, '')
+                     {g_jn}
                 """))
             result["msa_gen_art"] = int(r3.rowcount or 0)
         except Exception as e:

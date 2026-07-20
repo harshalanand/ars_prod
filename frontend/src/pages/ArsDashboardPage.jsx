@@ -1974,6 +1974,23 @@ function HoldTab() {
         <KpiTile label="Articles On Hold"   value={summary?.totals?.articles} accent="cyan" />
         <KpiTile label="Oldest Hold (days)" value={summary?.totals?.oldest_age_days} accent="cyan" />
       </div>
+      {/* FRESH vs GRT split of the open hold book (LEGACY = pre-typed rows).
+          Fed by /hold-dashboard/summary → by_type. Pend-type split needs a
+          typed pend endpoint (pend_alc.py) — not available yet. */}
+      {Array.isArray(summary?.by_type) && summary.by_type.length > 0 && (
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          {['FRESH', 'GRT', 'LEGACY'].map(t => {
+            const b = summary.by_type.find(x => x.alloc_type === t) || { open_rows: 0, open_qty: 0 }
+            return (
+              <KpiTile key={t}
+                       label={t === 'LEGACY' ? 'Legacy Hold Qty' : `${t} Hold Qty`}
+                       value={b.open_qty}
+                       sub={`${fmt(b.open_rows)} open rows`}
+                       accent={t === 'FRESH' ? 'cyan' : t === 'GRT' ? 'amber' : 'slate'} />
+            )
+          })}
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-4">
         <ExpandableChart title="Hold qty by RDC" chip={`${byRdc.length} RDCs`}
           isEmpty={byRdc.length === 0}
@@ -2012,12 +2029,13 @@ function HoldTab() {
   )
 }
 
-function KpiTile({ label, value, accent }) {
-  const colors = { cyan: 'bg-cyan-50 border-cyan-100 text-cyan-700', amber: 'bg-amber-50 border-amber-100 text-amber-700', rose: 'bg-rose-50 border-rose-100 text-rose-700' }
+function KpiTile({ label, value, accent, sub }) {
+  const colors = { cyan: 'bg-cyan-50 border-cyan-100 text-cyan-700', amber: 'bg-amber-50 border-amber-100 text-amber-700', rose: 'bg-rose-50 border-rose-100 text-rose-700', slate: 'bg-slate-50 border-slate-200 text-slate-600' }
   return (
     <div className={`border rounded-lg p-3 ${colors[accent]}`}>
       <div className="text-xs uppercase font-semibold">{label}</div>
       <div className="text-2xl font-bold mt-1 text-gray-900">{value == null ? '—' : fmt(value)}</div>
+      {sub && <div className="text-[10px] text-gray-500 mt-0.5">{sub}</div>}
     </div>
   )
 }

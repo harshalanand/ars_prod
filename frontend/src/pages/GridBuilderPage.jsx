@@ -414,6 +414,282 @@ const RunResultsModal = ({ results, onClose }) => {
   )
 }
 
+/* ── Sec-Cap Growth Matrix panel ─────────────────────────────────────────── */
+/* Editable cont%-band table with a global on/off toggle. When on, allocation
+ * replaces the flat per-grid sec_cap_pct with a per-grain growth% resolved
+ * from these bands (spec 2026-07-08). Half-open [lo, hi); last row hi=null
+ * for open-ended. Growth% must be >= 100 (matrix relaxes, never tightens).
+ */
+const DEFAULT_BANDS = [
+  { lo: 0,  hi: 5,    growth: 300 },
+  { lo: 5,  hi: 10,   growth: 250 },
+  { lo: 10, hi: 15,   growth: 200 },
+  { lo: 15, hi: 30,   growth: 150 },
+  { lo: 30, hi: null, growth: 120 },
+]
+
+function validateBandsClient(bands) {
+  const errors = []
+  const warnings = []
+  if (!bands || bands.length === 0) {
+    errors.push('At least one band is required')
+    return { errors, warnings }
+  }
+  const nums = bands.map((b, i) => {
+    const lo = Number(b.lo)
+    const hi = b.hi === null || b.hi === '' ? null : Number(b.hi)
+    const g  = Number(b.growth)
+    if (Number.isNaN(lo)) errors.push(`Row ${i+1}: lo must be numeric`)
+    if (Number.isNaN(g))  errors.push(`Row ${i+1}: growth must be numeric`)
+    if (hi !== null && Number.isNaN(hi)) errors.push(`Row ${i+1}: hi must be numeric or empty`)
+    if (lo < 0) errors.push(`Row ${i+1}: lo must be >= 0`)
+    if (g < 100) errors.push(`Row ${i+1}: growth must be >= 100`)
+    return { lo, hi, g }
+  })
+  if (errors.length) return { errors, warnings }
+  // Sorted by lo
+  for (let i = 1; i < nums.length; i++) {
+    if (nums[i].lo < nums[i-1].lo) errors.push('Bands must be sorted ascending by lo')
+  }
+  // Exactly one null hi, must be last
+  const nullCount = nums.filter(n => n.hi === null).length
+  if (nullCount !== 1) errors.push(`Exactly one row must have hi=empty (found ${nullCount})`)
+  else if (nums[nums.length-1].hi !== null) errors.push('The empty-hi row must be last')
+  // Contiguous
+  for (let i = 0; i < nums.length - 1; i++) {
+    if (nums[i].hi === null) { errors.push(`Row ${i+1}: only the last row may have hi empty`); break }
+    if (Math.abs(nums[i].hi - nums[i+1].lo) > 1e-9) {
+      errors.push(`Row ${i+1}: hi (${nums[i].hi}) must equal next row's lo (${nums[i+1].lo})`)
+    }
+  }
+  if (errors.length === 0) {
+    const monotonic = nums.every((n, i) => i === 0 || nums[i-1].g >= n.g)
+    if (!monotonic) warnings.push('Growth% is not monotonically non-increasing — small contributors may not always get a larger stretch.')
+  }
+  return { errors, warnings }
+}
+
+function resolveGrowthClient(contPct, bands, fallback) {
+  for (const b of bands) {
+    const hi = b.hi === null || b.hi === '' ? null : Number(b.hi)
+    const lo = Number(b.lo)
+    const g  = Number(b.growth)
+    if (hi === null) { if (contPct >= lo) return { growth: g, matched: true } }
+    else if (contPct >= lo && contPct < hi) return { growth: g, matched: true }
+  }
+  return { growth: fallback, matched: false }
+}
+
+function GrowthMatrixPanel() {
+  const [expanded, setExpanded] = useState(false)
+  const [loading,  setLoading]  = useState(false)
+  const [saving,   setSaving]   = useState(false)
+  const [enabled,  setEnabled]  = useState(false)
+  const [bands,    setBands]    = useState([])
+  const [previewCont, setPreviewCont] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const { data } = await gridBuilderAPI.getGrowthMatrix()
+      setEnabled(!!data.data?.enabled)
+      setBands((data.data?.bands || []).map(b => ({
+        lo: b.lo, hi: b.hi, growth: b.growth,
+      })))
+    } catch (e) {
+      toast.error('Failed to load growth matrix')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { if (expanded) load() }, [expanded, load])
+
+  const { errors, warnings } = validateBandsClient(bands)
+  const canSave = !saving && errors.length === 0 && bands.length > 0
+  const canEnable = bands.length > 0
+
+  const updateRow = (idx, key, val) => {
+    setBands(prev => prev.map((b, i) => i === idx
+      ? { ...b, [key]: val === '' ? (key === 'hi' ? null : '') : Number(val) }
+      : b
+    ))
+  }
+  const deleteRow = (idx) => {
+    setBands(prev => prev.filter((_, i) => i !== idx))
+  }
+  const addRow = () => {
+    setBands(prev => {
+      if (prev.length === 0) return [{ lo: 0, hi: null, growth: 100 }]
+      // Insert before the open-ended row; split its lo→new_hi at a sensible midpoint
+      const last = prev[prev.length - 1]
+      const secondLastHi = prev.length >= 2 ? prev[prev.length - 2].hi : 0
+      const newLo = Number(secondLastHi) || Number(last.lo) || 0
+      const newHi = newLo + 5
+      // Update the previously-last row's lo to newHi so contiguity holds
+      const updated = [...prev.slice(0, -1),
+        { lo: newLo, hi: newHi, growth: 100 },
+        { ...last, lo: newHi },
+      ]
+      return updated
+    })
+  }
+  const resetToDefaults = () => setBands(DEFAULT_BANDS.map(b => ({ ...b })))
+
+  const handleSave = async () => {
+    const { errors: eList } = validateBandsClient(bands)
+    if (eList.length) { toast.error(eList[0]); return }
+    if (enabled && bands.length === 0) {
+      toast.error('Add at least one band before enabling')
+      return
+    }
+    setSaving(true)
+    try {
+      const payload = {
+        enabled: !!enabled,
+        bands: bands.map(b => ({
+          lo: Number(b.lo),
+          hi: b.hi === null || b.hi === '' ? null : Number(b.hi),
+          growth: Number(b.growth),
+        })),
+      }
+      const { data } = await gridBuilderAPI.saveGrowthMatrix(payload)
+      const w = data?.data?.warnings || []
+      if (w.length) toast(w[0], { icon: '⚠️' })
+      else toast.success('Growth matrix saved')
+    } catch (e) {
+      const detail = e?.response?.data?.detail
+      const first = typeof detail === 'string' ? detail
+        : Array.isArray(detail?.errors) ? detail.errors[0] : 'Save failed'
+      toast.error(first)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const preview = (() => {
+    const cp = Number(previewCont)
+    if (previewCont === '' || Number.isNaN(cp)) return null
+    return resolveGrowthClient(cp, bands, 120)
+  })()
+
+  return (
+    <div style={{ background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:12,
+      marginBottom:16, overflow:'hidden', boxShadow:'0 1px 3px rgba(0,0,0,.08)' }}>
+      <div onClick={() => setExpanded(v => !v)}
+        style={{ display:'flex', alignItems:'center', gap:10, padding:'12px 18px',
+          cursor:'pointer', background:C.headerBg, borderBottom: expanded ? `1px solid ${C.cardBorder}` : 'none' }}>
+        {expanded ? <ChevronUp size={16} color={C.textSub}/> : <ChevronDown size={16} color={C.textSub}/>}
+        <span style={{ fontSize:13, fontWeight:600, color:C.text }}>Sec-Cap Growth Matrix</span>
+        <span style={{ fontSize:11, color:C.textSub }}>
+          cont%-driven per-grain ceiling override
+        </span>
+        <span style={{ marginLeft:'auto', fontSize:11, color: enabled ? C.green : C.textSub, fontWeight:600 }}>
+          {loading ? 'Loading…' : (enabled ? 'ENABLED' : 'disabled')}
+        </span>
+      </div>
+
+      {expanded && (
+        <div style={{ padding:'14px 18px' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
+            <label style={{ display:'inline-flex', alignItems:'center', gap:8, fontSize:13, color:C.text }}>
+              <input type="checkbox" checked={!!enabled} disabled={!canEnable}
+                onChange={e => setEnabled(e.target.checked)}
+                title={canEnable ? '' : 'Add at least one band before enabling'} />
+              Enabled
+            </label>
+            <span style={{ fontSize:11, color:C.textSub }}>
+              OFF → each grid's own sec_cap_pct is used (no change to today's behavior).
+            </span>
+            <div style={{ marginLeft:'auto', display:'flex', gap:8 }}>
+              <Btn onClick={resetToDefaults} color="gray">Reset to defaults</Btn>
+              <Btn onClick={handleSave} disabled={!canSave} color="primary">
+                {saving ? <Loader size={13} style={{ animation:'spin 1s linear infinite' }}/> : <Save size={13}/>}
+                Save
+              </Btn>
+            </div>
+          </div>
+
+          <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+            <thead>
+              <tr style={{ background:'#f1f5f9', borderBottom:`2px solid ${C.cardBorder}` }}>
+                {['#','cont % from','cont % to','growth %','actions'].map(h => (
+                  <th key={h} style={{ padding:'6px 10px', textAlign:'left',
+                    fontSize:10, fontWeight:700, color:C.textSub,
+                    textTransform:'uppercase', letterSpacing:'.04em' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {bands.map((b, i) => (
+                <tr key={i} style={{ borderBottom:`1px solid ${C.cardBorder}` }}>
+                  <td style={{ padding:'6px 10px', color:C.textSub }}>{i+1}</td>
+                  <td style={{ padding:'6px 10px' }}>
+                    <Input value={b.lo ?? ''} onChange={e => updateRow(i, 'lo', e.target.value)}
+                      style={{ width:100 }} type="number" />
+                  </td>
+                  <td style={{ padding:'6px 10px' }}>
+                    <Input value={b.hi === null ? '' : (b.hi ?? '')}
+                      onChange={e => updateRow(i, 'hi', e.target.value)}
+                      placeholder={b.hi === null ? '(open)' : ''}
+                      style={{ width:100 }} type="number" />
+                  </td>
+                  <td style={{ padding:'6px 10px' }}>
+                    <Input value={b.growth ?? ''} onChange={e => updateRow(i, 'growth', e.target.value)}
+                      style={{ width:100 }} type="number" />
+                  </td>
+                  <td style={{ padding:'6px 10px' }}>
+                    <button onClick={() => deleteRow(i)}
+                      style={{ background:'transparent', border:'none', cursor:'pointer', color:C.red }}
+                      title="Delete band">
+                      <Trash2 size={14}/>
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ marginTop:8 }}>
+            <Btn onClick={addRow} color="gray">
+              <Plus size={12}/> Add band
+            </Btn>
+          </div>
+
+          {errors.length > 0 && (
+            <div style={{ marginTop:10, padding:'8px 12px', background:C.redBg,
+              border:`1px solid ${C.redBd}`, borderRadius:6, fontSize:11, color:C.red }}>
+              {errors.map((e, i) => <div key={i}>• {e}</div>)}
+            </div>
+          )}
+          {errors.length === 0 && warnings.length > 0 && (
+            <div style={{ marginTop:10, padding:'8px 12px', background:C.amberBg,
+              border:`1px solid ${C.amberBd}`, borderRadius:6, fontSize:11, color:C.amber }}>
+              {warnings.map((w, i) => <div key={i}>• {w}</div>)}
+            </div>
+          )}
+
+          <div style={{ marginTop:14, padding:'10px 12px', background:C.grayBg,
+            border:`1px solid ${C.grayBd}`, borderRadius:6, display:'flex',
+            alignItems:'center', gap:10, fontSize:12 }}>
+            <span style={{ fontWeight:600, color:C.text }}>Preview:</span>
+            <span style={{ color:C.textSub }}>at cont =</span>
+            <Input value={previewCont} onChange={e => setPreviewCont(e.target.value)}
+              placeholder="e.g. 13" type="number" style={{ width:80 }} />
+            <span style={{ color:C.textSub }}>%,</span>
+            {preview ? (
+              preview.matched
+                ? <span>growth = <strong>{preview.growth}%</strong> × MBQ</span>
+                : <span style={{ color:C.amber }}>no band matched — fallback {preview.growth}%</span>
+            ) : (
+              <span style={{ color:C.textMuted }}>enter a cont% to resolve</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 /* ── Main Page ────────────────────────────────────────────────────────────── */
 export default function GridBuilderPage() {
   const navigate = useNavigate()
@@ -627,6 +903,9 @@ export default function GridBuilderPage() {
           . Each run creates / truncates / inserts into the output table.
         </p>
       </div>
+
+      {/* Sec-Cap Growth Matrix (collapsed by default) */}
+      <GrowthMatrixPanel />
 
       {/* Main card */}
       <div style={{ background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:12,

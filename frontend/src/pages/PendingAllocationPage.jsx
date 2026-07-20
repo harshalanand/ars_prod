@@ -174,6 +174,8 @@ export default function PendingAllocationPage() {
   const [sessionFilter, setSessionFilter] = useState('')
   const [majCatFilter, setMajCatFilter]   = useState('')
   const [modeFilter, setModeFilter]       = useState('')
+  // Typed pend filter — FRESH | GRT | LEGACY (rows with no ALLOC_TYPE).
+  const [typeFilter, setTypeFilter]       = useState('')
   const [showClosed, setShowClosed]       = useState(false)
 
   const loadSummary = useCallback(async () => {
@@ -195,13 +197,14 @@ export default function PendingAllocationPage() {
     if (sessionFilter) params.session_id  = sessionFilter
     if (majCatFilter)  params.maj_cat     = majCatFilter
     if (modeFilter)    params.alloc_mode  = modeFilter
+    if (typeFilter)    params.alloc_type  = typeFilter
     if (!showClosed)   params.closed      = false
     return pendAlcAPI.detail(params)
-  }, [sessionFilter, majCatFilter, modeFilter, showClosed])
+  }, [sessionFilter, majCatFilter, modeFilter, typeFilter, showClosed])
 
   const detailRefreshKey = useMemo(
-    () => `${sessionFilter}|${majCatFilter}|${modeFilter}|${showClosed}`,
-    [sessionFilter, majCatFilter, modeFilter, showClosed]
+    () => `${sessionFilter}|${majCatFilter}|${modeFilter}|${typeFilter}|${showClosed}`,
+    [sessionFilter, majCatFilter, modeFilter, typeFilter, showClosed]
   )
 
   const [gridBumpKey, setGridBumpKey] = useState(0)
@@ -394,6 +397,14 @@ export default function PendingAllocationPage() {
               <option value="AUTO">AUTO</option>
               <option value="MANUAL">MANUAL</option>
             </select>
+            <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)}
+              style={{ fontSize: 10, padding: '4px 8px', border: `1px solid ${C.border}`,
+                       borderRadius: 4 }}>
+              <option value="">All Types</option>
+              <option value="FRESH">FRESH</option>
+              <option value="GRT">GRT</option>
+              <option value="LEGACY">Legacy (untyped)</option>
+            </select>
             <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, cursor: 'pointer' }}>
               <input type="checkbox" checked={showClosed} onChange={e => setShowClosed(e.target.checked)}
                 style={{ accentColor: C.primary }}/>
@@ -435,6 +446,13 @@ export default function PendingAllocationPage() {
                 render:r => <span style={{fontSize:8, fontWeight:700, padding:'2px 6px', borderRadius:3,
                                             background:(SRC_COLOR[r.source]||C.textSub)+'22',
                                             color:SRC_COLOR[r.source]||C.textSub}}>{r.source || 'AUTO'}</span> },
+              { key:'alloc_type', label:'TYPE', sortable:true,
+                render:r => r.alloc_type
+                  ? <span style={{fontSize:8, fontWeight:700, padding:'2px 6px', borderRadius:3,
+                                  background:(r.alloc_type==='GRT'?C.amber:C.green)+'22',
+                                  color:r.alloc_type==='GRT'?C.amber:C.green}}>{r.alloc_type}</span>
+                  : <span style={{fontSize:8, fontWeight:700, padding:'2px 6px', borderRadius:3,
+                                  background:'#f1f5f9', color:C.textMuted}}>LEGACY</span> },
               { key:'alloc_qty', label:'ALLOC', sortable:true, align:'right',
                 render:r => fmt(r.alloc_qty) },
               { key:'bdc_qty', label:'BDC', sortable:true, align:'right',

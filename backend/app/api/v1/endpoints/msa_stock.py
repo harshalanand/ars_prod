@@ -4,7 +4,7 @@ RESTful API for MSA filtering, calculation, and analysis
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, Path
 from sqlalchemy.orm import Session
-from typing import Dict, Any
+from typing import Dict, Any, List
 import json
 from loguru import logger
 from sqlalchemy import text
@@ -22,6 +22,7 @@ from app.schemas.msa import (
     MSACalculateResponse,
 )
 from app.schemas.common import APIResponse
+from app.services.alloc_pool import SLOC_SETTINGS_TABLE
 from app.services.msa_service import MSAService
 from app.services.msa_result_storage import MSAResultStorageService
 from app.services.msa_job_service import create_msa_storage_job, get_job_status, list_jobs
@@ -676,10 +677,22 @@ def calculate_msa(
             )
             
             logger.info(f"📋 Queued storage job: {job_info['job_id']}")
-            
-            # Return calculation results with job info
+
+            # Return calculation results with job info.
+            # PREVIEW ONLY when auto-storing: the full frames are persisted to
+            # the DB by the storage job, so shipping every row back inline is
+            # pure overhead — and with row-per-type MSA a full-universe calc
+            # exceeds 2M rows / hundreds of MB of JSON, which the browser
+            # cannot JSON.parse (axios then yields res.data.data=undefined and
+            # the page crashed with "reading 'sequence_id'", 2026-07-10).
+            PREVIEW_ROWS = 500
             response_data = {
-                **results,  # Include all calculation results
+                **results,
+                'msa': (results.get('msa') or [])[:PREVIEW_ROWS],
+                'msa_gen_clr': (results.get('msa_gen_clr') or [])[:PREVIEW_ROWS],
+                'msa_gen_clr_var': (results.get('msa_gen_clr_var') or [])[:PREVIEW_ROWS],
+                'preview': True,
+                'preview_rows': PREVIEW_ROWS,
                 'sequence_id': sequence_id,
                 'storage_job': {
                     'job_id': job_info['job_id'],
@@ -688,17 +701,24 @@ def calculate_msa(
                     'total_rows': job_info['total_rows'],
                 }
             }
-            
+
             return APIResponse(
                 data=response_data,
                 message=f"MSA calculation completed. Storage queued as job {job_info['job_id']} (position {job_info['position_in_queue']})"
             )
         except Exception as storage_err:
             logger.error(f"⚠️ Error creating storage job (but calculation succeeded): {storage_err}")
-            # Return calculation results even if job creation failed
+            # Return calculation results even if job creation failed — preview
+            # slice here too (same browser JSON.parse limit applies).
+            PREVIEW_ROWS = 500
             return APIResponse(
                 data={
                     **results,
+                    'msa': (results.get('msa') or [])[:PREVIEW_ROWS],
+                    'msa_gen_clr': (results.get('msa_gen_clr') or [])[:PREVIEW_ROWS],
+                    'msa_gen_clr_var': (results.get('msa_gen_clr_var') or [])[:PREVIEW_ROWS],
+                    'preview': True,
+                    'preview_rows': PREVIEW_ROWS,
                     'sequence_id': 0,
                     'storage_error': str(storage_err)
                 },
@@ -1237,6 +1257,223 @@ def cancel_all_storage_jobs(
         )
     except Exception as e:
         logger.error(f"❌ Error cancelling all jobs: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Warehouse SLOC Pool Management (ARS_MSA_SLOC_SETTINGS — Fresh / GRT)
+# ============================================================================
+# Classifies WAREHOUSE (MSA) SLOCs into mutually exclusive allocation pools.
+# The row-per-type MSA expansion (msa_service Step 12) and the alloc-time pool
+# selection (alloc_pool.get_sloc_type_map) both read this table — changes
+# apply from the NEXT MSA generation, they never rewrite an existing MSA.
+
+_VALID_SLOC_TYPES = ("FRESH", "GRT")
+
+
+def _upsert_sloc_setting(db: Session, sloc: str, sloc_type: str,
+                         is_active: bool, username: str) -> Dict[str, Any]:
+    """Upsert one SLOC pool row. Stamps updated_by always and
+    type_changed_at only when sloc_type actually changed (SQL Server SET
+    expressions see pre-update column values, so the CASE compares the OLD
+    type). Returns {sloc, action}."""
+    existing = db.execute(text(
+        f"SELECT sloc_type FROM [{SLOC_SETTINGS_TABLE}] WHERE sloc = :s"
+    ), {"s": sloc}).fetchone()
+
+    if existing is not None:
+        db.execute(text(f"""
+            UPDATE [{SLOC_SETTINGS_TABLE}]
+            SET sloc_type = :t,
+                is_active = :a,
+                updated_by = :u,
+                updated_at = GETDATE(),
+                type_changed_at = CASE WHEN sloc_type <> :t
+                                       THEN GETDATE() ELSE type_changed_at END
+            WHERE sloc = :s
+        """), {"s": sloc, "t": sloc_type, "a": 1 if is_active else 0,
+               "u": username})
+        return {"sloc": sloc, "action": "updated"}
+
+    db.execute(text(f"""
+        INSERT INTO [{SLOC_SETTINGS_TABLE}]
+            (sloc, sloc_type, is_active, updated_by, type_changed_at)
+        VALUES (:s, :t, :a, :u, GETDATE())
+    """), {"s": sloc, "t": sloc_type, "a": 1 if is_active else 0,
+           "u": username})
+    return {"sloc": sloc, "action": "inserted"}
+
+
+def _validate_sloc_payload(item: Dict[str, Any]) -> tuple:
+    """Normalize/validate one {sloc_type, is_active} payload. Raises 400."""
+    sloc_type = str(item.get("sloc_type", "")).strip().upper()
+    if sloc_type not in _VALID_SLOC_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sloc_type must be one of {list(_VALID_SLOC_TYPES)}, got '{sloc_type}'"
+        )
+    is_active = bool(item.get("is_active", True))
+    return sloc_type, is_active
+
+
+@router.get(
+    "/sloc-settings",
+    response_model=APIResponse,
+    summary="List warehouse SLOC pool settings (Fresh/GRT)"
+)
+def list_sloc_settings(
+    db: Session = Depends(get_data_db),
+    current_user: User = Depends(get_current_user)
+):
+    """All rows from ARS_MSA_SLOC_SETTINGS with audit info."""
+    try:
+        rows = db.execute(text(
+            f"SELECT sloc, sloc_type, is_active, kpi, updated_by, "
+            f"type_changed_at, updated_at "
+            f"FROM [{SLOC_SETTINGS_TABLE}] ORDER BY sloc"
+        )).fetchall()
+        settings = [
+            {
+                "sloc": r[0],
+                "sloc_type": r[1],
+                "is_active": bool(r[2]),
+                "kpi": r[3],
+                "updated_by": r[4],
+                "type_changed_at": str(r[5]) if r[5] else None,
+                "updated_at": str(r[6]) if r[6] else None,
+            }
+            for r in rows
+        ]
+        return APIResponse(
+            data={"settings": settings, "count": len(settings)},
+            message=f"Retrieved {len(settings)} SLOC pool settings"
+        )
+    except Exception as e:
+        logger.error(f"❌ Error listing SLOC settings: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put(
+    "/sloc-settings",
+    response_model=APIResponse,
+    summary="Bulk-update warehouse SLOC pool settings"
+)
+def bulk_update_sloc_settings(
+    body: List[Dict[str, Any]],
+    db: Session = Depends(get_data_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Bulk upsert: list of {sloc, sloc_type: FRESH|GRT, is_active: bool}.
+    Validates every item BEFORE writing anything (all-or-nothing)."""
+    try:
+        if not body:
+            raise HTTPException(status_code=400, detail="Empty settings list")
+
+        validated = []
+        for item in body:
+            sloc = str(item.get("sloc", "")).strip()
+            if not sloc:
+                raise HTTPException(status_code=400, detail="Each item needs a non-empty 'sloc'")
+            sloc_type, is_active = _validate_sloc_payload(item)
+            validated.append((sloc, sloc_type, is_active))
+
+        username = getattr(current_user, "username", "system")
+        results = [
+            _upsert_sloc_setting(db, sloc, sloc_type, is_active, username)
+            for sloc, sloc_type, is_active in validated
+        ]
+        db.commit()
+
+        logger.info(f"✅ SLOC pool bulk update by {username}: {len(results)} rows")
+        return APIResponse(
+            data={"results": results, "count": len(results)},
+            message=f"Updated {len(results)} SLOC pool settings. Changes apply from the next MSA generation."
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Error bulk-updating SLOC settings: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put(
+    "/sloc-settings/{sloc}",
+    response_model=APIResponse,
+    summary="Update one warehouse SLOC pool setting"
+)
+def update_sloc_setting(
+    sloc: str = Path(..., description="Warehouse SLOC code"),
+    body: Dict[str, Any] = None,
+    db: Session = Depends(get_data_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Upsert one SLOC: body {sloc_type: FRESH|GRT, is_active: bool}."""
+    try:
+        sloc = (sloc or "").strip()
+        if not sloc:
+            raise HTTPException(status_code=400, detail="SLOC is required")
+        sloc_type, is_active = _validate_sloc_payload(body or {})
+
+        username = getattr(current_user, "username", "system")
+        result = _upsert_sloc_setting(db, sloc, sloc_type, is_active, username)
+        db.commit()
+
+        logger.info(f"✅ SLOC pool update by {username}: {sloc} → {sloc_type}, active={is_active}")
+        return APIResponse(
+            data=result,
+            message=f"SLOC '{sloc}' set to {sloc_type}. Changes apply from the next MSA generation."
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Error updating SLOC setting '{sloc}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/sloc-settings/sync",
+    response_model=APIResponse,
+    summary="Sync SLOC pool settings from the MSA stock view"
+)
+def sync_sloc_settings(
+    db: Session = Depends(get_data_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Insert any SLOC present in VW_ET_MSA_STK_WITH_MASTER but missing from
+    ARS_MSA_SLOC_SETTINGS as FRESH/active. Returns the newly added SLOCs."""
+    try:
+        missing = [r[0] for r in db.execute(text(f"""
+            SELECT DISTINCT v.SLOC
+            FROM VW_ET_MSA_STK_WITH_MASTER v
+            WHERE v.SLOC IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM [{SLOC_SETTINGS_TABLE}] t WHERE t.sloc = v.SLOC
+              )
+            ORDER BY v.SLOC
+        """)).fetchall()]
+
+        username = getattr(current_user, "username", "system")
+        for s in missing:
+            db.execute(text(
+                f"INSERT INTO [{SLOC_SETTINGS_TABLE}] "
+                f"(sloc, sloc_type, is_active, updated_by) "
+                f"VALUES (:s, 'FRESH', 1, :u)"
+            ), {"s": s, "u": username})
+        db.commit()
+
+        logger.info(f"✅ SLOC pool sync by {username}: {len(missing)} new SLOC(s) added as FRESH: {missing}")
+        return APIResponse(
+            data={"added": missing, "added_count": len(missing)},
+            message=(f"Added {len(missing)} new SLOC(s) as FRESH" if missing
+                     else "No new SLOCs found — settings are in sync")
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Error syncing SLOC settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

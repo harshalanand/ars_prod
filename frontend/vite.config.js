@@ -8,10 +8,11 @@ export default defineConfig({
     alias: { '@': path.resolve(__dirname, './src') }
   },
   server: {
-    port: 3000,
+    port: process.env.PORT ? Number(process.env.PORT) : 3000,
     host: true,
+    strictPort: false,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8080', changeOrigin: true, proxyTimeout:1200000 }
+      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true, proxyTimeout:1200000 }
     },
     allowedHosts: ['ars.v2retail.net']
   },

@@ -367,6 +367,29 @@ def run_parallel_pipeline(
         else:
             run.status = "failed"
 
+        # Consistency guard — a clear_previous run TRUNCATEs all three MSA
+        # tables up front (lines ~302-310), then appends per batch while
+        # _store_batch_results silently skips empty data. If the 'msa'
+        # aggregate came back empty while gen-art / variant did NOT, the
+        # tables are left INCONSISTENT: ARS_MSA_TOTAL is now empty even
+        # though the rebuild "succeeded". That state propagates downstream
+        # invisibly — a later listing run parks 0 MSA_TOTAL rows and Approve
+        # promotes 0 to ARS_MSA_TOTAL_HISTORY (observed: session
+        # 20260713_164356_383, whose 32-min run overlapped one such rebuild).
+        # Fail loudly so the operator re-runs instead of listing/allocating
+        # against an empty MSA_TOTAL.
+        if clear_previous and run.total_msa_rows == 0 and (
+            run.total_gen_art_rows > 0 or run.total_variant_rows > 0
+        ):
+            run.status = "failed"
+            run.error = (
+                "MSA rebuild produced 0 ARS_MSA_TOTAL rows while GEN_ART/"
+                f"VAR_ART got {run.total_gen_art_rows}/{run.total_variant_rows}"
+                " — MSA_TOTAL was truncated and left empty. Re-run the MSA "
+                "calculation; do not list/allocate against this state."
+            )
+            logger.error(f"Pipeline {run.run_id}: {run.error}")
+
         run.completed_at = datetime.utcnow()
 
         logger.info(
