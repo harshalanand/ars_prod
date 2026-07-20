@@ -630,8 +630,21 @@ function SessionList({ sessions, activeSid, onPick, search }) {
                           <span className={`font-mono ${active ? 'text-indigo-700 font-semibold' : 'text-gray-700'}`}>
                             {s.session_id}
                           </span>
-                          <span className={`px-1.5 py-0.5 text-[9px] uppercase tracking-wider rounded ${srcCls}`}>
-                            {s.src}
+                          <span className="flex items-center gap-1">
+                            {/* FRESH/GRT type badge — rendered only when the
+                                review-list response carries alloc_type
+                                (older sessions / older backend omit it). */}
+                            {s.alloc_type && (
+                              <span className={`px-1.5 py-0.5 text-[9px] uppercase tracking-wider rounded ${
+                                s.alloc_type === 'FRESH' ? 'bg-sky-100 text-sky-700'
+                                                         : 'bg-purple-100 text-purple-700'
+                              }`}>
+                                {s.alloc_type}
+                              </span>
+                            )}
+                            <span className={`px-1.5 py-0.5 text-[9px] uppercase tracking-wider rounded ${srcCls}`}>
+                              {s.src}
+                            </span>
                           </span>
                         </div>
                         <div className="flex items-center gap-1 text-[10px] text-gray-500">
@@ -730,6 +743,7 @@ export default function AlcReviewPage() {
               {activeSession && (
                 <span className="text-[11px] font-mono text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded">
                   {activeSession.session_id} · {activeSession.src?.toUpperCase()}
+                  {activeSession.alloc_type ? ` · ${activeSession.alloc_type}` : ''}
                 </span>
               )}
             </h1>

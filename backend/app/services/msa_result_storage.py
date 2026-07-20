@@ -292,6 +292,11 @@ class MSAResultStorageService:
         "GEN_ART_NUMBER": "BIGINT",
         # Text codes → NVARCHAR
         "RDC": "NVARCHAR(50)", "ST_CD": "NVARCHAR(50)",
+        # Pool type marker (FRESH|GRT) — matches migration 017 NVARCHAR(10).
+        # Row-per-type MSA output carries one ALLOC_TYPE per row; this keeps
+        # the dynamic column manager from widening it to NVARCHAR(200) if the
+        # table is ever recreated without the migration having run.
+        "ALLOC_TYPE": "NVARCHAR(10)",
         "WERKS": "NVARCHAR(50)", "SLOC": "NVARCHAR(50)",
         "MAJ_CAT": "NVARCHAR(100)", "CLR": "NVARCHAR(100)",
         "DIV": "NVARCHAR(100)", "SZ": "NVARCHAR(50)",

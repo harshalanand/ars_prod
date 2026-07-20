@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import datetime
 import io
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -73,6 +73,35 @@ def _engine():
     return get_data_engine()
 
 
+def _norm_alloc_type_field(v):
+    """Pydantic normalizer for row-level alloc_type: None/'' → None,
+    'fresh'/' GRT ' → 'FRESH'/'GRT', anything else → ValueError (422)."""
+    if v is None:
+        return None
+    s = str(v).strip().upper()
+    if s == "":
+        return None
+    if s in ("FRESH", "GRT"):
+        return s
+    raise ValueError("alloc_type must be FRESH, GRT, or blank")
+
+
+def _alloc_type_pred(alloc_type: Optional[str], params: dict,
+                     col: str = "P.ALLOC_TYPE") -> Optional[str]:
+    """WHERE fragment for the optional alloc_type view filter.
+    FRESH/GRT match typed rows exactly; LEGACY matches NULL/'' rows.
+    Returns None when no filter is requested; raises 400 on junk."""
+    if not alloc_type:
+        return None
+    at = alloc_type.strip().upper()
+    if at == "LEGACY":
+        return f"ISNULL({col},'') = ''"
+    if at in ("FRESH", "GRT"):
+        params["f_at"] = at
+        return f"ISNULL({col},'') = :f_at"
+    raise HTTPException(400, "alloc_type filter must be FRESH, GRT, or LEGACY")
+
+
 # Excludes (RDC, ST_CD, ARTICLE) combos that already have an open BDC
 # awaiting DO. A partial DO transitions the prior history row to
 # CLOSED_PARTIAL (see apply_do_deductions), so it no longer matches here —
@@ -87,13 +116,70 @@ _NO_OPEN_BDC_PREDICATE = (
     f")"
 )
 
+# ── Dispatch-control exclusions (2026-07-18) ───────────────────────────────
+# Three tables suppress BDC generation so controlled stock never dispatches:
+#   ARS_HOLD_ARTICLE_BDC               (GEN_ART_NUMBER, CLR) — hold an article colour
+#   ARS_DIVISION_DELETE_BDC            (STORE, DIV)          — no dispatch of a division to a store
+#   ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC (STORE, MAJ_CAT)      — no dispatch of a MAJ_CAT to a store
+# Each is a correlated EXISTS against the pending row (full-table-name
+# correlation, matching _NO_OPEN_BDC_PREDICATE). Generate BDC ANDs the NOT
+# forms so matching lines drop out; the Gap report uses the EXISTS forms to
+# surface what was held. DIV is resolved from MAJ_CAT via ARS_MSA_GEN_ART.
+_MATCH_ARTICLE_HOLD = (
+    f"EXISTS (SELECT 1 FROM ARS_HOLD_ARTICLE_BDC h WITH (NOLOCK) "
+    f"WHERE h.GEN_ART_NUMBER = {PEND_ALC_TABLE}.GEN_ART_NUMBER "
+    f"AND ISNULL(h.CLR,'') = ISNULL({PEND_ALC_TABLE}.CLR,''))"
+)
+_MATCH_DIV_DELETE = (
+    f"EXISTS (SELECT 1 FROM ARS_DIVISION_DELETE_BDC dd WITH (NOLOCK) "
+    f"JOIN (SELECT DISTINCT MAJ_CAT, DIV FROM ARS_MSA_GEN_ART) m "
+    f"ON m.MAJ_CAT = {PEND_ALC_TABLE}.MAJ_CAT "
+    f"WHERE dd.STORE = ISNULL({PEND_ALC_TABLE}.ST_CD,'') AND dd.DIV = m.DIV)"
+)
+_MATCH_STORE_MAJCAT = (
+    f"EXISTS (SELECT 1 FROM ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC d WITH (NOLOCK) "
+    f"WHERE d.STORE = ISNULL({PEND_ALC_TABLE}.ST_CD,'') "
+    f"AND d.MAJ_CAT = {PEND_ALC_TABLE}.MAJ_CAT)"
+)
+# (table, rule_label, match_sql). Order = precedence for display only.
+_DISPATCH_CONTROL = [
+    ("ARS_HOLD_ARTICLE_BDC",               "ARTICLE_HOLD", _MATCH_ARTICLE_HOLD),
+    ("ARS_DIVISION_DELETE_BDC",            "DIV_DELETE",   _MATCH_DIV_DELETE),
+    ("ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC", "STORE_MAJCAT", _MATCH_STORE_MAJCAT),
+]
+
+
+def _existing_dispatch_controls(conn):
+    """Subset of _DISPATCH_CONTROL whose tables exist (best-effort).
+
+    Missing control tables must never 500 a BDC run — they simply mean
+    "no exclusion for that rule" in this environment.
+    """
+    out = []
+    for tbl, rule, match_sql in _DISPATCH_CONTROL:
+        try:
+            if conn.execute(text("SELECT OBJECT_ID(:t,'U')"), {"t": tbl}).scalar():
+                out.append((tbl, rule, match_sql))
+        except Exception:
+            pass
+    return out
+
 
 # ---------------------------------------------------------------------------
 # GET /pend-alc/summary
 # ---------------------------------------------------------------------------
 @router.get("/summary")
-def pend_alc_summary(current_user: User = Depends(get_current_user)):
-    """Totals + breakdown by ALLOC_MODE and SOURCE."""
+def pend_alc_summary(
+    alloc_type: Optional[str] = Query(
+        None, description="FRESH | GRT | LEGACY (NULL/'' rows)"),
+    current_user: User = Depends(get_current_user),
+):
+    """Totals + breakdown by ALLOC_MODE, SOURCE and ALLOC_TYPE."""
+    # Computed before the try so a bad filter surfaces as 400, not 500.
+    params: dict = {}
+    at_pred = _alloc_type_pred(alloc_type, params, col="ALLOC_TYPE")
+    at_and  = f" AND {at_pred}" if at_pred else ""
+    at_where = f" WHERE {at_pred}" if at_pred else ""
     try:
         with _engine().connect() as conn:
             ensure_pend_alc_table(conn)
@@ -106,7 +192,8 @@ def pend_alc_summary(current_user: User = Depends(get_current_user)):
                        SUM(CASE WHEN IS_CLOSED=1 THEN 1 ELSE 0 END)     AS closed_rows,
                        SUM(CASE WHEN IS_CLOSED=0 THEN 1 ELSE 0 END)     AS open_rows
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-            """)).fetchone()
+                {at_where}
+            """), params).fetchone()
 
             by_mode = conn.execute(text(f"""
                 SELECT ISNULL(ALLOC_MODE,'AUTO')     AS mode,
@@ -116,10 +203,10 @@ def pend_alc_summary(current_user: User = Depends(get_current_user)):
                        SUM(PEND_QTY) AS pend_qty,
                        COUNT(*)      AS rows
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                WHERE IS_CLOSED = 0
+                WHERE IS_CLOSED = 0{at_and}
                 GROUP BY ISNULL(ALLOC_MODE,'AUTO')
                 ORDER BY SUM(PEND_QTY) DESC
-            """)).fetchall()
+            """), params).fetchall()
 
             by_source = conn.execute(text(f"""
                 SELECT ISNULL(SOURCE,'AUTO')          AS source,
@@ -129,10 +216,10 @@ def pend_alc_summary(current_user: User = Depends(get_current_user)):
                        SUM(PEND_QTY)  AS pend_qty,
                        COUNT(*)       AS rows
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                WHERE IS_CLOSED = 0
+                WHERE IS_CLOSED = 0{at_and}
                 GROUP BY ISNULL(SOURCE,'AUTO')
                 ORDER BY SUM(PEND_QTY) DESC
-            """)).fetchall()
+            """), params).fetchall()
 
             by_majcat = conn.execute(text(f"""
                 SELECT MAJ_CAT,
@@ -142,10 +229,25 @@ def pend_alc_summary(current_user: User = Depends(get_current_user)):
                        SUM(PEND_QTY)  AS pend_qty,
                        COUNT(*)       AS rows
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                WHERE IS_CLOSED = 0
+                WHERE IS_CLOSED = 0{at_and}
                 GROUP BY MAJ_CAT
                 ORDER BY SUM(PEND_QTY) DESC
-            """)).fetchall()
+            """), params).fetchall()
+
+            by_alloc_type = conn.execute(text(f"""
+                SELECT CASE WHEN ISNULL(ALLOC_TYPE,'') = '' THEN 'LEGACY'
+                            ELSE ALLOC_TYPE END AS alloc_type,
+                       SUM(ALLOC_QTY) AS alloc_qty,
+                       SUM(BDC_QTY)   AS bdc_qty,
+                       SUM(DO_QTY)    AS do_qty,
+                       SUM(PEND_QTY)  AS pend_qty,
+                       COUNT(*)       AS rows
+                FROM {PEND_ALC_TABLE} WITH (NOLOCK)
+                WHERE IS_CLOSED = 0{at_and}
+                GROUP BY CASE WHEN ISNULL(ALLOC_TYPE,'') = '' THEN 'LEGACY'
+                              ELSE ALLOC_TYPE END
+                ORDER BY SUM(PEND_QTY) DESC
+            """), params).fetchall()
 
         return {
             "success": True,
@@ -179,6 +281,12 @@ def pend_alc_summary(current_user: User = Depends(get_current_user)):
                      "bdc_qty": float(r[2] or 0), "do_qty": float(r[3] or 0),
                      "pend_qty": float(r[4] or 0), "rows": int(r[5] or 0)}
                     for r in by_majcat
+                ],
+                "by_alloc_type": [
+                    {"alloc_type": r[0], "alloc_qty": float(r[1] or 0),
+                     "bdc_qty": float(r[2] or 0), "do_qty": float(r[3] or 0),
+                     "pend_qty": float(r[4] or 0), "rows": int(r[5] or 0)}
+                    for r in by_alloc_type
                 ],
             },
         }
@@ -317,6 +425,7 @@ _DETAIL_SORTABLE = {
     "approved_at":    "P.APPROVED_AT",
     "last_bdc_at":    "P.LAST_BDC_AT",
     "is_closed":      "P.IS_CLOSED",
+    "alloc_type":     "P.ALLOC_TYPE",
     "bdc_alloc_no":   "B.ALLOCATION_NUMBER",
     "bdc_status":     "B.STATUS",
 }
@@ -328,6 +437,8 @@ def pend_alc_detail(
     maj_cat:      Optional[str]  = Query(None),
     alloc_mode:   Optional[str]  = Query(None),
     source:       Optional[str]  = Query(None),
+    alloc_type:   Optional[str]  = Query(
+        None, description="FRESH | GRT | LEGACY (NULL/'' rows)"),
     closed:       Optional[bool] = Query(None),
     # Pagination
     page:         int            = Query(1,   ge=1),
@@ -360,6 +471,9 @@ def pend_alc_detail(
             filters.append("P.SOURCE = :src");     params["src"] = source
         if closed is not None:
             filters.append("P.IS_CLOSED = :cl");   params["cl"]  = 1 if closed else 0
+        at_pred = _alloc_type_pred(alloc_type, params)
+        if at_pred:
+            filters.append(at_pred)
 
         def _multi(col, csv, prefix):
             vals = _parse_csv_filter(csv)
@@ -430,7 +544,8 @@ def pend_alc_detail(
                     P.ALLOC_QTY, P.BDC_QTY, P.DO_QTY, P.PEND_QTY,
                     P.APPROVED_AT, P.LAST_BDC_AT, P.DO_NUMBER, P.DO_UPLOADED_AT,
                     P.LAST_DO_AT, P.IS_CLOSED, P.REMARKS,
-                    B.ALLOCATION_NUMBER, B.STATUS, B.DO_RECEIVED, B.BDC_DATE
+                    B.ALLOCATION_NUMBER, B.STATUS, B.DO_RECEIVED, B.BDC_DATE,
+                    P.ALLOC_TYPE
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 {bdc_join}
                 {where}
@@ -474,10 +589,13 @@ def pend_alc_detail(
                     "bdc_status":     r[22] or ("NEVER_SENT" if not r[15] else None),
                     "do_received":    float(r[23] or 0) if r[23] is not None else None,
                     "bdc_date":       r[24].isoformat() if r[24] else None,
+                    "alloc_type":     r[25] or None,
                 }
                 for r in rows
             ],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -543,6 +661,15 @@ class DoUpdateRow(BaseModel):
     allocation_number: Optional[str] = None
     st_cd:             Optional[str] = None
     do_number:         Optional[str] = None
+    # Optional typed scoping (Package 3) — when FRESH/GRT, the FIFO only
+    # drains PEND rows whose folded ALLOC_TYPE matches (legacy NULL/'' pend
+    # folds to FRESH). Blank = today's type-agnostic behaviour.
+    alloc_type:        Optional[str] = None
+
+    @field_validator("alloc_type", mode="before")
+    @classmethod
+    def _v_alloc_type(cls, v):
+        return _norm_alloc_type_field(v)
 
 
 class DoUpdateRequest(BaseModel):
@@ -555,6 +682,22 @@ class DoUpdateRequest(BaseModel):
     session_id:     Optional[str] = None
     is_first_chunk: bool          = True
     is_last_chunk:  bool          = True
+    # FS-12 — DO session-wise deduction. NOTE: `session_id` above is the
+    # upload/ops-log key; `target_session_id` is a PEND_ALC allocation
+    # SESSION_ID and deliberately named differently. Required (400) when
+    # deduction_method != FIFO — see _validate_deduction_method().
+    deduction_method:  Literal["FIFO", "SESSION_FIRST", "SESSION_ONLY"] = "FIFO"
+    target_session_id: Optional[str] = None
+
+
+def _validate_deduction_method(body: "DoUpdateRequest") -> None:
+    """FS-12: non-FIFO methods must name the PEND_ALC session to target."""
+    if body.deduction_method != "FIFO" and not (body.target_session_id or "").strip():
+        raise HTTPException(
+            400,
+            f"target_session_id is required when "
+            f"deduction_method={body.deduction_method}",
+        )
 
 
 @router.post("/do-update")
@@ -581,6 +724,7 @@ def pend_alc_do_update(
     chunk's effect from a single click."""
     if not body.rows:
         raise HTTPException(400, "No rows provided")
+    _validate_deduction_method(body)
     try:
         import uuid as _uuid
         from app.services.pend_alc_service import log_operation_upsert
@@ -591,11 +735,16 @@ def pend_alc_do_update(
             {"rdc": r.rdc, "article_number": r.article_number,
              "do_qty": r.do_qty, "do_number": r.do_number,
              "st_cd": r.st_cd,
-             "allocation_number": r.allocation_number}
+             "allocation_number": r.allocation_number,
+             "alloc_type": r.alloc_type}
             for r in body.rows
         ]
         with _engine().connect() as conn:
-            do_result   = apply_do_deductions(conn, rows)
+            do_result   = apply_do_deductions(
+                conn, rows,
+                deduction_method=body.deduction_method,
+                target_session_id=body.target_session_id,
+            )
             hist_result = update_bdc_history_with_do(conn, rows)
             cancel_count = sum(
                 1 for h in (hist_result.get("history_updates") or [])
@@ -614,6 +763,9 @@ def pend_alc_do_update(
                 op_key=session_id,
                 payload={
                     "session_id":          session_id,
+                    # FS-12 audit: how this upload's deduction was targeted.
+                    "deduction_method":    body.deduction_method,
+                    "target_session_id":   body.target_session_id,
                     "pend_updates":        do_result["pend_updates"],
                     "history_updates":     hist_result["history_updates"],
                     # auto_history_closes = OPEN→CONFIRMED side-effect
@@ -689,6 +841,11 @@ def pend_alc_bdc_preview(
 
         with _engine().connect() as conn:
             ensure_pend_alc_table(conn)
+            # Preview must mirror Generate BDC — apply the same dispatch-control
+            # exclusions so held lines don't appear as "will be sent".
+            _dispatch_and = "".join(
+                f" AND NOT {m}" for _, _, m in _existing_dispatch_controls(conn)
+            )
             rows = conn.execute(text(f"""
                 SELECT RDC,
                        ISNULL(ST_CD,'')           AS ST_CD,
@@ -702,7 +859,7 @@ def pend_alc_bdc_preview(
                        MAX(LAST_BDC_AT)           AS last_bdc_at,
                        COUNT(DISTINCT SESSION_ID) AS session_count
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                {where}
+                {where}{_dispatch_and}
                 GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT,
                          ISNULL(GEN_ART_NUMBER,''), ISNULL(CLR,'')
                 ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
@@ -730,6 +887,118 @@ def pend_alc_bdc_preview(
                 for r in rows
             ],
         }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /pend-alc/dispatch-gap — pending lines HELD from BDC by dispatch controls
+# ---------------------------------------------------------------------------
+def _dispatch_gap_query(conn, rdc: Optional[str]):
+    """Open pending lines that Generate BDC will SKIP due to a control table.
+
+    Tags each held (RDC, ST_CD, GEN_ART, CLR, MAJ_CAT) group with which
+    rule(s) matched. Returns (detail, summary, total_held_qty). Held stock
+    stays pending — this is the visibility for it.
+    """
+    controls = _existing_dispatch_controls(conn)
+    if not controls:
+        return [], [], 0.0
+    params: dict = {}
+    base = ["IS_CLOSED = 0", "PEND_QTY > 0", _NO_OPEN_BDC_PREDICATE]
+    if rdc:
+        base.append("RDC = :rdc"); params["rdc"] = rdc
+    where = "WHERE " + " AND ".join(base)
+    rules = [rule for _, rule, _ in controls]
+    # Row-level flags in the CTE (no grouping → correlated EXISTS is legal),
+    # then aggregate the flags with MAX per held group.
+    cte_flags = ",\n                   ".join(
+        f"CASE WHEN {m} THEN 1 ELSE 0 END AS f_{rule}" for _, rule, m in controls)
+    out_flags = ",\n               ".join(f"MAX(f_{rule}) AS f_{rule}" for rule in rules)
+    any_flag  = " OR ".join(f"f_{rule} = 1" for rule in rules)
+    sql = f"""
+        WITH tagged AS (
+            SELECT RDC,
+                   ISNULL(ST_CD,'')          AS ST_CD,
+                   ISNULL(GEN_ART_NUMBER,'') AS GEN_ART_NUMBER,
+                   ISNULL(CLR,'')            AS CLR,
+                   MAJ_CAT, PEND_QTY,
+                   {cte_flags}
+            FROM {PEND_ALC_TABLE} WITH (NOLOCK)
+            {where}
+        )
+        SELECT RDC, ST_CD, GEN_ART_NUMBER, CLR, MAJ_CAT,
+               (SELECT TOP 1 DIV FROM ARS_MSA_GEN_ART g WITH (NOLOCK)
+                  WHERE g.MAJ_CAT = tagged.MAJ_CAT) AS DIV,
+               SUM(PEND_QTY) AS PEND_QTY,
+               {out_flags}
+        FROM tagged
+        WHERE {any_flag}
+        GROUP BY RDC, ST_CD, GEN_ART_NUMBER, CLR, MAJ_CAT
+        ORDER BY RDC, ST_CD, MAJ_CAT
+    """
+    rows = conn.execute(text(sql), params).fetchall()
+    detail = []
+    summ = {r: {"rule": r, "rows": 0, "pend_qty": 0.0} for r in rules}
+    total = 0.0
+    for row in rows:
+        pq = float(row[6] or 0)
+        flags = {rules[i]: int(row[7 + i] or 0) for i in range(len(rules))}
+        blocked = [r for r in rules if flags[r]]
+        detail.append({
+            "rdc": row[0], "st_cd": row[1], "gen_art_number": row[2],
+            "clr": row[3], "maj_cat": row[4], "div": row[5],
+            "pend_qty": pq, "blocked_by": blocked,
+        })
+        total += pq
+        for r in blocked:
+            summ[r]["rows"] += 1
+            summ[r]["pend_qty"] += pq
+    return detail, list(summ.values()), total
+
+
+@router.get("/dispatch-gap")
+def pend_alc_dispatch_gap(
+    rdc: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
+    """Reconciliation Gap report — pending stock withheld from BDC by the
+    three dispatch-control tables (article-hold / division-delete / store×
+    maj_cat), with a per-rule summary."""
+    try:
+        with _engine().connect() as conn:
+            detail, summary, total = _dispatch_gap_query(conn, rdc)
+        return {"success": True, "count": len(detail),
+                "total_held_qty": total, "summary": summary, "detail": detail}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/dispatch-gap/export")
+def pend_alc_dispatch_gap_export(
+    rdc: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
+    """Excel export of the dispatch-control Gap report detail."""
+    try:
+        with _engine().connect() as conn:
+            detail, _, _ = _dispatch_gap_query(conn, rdc)
+        cols = ["RDC", "STORE", "GEN_ART_NUMBER", "CLR", "MAJ_CAT", "DIV",
+                "PEND_QTY", "BLOCKED_BY"]
+        df = pd.DataFrame([{
+            "RDC": d["rdc"], "STORE": d["st_cd"], "GEN_ART_NUMBER": d["gen_art_number"],
+            "CLR": d["clr"], "MAJ_CAT": d["maj_cat"], "DIV": d["div"],
+            "PEND_QTY": d["pend_qty"], "BLOCKED_BY": ", ".join(d["blocked_by"]),
+        } for d in detail], columns=cols)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            df.to_excel(xw, index=False, sheet_name="Dispatch Gap")
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=dispatch_control_gap.xlsx"},
+        )
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -814,6 +1083,11 @@ def pend_alc_bdc_generate(
         # never block on Generate BDC. RCSI + the new covering index
         # IX_ARS_PEND_ALC_bdc_lookup turn this into a seek.
         with _engine().connect() as conn:
+            # Dispatch-control exclusions: drop pending lines matching any of
+            # the 3 control tables so they never generate a BDC (held).
+            _dispatch_and = "".join(
+                f" AND NOT {m}" for _, _, m in _existing_dispatch_controls(conn)
+            )
             rows = conn.execute(text(f"""
                 SELECT RDC,
                        ISNULL(ST_CD,'')          AS ST_CD,
@@ -821,7 +1095,7 @@ def pend_alc_bdc_generate(
                        MAJ_CAT,
                        SUM(PEND_QTY)             AS PEND_QTY
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                {where}
+                {where}{_dispatch_and}
                 GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
                 HAVING SUM(PEND_QTY) > 0
                 ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
@@ -868,7 +1142,10 @@ def pend_alc_bdc_generate(
                 # Stamp BDC_QTY ONLY on the exact (RDC, ST_CD, ARTICLE) rows
                 # that went into this RDC's slice — scoping by all 3 keys is
                 # critical when the user picks a date/store subset.
-                stamped_deltas = stamp_bdc_qty(conn, article_rdc)
+                # FS-13 fix #3: store-scoped generate drops the empty-ST_CD
+                # wildcard so it can't stamp all stores for (RDC, ARTICLE).
+                stamped_deltas = stamp_bdc_qty(
+                    conn, article_rdc, store_scoped=bool(store_filter))
                 history_ids = insert_bdc_history(
                     conn,
                     allocation_number=allocation_no,
@@ -993,6 +1270,129 @@ from datetime import datetime as _dt
 _jobs: dict = {}
 _jobs_lock = _threading.Lock()
 
+# ---------------------------------------------------------------------------
+# FS-13 fix #1 — cross-worker job persistence. `_jobs` is a per-process dict;
+# under gunicorn -w N a poll/download request can land on a worker that never
+# saw the job and 404 even though the job is running (or has already committed
+# its stamps). Every state change is written through to ARS_ASYNC_JOBS so ANY
+# worker can answer /async-jobs/{id}; the dict stays as a warm cache.
+#
+# Deviation from the FS-13 DDL sketch (progress INT): `progress` is stored as
+# NVARCHAR(200) because job progress is a human-readable string ("applied
+# 125,000 / 213,050 rows") that both frontends render verbatim — an INT would
+# lose the message on every cross-worker poll (the common case with 4 workers).
+# ---------------------------------------------------------------------------
+import json as _json
+
+ASYNC_JOBS_TABLE = "ARS_ASYNC_JOBS"
+
+_ASYNC_JOBS_DDL = f"""
+IF OBJECT_ID('dbo.{ASYNC_JOBS_TABLE}','U') IS NULL
+CREATE TABLE dbo.{ASYNC_JOBS_TABLE} (
+    job_id      NVARCHAR(50)   NOT NULL,
+    kind        NVARCHAR(20)   NULL,
+    status      NVARCHAR(20)   NULL,
+    progress    NVARCHAR(200)  NULL,
+    error       NVARCHAR(1000) NULL,
+    result_json NVARCHAR(MAX)  NULL,
+    zip_path    NVARCHAR(500)  NULL,
+    created_at  DATETIME       NOT NULL DEFAULT GETDATE(),
+    updated_at  DATETIME       NULL,
+    CONSTRAINT PK_ARS_ASYNC_JOBS PRIMARY KEY (job_id)
+)
+"""
+
+_async_jobs_table_ready = False
+
+
+def _ensure_async_jobs_table(conn) -> None:
+    """Idempotent first-use DDL guard — same pattern as ensure_*_table()."""
+    global _async_jobs_table_ready
+    if _async_jobs_table_ready:
+        return
+    conn.execute(text(_ASYNC_JOBS_DDL))
+    conn.commit()
+    _async_jobs_table_ready = True
+
+
+def _job_db_write(job_id: str) -> None:
+    """Write-through of the in-memory job dict to ARS_ASYNC_JOBS (upsert).
+
+    Best-effort: a DB hiccup must never kill the job thread — same-worker
+    polls are still served from the dict."""
+    with _jobs_lock:
+        j = dict(_jobs.get(job_id) or {})
+    if not j:
+        return
+    try:
+        result = j.get("result")
+        params = {
+            "id":       job_id,
+            "kind":     (str(j.get("type") or ""))[:20],
+            "status":   (str(j.get("status") or ""))[:20],
+            "progress": (str(j.get("progress") or ""))[:200],
+            "error":    (str(j.get("error"))[:1000] if j.get("error") else None),
+            "result":   (_json.dumps(result, default=str)
+                         if result is not None else None),
+            "zip":      j.get("zip_path"),
+        }
+        with _engine().connect() as conn:
+            _ensure_async_jobs_table(conn)
+            conn.execute(text(f"""
+                UPDATE {ASYNC_JOBS_TABLE}
+                   SET kind = :kind, status = :status, progress = :progress,
+                       error = :error, result_json = :result,
+                       zip_path = :zip, updated_at = GETDATE()
+                 WHERE job_id = :id;
+                IF @@ROWCOUNT = 0
+                INSERT INTO {ASYNC_JOBS_TABLE}
+                       (job_id, kind, status, progress, error, result_json,
+                        zip_path, updated_at)
+                VALUES (:id, :kind, :status, :progress, :error, :result,
+                        :zip, GETDATE())
+            """), params)
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[async-jobs] DB write-through failed for {job_id}: {e}")
+
+
+def _job_db_read(job_id: str) -> Optional[dict]:
+    """Rebuild a poll-shaped job dict from ARS_ASYNC_JOBS.
+
+    Cross-worker / post-restart path: returns None when the row doesn't
+    exist (true 404) or the DB is unreachable (caller falls back to 404)."""
+    try:
+        with _engine().connect() as conn:
+            _ensure_async_jobs_table(conn)
+            r = conn.execute(text(f"""
+                SELECT job_id, kind, status, progress, error, result_json,
+                       zip_path, created_at, updated_at
+                FROM {ASYNC_JOBS_TABLE} WITH (NOLOCK)
+                WHERE job_id = :id
+            """), {"id": job_id}).fetchone()
+    except Exception as e:
+        logger.warning(f"[async-jobs] DB read failed for {job_id}: {e}")
+        return None
+    if not r:
+        return None
+    result = None
+    if r[5]:
+        try:
+            result = _json.loads(r[5])
+        except Exception:
+            result = None
+    return {
+        "id":          r[0],
+        "type":        r[1],
+        "status":      r[2],
+        "progress":    r[3],
+        "error":       r[4],
+        "result":      result,
+        "zip_path":    r[6],
+        "created_at":  r[7].isoformat() if r[7] else None,
+        "finished_at": r[8].isoformat() if r[8] else None,
+    }
+
 
 def _new_job(job_type: str, label: str = "") -> str:
     job_id = _uuid.uuid4().hex[:12]
@@ -1011,6 +1411,7 @@ def _new_job(job_type: str, label: str = "") -> str:
             "result":     None,
             "zip_path":   None,
         }
+    _job_db_write(job_id)
     return job_id
 
 
@@ -1019,6 +1420,7 @@ def _job_update(job_id: str, **kwargs):
         j = _jobs.get(job_id)
         if j:
             j.update(kwargs)
+    _job_db_write(job_id)
 
 
 # Backwards-compat shim — older block referenced _bdc_job_update.
@@ -1054,6 +1456,11 @@ def _bdc_run_job(job_id: str, params: dict, store_filter, file_date_str: str,
         from app.api.v1.endpoints.bdc import _get_next_allocation_no
 
         with _engine().connect() as conn:
+            # Dispatch-control exclusions — same as the sync path so async
+            # generate holds the same lines.
+            _dispatch_and = "".join(
+                f" AND NOT {m}" for _, _, m in _existing_dispatch_controls(conn)
+            )
             rows = conn.execute(text(f"""
                 SELECT RDC,
                        ISNULL(ST_CD,'')          AS ST_CD,
@@ -1061,14 +1468,36 @@ def _bdc_run_job(job_id: str, params: dict, store_filter, file_date_str: str,
                        MAJ_CAT,
                        SUM(PEND_QTY)             AS PEND_QTY
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                {where}
+                {where}{_dispatch_and}
                 GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
                 HAVING SUM(PEND_QTY) > 0
                 ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
             """), sql_params).fetchall()
 
         if not rows:
-            _job_update(job_id, status="failed", error="No open pending rows found for BDC",
+            # FS-13 fix #4 — self-explanatory failure. Count the rows that
+            # match every filter EXCEPT _NO_OPEN_BDC_PREDICATE: those are
+            # excluded solely because an open BDC already covers their
+            # (RDC, ST_CD, ARTICLE) key.
+            err = "No open pending rows found for BDC"
+            try:
+                other = [f for f in filters if f != _NO_OPEN_BDC_PREDICATE]
+                blocked_where = ("WHERE " + " AND ".join(other)
+                                 + f" AND NOT ({_NO_OPEN_BDC_PREDICATE})")
+                with _engine().connect() as conn:
+                    blocked = int(conn.execute(text(
+                        f"SELECT COUNT(*) FROM {PEND_ALC_TABLE} WITH (NOLOCK) "
+                        f"{blocked_where}"
+                    ), sql_params).scalar() or 0)
+                if blocked > 0:
+                    err += (f" — {blocked} rows are blocked by open BDC "
+                            f"history (revert or close them from Operations "
+                            f"Log / Open BDC Report)")
+            except Exception as diag_err:
+                logger.warning(
+                    f"[bdc-generate-async] blocked-row diagnostic failed: {diag_err}"
+                )
+            _job_update(job_id, status="failed", error=err,
                         finished_at=_dt.now().isoformat())
             return
 
@@ -1103,7 +1532,10 @@ def _bdc_run_job(job_id: str, params: dict, store_filter, file_date_str: str,
                     for r in rdc_rows
                 ]
                 rdc_total_qty = sum(float(r[4] or 0) for r in rdc_rows)
-                stamped_deltas = stamp_bdc_qty(conn, article_rdc)
+                # FS-13 fix #3: store-scoped generate must never let an
+                # empty-ST_CD pair wildcard-stamp every store's rows.
+                stamped_deltas = stamp_bdc_qty(
+                    conn, article_rdc, store_scoped=bool(store_filter))
                 history_ids = insert_bdc_history(
                     conn, allocation_number=allocation_no,
                     rows=history_rows_input, created_by=username,
@@ -1247,7 +1679,8 @@ _DO_SLICE = 25_000
 
 
 def _do_run_job(job_id: str, rows: list, session_id: str, is_first: bool,
-                username):
+                username, deduction_method: str = "FIFO",
+                target_session_id: Optional[str] = None):
     """Worker: apply DO deductions to ARS_PEND_ALC + history update +
     log_operation_upsert, slicing the input internally so progress can be
     reported mid-flight.
@@ -1289,7 +1722,13 @@ def _do_run_job(job_id: str, rows: list, session_id: str, is_first: bool,
             slices_total = (total + _DO_SLICE - 1) // _DO_SLICE if total else 0
             for slice_idx, i in enumerate(range(0, total, _DO_SLICE)):
                 sl = rows[i:i + _DO_SLICE]
-                do_result   = apply_do_deductions(conn, sl)
+                # FS-12: same deduction args on every slice — SESSION_FIRST /
+                # SESSION_ONLY target the same PEND_ALC session throughout.
+                do_result   = apply_do_deductions(
+                    conn, sl,
+                    deduction_method=deduction_method,
+                    target_session_id=target_session_id,
+                )
                 hist_result = update_bdc_history_with_do(conn, sl)
                 agg_touched      += int(do_result.get("touched") or 0)
                 agg_hist_touched += int(hist_result.get("touched") or 0)
@@ -1320,6 +1759,10 @@ def _do_run_job(job_id: str, rows: list, session_id: str, is_first: bool,
                         op_key=session_id,
                         payload={
                             "session_id":          session_id,
+                            # FS-12 audit — scalar keys persist from slice 1
+                            # (chunks 2..N only merge the list fields).
+                            "deduction_method":    deduction_method,
+                            "target_session_id":   target_session_id,
                             "pend_updates":        slice_pend_updates,
                             "history_updates":     slice_hist_updates,
                             "auto_history_closes": slice_auto_closes,
@@ -1437,12 +1880,14 @@ def pend_alc_do_update_async(
     Poll /async-jobs/{job_id}; result carries session_id + counts."""
     if not body.rows:
         raise HTTPException(400, "No rows provided")
+    _validate_deduction_method(body)
     import uuid as _uu
     session_id = body.session_id or _uu.uuid4().hex[:12]
     rows = [
         {"rdc": r.rdc, "article_number": r.article_number,
          "do_qty": r.do_qty, "do_number": r.do_number,
-         "st_cd": r.st_cd, "allocation_number": r.allocation_number}
+         "st_cd": r.st_cd, "allocation_number": r.allocation_number,
+         "alloc_type": r.alloc_type}
         for r in body.rows
     ]
     label = f"DO upload {session_id} ({len(rows)} lines)"
@@ -1450,7 +1895,8 @@ def pend_alc_do_update_async(
     username = getattr(current_user, "username", None)
     _threading.Thread(
         target=_do_run_job,
-        args=(job_id, rows, session_id, bool(body.is_first_chunk), username),
+        args=(job_id, rows, session_id, bool(body.is_first_chunk), username,
+              body.deduction_method, body.target_session_id),
         daemon=True,
     ).start()
     # Return session_id eagerly so multi-chunk callers can reuse it on
@@ -1525,10 +1971,14 @@ def pend_alc_operations_revert_async(
 def pend_alc_async_job_status(job_id: str,
                               current_user: User = Depends(get_current_user)):
     with _jobs_lock:
-        j = _jobs.get(job_id)
+        j = dict(_jobs.get(job_id) or {})
+    if not j:
+        # FS-13 fix #1: dict miss ≠ job missing — under gunicorn -w N this
+        # worker may simply not own the job. Fall back to ARS_ASYNC_JOBS.
+        j = _job_db_read(job_id)
         if not j:
             raise HTTPException(404, f"Job {job_id} not found")
-        out = {k: v for k, v in j.items() if k != "zip_path"}
+    out = {k: v for k, v in j.items() if k != "zip_path"}
     return {"success": True, "data": out}
 
 
@@ -1537,17 +1987,28 @@ def pend_alc_async_job_download(job_id: str,
                                 current_user: User = Depends(get_current_user)):
     """Stream the BDC ZIP (only valid for type='bdc' jobs once complete)."""
     with _jobs_lock:
-        j = _jobs.get(job_id)
-        if not j:
-            raise HTTPException(404, f"Job {job_id} not found")
-        if j.get("status") != "completed":
-            raise HTTPException(409, f"Job {job_id} status={j.get('status')}")
-        zip_path = j.get("zip_path")
-        res = j.get("result") or {}
-        allocation_no = res.get("allocation_no") or "BDC"
-        file_date     = res.get("file_date") or _dt.now().strftime("%Y-%m-%d")
+        j = dict(_jobs.get(job_id) or {})
+    if not j:
+        # FS-13 fix #1: cross-worker download — the ZIP lives in the shared
+        # temp dir, so any worker on this host can stream it from the
+        # zip_path recorded in ARS_ASYNC_JOBS.
+        j = _job_db_read(job_id)
+    if not j:
+        raise HTTPException(404, f"Job {job_id} not found")
+    if j.get("status") != "completed":
+        raise HTTPException(409, f"Job {job_id} status={j.get('status')}")
+    zip_path = j.get("zip_path")
+    res = j.get("result") or {}
+    allocation_no = res.get("allocation_no") or "BDC"
+    file_date     = res.get("file_date") or _dt.now().strftime("%Y-%m-%d")
     if not zip_path or not _os.path.exists(zip_path):
-        raise HTTPException(410, "Download no longer available (server restart or cleanup)")
+        raise HTTPException(
+            410,
+            "Download no longer available (server restart or cleanup). The "
+            "BDC stamps and history WERE committed — if this generate should "
+            "be undone, revert it from the Operations Log; the SAP file can "
+            "be re-downloaded from the Open BDC Report.",
+        )
 
     fname = f"ARS_BDC_{file_date.replace('-','')}_{allocation_no}.zip"
 
@@ -2308,6 +2769,15 @@ class ManualRow(BaseModel):
     gen_art_number: Optional[str] = None
     clr:            Optional[str] = None
     remarks:        Optional[str] = None
+    # Typed pend (Package 3): FRESH/GRT stored on the row and deducted from
+    # the matching typed MSA row; None/'' stored as NULL (legacy → folds
+    # into FRESH in the MSA delta).
+    alloc_type:     Optional[str] = None
+
+    @field_validator("alloc_type", mode="before")
+    @classmethod
+    def _v_alloc_type(cls, v):
+        return _norm_alloc_type_field(v)
 
 
 class ManualUploadRequest(BaseModel):
@@ -2320,6 +2790,9 @@ class ManualUploadRequest(BaseModel):
     session_id:     Optional[str]  = None
     is_first_chunk: bool           = True
     is_last_chunk:  bool           = True
+    # Applied to rows that don't carry their own alloc_type. None keeps
+    # legacy behaviour (rows insert with ALLOC_TYPE NULL → fold FRESH).
+    default_alloc_type: Optional[Literal["FRESH", "GRT"]] = None
 
 
 @router.post("/manual-upload")
@@ -2345,6 +2818,11 @@ def pend_alc_manual_upload(
         raise HTTPException(400, "No rows provided")
     try:
         rows = [r.model_dump() for r in body.rows]
+        # Request-level default type fills rows that didn't carry their own.
+        if body.default_alloc_type:
+            for r in rows:
+                if not r.get("alloc_type"):
+                    r["alloc_type"] = body.default_alloc_type
         article_rdc_pairs = [
             {"rdc": r["rdc"], "article_number": r["article_number"]}
             for r in rows
@@ -2667,6 +3145,7 @@ _RECO_SORTABLE = {
     "do_number":       "P.DO_NUMBER",
     "is_closed":       "P.IS_CLOSED",
     "aging_days":      "DATEDIFF(day, P.APPROVED_AT, GETDATE())",
+    "alloc_type":      "P.ALLOC_TYPE",
     "bdc_alloc_no":    "B.ALLOCATION_NUMBER",
     "bdc_status":      "B.STATUS",
     "do_received":     "B.DO_RECEIVED",
@@ -2686,6 +3165,8 @@ def pend_alc_reco(
     maj_cat:     Optional[str]  = Query(None),
     alloc_mode:  Optional[str]  = Query(None),
     source:      Optional[str]  = Query(None),
+    alloc_type:  Optional[str]  = Query(
+        None, description="FRESH | GRT | LEGACY (NULL/'' rows)"),
     closed:      Optional[bool] = Query(None),
     session_id:  Optional[str]  = Query(None),
     # Pagination
@@ -2734,6 +3215,9 @@ def pend_alc_reco(
             filters.append("P.IS_CLOSED = :cl"); params["cl"] = 1 if closed else 0
         if session_id:
             filters.append("P.SESSION_ID = :sid"); params["sid"] = session_id
+        at_pred = _alloc_type_pred(alloc_type, params)
+        if at_pred:
+            filters.append(at_pred)
 
         # Multi-value column filters
         def _multi(col: str, csv: Optional[str], prefix: str):
@@ -2838,7 +3322,8 @@ def pend_alc_reco(
                     B.ALLOCATION_NUMBER AS BDC_ALLOC_NO,
                     B.STATUS            AS BDC_STATUS,
                     B.DO_RECEIVED       AS BDC_DO_RECEIVED,
-                    B.BDC_DATE          AS BDC_DATE
+                    B.BDC_DATE          AS BDC_DATE,
+                    P.ALLOC_TYPE        AS ALLOC_TYPE
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 {bdc_join}
                 {where}
@@ -2884,10 +3369,13 @@ def pend_alc_reco(
                     "bdc_status":      r[24] or ("NEVER_SENT" if not r[16] else None),
                     "do_received":     float(r[25] or 0) if r[25] is not None else None,
                     "bdc_date":        r[26].isoformat() if r[26] else None,
+                    "alloc_type":      r[27] or None,
                 }
                 for r in rows
             ],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -2905,6 +3393,8 @@ def pend_alc_reco_export(
     maj_cat:      Optional[str]  = Query(None),
     alloc_mode:   Optional[str]  = Query(None),
     source:       Optional[str]  = Query(None),
+    alloc_type:   Optional[str]  = Query(
+        None, description="FRESH | GRT | LEGACY (NULL/'' rows)"),
     closed:       Optional[bool] = Query(None),
     session_id:   Optional[str]  = Query(None),
     f_rdc:        Optional[str]  = Query(None),
@@ -2937,6 +3427,9 @@ def pend_alc_reco_export(
             filters.append("P.IS_CLOSED = :cl"); params["cl"] = 1 if closed else 0
         if session_id:
             filters.append("P.SESSION_ID = :sid"); params["sid"] = session_id
+        at_pred = _alloc_type_pred(alloc_type, params)
+        if at_pred:
+            filters.append(at_pred)
 
         def _multi(col: str, csv: Optional[str], prefix: str):
             vals = _parse_csv_filter(csv)
@@ -3011,7 +3504,8 @@ def pend_alc_reco_export(
                     B.ALLOCATION_NUMBER AS BDC_ALLOC_NO,
                     ISNULL(B.STATUS, 'NEVER_SENT') AS BDC_STATUS,
                     B.DO_RECEIVED AS BDC_DO_RECVD,
-                    B.BDC_DATE
+                    B.BDC_DATE,
+                    P.ALLOC_TYPE
                 FROM {PEND_ALC_TABLE} P
                 {bdc_join}
                 {where}
@@ -3032,6 +3526,7 @@ def pend_alc_reco_export(
             "APPROVED_AT", "LAST_BDC_AT", "DO_NUMBER", "DO_UPLOADED_AT",
             "IS_CLOSED", "REMARKS", "AGING_DAYS",
             "BDC_ALLOC_NO", "BDC_STATUS", "BDC_DO_RECEIVED", "BDC_DATE",
+            "ALLOC_TYPE",
         ])
         for r in rows:
             w.writerow([
@@ -3049,6 +3544,7 @@ def pend_alc_reco_export(
                 r[21] or "",
                 float(r[22] or 0) if r[22] is not None else "",
                 r[23].strftime("%Y-%m-%d") if r[23] else "",
+                r[24] or "",
             ])
 
         # File-name tag captures the dominant filter so the user can tell
@@ -3068,6 +3564,8 @@ def pend_alc_reco_export(
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"[pend_alc] reco-export failed: {e}")
         raise HTTPException(500, str(e))
@@ -3077,8 +3575,18 @@ def pend_alc_reco_export(
 # GET /pend-alc/reco-summary
 # ---------------------------------------------------------------------------
 @router.get("/reco-summary")
-def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
-    """Aggregated reco tiles: by mode, source, aging band, and RDC."""
+def pend_alc_reco_summary(
+    alloc_type: Optional[str] = Query(
+        None, description="FRESH | GRT | LEGACY (NULL/'' rows)"),
+    current_user: User = Depends(get_current_user),
+):
+    """Aggregated reco tiles: by mode, source, aging band, RDC and type."""
+    # Computed before the try so a bad filter surfaces as 400, not 500.
+    at_params: dict = {}
+    at_pred = _alloc_type_pred(alloc_type, at_params)
+    p_and   = f" AND {at_pred}" if at_pred else ""             # P-aliased
+    b_and   = (f" AND {at_pred.replace('P.ALLOC_TYPE', 'ALLOC_TYPE')}"
+               if at_pred else "")                             # bare-table
     try:
         with _engine().connect() as conn:
             ensure_pend_alc_table(conn)
@@ -3117,9 +3625,9 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                   ON  ok.RDC = P.RDC
                  AND ok.ST_CD = ISNULL(P.ST_CD,'')
                  AND ok.ARTICLE_NUMBER = P.ARTICLE_NUMBER
-                WHERE P.IS_CLOSED = 0
+                WHERE P.IS_CLOSED = 0{p_and}
                 GROUP BY ISNULL(P.ALLOC_MODE,'AUTO')
-            """)).fetchall()
+            """), at_params).fetchall()
 
             by_aging = conn.execute(text(f"""
                 SELECT
@@ -3133,7 +3641,7 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                     SUM(PEND_QTY)      AS pend_qty,
                     SUM(ALLOC_QTY)     AS alloc_qty
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-                WHERE IS_CLOSED = 0
+                WHERE IS_CLOSED = 0{b_and}
                 GROUP BY
                     CASE
                         WHEN DATEDIFF(day, APPROVED_AT, GETDATE()) <= 7   THEN '0-7d'
@@ -3142,7 +3650,7 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                         ELSE '60d+'
                     END
                 ORDER BY MIN(DATEDIFF(day, APPROVED_AT, GETDATE()))
-            """)).fetchall()
+            """), at_params).fetchall()
 
             by_rdc = conn.execute(text(f"""
                 ;WITH open_keys AS (
@@ -3167,10 +3675,26 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                   ON  ok.RDC = P.RDC
                  AND ok.ST_CD = ISNULL(P.ST_CD,'')
                  AND ok.ARTICLE_NUMBER = P.ARTICLE_NUMBER
-                WHERE P.IS_CLOSED = 0
+                WHERE P.IS_CLOSED = 0{p_and}
                 GROUP BY P.RDC
                 ORDER BY SUM(P.PEND_QTY) DESC
-            """)).fetchall()
+            """), at_params).fetchall()
+
+            # Typed-pend breakdown (Package 3): LEGACY = ALLOC_TYPE NULL/''.
+            by_alloc_type = conn.execute(text(f"""
+                SELECT CASE WHEN ISNULL(ALLOC_TYPE,'') = '' THEN 'LEGACY'
+                            ELSE ALLOC_TYPE END AS alloc_type,
+                       SUM(ALLOC_QTY) AS alloc_qty,
+                       SUM(BDC_QTY)   AS bdc_qty,
+                       SUM(DO_QTY)    AS do_qty,
+                       SUM(PEND_QTY)  AS pend_qty,
+                       COUNT(*)       AS rows
+                FROM {PEND_ALC_TABLE} WITH (NOLOCK)
+                WHERE IS_CLOSED = 0{b_and}
+                GROUP BY CASE WHEN ISNULL(ALLOC_TYPE,'') = '' THEN 'LEGACY'
+                              ELSE ALLOC_TYPE END
+                ORDER BY SUM(PEND_QTY) DESC
+            """), at_params).fetchall()
 
             # Legacy status buckets driven by PEND_ALC.BDC_QTY snapshot.
             # Kept for back-compat with the existing 4-tile UI.
@@ -3200,7 +3724,8 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                     SUM(CASE WHEN IS_CLOSED=1 THEN 1 ELSE 0 END) AS closed_rows,
                     SUM(CASE WHEN IS_CLOSED=1 THEN ALLOC_QTY ELSE 0 END) AS closed_qty
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
-            """)).fetchone()
+                WHERE 1=1{b_and}
+            """), at_params).fetchone()
 
             # Accurate lifecycle tiles driven by ARS_BDC_HISTORY status:
             #   pending_bdc_generate = (RDC, ST_CD, ARTICLE) keys with open
@@ -3214,7 +3739,7 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                 FROM (
                     SELECT SUM(P.PEND_QTY) AS PEND_QTY
                     FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
-                    WHERE P.IS_CLOSED = 0 AND P.PEND_QTY > 0
+                    WHERE P.IS_CLOSED = 0 AND P.PEND_QTY > 0{p_and}
                       AND NOT EXISTS (
                           SELECT 1 FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)
                           WHERE h.RDC = P.RDC
@@ -3225,7 +3750,7 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                     GROUP BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
                     HAVING SUM(P.PEND_QTY) > 0
                 ) x
-            """)).fetchone()
+            """), at_params).fetchone()
 
             # Pending DO (Open BDC) is now anchored on PEND_ALC, not on
             # BDC_HISTORY. The previous version summed BDC_QTY-DO_RECEIVED
@@ -3238,7 +3763,7 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                 SELECT COUNT(*) AS rows,
                        ISNULL(SUM(P.BDC_QTY - P.DO_QTY), 0) AS qty
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
-                WHERE P.IS_CLOSED = 0
+                WHERE P.IS_CLOSED = 0{p_and}
                   AND P.BDC_QTY > P.DO_QTY
                   AND EXISTS (
                       SELECT 1 FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)
@@ -3247,7 +3772,7 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                         AND h.ARTICLE_NUMBER = P.ARTICLE_NUMBER
                         AND h.STATUS = 'OPEN'
                   )
-            """)).fetchone()
+            """), at_params).fetchone()
 
             # Keep the old history-based view available too for diagnostics
             # (UI shows the new one; this lets us spot drift if it
@@ -3282,6 +3807,12 @@ def pend_alc_reco_summary(current_user: User = Depends(get_current_user)):
                      "pending_bdc_qty": float(r[5] or 0),
                      "rows": int(r[6] or 0)}
                     for r in by_rdc
+                ],
+                "by_alloc_type": [
+                    {"alloc_type": r[0], "alloc_qty": float(r[1] or 0),
+                     "bdc_qty": float(r[2] or 0), "do_qty": float(r[3] or 0),
+                     "pend_qty": float(r[4] or 0), "rows": int(r[5] or 0)}
+                    for r in by_alloc_type
                 ],
                 "by_status": {
                     "awaiting_bdc": {

@@ -90,5 +90,18 @@
       "d:\\d\\projects\\ars_prod\\backend",
       "d:\\ARS_PROD\\ars_prod\\backend"
     ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node tools/manual/doc_drift_hook.mjs"
+          }
+        ]
+      }
+    ]
   }
 }

@@ -17,13 +17,12 @@ Endpoints:
 """
 import io
 import json
-import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Any, Dict, Optional, List
+from pydantic import BaseModel, field_validator
+from typing import Any, Dict, Literal, Optional, List
 from sqlalchemy import text
 from loguru import logger
 
@@ -32,6 +31,10 @@ from app.security.dependencies import get_current_user, RequireRoles
 from app.models.rbac import User
 from app.utils.db_helpers import (
     run_sql, table_exists, get_columns, msa_expr, msa_col,
+)
+from app.services.alloc_pool import (
+    NoPoolColumnsError, get_sloc_type_map, typed_sloc_cols,
+    pool_stk_expr, pend_agg_sql, hold_agg_sql, fnl_q_eff_expr,
 )
 
 router = APIRouter(prefix="/listing", tags=["Listing"])
@@ -49,6 +52,9 @@ _FINAL_KEEP_COLS = {
     "LISTING", "I_ROD", "CLR_MIN", "CLR_MAX",
     "FOCUS_W_CAP", "FOCUS_WO_CAP",
     "RL_HOLD_QTY", "MSA_FNL_Q", "VAR_COUNT", "VAR_FNL_COUNT",
+    # Fresh/GRT hold control (FS-04): UPC flag + segment for the FS-05/FS-06
+    # suppression predicate
+    "ST_STATUS", "SEG",
     "PER_OPT_SALE", "OPT_MBQ", "OPT_REQ", "OPT_MBQ_WH", "OPT_REQ_WH", "EXCESS_STK",
     "ST_RANK", "MAX_DAILY_SALE",
     "FINAL_OPT_TYPE", "ALLOC_BATCH_ID", "ALLOC_TYPE",
@@ -131,9 +137,21 @@ class GenerateRequest(BaseModel):
     #              for the next OPT in the band. Cleaner rod-completion at
     #              the cost of possibly stranding budget when every OPT in
     #              band exceeds the remaining cap.
-    # Per-OPT engine only; sequential mode ignores these.
+    # Per-OPT engine settings.
     rl_dispatch_mode:  str = "COMPLETE"
     tbc_dispatch_mode: str = "COMPLETE"
+
+    @field_validator("rl_dispatch_mode", "tbc_dispatch_mode")
+    @classmethod
+    def _force_complete_dispatch(cls, v):
+        # SCALED dispatch is DISABLED (2026-07-17). The round-then-shave path
+        # produced a contradictory OVERSHOOT+SCALE double-stamp when it ran as
+        # an unguarded fall-through after a COMPLETE-mode overshoot admit (see
+        # rule_engine_per_opt.py). COMPLETE is now the ONLY supported RL/TBC
+        # dispatch mode. Coerce any incoming value — stale saved setting,
+        # direct-API caller, or legacy UI — to COMPLETE so SCALED can never
+        # take effect regardless of what the client sends.
+        return "COMPLETE"
     # MJ_MBQ growth headroom (Allocation Gate).  100 = strict (waterfall stops
     # at the MAJ_CAT target, current default).  >100 scales MJ_MBQ to a
     # SIBLING column MJ_MBQ_REV — the original MJ_MBQ is preserved untouched —
@@ -143,23 +161,17 @@ class GenerateRequest(BaseModel):
     # waterfall MJ_REQ_REM recompute) reads the scaled ceiling with no math
     # change.  Original MJ_REQ value is kept in MJ_REQ_ORIG for audit.
     mj_req_growth_pct: float = 100.0
-    # Allocation mode:
-    #   pandas      – vectorized cumulative-window race
-    #   per_opt     – one-OPT-at-a-time sequential engine (default); flips
-    #                 ARS_PER_OPT_MODE=1 and dispatches through pandas path.
-    #                 Pool draw is pre-validated per gate — no post-pass zeroing
-    #                 leaves stranded POOL_CONSUMED. See rule_engine_per_opt.py.
-    #   sequential  – single-thread SQL fallback
-    allocation_mode:  str = "per_opt"  # "sequential" | "pandas" | "per_opt"
-    # Execution order for per_opt mode. opt_type_first = RL all rounds → TBC all
-    # rounds → TBL all rounds (Order A, today's nesting). round_first = R1 across
-    # all OPT_TYPEs → R2 across all → R3 (Order B, fairer to TBL). Engine wiring
-    # for round_first is pending — currently both options run as opt_type_first.
-    exec_order:       str = "opt_type_first"  # "opt_type_first" | "round_first"
-    parallel_workers: int = 8        # used only by pandas mode
+    # Allocation mode: 'per_opt' is the ONLY supported engine (2026-07-10
+    # removal — see docs/REMOVAL_PLAN_PER_OPT_ONLY.md). The field is kept so
+    # old scripts/replays fail LOUDLY: /generate hard-400s on any other value
+    # instead of silently running a renamed engine. Dispatch goes through
+    # rule_engine_pandas.run_listing_and_allocation_pandas (orchestration:
+    # worker pool, writer queue, table loads, Stage D, write-back), whose
+    # band is hard-pinned to rule_engine_per_opt._run_band_per_opt.
+    allocation_mode:  str = "per_opt"
+    parallel_workers: int = 8        # worker pool size for the per_opt run
     # Per-run override for the single-writer-queue path. None → use .env default
     # (settings.USE_WRITER_QUEUE). True/False → force on/off for this run only.
-    # Pandas mode only — sequential mode has no writers to coordinate.
     use_writer_queue: Optional[bool] = None
     # Source tables:
     msa_table: str = "ARS_MSA_GEN_ART"
@@ -181,6 +193,51 @@ class GenerateRequest(BaseModel):
     #   'STRICT'     — deprecated (still handled backend-side for API back-
     #                  compat); UI no longer exposes this
     cont_fallback_mode: str = "P4_UNIFORM"
+    # ── Fresh/GRT typed pool + selective hold control ────────────────────
+    # (FSD_FRESH_GRT_HOLD_CONTROL FS-02/FS-03/FS-05/FS-06)
+    # alloc_type is REQUIRED — no default, 422 when missing/invalid (E-02).
+    # Every run allocates from exactly one warehouse pool; SLOC → pool
+    # membership lives in ARS_SLOC_SETTINGS (FS-01). Stage A/B recomputes
+    #   FNL_Q_EFF = max(min(Σ SLOC-cols(type) − PEND_T − HOLD_T, FNL_Q), 0)
+    alloc_type: Literal["FRESH", "GRT"]
+    # Hold-suppression toggles (per_opt / pandas modes only — IM-3 guard):
+    #   skip_hold_upc      — True  = UPC stores get no TBL warehouse hold
+    #   apply_hold_seg_app — False = APP options get no TBL warehouse hold
+    #   apply_hold_seg_gm  — False = GM options get no TBL warehouse hold
+    # Suppressed rows are budgeted like RL/TBC from the start (FS-05):
+    # OPT_MBQ_WH = OPT_MBQ, and OPT_REQ_WH follows automatically.
+    skip_hold_upc: bool = False
+    apply_hold_seg_app: bool = True
+    apply_hold_seg_gm: bool = True
+    # ── Run dates (information-only, 2026-07-18) ─────────────────────────
+    # Pure metadata stamped onto every allocation output row — they do NOT
+    # enter any stock/MSA/allocation math. Carried WORKING → PARKED →
+    # HISTORY by the column-introspection copy in parked_history.py.
+    #   stock_consider_dt — MANDATORY. The business date the stock figures
+    #                       reflect (UI defaults it to D-1 / yesterday).
+    #   picking_dt        — MANDATORY (2026-07-18). Planned warehouse
+    #                       picking/dispatch date. UI leaves it BLANK by
+    #                       default so the user must consciously pick a date
+    #                       per requirement — there is no sensible default.
+    # Both are ISO 'YYYY-MM-DD' strings; neither may be empty.
+    stock_consider_dt: str
+    picking_dt: str
+
+    @field_validator("stock_consider_dt", "picking_dt")
+    @classmethod
+    def _require_run_date(cls, v, info):
+        from datetime import date as _date
+        field = info.field_name
+        s = (str(v).strip() if v is not None else "")
+        if not s:
+            raise ValueError(f"{field} is required (YYYY-MM-DD)")
+        try:
+            _date.fromisoformat(s)
+        except ValueError:
+            raise ValueError(
+                f"{field} must be a valid YYYY-MM-DD date, got {v!r}"
+            )
+        return s
 
 
 # ── Helpers — delegating to shared db_helpers ───────────────────────────────
@@ -287,6 +344,25 @@ def get_config(current_user: User = Depends(get_current_user)):
             )).fetchall()
             result["stores"] = [str(r[0]).strip() for r in stores if r[0]]
 
+            # Store code → name map so the UI can show "HB05 — GUWAHATI"
+            if "ST_NM" in st_cols:
+                name_rows = conn.execute(text(
+                    f"SELECT DISTINCT [ST_CD], [ST_NM] FROM [Master_ALC_INPUT_ST_MASTER]{listing_filter}"
+                )).fetchall()
+                result["store_name_map"] = {
+                    str(r[0]).strip(): str(r[1]).strip() for r in name_rows if r[0] and r[1]
+                }
+
+            # Store code → HUB map so the UI can search/bulk-select by hub
+            # (store_rdc_map below covers the same for RDC)
+            if "HUB" in st_cols:
+                hub_rows = conn.execute(text(
+                    f"SELECT DISTINCT [ST_CD], [HUB] FROM [Master_ALC_INPUT_ST_MASTER]{listing_filter}"
+                )).fetchall()
+                result["store_hub_map"] = {
+                    str(r[0]).strip(): str(r[1]).strip() for r in hub_rows if r[0] and r[1]
+                }
+
             # Store → RDC mapping (for auto RDC detection in frontend)
             if st_rdc_col:
                 store_rdc_rows = conn.execute(text(
@@ -303,6 +379,24 @@ def get_config(current_user: User = Depends(get_current_user)):
                 "WHERE [MAJ_CAT] IS NOT NULL ORDER BY [MAJ_CAT]"
             )).fetchall()
             result["maj_cats"] = [str(r[0]).strip() for r in maj_cats if r[0]]
+
+            # MAJ_CAT → SEG/DIV/SUB_DIV/SSN map so the UI can search and
+            # bulk-select MAJ_CATs by hierarchy level (all four are
+            # single-valued per MAJ_CAT in ARS_MSA_GEN_ART; MAX() collapses
+            # the group cleanly).
+            attr_rows = conn.execute(text(
+                "SELECT [MAJ_CAT], MAX([SEG]), MAX([DIV]), MAX([SUB_DIV]), MAX([SSN]) "
+                "FROM [ARS_MSA_GEN_ART] WHERE [MAJ_CAT] IS NOT NULL GROUP BY [MAJ_CAT]"
+            )).fetchall()
+            result["maj_cat_attr_map"] = {
+                str(r[0]).strip(): {
+                    "seg":     str(r[1]).strip() if r[1] else None,
+                    "div":     str(r[2]).strip() if r[2] else None,
+                    "sub_div": str(r[3]).strip() if r[3] else None,
+                    "ssn":     str(r[4]).strip() if r[4] else None,
+                }
+                for r in attr_rows if r[0]
+            }
 
         if _table_exists(conn, "ARS_GRID_MJ_GEN_ART"):
             result["grid_gen_art_rows"] = conn.execute(text(
@@ -360,6 +454,12 @@ _SETTING_DEFAULTS = {
     "mj_req_growth_pct": "100.0",
     "allow_multi_parked": "false",
     "cont_fallback_mode": "P4_UNIFORM",  # P4_UNIFORM (default) | P3_FNL_Q
+    # Fresh/GRT hold control (FS-03). alloc_type persists the last-used pool
+    # for display only — the UI still forces an explicit choice per run.
+    "alloc_type": "",
+    "skip_hold_upc": "false",
+    "apply_hold_seg_app": "true",
+    "apply_hold_seg_gm": "true",
 }
 _SETTING_PREFIX = "listing."
 
@@ -528,14 +628,49 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
                 "Parking Mode to 'Multiple' under Settings → Application."
             )
 
+    # ── Engine guard — per_opt is the only allocation engine ────────────
+    # pandas/sequential were removed 2026-07-10 (identical inputs produced
+    # divergent allocations — see docs/REMOVAL_PLAN_PER_OPT_ONLY.md). Reject
+    # loudly instead of accept-and-ignore so old scripts/replays fail fast.
+    # This also subsumes the former IM-3 guard: the hold-suppression toggles
+    # (skip_hold_upc / apply_hold_seg_app / apply_hold_seg_gm) are fully
+    # supported by per_opt, so no per-mode toggle rejection is needed.
+    _req_mode = (req.allocation_mode or "").strip().lower()
+    if _req_mode != "per_opt":
+        raise HTTPException(
+            400,
+            f"allocation_mode '{req.allocation_mode}' was removed 2026-07-10 "
+            f"— only 'per_opt' is supported"
+        )
+    # E-01: the MSA must expose at least one SLOC pivot column of the
+    # requested pool type — otherwise the run would allocate from an empty
+    # pool. Missing MSA table is left to the impl's own 400.
+    try:
+        with de.connect() as _pool_conn:
+            if table_exists(_pool_conn, req.msa_table):
+                typed_sloc_cols(
+                    _pool_conn, req.msa_table, req.alloc_type,
+                    get_sloc_type_map(_pool_conn),
+                )
+    except NoPoolColumnsError:
+        raise HTTPException(
+            400,
+            f"MSA contains no {req.alloc_type} SLOC columns. Regenerate MSA "
+            f"including {req.alloc_type} SLOCs (see ARS_SLOC_SETTINGS)."
+        )
+    except HTTPException:
+        raise
+    except Exception as _pool_err:
+        logger.warning(f"[generate] E-01 pool-column pre-check failed: {_pool_err}")
+
     session_id = make_session_id()
     user_name  = getattr(current_user, "username", None)
     req_dict   = req.dict() if hasattr(req, "dict") else dict(req.__dict__)
-    mode       = (req_dict.get("allocation_mode") or "python_parallel").lower()
-    # For parallel modes the batch_id == session_id so the UI can poll
-    # /alloc-progress with the same id it gets back here, and the queue
-    # table rows line up with the session row.
-    alloc_batch_id = session_id if mode != "sequential" else None
+    mode       = "per_opt"  # only engine — guarded above with a hard 400
+    # batch_id == session_id so the UI can poll /alloc-progress with the
+    # same id it gets back here, and the queue table rows line up with the
+    # session row.
+    alloc_batch_id = session_id
 
     # Insert the RUNNING row + attach the per-session loguru sink BEFORE
     # the thread starts so the very first log line ('=== SESSION START …')
@@ -707,6 +842,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "mj_req_growth_pct": str(req.mj_req_growth_pct),
                 "allow_multi_parked": str(req.allow_multi_parked).lower(),
                 "cont_fallback_mode": str(req.cont_fallback_mode).upper(),
+                "alloc_type": str(req.alloc_type),
+                "skip_hold_upc": str(req.skip_hold_upc).lower(),
+                "apply_hold_seg_app": str(req.apply_hold_seg_app).lower(),
+                "apply_hold_seg_gm": str(req.apply_hold_seg_gm).lower(),
             })
     except Exception as e:
         logger.error(f"[generate] failed to persist listing settings: {e}")
@@ -718,6 +857,76 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     # logs.  Idempotent: CREATE IF NOT EXISTS + bulk insert.
     try:
         _run_uid = session_id or preset_batch_id or f"run-{int(time.time()*1000)}"
+        # Sec-cap growth matrix — snapshot BEFORE the run so the audit row
+        # reflects exactly the matrix each engine will see. Best-effort:
+        # audit never blocks the run, so any load failure stamps '{}'.
+        try:
+            from app.services.sec_cap_growth_matrix import (
+                load_matrix as _load_growth_matrix,
+                snapshot_matrix as _snapshot_growth_matrix,
+            )
+            _gm_enabled, _gm_bands = _load_growth_matrix(de)
+            _growth_matrix_snapshot = json.dumps(
+                _snapshot_growth_matrix(_gm_enabled, _gm_bands)
+            )
+        except Exception as _gm_err:
+            logger.warning(f"[audit] growth matrix snapshot skipped: {_gm_err}")
+            _growth_matrix_snapshot = "{}"
+            _gm_enabled = False  # so the sec_cap_mode row below never NameErrors
+            _gm_bands = []
+
+        # ── Grid config + matrix snapshot (extra audit rows) ───────────────
+        # Capture the grid configuration that was in force during this run
+        # (ARS_GRID_BUILDER) so reviewers can diff grid state across runs and
+        # trend grid metrics. One readable, diffable row per grid + numeric
+        # summary rows. Best-effort — never blocks a run.
+        _extra_rows: List[tuple] = []
+        try:
+            with de.connect() as _gc:
+                _grid_rows_db = _gc.execute(text(
+                    "SELECT grid_name, status, grid_group, sec_cap_applicable, "
+                    "sec_cap_pct, weightage, use_for_opt_sale "
+                    "FROM [ARS_GRID_BUILDER] ORDER BY seq, grid_name"
+                )).fetchall()
+            _n_active = 0
+            _capping_names: List[str] = []
+            for _gname, _gstatus, _ggroup, _gseccap, _gcap_pct, _gwt, _gopt in _grid_rows_db:
+                _gname = str(_gname)
+                _is_active  = str(_gstatus or "").strip().lower() == "active"
+                _is_capping = bool(_gseccap)
+                if _is_active:
+                    _n_active += 1
+                if _is_capping:
+                    _capping_names.append(_gname)
+                _parts = [str(_gstatus or "—"), str(_ggroup or "—"),
+                          f"capping {'ON' if _is_capping else 'off'}"]
+                if _is_capping and _gcap_pct is not None:
+                    _parts.append(f"cap {float(_gcap_pct):g}%")
+                if _gwt is not None:
+                    _parts.append(f"wt {float(_gwt):g}")
+                if _gopt:
+                    _parts.append("opt_sale")
+                _extra_rows.append(("GRIDS", _gname, " · ".join(_parts)))
+                if _is_capping and _gcap_pct is not None:
+                    # numeric per-capping-grid cap% — trendable
+                    _extra_rows.append(("GRIDS", f"cap_pct::{_gname}", f"{float(_gcap_pct):g}"))
+            _extra_rows.append(("GRIDS", "active_grid_count",  str(_n_active)))
+            _extra_rows.append(("GRIDS", "capping_grid_count", str(len(_capping_names))))
+            _extra_rows.append(("GRIDS", "capping_grids",      ",".join(_capping_names)))
+        except Exception as _grid_err:
+            logger.warning(f"[audit] grid config snapshot skipped: {_grid_err}")
+        # Matrix band values as a readable row (the full JSON is stamped below).
+        try:
+            if _gm_bands:
+                _band_strs = []
+                for _lo, _hi, _g in _gm_bands:
+                    _rng = (f"{float(_lo):g}-{float(_hi):g}" if _hi is not None
+                            else f"{float(_lo):g}+")
+                    _band_strs.append(f"{_rng}→{float(_g):g}%")
+                _extra_rows.append(("SEC_CAP", "matrix_bands", "; ".join(_band_strs)))
+        except Exception as _mb_err:
+            logger.warning(f"[audit] matrix band rows skipped: {_mb_err}")
+
         _audit_rows = [
             # LISTING params
             ("LISTING",    "stock_threshold_pct",   str(req.stock_threshold_pct)),
@@ -731,6 +940,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             ("LISTING",    "rdc_mode",              str(req.rdc_mode)),
             ("LISTING",    "run_mode",              str(req.run_mode)),
             ("LISTING",    "ssn_values",            json.dumps(req.ssn_values)),
+            # Run dates (information-only, 2026-07-18)
+            ("LISTING",    "stock_consider_dt",     str(req.stock_consider_dt)),
+            ("LISTING",    "picking_dt",            str(req.picking_dt)),
             # RANKING
             ("RANKING",    "req_weight",            str(req.req_weight)),
             ("RANKING",    "fill_weight",           str(req.fill_weight)),
@@ -748,14 +960,34 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             ("ALLOCATION", "mj_req_growth_pct",     str(req.mj_req_growth_pct)),
             ("ALLOCATION", "opt_types",             json.dumps(req.opt_types)),
             ("ALLOCATION", "cont_fallback_mode",    str(req.cont_fallback_mode).upper()),
+            # Fresh/GRT typed pool + hold suppression (FS-03)
+            ("ALLOCATION", "alloc_type",            str(req.alloc_type)),
+            ("ALLOCATION", "skip_hold_upc",         str(req.skip_hold_upc).lower()),
+            ("ALLOCATION", "apply_hold_seg_app",    str(req.apply_hold_seg_app).lower()),
+            ("ALLOCATION", "apply_hold_seg_gm",     str(req.apply_hold_seg_gm).lower()),
             # SEC_CAP
             ("SEC_CAP",    "apply_sec_cap_in_normal", str(req.apply_sec_cap_in_normal).lower()),
+            # SEC_CAP fallback condition as a flat, reviewable flag (2026-07-18):
+            # STANDARD = flat per-grid cap%; MATRIX = cont%→growth% band lookup.
+            # Derived from the matrix `enabled` flag loaded above. The full
+            # `growth_matrix` JSON row below still carries the bands; this row
+            # exists so the "which sec-cap fallback did this run use?" question
+            # is answerable without parsing JSON.
+            ("SEC_CAP",    "sec_cap_mode",          ("MATRIX" if _gm_enabled else "STANDARD")),
+            # SEC_CAP growth matrix snapshot (spec 2026-07-08). Loaded above
+            # into _growth_matrix_snapshot; a single JSON row so historic
+            # runs can be traced to the matrix active at the time (matches
+            # cont_fallback_mode pattern).
+            ("SEC_CAP",    "growth_matrix",         _growth_matrix_snapshot),
             # FLAGS
             ("FLAGS",      "allocation_mode",       str(req.allocation_mode)),
             ("FLAGS",      "parallel_workers",      str(req.parallel_workers)),
             ("FLAGS",      "use_writer_queue",      str(req.use_writer_queue)),
             ("FLAGS",      "allow_multi_parked",    str(req.allow_multi_parked).lower()),
         ]
+        # Grid config + matrix band rows (built above) — one row per grid,
+        # grid summary/numeric metrics, and the readable matrix bands.
+        _audit_rows.extend(_extra_rows)
         with de.connect() as ac:
             _run(ac, """
                 IF OBJECT_ID('ARS_RUN_PARAMS_AUDIT', 'U') IS NULL
@@ -785,6 +1017,12 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                  "grp": grp, "name": pname, "val": pval, "src": "UI"}
                 for grp, pname, pval in _audit_rows
             ])
+            # CRITICAL: commit the INSERT. `_run` (run_sql) auto-commits the
+            # CREATE above, but this executemany goes through ac.execute()
+            # directly — without this commit SQLAlchemy rolls it back when the
+            # `with de.connect()` block closes, so the table was created but
+            # stayed EMPTY on every run (bug found 2026-07-18).
+            ac.commit()
         logger.info(f"[audit] ARS_RUN_PARAMS_AUDIT: {len(_audit_rows)} rows for run={_run_uid}")
     except Exception as e:
         # Audit failure must never abort the run.
@@ -884,6 +1122,16 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         if not st_rdc_col:
             raise HTTPException(400, "ST_MASTER missing RDC column")
 
+        # FS-04(a): ST_STATUS from the store master — feeds the skip_hold_upc
+        # suppression (FS-05). Missing column → '' (a row is never suppressed
+        # on an unknown status).
+        _has_st_status = "ST_STATUS" in st_cols
+        if not _has_st_status:
+            logger.warning(
+                f"FS-04: [{req.st_master_table}] has no ST_STATUS column — "
+                f"skip_hold_upc cannot match UPC stores"
+            )
+
         # ── Filters ─────────────────────────────────────────────────────
         # When SSN is selected but no explicit MAJ_CAT, resolve SSN→MAJ_CATs
         # once here so every downstream query benefits (grid, MSA, var, etc.).
@@ -946,7 +1194,14 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 rl = ", ".join(f"'{v}'" for v in rdc_filter_list)
                 parts.append(f"[{st_rdc_col}] IN ({rl})")
             w = (" WHERE " + " AND ".join(parts)) if parts else ""
-            return f"SELECT DISTINCT [ST_CD], [{st_rdc_col}] AS RDC FROM [{req.st_master_table}]{w}"
+            # FS-04(a): carry ST_STATUS through the store pool ('' when the
+            # master lacks the column so downstream SELECTs stay uniform).
+            st_status_sel = (
+                ", ISNULL([ST_STATUS], '') AS ST_STATUS" if _has_st_status
+                else ", CAST('' AS NVARCHAR(50)) AS ST_STATUS"
+            )
+            return (f"SELECT DISTINCT [ST_CD], [{st_rdc_col}] AS RDC"
+                    f"{st_status_sel} FROM [{req.st_master_table}]{w}")
 
         # ── MSA option filter based on RDC mode ─────────────────────────
         # MSA stores all columns as VARCHAR(MAX) — must TRIM RDC for matching
@@ -985,7 +1240,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 [STK_TTL] FLOAT NULL DEFAULT 0,
                 [STR] FLOAT NULL DEFAULT 0,
                 [IS_NEW] BIT NOT NULL DEFAULT 0,
-                [OPT_TYPE] NVARCHAR(10) NULL
+                [OPT_TYPE] NVARCHAR(10) NULL,
+                [ST_STATUS] NVARCHAR(50) NULL
             )
         """)
 
@@ -1004,7 +1260,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         stk_zeros = ", ".join("0" for _ in stock_cols)
         stk_zeros_str = f", {stk_zeros}" if stk_zeros else ""
 
-        all_cols = f"[WERKS], [RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR]{stk_ins_str}, [STK_TTL], [STR], [IS_NEW], [OPT_TYPE]"
+        all_cols = f"[WERKS], [RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR]{stk_ins_str}, [STK_TTL], [STR], [IS_NEW], [OPT_TYPE], [ST_STATUS]"
 
         if sale_cols:
             logger.info(f"Sale columns excluded from STK_TTL sum: {sale_cols}")
@@ -1030,7 +1286,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 LTRIM(RTRIM(G.[MAJ_CAT])),
                 TRY_CAST(G.[GEN_ART_NUMBER] AS BIGINT),
                 LTRIM(RTRIM(G.[CLR]))
-                {stk_sel_str}, {stk_ttl} AS STK_TTL, {str_ttl} AS STR, 0 AS IS_NEW, NULL AS OPT_TYPE
+                {stk_sel_str}, {stk_ttl} AS STK_TTL, {str_ttl} AS STR, 0 AS IS_NEW, NULL AS OPT_TYPE, S.[ST_STATUS]
             FROM [{req.grid_table}] G WITH (NOLOCK)
             INNER JOIN ({stores_sql}) S ON G.[WERKS] = S.[ST_CD]
             WHERE 1=1 {grid_mc_g}{mp_majcat_filter_g}
@@ -1056,7 +1312,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             SELECT
                 S.[ST_CD] AS WERKS, S.[RDC],
                 M.[MAJ_CAT], M.[GEN_ART_NUMBER], M.[CLR]
-                {stk_zeros_str}, 0 AS STK_TTL, 0 AS STR, 1 AS IS_NEW, NULL AS OPT_TYPE
+                {stk_zeros_str}, 0 AS STK_TTL, 0 AS STR, 1 AS IS_NEW, NULL AS OPT_TYPE, S.[ST_STATUS]
             FROM ({msa_with_rdc}) M
             INNER JOIN ({stores_sql}) S ON 1=1 {msa_rdc_join}
             WHERE NOT EXISTS (
@@ -1267,6 +1523,18 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         except Exception:
             pass  # column may already exist
         if _table_exists(conn, "ARS_NL_TBL_HOLD_TRACKING"):
+            # FS-09: the RL_HOLD_QTY bake is pool-scoped — a hold created by
+            # a run of the OTHER type is invisible here; legacy NULL/'' rows
+            # match any run type. Column guard keeps pre-migration DBs
+            # working (filter simply not applied there).
+            _ht_has_type = "ALLOC_TYPE" in {
+                c.upper() for c in _get_columns(conn, "ARS_NL_TBL_HOLD_TRACKING")
+            }
+            _ht_type_filter = (
+                "\n                          AND   ([ALLOC_TYPE] = :pool_alloc_type "
+                "OR ISNULL([ALLOC_TYPE],'') = '')"
+                if _ht_has_type else ""
+            )
             try:
                 _run(conn, f"""
                     UPDATE L
@@ -1280,7 +1548,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                                 SUM([HOLD_REM])  AS [HOLD_REM_OPT]
                         FROM    [ARS_NL_TBL_HOLD_TRACKING]
                         WHERE   ISNULL([IS_CLOSED], 0) = 0
-                          AND   ISNULL([HOLD_REM],  0) > 0
+                          AND   ISNULL([HOLD_REM],  0) > 0{_ht_type_filter}
                         GROUP BY [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], ISNULL([CLR],'')
                     ) H
                       ON  L.[WERKS]                              = H.[WERKS]
@@ -1288,7 +1556,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                       AND TRY_CAST(L.[GEN_ART_NUMBER] AS BIGINT) = H.[GEN_ART_NUMBER]
                       AND ISNULL(L.[CLR],'')                     = H.[CLR]
                     WHERE  H.[HOLD_REM_OPT] > 0
-                """)
+                """, {"pool_alloc_type": req.alloc_type} if _ht_has_type else None)
                 hq_cnt = conn.execute(text(
                     f"SELECT COUNT(*) FROM [{LISTING_TABLE}] WHERE ISNULL([RL_HOLD_QTY],0) > 0"
                 )).scalar() or 0
@@ -1306,11 +1574,23 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         t0 = _time_step("Part 3.54 (RL_HOLD_QTY from ARS_NL_TBL_HOLD_TRACKING)", t0)
 
         # ── PART 3.55: Populate MSA_FNL_Q early (needed by Part 3.6 for TBL/TBC tagging)
-        # Part 5c re-populates the same value later — idempotent.
+        # FS-02: MSA_FNL_Q is the TYPED pool at gen grain — per MSA row
+        #   FNL_Q_EFF = max(min(Σ SLOC-cols(alloc_type) − PEND_T − HOLD_T, FNL_Q), 0)
+        # summed per option. PEND_T/HOLD_T are LIVE typed aggregates at
+        # (RDC, GEN_ART_NUMBER, CLR); legacy NULL/'' ledger rows deduct from
+        # both pools. FNL_Q (total) remains the safety cap.
         try:
             _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [MSA_FNL_Q] FLOAT NULL")
         except Exception:
             pass
+        # Row-per-type MSA: MSA_FNL_Q reads the baked FNL_Q of the run's typed
+        # MSA rows directly (WHERE ALLOC_TYPE = req.alloc_type). No column-sum
+        # or live pend/hold math — the typed row already has the correct pool.
+        _mtype_filter = ""
+        _mtype_params = None
+        if 'ALLOC_TYPE' in _get_columns(conn, req.msa_table):
+            _mtype_filter = " AND ISNULL([ALLOC_TYPE],'FRESH') = :pool_alloc_type"
+            _mtype_params = {"pool_alloc_type": req.alloc_type}
         if _table_exists(conn, req.msa_table):
             _pre_msa_cols = _get_columns(conn, req.msa_table)
             if "FNL_Q" in _pre_msa_cols:
@@ -1327,13 +1607,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                                    {_rdc_select},
                                    SUM(TRY_CAST([FNL_Q] AS FLOAT)) AS FNL_Q
                             FROM [{req.msa_table}]
-                            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{msa_rdc_filter}
+                            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{msa_rdc_filter}{_mtype_filter}
                             GROUP BY {_msa_expr('MAJ_CAT')}, {_msa_expr('GEN_ART_NUMBER')}, {_msa_expr('CLR')}{_rdc_group}
                         ) M ON L.[MAJ_CAT] = M.[MAJ_CAT]
                             AND L.[GEN_ART_NUMBER] = M.[GEN_ART_NUMBER]
                             AND L.[CLR] = M.[CLR] {_rdc_join}
-                    """)
-                    logger.info(f"Part 3.55: MSA_FNL_Q pre-populated from {req.msa_table} (for OPT_TYPE tagging)")
+                    """, _mtype_params)
+                    logger.info(
+                        f"Part 3.55: MSA_FNL_Q = {req.alloc_type} typed rows from {req.msa_table}"
+                    )
                 except Exception as e:
                     logger.warning(f"Part 3.55: MSA_FNL_Q pre-populate failed: {str(e)[:150]}")
 
@@ -1348,11 +1630,23 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             if all(c in var_cols for c in ["MAJ_CAT", "GEN_ART_NUMBER", "CLR"]):
                 has_fnl = "FNL_Q" in var_cols
                 has_var_rdc = "RDC" in var_cols
-                fnl_expr = f", SUM(CASE WHEN TRY_CAST([FNL_Q] AS FLOAT) > 0 THEN 1 ELSE 0 END) AS fnl_cnt" if has_fnl else ", 0 AS fnl_cnt"
+                has_var_art = "ARTICLE_NUMBER" in var_cols
                 vrdc_select = f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50)))) AS MSA_RDC" if has_var_rdc else ""
                 vrdc_group = f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50))))" if has_var_rdc else ""
                 vrdc_join = "AND L.[RDC] = V.[MSA_RDC]" if has_var_rdc and req.rdc_mode == "own" else ""
                 var_rdc_where = msa_rdc_filter.replace(f"[{msa_rdc_col}]", "[RDC]") if has_var_rdc else ""
+                # Row-per-type MSA: VAR_FNL_COUNT counts sizes whose baked typed
+                # FNL_Q is positive, filtered to the run's ALLOC_TYPE rows.
+                _var_type_where = ""
+                var_params = None
+                if 'ALLOC_TYPE' in var_cols:
+                    _var_type_where = " AND ISNULL([ALLOC_TYPE],'FRESH') = :pool_alloc_type"
+                    var_params = {"pool_alloc_type": req.alloc_type}
+                if has_fnl:
+                    fnl_expr = (", SUM(CASE WHEN TRY_CAST([FNL_Q] AS FLOAT) > 0 "
+                                "THEN 1 ELSE 0 END) AS fnl_cnt")
+                else:
+                    fnl_expr = ", 0 AS fnl_cnt"
                 try:
                     _run(conn, f"""
                         UPDATE L SET L.[VAR_COUNT] = V.var_cnt, L.[VAR_FNL_COUNT] = V.fnl_cnt
@@ -1362,13 +1656,14 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                                    {vrdc_select},
                                    COUNT(*) AS var_cnt{fnl_expr}
                             FROM [ARS_MSA_VAR_ART]
-                            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{var_rdc_where}
+                            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{var_rdc_where}{_var_type_where}
                             GROUP BY {_msa_expr('MAJ_CAT')}, {_msa_expr('GEN_ART_NUMBER')}, {_msa_expr('CLR')}{vrdc_group}
                         ) V ON L.[MAJ_CAT] = V.[MAJ_CAT]
                             AND L.[GEN_ART_NUMBER] = V.[GEN_ART_NUMBER]
                             AND L.[CLR] = V.[CLR] {vrdc_join}
-                    """)
-                    logger.info(f"Part 3.55: VAR_COUNT + VAR_FNL_COUNT from ARS_MSA_VAR_ART")
+                    """, var_params)
+                    logger.info(f"Part 3.55: VAR_COUNT + VAR_FNL_COUNT from ARS_MSA_VAR_ART"
+                                f"{' (typed ' + req.alloc_type + ')' if _var_type_where else ''}")
                 except Exception as e:
                     logger.warning(f"Part 3.55: VAR_COUNT/FNL_COUNT failed: {str(e)[:150]}")
         t0 = _time_step("Part 3.55 (MSA_FNL_Q + VAR_COUNT)", t0)
@@ -1920,6 +2215,93 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 SET [OPT_MBQ_WH] = ROUND(ISNULL([ACS_D], 0) + ({rate_expr})
                     * (ISNULL([ALC_D], 0) + CASE WHEN ISNULL([OPT_TYPE], '') = 'TBL' THEN {hold} ELSE 0 END), 0)
             """)
+
+            # ── FS-05: hold-suppression source layer ────────────────────
+            # suppress(row) = (skip_hold_upc AND ST_STATUS='UPC')
+            #              OR (NOT apply_hold_seg_app AND SEG='APP')
+            #              OR (NOT apply_hold_seg_gm  AND SEG='GM')
+            # Suppressed rows never receive the TBL hold-days uplift:
+            # OPT_MBQ_WH = OPT_MBQ, so the OPT_REQ_WH computed below mirrors
+            # OPT_REQ automatically — the option is budgeted like RL/TBC
+            # from the start (BR-10). NULL ST_STATUS/SEG never suppresses
+            # (E-04). Runs between the OPT_MBQ_WH and OPT_REQ_WH updates by
+            # design.
+            _suppress_parts = []
+            if req.skip_hold_upc:
+                _suppress_parts.append(
+                    "UPPER(LTRIM(RTRIM(CAST(ISNULL([ST_STATUS],'') "
+                    "AS NVARCHAR(50))))) = 'UPC'")
+            if not req.apply_hold_seg_app:
+                _suppress_parts.append(
+                    "UPPER(LTRIM(RTRIM(CAST(ISNULL([SEG],'') "
+                    "AS NVARCHAR(50))))) = 'APP'")
+            if not req.apply_hold_seg_gm:
+                _suppress_parts.append(
+                    "UPPER(LTRIM(RTRIM(CAST(ISNULL([SEG],'') "
+                    "AS NVARCHAR(50))))) = 'GM'")
+            if _suppress_parts:
+                # SEG lookup at MAJ_CAT grain — vw_master_product first,
+                # MSA source view as fallback. Deliberately NOT the MSA SEG
+                # column (pre-filtered to APP/GM at MSA Step 4 and not
+                # projected by Stage B) — FS-04(2).
+                try:
+                    _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [SEG] NVARCHAR(50) NULL")
+                except Exception:
+                    pass  # column may already exist
+                _seg_src = next(
+                    (t for t in ("vw_master_product", "VW_ET_MSA_STK_WITH_MASTER")
+                     if _table_exists(conn, t)
+                     and {"MAJ_CAT", "SEG"} <= {c.upper() for c in _get_columns(conn, t)}),
+                    None,
+                )
+                if _seg_src:
+                    _run(conn, f"""
+                        UPDATE L SET L.[SEG] = S.[SEG]
+                        FROM [{LISTING_TABLE}] L
+                        INNER JOIN (
+                            SELECT [MAJ_CAT],
+                                   MAX(LTRIM(RTRIM(CAST([SEG] AS NVARCHAR(50))))) AS SEG
+                            FROM [{_seg_src}] WITH (NOLOCK)
+                            WHERE [MAJ_CAT] IS NOT NULL AND [SEG] IS NOT NULL
+                            GROUP BY [MAJ_CAT]
+                        ) S ON LTRIM(RTRIM(CAST(L.[MAJ_CAT] AS NVARCHAR(200))))
+                             = LTRIM(RTRIM(CAST(S.[MAJ_CAT] AS NVARCHAR(200))))
+                    """)
+                    logger.info(f"Part 4c (FS-05): SEG merged from {_seg_src} (MAJ_CAT grain)")
+                else:
+                    logger.warning(
+                        "Part 4c (FS-05): no MAJ_CAT→SEG source found "
+                        "(vw_master_product / VW_ET_MSA_STK_WITH_MASTER) — "
+                        "SEG toggles cannot suppress")
+                _supp_res = conn.execute(text(f"""
+                    UPDATE [{LISTING_TABLE}]
+                    SET [OPT_MBQ_WH] = [OPT_MBQ]
+                    WHERE ({' OR '.join(_suppress_parts)})
+                """))
+                conn.commit()
+                # E-04: rows with NULL/blank attributes are never suppressed —
+                # log the counts so a silent mismatch is visible per run.
+                try:
+                    _null_status = conn.execute(text(
+                        f"SELECT COUNT(*) FROM [{LISTING_TABLE}] "
+                        f"WHERE LTRIM(RTRIM(CAST(ISNULL([ST_STATUS],'') AS NVARCHAR(50)))) = ''"
+                    )).scalar() or 0
+                    _null_seg = conn.execute(text(
+                        f"SELECT COUNT(*) FROM [{LISTING_TABLE}] "
+                        f"WHERE LTRIM(RTRIM(CAST(ISNULL([SEG],'') AS NVARCHAR(50)))) = ''"
+                    )).scalar() or 0
+                    logger.info(
+                        f"Part 4c (FS-05): hold suppressed on "
+                        f"{_supp_res.rowcount} rows "
+                        f"(skip_hold_upc={req.skip_hold_upc}, "
+                        f"apply_hold_seg_app={req.apply_hold_seg_app}, "
+                        f"apply_hold_seg_gm={req.apply_hold_seg_gm}); "
+                        f"E-04 unsuppressable: ST_STATUS blank={_null_status}, "
+                        f"SEG blank={_null_seg}"
+                    )
+                except Exception:
+                    pass
+
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
                 SET [OPT_REQ_WH] = CASE
@@ -2152,40 +2534,149 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     rank_rows = 0
     rw = float(req.req_weight or 0.4)
     fw = float(req.fill_weight or 0.6)
+
+    # ── Manual store priority override ────────────────────────────────
+    # MANUAL_ST_PRIORITY on the store master (Master_ALC_INPUT_ST_MASTER,
+    # keyed by ST_CD = WERKS) lets ops pin a store's ST_RANK. A positive
+    # integer P pins that store to ST_RANK = P inside every MAJ_CAT it is
+    # listed in; NULL/0/blank/negative means "rank me by score as usual".
+    # Non-manual stores keep their score order but shift into the smallest
+    # rank numbers NOT occupied by a pinned store (literal + skip-used-slots).
+    # Self-heal the column so it survives store-master re-uploads.
+    ST_MASTER_TBL = "Master_ALC_INPUT_ST_MASTER"
+    has_manual = False
+    try:
+        with de.connect() as mc:
+            if _table_exists(mc, ST_MASTER_TBL):
+                st_cols_up = {c.upper() for c in _get_columns(mc, ST_MASTER_TBL)}
+                if "MANUAL_ST_PRIORITY" not in st_cols_up:
+                    _run(mc, f"ALTER TABLE [{ST_MASTER_TBL}] ADD [MANUAL_ST_PRIORITY] INT NULL")
+                    logger.info(f"Added MANUAL_ST_PRIORITY column to {ST_MASTER_TBL}")
+                has_manual = True
+    except Exception as e:
+        logger.warning(f"MANUAL_ST_PRIORITY ensure on {ST_MASTER_TBL} failed: {e}")
+
+    if has_manual:
+        manual_join = f"LEFT JOIN [{ST_MASTER_TBL}] SM WITH (NOLOCK) ON SM.[ST_CD] = L.[WERKS]"
+        # Only positive integers count as a manual pin; anything else → NULL (auto).
+        manual_expr = ("CASE WHEN MAX(ISNULL(SM.[MANUAL_ST_PRIORITY],0)) > 0 "
+                       "THEN MAX(ISNULL(SM.[MANUAL_ST_PRIORITY],0)) ELSE NULL END")
+    else:
+        manual_join = ""
+        manual_expr = "CAST(NULL AS INT)"
+
     try:
         with de.connect() as rc:
             _run(rc, f"IF OBJECT_ID('{RANK_TABLE}','U') IS NOT NULL DROP TABLE [{RANK_TABLE}]")
             _run(rc, f"""
                 ;WITH StoreAgg AS (
                     SELECT
-                        [MAJ_CAT], [WERKS], MAX([RDC]) AS RDC,
-                        MAX(ISNULL([MJ_REQ], 0))     AS MJ_REQ,
-                        MAX(ISNULL([MJ_MBQ], 0))     AS MJ_MBQ,
-                        MAX(ISNULL([MJ_STK_TTL], 0))  AS MJ_STK,
-                        MAX(ISNULL([ACS_D], 0))       AS ACS_D,
-                        CASE WHEN MAX(ISNULL([MJ_MBQ],0)) = 0 THEN 0
-                             ELSE ROUND(MAX(ISNULL([MJ_STK_TTL],0)) / NULLIF(MAX([MJ_MBQ]),0), 4)
-                        END AS FILL_RATE
-                    FROM [{LISTING_TABLE}]
-                    WHERE ISNULL([OPT_TYPE],'') <> 'MIX'
-                    GROUP BY [MAJ_CAT], [WERKS]
+                        L.[MAJ_CAT], L.[WERKS], MAX(L.[RDC]) AS RDC,
+                        MAX(ISNULL(L.[MJ_REQ], 0))      AS MJ_REQ,
+                        MAX(ISNULL(L.[MJ_MBQ], 0))      AS MJ_MBQ,
+                        MAX(ISNULL(L.[MJ_STK_TTL], 0))  AS MJ_STK,
+                        MAX(ISNULL(L.[ACS_D], 0))       AS ACS_D,
+                        CASE WHEN MAX(ISNULL(L.[MJ_MBQ],0)) = 0 THEN 0
+                             ELSE ROUND(MAX(ISNULL(L.[MJ_STK_TTL],0)) / NULLIF(MAX(L.[MJ_MBQ]),0), 4)
+                        END AS FILL_RATE,
+                        {manual_expr} AS MANUAL_PRI
+                    FROM [{LISTING_TABLE}] L
+                    {manual_join}
+                    WHERE ISNULL(L.[OPT_TYPE],'') <> 'MIX'
+                    GROUP BY L.[MAJ_CAT], L.[WERKS]
                 ),
                 Ranked AS (
                     SELECT *,
-                        DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY MJ_REQ ASC)    AS REQ_RANK,
-                        DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY FILL_RATE DESC) AS FILL_RANK
+                        DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY MJ_REQ ASC)     AS REQ_RANK,
+                        DENSE_RANK() OVER (PARTITION BY MAJ_CAT ORDER BY FILL_RATE DESC)  AS FILL_RANK
                     FROM StoreAgg
+                ),
+                Scored AS (
+                    SELECT *, ROUND(REQ_RANK * {rw} + FILL_RANK * {fw}, 2) AS W_SCORE
+                    FROM Ranked
+                ),
+                Tagged AS (
+                    -- Winning manual row per (MAJ_CAT, MANUAL_PRI): best W_SCORE keeps
+                    -- the pinned slot. Duplicate manual values and non-manual rows get
+                    -- IS_MANUAL=0 and are placed by score into the free slots below.
+                    SELECT *,
+                        CASE WHEN MANUAL_PRI IS NOT NULL
+                                  AND ROW_NUMBER() OVER (PARTITION BY MAJ_CAT, MANUAL_PRI
+                                                         ORDER BY W_SCORE DESC, WERKS ASC) = 1
+                             THEN 1 ELSE 0 END AS IS_MANUAL,
+                        -- Score-only rank (ignores manual pins). Audit column so ops
+                        -- can compare the final ST_RANK against what pure W_SCORE gives.
+                        ROW_NUMBER() OVER (PARTITION BY MAJ_CAT
+                            ORDER BY W_SCORE DESC, WERKS ASC) AS AUTO_ST_RANK
+                    FROM Scored
+                ),
+                AutoRows AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY MAJ_CAT ORDER BY W_SCORE DESC, WERKS ASC) AS auto_seq
+                    FROM Tagged
+                    WHERE IS_MANUAL = 0
+                ),
+                Counts AS (
+                    SELECT MAJ_CAT, COUNT(*) AS n_rows FROM Tagged GROUP BY MAJ_CAT
+                ),
+                Nums AS (
+                    SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+                    FROM sys.all_objects a CROSS JOIN sys.all_objects b
+                ),
+                FreeSlots AS (
+                    -- Rank numbers 1..n_rows not taken by a pinned store, numbered
+                    -- ascending. The k-th free slot receives the k-th best non-manual
+                    -- store. n_rows is always enough: pins within 1..n_rows are exactly
+                    -- the numbers removed here; any pin > n_rows just leaves extra slots.
+                    SELECT c.MAJ_CAT, nums.n,
+                           ROW_NUMBER() OVER (PARTITION BY c.MAJ_CAT ORDER BY nums.n) AS free_seq
+                    FROM Counts c
+                    JOIN Nums nums ON nums.n <= c.n_rows
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM Tagged t
+                        WHERE t.MAJ_CAT = c.MAJ_CAT AND t.IS_MANUAL = 1 AND t.MANUAL_PRI = nums.n
+                    )
                 )
-                SELECT *,
-                    ROUND(REQ_RANK * {rw} + FILL_RANK * {fw}, 2) AS W_SCORE,
-                    ROW_NUMBER() OVER (PARTITION BY MAJ_CAT
-                        ORDER BY ROUND(REQ_RANK * {rw} + FILL_RANK * {fw}, 2) DESC,
-                                 WERKS ASC) AS ST_RANK
+                SELECT MAJ_CAT, WERKS, RDC, MJ_REQ, MJ_MBQ, MJ_STK, ACS_D, FILL_RATE,
+                       REQ_RANK, FILL_RANK, W_SCORE, MANUAL_PRI, ST_RANK, MANUAL,
+                       AUTO_ST_RANK, RANK_DELTA
                 INTO [{RANK_TABLE}]
-                FROM Ranked
+                FROM (
+                    SELECT MAJ_CAT, WERKS, RDC, MJ_REQ, MJ_MBQ, MJ_STK, ACS_D, FILL_RATE,
+                           REQ_RANK, FILL_RANK, W_SCORE, MANUAL_PRI,
+                           MANUAL_PRI AS ST_RANK, CAST(1 AS BIT) AS MANUAL,
+                           AUTO_ST_RANK, (AUTO_ST_RANK - MANUAL_PRI) AS RANK_DELTA
+                    FROM Tagged WHERE IS_MANUAL = 1
+                    UNION ALL
+                    SELECT a.MAJ_CAT, a.WERKS, a.RDC, a.MJ_REQ, a.MJ_MBQ, a.MJ_STK, a.ACS_D, a.FILL_RATE,
+                           a.REQ_RANK, a.FILL_RANK, a.W_SCORE, a.MANUAL_PRI,
+                           fs.n AS ST_RANK, CAST(0 AS BIT) AS MANUAL,
+                           a.AUTO_ST_RANK, (a.AUTO_ST_RANK - fs.n) AS RANK_DELTA
+                    FROM AutoRows a
+                    JOIN FreeSlots fs ON fs.MAJ_CAT = a.MAJ_CAT AND fs.free_seq = a.auto_seq
+                ) X
             """)
             rank_rows = rc.execute(text(f"SELECT COUNT(*) FROM [{RANK_TABLE}]")).scalar()
-            logger.info(f"{RANK_TABLE}: {rank_rows} rows (req_wt={rw}, fill_wt={fw})")
+            manual_cnt = rc.execute(text(f"SELECT COUNT(*) FROM [{RANK_TABLE}] WHERE [MANUAL] = 1")).scalar()
+            logger.info(f"{RANK_TABLE}: {rank_rows} rows (req_wt={rw}, fill_wt={fw}); "
+                        f"manual priority pinned {manual_cnt} store-MAJ_CAT slot(s)")
+            # Validation: two stores set to the SAME priority P inside one MAJ_CAT.
+            # Both are kept (best W_SCORE holds slot P, the other shifts to the next
+            # free slot); surface a warning so the master data can be corrected.
+            if has_manual:
+                dups = rc.execute(text(f"""
+                    SELECT MAJ_CAT, MANUAL_PRI, COUNT(*) AS c
+                    FROM [{RANK_TABLE}]
+                    WHERE MANUAL_PRI IS NOT NULL
+                    GROUP BY MAJ_CAT, MANUAL_PRI
+                    HAVING COUNT(*) > 1
+                """)).fetchall()
+                for mc_name, pri, c in dups[:50]:
+                    logger.warning(
+                        f"{RANK_TABLE}: MANUAL_ST_PRIORITY={pri} set on {c} stores in "
+                        f"MAJ_CAT={mc_name}; kept best by W_SCORE at slot {pri}, "
+                        f"other(s) shifted to next free slot"
+                    )
 
             # Populate ST_RANK on ARS_LISTING. ST_RANK is the per-MAJ_CAT
             # store rank computed above (REQ × FILL weighted score). It is
@@ -2685,99 +3176,54 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         logger.warning(f"Auto-create {FINAL_TABLE} failed: {e}")
     t0 = _time_step(f"Part 7 (Working table + Hierarchy + ALLOC_FLAG → {working_rows} rows)", t0)
 
-    # ── Part 8 — NEW rule engine (list OPTs + allocate VAR_ART × SZ) ──
+    # ── Part 8 — rule engine (list OPTs + allocate VAR_ART × SZ) ──
     # Spec: docs/NEW_RULE_ENGINE_SPEC.md
-    # Old rule_engine.py / listing_allocator.py are preserved for reference
-    # but no longer called. The `if False` block below documents the old call
-    # site so reviewers can compare signatures.
-    if False:  # OLD — kept for reference only
-        from app.services.rule_engine import run_rule_based_allocation
-        with de.connect() as ac:
-            _ = run_rule_based_allocation(
-                conn=ac,
-                final_table=FINAL_TABLE,
-                alloc_table=ALLOC_TABLE,
-                size_threshold=req.size_threshold,
-            )
-
+    # per_opt is the ONLY engine (2026-07-10 removal — see
+    # docs/REMOVAL_PLAN_PER_OPT_ONLY.md). Dispatch goes through
+    # rule_engine_pandas.run_listing_and_allocation_pandas, which owns the
+    # orchestration (worker pool, writer queue, table loads, sec-cap specs,
+    # Stage D pak rounding, write-back) and is hard-pinned to the per_opt
+    # band (rule_engine_per_opt._run_band_per_opt). No env-var switch —
+    # /generate already 400s on any allocation_mode other than 'per_opt'.
     alloc_rows = 0
     alloc_batch_id = None
     alloc_failed_count = 0
-    mode = (req.allocation_mode or "pandas").lower()
+    mode = "per_opt"
     n_workers = max(2, min(8, int(req.parallel_workers or 4)))
     _growth = req.mj_req_growth_pct
-    # Per-OPT engine activation: setting allocation_mode="per_opt" sets the
-    # ARS_PER_OPT_MODE env var (inherited by worker processes) and then runs
-    # the pandas dispatch path. rule_engine_pandas._is_per_opt_mode() reads
-    # this env var fresh at each session, swapping _run_band with
-    # rule_engine_per_opt._run_band_per_opt. See rule_engine_per_opt.py.
-    if mode == "per_opt":
-        os.environ["ARS_PER_OPT_MODE"] = "1"
-        # exec_order is also surfaced as an env var so the per-OPT engine (once
-        # round_first is wired) can pick up the loop nesting choice without
-        # plumbing changes. Today only opt_type_first is implemented.
-        os.environ["ARS_EXEC_ORDER"] = (req.exec_order or "opt_type_first").strip().lower()
-        mode = "pandas"
-        logger.info(
-            f"[alloc] allocation_mode=per_opt exec_order={os.environ['ARS_EXEC_ORDER']} "
-            f"→ ARS_PER_OPT_MODE=1, dispatching via pandas engine"
-        )
-    else:
-        # Explicitly disable in case a prior request left it on in this process.
-        os.environ.pop("ARS_PER_OPT_MODE", None)
-        os.environ.pop("ARS_EXEC_ORDER", None)
     try:
-        if mode == "pandas":
-            from app.services.rule_engine_pandas import (
-                run_listing_and_allocation_pandas,
-            )
-            alloc_result = run_listing_and_allocation_pandas(
-                working_table=FINAL_TABLE,
-                listed_table="ARS_LISTED_OPT",
-                alloc_table=ALLOC_TABLE,
-                n_workers=n_workers,
-                batch_id=preset_batch_id,
-                size_threshold=req.size_threshold,
-                min_size_count=req.min_size_count,
-                pri_ct_check_rl=req.pri_ct_check_rl,
-                pri_ct_check_tbc=req.pri_ct_check_tbc,
-                rl_mbq_cap_pct=req.rl_mbq_cap_pct,
-                tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
-                tbl_mbq_cap_pct=req.tbl_mbq_cap_pct,
-                rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
-                tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
-                tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,
-                mj_req_growth_pct=_growth,
-                opt_types=req.opt_types or ["RL", "TBC", "TBL"],
-                use_writer_queue=req.use_writer_queue,
-                apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
-                rl_dispatch_mode=req.rl_dispatch_mode,
-                tbc_dispatch_mode=req.tbc_dispatch_mode,
-                cont_fallback_mode=req.cont_fallback_mode,
-            )
-        else:  # "sequential" — single-thread reference path
-            from app.services.rule_engine_new import run_listing_and_allocation
-            with de.connect() as ac:
-                alloc_result = run_listing_and_allocation(
-                    conn=ac,
-                    working_table=FINAL_TABLE,
-                    listed_table="ARS_LISTED_OPT",
-                    alloc_table=ALLOC_TABLE,
-                    size_threshold=req.size_threshold,
-                    min_size_count=req.min_size_count,
-                    pri_ct_check_rl=req.pri_ct_check_rl,
-                    pri_ct_check_tbc=req.pri_ct_check_tbc,
-                    rl_mbq_cap_pct=req.rl_mbq_cap_pct,
-                    tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
-                    tbl_mbq_cap_pct=req.tbl_mbq_cap_pct,
-                    rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
-                    tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
-                    tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,
-                    mj_req_growth_pct=_growth,
-                    opt_types=req.opt_types or ["RL", "TBC", "TBL"],
-                    apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
-                    cont_fallback_mode=req.cont_fallback_mode,
-                )
+        from app.services.rule_engine_pandas import (
+            run_listing_and_allocation_pandas,
+        )
+        alloc_result = run_listing_and_allocation_pandas(
+            working_table=FINAL_TABLE,
+            listed_table="ARS_LISTED_OPT",
+            alloc_table=ALLOC_TABLE,
+            n_workers=n_workers,
+            batch_id=preset_batch_id,
+            size_threshold=req.size_threshold,
+            min_size_count=req.min_size_count,
+            pri_ct_check_rl=req.pri_ct_check_rl,
+            pri_ct_check_tbc=req.pri_ct_check_tbc,
+            rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+            tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
+            tbl_mbq_cap_pct=req.tbl_mbq_cap_pct,
+            rl_mj_req_cap_pct=req.rl_mj_req_cap_pct,
+            tbc_mj_req_cap_pct=req.tbc_mj_req_cap_pct,
+            tbl_mj_req_cap_pct=req.tbl_mj_req_cap_pct,
+            mj_req_growth_pct=_growth,
+            opt_types=req.opt_types or ["RL", "TBC", "TBL"],
+            use_writer_queue=req.use_writer_queue,
+            apply_sec_cap_in_normal=req.apply_sec_cap_in_normal,
+            rl_dispatch_mode=req.rl_dispatch_mode,
+            tbc_dispatch_mode=req.tbc_dispatch_mode,
+            cont_fallback_mode=req.cont_fallback_mode,
+            # Fresh/GRT typed pool + hold suppression (FS-02/03/05/06)
+            alloc_type=req.alloc_type,
+            skip_hold_upc=req.skip_hold_upc,
+            apply_hold_seg_app=req.apply_hold_seg_app,
+            apply_hold_seg_gm=req.apply_hold_seg_gm,
+        )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")
         alloc_failed_count = alloc_result.get("failed", 0) or 0
@@ -2795,6 +3241,71 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         f"failed={alloc_failed_count}, batch={alloc_batch_id})",
         t0,
     )
+
+    # ── Part 8.35 — FS-07: stamp ALLOC_TYPE on ARS_ALLOC_WORKING ──────
+    # Stage B re-creates the alloc table via SELECT…INTO every run, so the
+    # column must be (re-)added when the engine path didn't emit it (this
+    # is the catch-all for the per_opt dispatch). Runs BEFORE Part 8.4 so
+    # the parked snapshot — and the later promotion to ARS_ALLOC_HISTORY —
+    # carries the run's pool type.
+    try:
+        with de.connect() as ac:
+            if _table_exists(ac, ALLOC_TABLE):
+                _run(ac, f"""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('{ALLOC_TABLE}')
+                          AND name = 'ALLOC_TYPE'
+                    )
+                    ALTER TABLE [{ALLOC_TABLE}] ADD [ALLOC_TYPE] NVARCHAR(10) NULL
+                """)
+                _run(ac, f"UPDATE [{ALLOC_TABLE}] SET [ALLOC_TYPE] = :t",
+                     {"t": req.alloc_type})
+                logger.info(
+                    f"Part 8.35: ALLOC_TYPE='{req.alloc_type}' stamped on {ALLOC_TABLE}"
+                )
+    except Exception as e:
+        logger.warning(f"Part 8.35: ALLOC_TYPE stamp failed: {e}")
+    t0 = _time_step("Part 8.35 (ALLOC_TYPE stamp)", t0)
+
+    # ── Part 8.36 — stamp run dates on ARS_ALLOC_WORKING (2026-07-18) ──
+    # Information-only columns: STOCK_CONSIDER_DT (mandatory, the date the
+    # stock figures reflect) and PICKING_DT (optional, planned pick/dispatch
+    # date). Same pattern as the ALLOC_TYPE stamp above and runs BEFORE Part
+    # 8.4 parking, so the column-introspection copy in parked_history.py
+    # carries both columns and their values into ARS_ALLOC_PARKED and then
+    # ARS_ALLOC_HISTORY with no changes to the parking code. These dates do
+    # NOT enter any allocation/stock math — pure traceability.
+    try:
+        with de.connect() as ac:
+            if _table_exists(ac, ALLOC_TABLE):
+                _run(ac, f"""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('{ALLOC_TABLE}')
+                          AND name = 'STOCK_CONSIDER_DT'
+                    )
+                    ALTER TABLE [{ALLOC_TABLE}] ADD [STOCK_CONSIDER_DT] DATE NULL
+                """)
+                _run(ac, f"""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('{ALLOC_TABLE}')
+                          AND name = 'PICKING_DT'
+                    )
+                    ALTER TABLE [{ALLOC_TABLE}] ADD [PICKING_DT] DATE NULL
+                """)
+                _run(ac, f"""
+                    UPDATE [{ALLOC_TABLE}]
+                    SET [STOCK_CONSIDER_DT] = :s, [PICKING_DT] = :p
+                """, {"s": req.stock_consider_dt, "p": req.picking_dt})
+                logger.info(
+                    f"Part 8.36: run dates stamped on {ALLOC_TABLE} "
+                    f"(stock={req.stock_consider_dt}, picking={req.picking_dt})"
+                )
+    except Exception as e:
+        logger.warning(f"Part 8.36: run-date stamp failed: {e}")
+    t0 = _time_step("Part 8.36 (run-date stamp)", t0)
 
     # ── Part 8.4 — Park ARS_ALLOC_WORKING + ARS_LISTING_WORKING for review ──
     # Snapshot the freshly-built allocation AND the working listing into
@@ -2820,9 +3331,19 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             # the partial parked rows are still safely recorded under
             # this session_id.
             parked_status = "SKIPPED_ERROR"
+        elif snap.get("empty_targets"):
+            # At least one EXPECTED target parked 0 rows (its source table was
+            # empty at park time — e.g. ARS_MSA_TOTAL emptied by a concurrent
+            # MSA rebuild). The run's alloc/listing are safely parked, but the
+            # empty target will NOT reach *_HISTORY on Approve. Flag it so the
+            # UI warns instead of showing a clean PARKED. Observed on
+            # 20260713_164356_383 (MSA_TOTAL missing from history).
+            parked_status = "PARKED_PARTIAL"
+            summary["parked_empty_targets"] = snap.get("empty_targets")
         logger.info(
             f"[generate] parked snapshot: total_rows={snap.get('total_parked_rows')} "
-            f"by_table={snap.get('by_table')} parked_status={parked_status}"
+            f"by_table={snap.get('by_table')} parked_status={parked_status} "
+            f"empty_targets={snap.get('empty_targets')}"
         )
     except Exception as e:
         logger.warning(f"[generate] parked snapshot failed: {e}")
@@ -2924,8 +3445,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     [LAST_UPDATED]    DATETIME      NOT NULL DEFAULT GETDATE(),
                     [IS_CLOSED]       BIT           NOT NULL DEFAULT 0,
                     [CLOSED_DATE]     DATETIME      NULL,
+                    [ALLOC_TYPE]      NVARCHAR(10)  NOT NULL DEFAULT '',
                     CONSTRAINT PK_ARS_NL_TBL_HOLD_TRACKING
-                        PRIMARY KEY CLUSTERED ([WERKS], [VAR_ART], [SZ])
+                        PRIMARY KEY CLUSTERED ([WERKS], [VAR_ART], [SZ], [ALLOC_TYPE])
                 )
             """)
             # Add RDC column if the table predates this change (idempotent).
@@ -2939,6 +3461,26 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                           AND name = 'RDC'
                     )
                     ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING] ADD [RDC] NVARCHAR(20) NULL
+                """)
+            except Exception:
+                pass
+
+            # Add ALLOC_TYPE if the table predates the Fresh/GRT change
+            # (FS-DB-03 / FS-10 item 1 — mirrors the RDC guard above).
+            # NOT NULL DEFAULT '' backfills legacy rows with '' = "matches
+            # any run type". Note: the PK widening to (WERKS, VAR_ART, SZ,
+            # ALLOC_TYPE) on pre-existing tables is handled by the migration
+            # (already applied on HOPC866); this inline guard only adds the
+            # column so fresh envs and old snapshots keep working.
+            try:
+                _run(ac, """
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
+                          AND name = 'ALLOC_TYPE'
+                    )
+                    ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING]
+                        ADD [ALLOC_TYPE] NVARCHAR(10) NOT NULL DEFAULT ''
                 """)
             except Exception:
                 pass
@@ -3048,9 +3590,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             },
             "step_timings": step_timings,
             "session_id":   session_id,
-            # Parallel allocation tracking — None for sequential mode.
+            # Parallel allocation tracking.
             "allocation_mode":  mode,
-            "parallel_workers": n_workers if mode != "sequential" else None,
+            "parallel_workers": n_workers,
             "alloc_batch_id":   alloc_batch_id,
             "alloc_failed":     alloc_failed_count,
         }
@@ -3097,8 +3639,6 @@ def alloc_progress(batch_id: str,
 
 class RetryFailedRequest(BaseModel):
     batch_id:         str
-    allocation_mode:  str = "per_opt"  # "sequential" | "pandas" | "per_opt"
-    exec_order:       str = "opt_type_first"  # "opt_type_first" | "round_first"
     parallel_workers: int = 8
 
 
@@ -3150,9 +3690,29 @@ def retry_failed(req: RetryFailedRequest,
         failed_mcs = [f["maj_cat"] for f in failed]
         reset_count = reset_failed_for_retry(conn, req.batch_id)
 
+        # Recover the original run's pool + hold-toggle context. Retry reuses
+        # the existing ARS_ALLOC_WORKING (Stage A/B not re-run), but the
+        # waterfall still needs alloc_type for the typed hold-tracking load
+        # and the three toggles for the TBL suppression mask — defaulting
+        # them would silently retry a GRT run as FRESH.
+        _retry_alloc_type = None
+        try:
+            _retry_alloc_type = conn.execute(text(
+                "SELECT TOP 1 [ALLOC_TYPE] FROM [ARS_ALLOC_WORKING] "
+                "WHERE [ALLOC_TYPE] IN ('FRESH','GRT')"
+            )).scalar()
+        except Exception:
+            pass
+        _saved = _load_listing_settings(conn)
+        _retry_alloc_type = _retry_alloc_type or _saved.get("alloc_type") or "FRESH"
+        _retry_skip_upc  = str(_saved.get("skip_hold_upc", "false")).lower() == "true"
+        _retry_hold_app  = str(_saved.get("apply_hold_seg_app", "true")).lower() != "false"
+        _retry_hold_gm   = str(_saved.get("apply_hold_seg_gm", "true")).lower() != "false"
+
     logger.info(
-        f"[retry-failed] batch={req.batch_id} mode={req.allocation_mode} "
-        f"workers={req.parallel_workers} → re-dispatching {reset_count} "
+        f"[retry-failed] batch={req.batch_id} mode=per_opt "
+        f"workers={req.parallel_workers} alloc_type={_retry_alloc_type} "
+        f"→ re-dispatching {reset_count} "
         f"MAJ_CAT(s): {failed_mcs[:10]}{'...' if len(failed_mcs) > 10 else ''}"
     )
 
@@ -3162,6 +3722,10 @@ def retry_failed(req: RetryFailedRequest,
         n_workers=n_workers,
         batch_id=req.batch_id,
         only_majcats=failed_mcs,
+        alloc_type=_retry_alloc_type,
+        skip_hold_upc=_retry_skip_upc,
+        apply_hold_seg_app=_retry_hold_app,
+        apply_hold_seg_gm=_retry_hold_gm,
     )
 
     # Re-read progress so the UI can update without a separate poll round-trip.
@@ -3249,6 +3813,20 @@ def approve_parked_run(session_id: str,
     result = parked_history.approve_parked(session_id, user=user)
     if result.get("error") and not result.get("already_approved"):
         raise HTTPException(400, result["error"])
+    # Fire report-generation events on a FRESH approve only (not a duplicate).
+    # In ARS one parked-run approve both promotes the listing AND writes its
+    # pending allocations, so both events fire from this single point — a
+    # report subscribed to either will run in the background with this
+    # session_id as its folder name. Never blocks/​fails the approve.
+    if not result.get("error") and not result.get("already_approved"):
+        try:
+            from app.services.report_scheduler_service import (
+                emit_event, EVENT_LISTING_APPROVED, EVENT_PENDALC_APPROVED,
+            )
+            emit_event(EVENT_LISTING_APPROVED, session_id=session_id, user=user)
+            emit_event(EVENT_PENDALC_APPROVED, session_id=session_id, user=user)
+        except Exception as e:
+            logger.warning(f"[report-gen] emit approve events failed: {e}")
     return {"success": True, **result}
 
 
@@ -3345,6 +3923,203 @@ def get_listing_session(session_id: str,
     if not s:
         raise HTTPException(404, f"Session {session_id} not found")
     return {"success": True, "session": s}
+
+
+@router.get("/sessions/{session_id}/run-params")
+def get_session_run_params(session_id: str,
+                           current_user: User = Depends(get_current_user)):
+    """Every tunable + condition that produced a run, from ARS_RUN_PARAMS_AUDIT.
+
+    Session-wise review surface for the audit table (which is otherwise
+    write-only). Returns params grouped by PARAM_GROUP plus a friendly
+    `conditions` summary that answers "which fallback / which mode did this
+    run use?" at a glance — including the sec-cap STANDARD vs MATRIX
+    condition.
+
+    Pins to the LATEST run of the session (a session normally has one
+    /generate, but reruns are guarded via MAX(RUN_TS)). Never raises 500 —
+    a missing table or a session with no audit rows returns empty groups
+    with a `note`, so the UI degrades gracefully for pre-audit sessions.
+    """
+    # Friendly summary keys → the "conditions" strip in the UI.
+    _COND_KEYS = [
+        "sec_cap_mode", "apply_sec_cap_in_normal", "cont_fallback_mode",
+        "rl_dispatch_mode", "tbc_dispatch_mode", "alloc_type",
+        "mix_mode", "rdc_mode", "run_mode",
+    ]
+    _GROUP_ORDER = ["LISTING", "RANKING", "ALLOCATION", "SEC_CAP", "FLAGS"]
+
+    de = get_data_engine()
+    try:
+        with de.connect() as conn:
+            if not _table_exists(conn, "ARS_RUN_PARAMS_AUDIT"):
+                return {"success": True, "session_id": session_id,
+                        "run_id": None, "user_id": None, "run_ts": None,
+                        "groups": {}, "conditions": {},
+                        "note": "ARS_RUN_PARAMS_AUDIT does not exist yet — "
+                                "no run has been audited."}
+
+            head = conn.execute(text(
+                "SELECT TOP 1 RUN_ID, USER_ID, RUN_TS "
+                "FROM [ARS_RUN_PARAMS_AUDIT] WHERE SESSION_ID = :sid "
+                "ORDER BY RUN_TS DESC"
+            ), {"sid": session_id}).fetchone()
+            if not head:
+                return {"success": True, "session_id": session_id,
+                        "run_id": None, "user_id": None, "run_ts": None,
+                        "groups": {}, "conditions": {},
+                        "note": f"No audited parameters for session {session_id}."}
+
+            run_id  = head[0]
+            user_id = head[1]
+            run_ts  = head[2].isoformat() if head[2] is not None else None
+
+            rows = conn.execute(text(
+                "SELECT PARAM_GROUP, PARAM_NAME, PARAM_VALUE "
+                "FROM [ARS_RUN_PARAMS_AUDIT] WHERE RUN_ID = :rid "
+                "ORDER BY PARAM_GROUP, PARAM_NAME"
+            ), {"rid": run_id}).fetchall()
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        flat: Dict[str, str] = {}
+        for grp, name, val in rows:
+            grp = str(grp)
+            groups.setdefault(grp, []).append({"name": str(name), "value": val})
+            flat[str(name)] = val
+
+        # Back-compat: runs written before 2026-07-18 have no flat
+        # `sec_cap_mode` row — derive it from the growth_matrix JSON `enabled`
+        # flag so historic runs still show STANDARD/MATRIX.
+        if "sec_cap_mode" not in flat and "growth_matrix" in flat:
+            try:
+                _gm = json.loads(flat["growth_matrix"] or "{}")
+                _mode = "MATRIX" if _gm.get("enabled") else "STANDARD"
+            except Exception:
+                _mode = "STANDARD"
+            flat["sec_cap_mode"] = _mode
+            groups.setdefault("SEC_CAP", []).append(
+                {"name": "sec_cap_mode", "value": _mode, "derived": True})
+
+        # Order groups for stable UI rendering; unknown groups appended.
+        ordered = {g: groups[g] for g in _GROUP_ORDER if g in groups}
+        for g in groups:
+            if g not in ordered:
+                ordered[g] = groups[g]
+
+        conditions = {k: flat[k] for k in _COND_KEYS if k in flat}
+
+        return {"success": True, "session_id": session_id,
+                "run_id": run_id, "user_id": user_id, "run_ts": run_ts,
+                "groups": ordered, "conditions": conditions}
+    except Exception as e:
+        logger.warning(f"[run-params] read failed for session {session_id}: {e}")
+        return {"success": False, "session_id": session_id,
+                "groups": {}, "conditions": {}, "error": str(e)}
+
+
+def _rp_is_number(v) -> bool:
+    if v is None:
+        return False
+    try:
+        float(str(v))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+@router.get("/run-params/catalog")
+def get_run_params_catalog(current_user: User = Depends(get_current_user)):
+    """Distinct (group, name) params ever audited — drives the Trends picker.
+
+    `numeric` = every non-null value for that param parses as a float, so the
+    UI can plot it as a line vs. render it as a categorical step.
+    """
+    de = get_data_engine()
+    try:
+        with de.connect() as conn:
+            if not _table_exists(conn, "ARS_RUN_PARAMS_AUDIT"):
+                return {"success": True, "params": []}
+            rows = conn.execute(text(
+                "SELECT PARAM_GROUP, PARAM_NAME, PARAM_VALUE "
+                "FROM [ARS_RUN_PARAMS_AUDIT]"
+            )).fetchall()
+        agg: Dict[tuple, Dict[str, Any]] = {}
+        for grp, name, val in rows:
+            key = (str(grp), str(name))
+            a = agg.setdefault(key, {"group": str(grp), "name": str(name),
+                                     "numeric": True, "n": 0})
+            if val is not None and str(val) != "":
+                a["n"] += 1
+                if not _rp_is_number(val):
+                    a["numeric"] = False
+        params = sorted(agg.values(), key=lambda x: (x["group"], x["name"]))
+        return {"success": True, "params": params}
+    except Exception as e:
+        logger.warning(f"[run-params] catalog failed: {e}")
+        return {"success": False, "params": [], "error": str(e)}
+
+
+@router.get("/run-params/trend")
+def get_run_params_trend(params: str = "",
+                         limit: int = 30,
+                         current_user: User = Depends(get_current_user)):
+    """Value of each requested param across the last N runs (ascending by time).
+
+    `params` = comma-separated PARAM_NAMEs. Returns one series per param with
+    points {session_id, run_ts, value, num}; `num` is the float value or null,
+    and series-level `numeric` says whether every point is numeric.
+    """
+    names = [p.strip() for p in (params or "").split(",") if p.strip()]
+    de = get_data_engine()
+    try:
+        with de.connect() as conn:
+            if not names or not _table_exists(conn, "ARS_RUN_PARAMS_AUDIT"):
+                return {"success": True, "series": []}
+            # The last N runs (by RUN_TS), ascending for charting.
+            run_rows = conn.execute(text(
+                "SELECT RUN_ID, MAX(RUN_TS) AS TS, MAX(SESSION_ID) AS SID "
+                "FROM [ARS_RUN_PARAMS_AUDIT] GROUP BY RUN_ID "
+                "ORDER BY TS DESC OFFSET 0 ROWS FETCH NEXT :lim ROWS ONLY"
+            ), {"lim": int(limit)}).fetchall()
+            runs = list(reversed(run_rows))  # ascending
+            run_ids = [r[0] for r in runs]
+            if not run_ids:
+                return {"success": True, "series": []}
+            # Pull all values for the requested names across those runs.
+            in_names = ", ".join(f":n{i}" for i in range(len(names)))
+            in_runs = ", ".join(f":r{i}" for i in range(len(run_ids)))
+            qp: Dict[str, Any] = {}
+            for i, n in enumerate(names):
+                qp[f"n{i}"] = n
+            for i, r in enumerate(run_ids):
+                qp[f"r{i}"] = r
+            vrows = conn.execute(text(
+                f"SELECT RUN_ID, PARAM_NAME, PARAM_VALUE FROM [ARS_RUN_PARAMS_AUDIT] "
+                f"WHERE PARAM_NAME IN ({in_names}) AND RUN_ID IN ({in_runs})"
+            ), qp).fetchall()
+        val_by = {(str(rid), str(nm)): val for rid, nm, val in vrows}
+        meta_by_run = {r[0]: (r[1], r[2]) for r in runs}
+        series = []
+        for nm in names:
+            points = []
+            numeric = True
+            for rid in run_ids:
+                v = val_by.get((str(rid), nm))
+                ts, sid = meta_by_run.get(rid, (None, None))
+                num = float(str(v)) if _rp_is_number(v) else None
+                if v is not None and num is None:
+                    numeric = False
+                points.append({
+                    "session_id": sid,
+                    "run_ts": ts.isoformat() if ts is not None else None,
+                    "value": v,
+                    "num": num,
+                })
+            series.append({"name": nm, "numeric": numeric, "points": points})
+        return {"success": True, "series": series}
+    except Exception as e:
+        logger.warning(f"[run-params] trend failed: {e}")
+        return {"success": False, "series": [], "error": str(e)}
 
 
 @router.get("/sessions/{session_id}/log")

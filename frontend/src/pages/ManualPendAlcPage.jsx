@@ -28,8 +28,11 @@ const C = {
 
 const EMPTY_ROW = {
   rdc: '', st_cd: '', article_number: '', alloc_qty: '',
-  maj_cat: '', gen_art_number: '', clr: '', remarks: '',
+  maj_cat: '', gen_art_number: '', clr: '', alloc_type: '', remarks: '',
 }
+
+// Valid ALLOC_TYPE values. '' on a row = "use the page-level default".
+const ALLOC_TYPES = ['FRESH', 'GRT']
 
 // Above this row count, switch to bulk mode (no table render).
 const BULK_THRESHOLD = 100
@@ -63,6 +66,7 @@ function parseCsv(text) {
     'gen_article','gen_article_number','generic_article','generic_article_number'
   )
   const clrIdx  = idx('clr','colour','color')
+  const atIdx   = idx('alloc_type','alloctype','allocation_type','type')
   const remIdx  = idx('remarks','remark','notes','note','comment')
 
   // Soft warn so users can see what didn't match in DevTools without breaking
@@ -86,6 +90,12 @@ function parseCsv(text) {
       maj_cat:        get(mcIdx),
       gen_art_number: get(ganIdx),
       clr:            get(clrIdx),
+      // Optional typed pend: only FRESH/GRT are kept — anything else falls
+      // back to '' so the page-level default applies at submit time.
+      alloc_type:     (() => {
+        const v = get(atIdx).toUpperCase()
+        return ALLOC_TYPES.includes(v) ? v : ''
+      })(),
       remarks:        get(remIdx),
     }
     if (r.rdc && r.article_number && parseFloat(r.alloc_qty) > 0) out.push(r)
@@ -93,7 +103,10 @@ function parseCsv(text) {
   return out
 }
 
-function buildPayload(r) {
+function buildPayload(r, defaultAllocType) {
+  // Row-level Alloc_Type wins; rows without one get the page-level default.
+  const at = (r.alloc_type || '').trim().toUpperCase()
+  const allocType = ALLOC_TYPES.includes(at) ? at : (defaultAllocType || '')
   return {
     rdc:            r.rdc.trim(),
     article_number: r.article_number.trim(),
@@ -102,6 +115,7 @@ function buildPayload(r) {
     ...(r.maj_cat?.trim()          ? { maj_cat:        r.maj_cat.trim() }        : {}),
     ...(r.gen_art_number?.trim()   ? { gen_art_number: r.gen_art_number.trim() } : {}),
     ...(r.clr?.trim()              ? { clr:            r.clr.trim() }            : {}),
+    ...(allocType                  ? { alloc_type:     allocType }               : {}),
     ...(r.remarks?.trim()          ? { remarks:        r.remarks.trim() }        : {}),
   }
 }
@@ -118,6 +132,9 @@ export default function ManualPendAlcPage() {
   const [submitting, setSubmitting] = useState(false)
   const [progress, setProgress]     = useState(null) // { sent, total }
   const [result, setResult]         = useState(null)
+  // Typed pend — applied to rows that don't carry their own Alloc_Type
+  // (CSV column or per-row select). FRESH is the operational default.
+  const [defaultAllocType, setDefaultAllocType] = useState('FRESH')
   const fileRef = useRef()
 
   // Warn before tab close / refresh while an upload is in flight. Browser
@@ -154,7 +171,7 @@ export default function ManualPendAlcPage() {
     reader.onload = ev => {
       const parsed = parseCsv(ev.target.result)
       if (!parsed) {
-        toast.error('CSV must have columns: RDC, Article_Number, Alloc_Qty (optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER or GEN_ART, CLR, Remarks)')
+        toast.error('CSV must have columns: RDC, Article_Number, Alloc_Qty (optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER or GEN_ART, CLR, Alloc_Type [FRESH/GRT], Remarks)')
         return
       }
       if (parsed.length === 0) {
@@ -179,10 +196,10 @@ export default function ManualPendAlcPage() {
 
   const downloadSample = () => {
     const csv = '﻿'
-      + 'RDC,ST_CD,Article_Number,Alloc_Qty,MAJ_CAT,GEN_ART_NUMBER,CLR,Remarks\n'
-      + 'DW01,S001,1000000001,50,FOOTWEAR,90000001,RED,Manual top-up\n'
-      + 'DW01,S002,1000000001,30,FOOTWEAR,90000001,RED,Manual top-up\n'
-      + 'DW02,S003,1000000002,120,APPAREL,90000002,BLUE,\n'
+      + 'RDC,ST_CD,Article_Number,Alloc_Qty,MAJ_CAT,GEN_ART_NUMBER,CLR,Alloc_Type,Remarks\n'
+      + 'DW01,S001,1000000001,50,FOOTWEAR,90000001,RED,FRESH,Manual top-up\n'
+      + 'DW01,S002,1000000001,30,FOOTWEAR,90000001,RED,GRT,Manual top-up\n'
+      + 'DW02,S003,1000000002,120,APPAREL,90000002,BLUE,,\n'
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -228,10 +245,12 @@ export default function ManualPendAlcPage() {
     for (let i = 0, chunkIdx = 0; i < valid.length; i += SUBMIT_CHUNK, chunkIdx++) {
       const slice = valid.slice(i, i + SUBMIT_CHUNK)
       const payload = {
-        rows: slice.map(buildPayload),
+        rows: slice.map(r => buildPayload(r, defaultAllocType)),
         session_id:     uploadSessionId,
         is_first_chunk: i === 0,
         is_last_chunk:  i + SUBMIT_CHUNK >= valid.length,
+        // Backend-side safety net — fills any row that still lacks a type.
+        default_alloc_type: defaultAllocType || undefined,
       }
       try {
         const { data } = await pendAlcAPI.manualUpload(payload)
@@ -301,10 +320,22 @@ export default function ManualPendAlcPage() {
             IMPORT FROM CSV
           </div>
           <div style={{ fontSize: 9, color: C.textMuted }}>
-            Required: RDC, Article_Number, Alloc_Qty — optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER (or GEN_ART), CLR, Remarks
+            Required: RDC, Article_Number, Alloc_Qty — optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER (or GEN_ART), CLR, Alloc_Type (FRESH/GRT), Remarks
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: C.textSub }}>Default Type:</span>
+            <select value={defaultAllocType} disabled={submitting}
+              onChange={e => setDefaultAllocType(e.target.value)}
+              title="Applied to rows without their own Alloc_Type column/value"
+              style={{ fontSize: 10, padding: '4px 6px', borderRadius: 4,
+                       border: `1px solid ${C.border}`, background: '#fff',
+                       color: C.text, outline: 'none' }}>
+              <option value="FRESH">FRESH</option>
+              <option value="GRT">GRT</option>
+            </select>
+          </div>
           <button onClick={() => fileRef.current?.click()} disabled={submitting}
             style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10,
                      padding: '5px 12px', borderRadius: 4, border: `1px solid ${C.primary}`,
@@ -362,7 +393,7 @@ export default function ManualPendAlcPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead>
                 <tr style={{ background: C.bg }}>
-                  {['RDC','ST_CD','Article','Qty','MAJ_CAT','GEN_ART','CLR','Remarks'].map(h => (
+                  {['RDC','ST_CD','Article','Qty','MAJ_CAT','GEN_ART','CLR','Type','Remarks'].map(h => (
                     <th key={h} style={{ padding: '5px 8px', textAlign: 'left',
                                           fontSize: 9, fontWeight: 700, color: C.textSub,
                                           letterSpacing: '.05em',
@@ -382,6 +413,13 @@ export default function ManualPendAlcPage() {
                     <td style={{ padding: '4px 8px' }}>{r.maj_cat}</td>
                     <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{r.gen_art_number}</td>
                     <td style={{ padding: '4px 8px' }}>{r.clr}</td>
+                    <td style={{ padding: '4px 8px' }}>
+                      <span style={{ fontSize: 8, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
+                                     background: (r.alloc_type === 'GRT' ? C.amber : C.green) + '22',
+                                     color: r.alloc_type === 'GRT' ? C.amber : C.green }}>
+                        {r.alloc_type || `${defaultAllocType}*`}
+                      </span>
+                    </td>
                     <td style={{ padding: '4px 8px', color: C.textMuted }}>{r.remarks}</td>
                   </tr>
                 ))}
@@ -405,7 +443,7 @@ export default function ManualPendAlcPage() {
           <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 1100 }}>
             <thead>
               <tr style={{ background: C.bg }}>
-                {['RDC', 'ST_CD', 'Article Number', 'Alloc Qty', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'Remarks', ''].map((h, i) => (
+                {['RDC', 'ST_CD', 'Article Number', 'Alloc Qty', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'Type', 'Remarks', ''].map((h, i) => (
                   <th key={i} style={{ padding: '6px 8px', textAlign: 'left', fontSize: 9,
                                        fontWeight: 700, color: C.textSub, letterSpacing: '.05em',
                                        borderBottom: `1px solid ${C.border}` }}>
@@ -447,7 +485,16 @@ export default function ManualPendAlcPage() {
                     <input value={r.clr} onChange={e => setRow(i, 'clr', e.target.value)}
                       placeholder="RED" style={_inp}/>
                   </td>
-                  <td style={{ padding: '4px 6px', width: '20%' }}>
+                  <td style={{ padding: '4px 6px', width: '8%' }}>
+                    <select value={r.alloc_type || ''}
+                      onChange={e => setRow(i, 'alloc_type', e.target.value)}
+                      title="Blank = page default" style={_inp}>
+                      <option value="">({defaultAllocType})</option>
+                      <option value="FRESH">FRESH</option>
+                      <option value="GRT">GRT</option>
+                    </select>
+                  </td>
+                  <td style={{ padding: '4px 6px', width: '16%' }}>
                     <input value={r.remarks} onChange={e => setRow(i, 'remarks', e.target.value)}
                       placeholder="optional note" style={_inp}/>
                   </td>

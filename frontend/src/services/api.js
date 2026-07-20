@@ -206,7 +206,13 @@ export const msaAPI = {
   getStoredSequences: (limit = 10) => api.get('/msa/results/sequences', { params: { limit } }),
   getStoredResults: (sequenceId, table = 'msa') => api.get(`/msa/results/${sequenceId}`, { params: { table } }),
   getSequenceSummary: (sequenceId) => api.get(`/msa/results/${sequenceId}/summary`),
-  
+
+  // Warehouse SLOC pool management (ARS_MSA_SLOC_SETTINGS — Fresh/GRT)
+  slocSettings: () => api.get('/msa/sloc-settings'),
+  updateSlocSetting: (sloc, payload) => api.put(`/msa/sloc-settings/${encodeURIComponent(sloc)}`, payload),
+  bulkSlocSettings: (list) => api.put('/msa/sloc-settings', list),
+  syncSlocSettings: () => api.post('/msa/sloc-settings/sync'),
+
   // Legacy
   run: (payload) => api.post('/msa/run', payload),
 }
@@ -260,6 +266,9 @@ export const gridBuilderAPI = {
   calcPreview: ()           => api.get('/grid-builder/calculation-preview'),
   buildCalcTables: ()       => api.post('/grid-builder/build-calc-tables', null, { timeout: 600000 }),
   hierarchyGaps: (opts={})  => api.get('/grid-builder/hierarchy/gaps', { quiet: true, timeout: 30000, ...opts }),
+  // Sec-cap growth matrix (spec 2026-07-08) — single global toggle + editable cont% bands.
+  getGrowthMatrix:  ()     => api.get('/grid-builder/growth-matrix'),
+  saveGrowthMatrix: (data) => api.put('/grid-builder/growth-matrix', data),
 }
 
 // ============== Merge Rules (ARS_MERGE_RULES — drives MERGE_<col> derivation) ==============
@@ -272,6 +281,14 @@ export const mergeRulesAPI = {
   refresh:      (sourceCol)    => api.post(`/merge-rules/refresh/${encodeURIComponent(sourceCol)}`, null, { timeout: 300000 }),
   bulk:         (rules, refresh_after=true) =>
                                    api.post('/merge-rules/bulk', { rules, refresh_after }, { timeout: 600000 }),
+}
+
+// ============== Data Dictionary ==============
+export const dataDictionaryAPI = {
+  list:   (q)        => api.get('/data-dictionary', { params: q ? { q } : {} }),
+  create: (data)     => api.post('/data-dictionary', data),
+  update: (id, data) => api.put(`/data-dictionary/${id}`, data),
+  remove: (id)       => api.delete(`/data-dictionary/${id}`),
 }
 
 // ============== Listing (Data Preparation) ==============
@@ -356,6 +373,12 @@ export const listingAPI = {
   sessions:      (params)    => api.get('/listing/sessions', { params }),
   session:       (sid)       => api.get(`/listing/sessions/${sid}`),
   sessionLog:    (sid, tail) => api.get(`/listing/sessions/${sid}/log`, { params: tail ? { tail } : {} }),
+  // All tunables + conditions that produced a run (ARS_RUN_PARAMS_AUDIT).
+  runParams:     (sid)       => api.get(`/listing/sessions/${sid}/run-params`),
+  // Trend chart: catalog of trendable params + per-param series across runs.
+  runParamCatalog: ()        => api.get('/listing/run-params/catalog'),
+  runParamTrend:   (names, limit = 30) =>
+    api.get('/listing/run-params/trend', { params: { params: (names || []).join(','), limit } }),
   killSession:   (sid)       => api.post(`/listing/sessions/${sid}/kill`),
   deleteSession: (sid)       => api.delete(`/listing/sessions/${sid}`),
   // Park-then-promote alloc history: snapshot of ARS_ALLOC_WORKING per
@@ -587,13 +610,32 @@ export const reportsAPI = {
   },
 }
 
+// ============== Report Generation hub (scheduled/manual/event reports) ======
+export const reportGenAPI = {
+  list:        ()             => api.get('/report-gen/reports'),
+  get:         (id)           => api.get(`/report-gen/reports/${id}`),
+  create:      (body)         => api.post('/report-gen/reports', body),
+  update:      (id, body)     => api.put(`/report-gen/reports/${id}`, body),
+  toggle:      (id, enabled)  => api.post(`/report-gen/reports/${id}/toggle`, { enabled }),
+  remove:      (id)           => api.delete(`/report-gen/reports/${id}`),
+  runNow:      (id)           => api.post(`/report-gen/reports/${id}/run`),
+  cancel:      (id)           => api.post(`/report-gen/reports/${id}/cancel`),
+  runs:        (id, limit=50) => api.get(`/report-gen/reports/${id}/runs`, { params: { limit } }),
+  codeSteps:   ()             => api.get('/report-gen/code-steps'),
+  procedures:  (search='')    => api.get('/report-gen/procedures', { params: { search } }),
+  procParams:  (name)         => api.get('/report-gen/proc-params', { params: { name } }),
+  events:      ()             => api.get('/report-gen/events'),
+  status:      ()             => api.get('/report-gen/status'),
+}
+
 // ============== Hold Dashboard (HOLD_QTY review across angles) ==============
 export const holdDashboardAPI = {
-  summary:        () => api.get('/hold-dashboard/summary'),
+  // params: { alloc_type: 'FRESH'|'GRT'|'LEGACY' } (optional typed filter)
+  summary:        (params) => api.get('/hold-dashboard/summary', { params }),
   byStore:        (params) => api.get('/hold-dashboard/by-store', { params }),
   byRdc:          (params) => api.get('/hold-dashboard/by-rdc', { params }),
   byArticle:      (params) => api.get('/hold-dashboard/by-article', { params }),
-  byStatus:       () => api.get('/hold-dashboard/by-status'),
+  byStatus:       (params) => api.get('/hold-dashboard/by-status', { params }),
   byAge:          () => api.get('/hold-dashboard/by-age'),
   timeline:       (params) => api.get('/hold-dashboard/timeline', { params }),
   detail:         (params) => api.get('/hold-dashboard/detail', { params }),
@@ -649,6 +691,10 @@ export const pendAlcAPI = {
     // unexpected lock waits on huge uploads.
     { timeout: 10 * 60 * 1000 }),
   bdcPreview:  (params = {})    => api.get('/pend-alc/bdc-preview', { params }),
+  // Dispatch-control Gap: pending lines HELD from BDC by the 3 control tables.
+  dispatchGap:       (params = {}) => api.get('/pend-alc/dispatch-gap', { params }),
+  exportDispatchGap: (params = {}) => api.get('/pend-alc/dispatch-gap/export',
+                                       { params, responseType: 'blob', timeout: 120000 }),
   bdcGenerate: (params = {})    => api.post('/pend-alc/bdc-generate', null,
                                     { params, responseType: 'blob', timeout: 300000,
                                       paramsSerializer: { indexes: null } }),
@@ -786,6 +832,12 @@ export const ptAPI = {
                                     { responseType: 'blob' }),
     delete:   (aid)      => api.delete(`/pt/attachments/${aid}`),
   },
+}
+
+// ============== Daily Activity Log (superadmin) ==============
+export const activityLogAPI = {
+  get:      (date, opts = {}) => api.get('/activity-log', { params: { date, ...opts } }),
+  validate: (data)            => api.post('/activity-log/validate', data),
 }
 
 export default api

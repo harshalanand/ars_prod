@@ -64,6 +64,7 @@ CREATE TABLE dbo.{SESSIONS_TABLE} (
     DURATION_SEC      FLOAT          NULL,
     STATUS            NVARCHAR(20)   NOT NULL DEFAULT 'RUNNING',
     ALLOCATION_MODE   NVARCHAR(20)   NULL,
+    ALLOC_TYPE        NVARCHAR(10)   NULL,
     PARALLEL_WORKERS  INT            NULL,
     RDC_MODE          NVARCHAR(20)   NULL,
     STORE_COUNT       INT            NULL,
@@ -96,6 +97,11 @@ _COLUMN_RECONCILE_DDL = [
         "PARKED_STATUS",
         f"IF COL_LENGTH('dbo.{SESSIONS_TABLE}','PARKED_STATUS') IS NULL "
         f"ALTER TABLE dbo.{SESSIONS_TABLE} ADD PARKED_STATUS NVARCHAR(20) NULL",
+    ),
+    (
+        "ALLOC_TYPE",
+        f"IF COL_LENGTH('dbo.{SESSIONS_TABLE}','ALLOC_TYPE') IS NULL "
+        f"ALTER TABLE dbo.{SESSIONS_TABLE} ADD ALLOC_TYPE NVARCHAR(10) NULL",
     ),
 ]
 
@@ -170,18 +176,21 @@ def start_session(
             conn.execute(text(f"""
                 INSERT INTO {SESSIONS_TABLE}
                     (SESSION_ID, USER_NAME, STARTED_AT, STATUS,
-                     ALLOCATION_MODE, PARALLEL_WORKERS, RDC_MODE,
+                     ALLOCATION_MODE, ALLOC_TYPE, PARALLEL_WORKERS, RDC_MODE,
                      STORE_COUNT, MAJCAT_COUNT,
                      REQUEST_JSON, LOG_FILE_PATH)
                 VALUES
                     (:sid, :user, GETDATE(), 'RUNNING',
-                     :mode, :workers, :rdc_mode,
+                     :mode, :alloc_type, :workers, :rdc_mode,
                      :store_count, :majcat_count,
                      :req_json, :log_path)
             """), {
                 "sid":          session_id,
                 "user":         (user_name or "")[:200],
                 "mode":         (request_dict.get("allocation_mode") or "")[:20],
+                # Queryable pool marker (migration 018); REQUEST_JSON keeps
+                # the full payload but reports shouldn't have to parse it.
+                "alloc_type":   (str(request_dict.get("alloc_type") or "").strip().upper() or None),
                 "workers":      int(request_dict.get("parallel_workers") or 0) or None,
                 "rdc_mode":     (request_dict.get("rdc_mode") or "")[:20],
                 "store_count":  len(request_dict.get("store_codes") or []) or None,

@@ -3,19 +3,21 @@
  */
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { listingAPI, gridBuilderAPI } from '@/services/api'
+import { listingAPI, gridBuilderAPI, pendAlcAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
   List, RefreshCw, Loader2, Database, Play, Pause, ChevronLeft, ChevronRight,
   Eye, BarChart3, Search, Filter, Download, X, XCircle, Square, Cpu, Zap,
   ChevronDown, ChevronUp, Activity, Clock, FileText, Maximize2, AlertTriangle,
+  Calendar,
+  Sliders,
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 import { BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 import * as XLSX from 'xlsx'
 
 /* ── Searchable Multi-Select (dropdown only on search) ────────────────── */
-function SearchSelect({ label, items, selected, setSelected, placeholder }) {
+function SearchSelect({ label, items, selected, setSelected, placeholder, labels, extra, groups, unit = 'stores' }) {
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState(false)
   const [activeIdx, setActiveIdx] = useState(0)
@@ -25,9 +27,44 @@ function SearchSelect({ label, items, selected, setSelected, placeholder }) {
   const ref = useRef(null)
   const listRef = useRef(null)
 
-  const filtered = items.filter(s =>
-    search ? s.toLowerCase().includes(search.toLowerCase()) : false
-  ).slice(0, 40)
+  // With a labels map (code → name from master), search matches either the
+  // code or the name, and the dropdown shows "CODE — NAME".  The optional
+  // `extra` map (code → "RDC HUB") widens the match to those tokens, and
+  // `groups` ([{kind, code, stores}]) adds bulk-select rows when the query
+  // hits an RDC/HUB code.
+  const filtered = items.filter(s => {
+    if (!search) return false
+    const q = search.toLowerCase()
+    return s.toLowerCase().includes(q)
+      || (labels?.[s] || '').toLowerCase().includes(q)
+      || (extra?.[s]  || '').toLowerCase().includes(q)
+  }).slice(0, 40)
+
+  // Rank matched groups so an exact code match (e.g. SSN "S") always surfaces
+  // first, then prefix matches, then substrings; shorter codes win ties.
+  // Without this, a short query like "s" is a substring of many longer codes
+  // (MENS, LADIES, SSNL, …) and — combined with the old slice(0,6) in
+  // SEG→DIV→SUB_DIV→SSN insertion order — pushed the exact SSN:S group off the
+  // list so it never showed. Cap raised to 8 to leave room across kinds.
+  const matchedGroups = (search && groups)
+    ? (() => {
+        const q = search.toLowerCase()
+        const rank = c => { const lc = c.toLowerCase(); return lc === q ? 0 : lc.startsWith(q) ? 1 : 2 }
+        return groups
+          .filter(g => g.code.toLowerCase().includes(q))
+          .sort((a, b) => rank(a.code) - rank(b.code) || a.code.length - b.code.length)
+          .slice(0, 8)
+      })()
+    : []
+
+  const toggleGroup = (g) => {
+    setSelected(prev => {
+      const allIn = g.stores.every(s => prev.includes(s))
+      return allIn
+        ? prev.filter(s => !g.stores.includes(s))        // deselect whole group
+        : [...new Set([...prev, ...g.stores])]           // select whole group
+    })
+  }
 
   // Reset active index when filter results change
   useEffect(() => { setActiveIdx(0) }, [search])
@@ -64,11 +101,7 @@ function SearchSelect({ label, items, selected, setSelected, placeholder }) {
     } else if (e.key === 'Enter') {
       e.preventDefault()
       const item = filtered[activeIdx]
-      if (item) {
-        toggle(item)
-        setSearch('')
-        setOpen(false)
-      }
+      if (item) toggle(item) // stay open so multiple items can be picked
     } else if (e.key === 'Escape') {
       setOpen(false)
     } else if (e.key === 'Tab') {
@@ -102,7 +135,7 @@ function SearchSelect({ label, items, selected, setSelected, placeholder }) {
             </span>
             {visible.map(s => (
               <span key={s} onClick={() => toggle(s)}
-                title="Click to remove"
+                title={labels?.[s] ? `${labels[s]} — click to remove` : 'Click to remove'}
                 style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, cursor: 'pointer',
                   background: C.primaryLt, color: C.primary, border: `1px solid ${C.primaryBd}` }}>
                 {s} x
@@ -167,30 +200,85 @@ function SearchSelect({ label, items, selected, setSelected, placeholder }) {
             width: '100%', boxSizing: 'border-box' }}/>
 
         {/* Dropdown */}
-        {open && search && filtered.length > 0 && (
+        {open && search && (filtered.length > 0 || matchedGroups.length > 0) && (
           <div ref={listRef} style={{ position: 'absolute', top: 26, left: 0, right: 0, zIndex: 20,
             background: '#fff', border: '1px solid #e2e8f0', borderRadius: 4, boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-            maxHeight: 120, overflowY: 'auto' }}>
+            maxHeight: 160, overflowY: 'auto' }}>
+            {/* Bulk-select rows — query matched an RDC/HUB code */}
+            {matchedGroups.map(g => {
+              const allIn = g.stores.every(s => selected.includes(s))
+              const someIn = !allIn && g.stores.some(s => selected.includes(s))
+              return (
+                <div key={`${g.kind}:${g.code}`}
+                  onClick={() => toggleGroup(g)}
+                  title={allIn ? `Deselect all ${g.stores.length} ${unit} of ${g.kind} ${g.code}`
+                               : `Select all ${g.stores.length} ${unit} of ${g.kind} ${g.code}`}
+                  style={{ padding: '4px 8px', fontSize: 9, cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    background: allIn ? C.primaryLt : '#f8fafc',
+                    borderBottom: '1px solid #e2e8f0',
+                    color: C.primary, fontWeight: 700 }}>
+                  <input type="checkbox" checked={allIn} readOnly
+                    ref={el => { if (el) el.indeterminate = someIn }}
+                    style={{ margin: 0, width: 11, height: 11, cursor: 'pointer',
+                      accentColor: C.primary, flexShrink: 0, pointerEvents: 'none' }}/>
+                  {(() => {
+                    const kc = {
+                      RDC:     ['#eef2ff', C.primary, C.primaryBd],
+                      HUB:     ['#ecfeff', '#0891b2', '#a5f3fc'],
+                      SEG:     ['#ecfdf5', '#059669', '#a7f3d0'],
+                      DIV:     ['#fffbeb', '#d97706', '#fde68a'],
+                      SUB_DIV: ['#f5f3ff', '#7c3aed', '#ddd6fe'],
+                      SSN:     ['#fdf2f8', '#db2777', '#fbcfe8'],
+                    }[g.kind] || ['#eef2ff', C.primary, C.primaryBd]
+                    return (
+                      <span style={{ fontSize: 8, padding: '0 4px', borderRadius: 3,
+                        background: kc[0], color: kc[1], border: `1px solid ${kc[2]}` }}>{g.kind}</span>
+                    )
+                  })()}
+                  {g.code}
+                  <span style={{ color: C.textMuted, fontWeight: 400 }}>
+                    — {allIn ? 'deselect' : 'select'} all {g.stores.length} {unit}
+                  </span>
+                </div>
+              )
+            })}
             {filtered.map((item, idx) => {
               const isSel = selected.includes(item)
               const isActive = idx === activeIdx
               const bg = isActive ? '#dbeafe' : (isSel ? C.primaryLt : 'transparent')
               return (
                 <div key={item} data-idx={idx}
-                  onClick={() => { toggle(item); setSearch(''); setOpen(false) }}
+                  onClick={() => toggle(item)}
                   onMouseEnter={() => setActiveIdx(idx)}
                   style={{ padding: '3px 8px', fontSize: 9, cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', gap: 5,
                     background: bg,
                     color: isSel ? C.primary : C.text,
                     fontWeight: isSel ? 700 : 400,
                     borderLeft: isActive ? `2px solid ${C.primary}` : '2px solid transparent' }}>
-                  {item} {isSel && '(selected)'}
+                  <input type="checkbox" checked={isSel} readOnly
+                    style={{ margin: 0, width: 11, height: 11, cursor: 'pointer',
+                      accentColor: C.primary, flexShrink: 0, pointerEvents: 'none' }}/>
+                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {item}
+                    {labels?.[item] && (
+                      <span style={{ color: isSel ? C.primary : C.textMuted, fontWeight: 400 }}>
+                        {' — '}{labels[item]}
+                      </span>
+                    )}
+                  </span>
+                  {extra?.[item] && (
+                    <span style={{ color: C.textMuted, fontWeight: 400, fontSize: 8, flexShrink: 0 }}>
+                      {extra[item].split(' ').join(' · ')}
+                    </span>
+                  )}
                 </div>
               )
             })}
           </div>
         )}
-        {open && search && filtered.length === 0 && (
+        {open && search && filtered.length === 0 && matchedGroups.length === 0 && (
           <div style={{ position: 'absolute', top: 26, left: 0, right: 0, zIndex: 20,
             background: '#fff', border: '1px solid #e2e8f0', borderRadius: 4, padding: '6px 8px',
             fontSize: 9, color: C.textMuted }}>
@@ -539,6 +627,92 @@ function ToggleRow({ checked, setChecked, label, color, hint }) {
   )
 }
 
+/* ── Run-date field ────────────────────────────────────────────────────
+   Native <input type=date> for selection, but the box DISPLAYS the value in
+   dd-mmm-yy ddd format (e.g. "17-Jul-26 Fri") INSIDE the field — not as a
+   caption below. The native input is overlaid at 1×1/opacity 0 as the value
+   holder + calendar source; clicking the box opens the picker via
+   showPicker(). Empty picking date shows a muted placeholder. */
+function fmtRunDate(iso) {
+  if (!iso) return ''
+  const [y, m, d] = String(iso).split('-').map(Number)
+  if (!y || !m || !d) return ''
+  const dt = new Date(y, m - 1, d)
+  const mon = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][dt.getMonth()]
+  const wd  = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][dt.getDay()]
+  return `${String(d).padStart(2,'0')}-${mon}-${String(y).slice(-2)} ${wd}`
+}
+
+function RunDateField({ label, value, setValue, required, hint }) {
+  const ref = useRef(null)
+  const openPicker = () => {
+    const el = ref.current
+    if (!el) return
+    try { if (el.showPicker) el.showPicker(); else el.focus() } catch { el.focus() }
+  }
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: 12 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.text, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+        {label}{required && <span style={{ color: C.red }}>*</span>}
+      </div>
+      <div onClick={openPicker}
+        style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                 height: 34, boxSizing: 'border-box', padding: '0 8px', borderRadius: 6, cursor: 'pointer',
+                 background: C.inputBg, border: `1px solid ${value ? C.inputBorder : C.red}` }}>
+        <span style={{ fontSize: 12, fontWeight: 700, fontFamily: 'monospace', color: value ? C.text : C.textMuted }}>
+          {value ? fmtRunDate(value) : 'dd-mmm-yy'}
+        </span>
+        <Calendar size={13} color={C.textSub} style={{ flexShrink: 0 }}/>
+        <input ref={ref} type="date" value={value} onChange={e => setValue(e.target.value)} tabIndex={-1}
+          style={{ position: 'absolute', right: 0, bottom: 0, width: 1, height: 1, opacity: 0,
+                   pointerEvents: 'none', border: 'none', padding: 0, margin: 0 }}/>
+      </div>
+      {hint && <div style={{ fontSize: 9, color: C.textMuted, marginTop: 4 }}>{hint}</div>}
+    </div>
+  )
+}
+
+/* ── Collapsible section shell ─────────────────────────────────────────
+   Heavy panels (KPI tiles, run setup, tunables, charts) can be hidden by
+   the user; the choice persists per browser via localStorage. */
+const SECTIONS_LS_KEY = 'ars_listing_hidden_sections'
+function loadHiddenSections() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SECTIONS_LS_KEY))
+    if (saved && typeof saved === 'object') return saved
+  } catch { /* corrupt state → fall through to default */ }
+  return { insights: true } // charts are heavy — collapsed until first requested
+}
+
+function Section({ id, title, icon: Icon, badge, hidden, onToggle, children }) {
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`,
+      borderRadius: 10, boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+      <button onClick={() => onToggle(id)}
+        title={hidden ? `Show ${title}` : `Hide ${title}`}
+        style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 6,
+          padding: '7px 12px', background: 'transparent', border: 'none',
+          cursor: 'pointer', textAlign: 'left' }}>
+        {Icon && <Icon size={12} color={C.primary}/>}
+        <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: '.06em',
+          color: C.textSub, textTransform: 'uppercase' }}>{title}</span>
+        {badge != null && (
+          <span style={{ fontSize: 9, fontWeight: 700, color: C.textMuted,
+            background: '#f1f5f9', padding: '1px 6px', borderRadius: 8 }}>{badge}</span>
+        )}
+        <span style={{ flex: 1, height: 1, background: '#f1f5f9' }}/>
+        {hidden && <span style={{ fontSize: 9, color: C.textMuted }}>hidden</span>}
+        {hidden ? <ChevronDown size={13} color={C.textMuted}/> : <ChevronUp size={13} color={C.textMuted}/>}
+      </button>
+      {!hidden && (
+        <div style={{ padding: '0 10px 10px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {children}
+        </div>
+      )}
+    </div>
+  )
+}
+
 const pillStyle = (color) => ({
   fontSize: 9, fontWeight: 700, color, background: `${color}15`, padding: '2px 8px', borderRadius: 4,
   border: `1px solid ${color}40`, display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -555,6 +729,14 @@ const statusPillStyle = (status) => {
 
 export default function ListingPage() {
   const navigate = useNavigate()
+  const [hiddenSections, setHiddenSections] = useState(loadHiddenSections)
+  const toggleSection = useCallback((id) => {
+    setHiddenSections(prev => {
+      const next = { ...prev, [id]: !prev[id] }
+      try { localStorage.setItem(SECTIONS_LS_KEY, JSON.stringify(next)) } catch { /* private mode */ }
+      return next
+    })
+  }, [])
   const [config, setConfig] = useState(null)
   const [loading, setLoading] = useState(false)
   const [generating, setGenerating] = useState(false)
@@ -632,6 +814,69 @@ export default function ListingPage() {
   // ARS_GRID_HIERARCHY.SZ_APPLICABLE='N'. Y MAJ_CATs are never touched
   // (2026-07-02 spec still holds — missing sizes stay at 0).
   const [contFallbackMode, setContFallbackMode] = useState('P4_UNIFORM')
+  // Fresh/GRT pool selection. Defaults to FRESH (the everyday run); one MSA
+  // carries per-SLOC columns and the run allocates only from SLOCs classified
+  // as the chosen type in ARS_SLOC_SETTINGS (typed pool, FSD FS-02).
+  const [allocType, setAllocType] = useState('FRESH')
+  // Run dates (information-only, 2026-07-18). Stamped onto every allocation
+  // output row (ARS_ALLOC_WORKING → PARKED → HISTORY); never used in any
+  // stock/allocation calculation. Stock consider date is MANDATORY and
+  // defaults to D-1 (yesterday, local date); picking date is OPTIONAL/blank.
+  const _yesterdayISO = () => {
+    const d = new Date(); d.setDate(d.getDate() - 1)
+    const m = String(d.getMonth() + 1).padStart(2, '0')
+    const day = String(d.getDate()).padStart(2, '0')
+    return `${d.getFullYear()}-${m}-${day}`
+  }
+  const [stockConsiderDt, setStockConsiderDt] = useState(_yesterdayISO)
+  const [pickingDt, setPickingDt] = useState('')
+  // Auto-load Select Store from the BDC schedule (ARS_STORE_BDC_SCHEDULE)
+  // whenever the Picking Date changes — same source the Reconciliation
+  // "Generate BDC" uses (get_stores_for_date, maps the date's weekday to the
+  // Mon–Sat columns). Sunday / no schedule → clears the selection. Only codes
+  // present in the current run config are kept. Blank picking date → no-op
+  // (so the initial page load never clobbers a manual selection).
+  useEffect(() => {
+    if (!pickingDt) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { data } = await pendAlcAPI.scheduleStoresFor(pickingDt)
+        if (cancelled) return
+        const d = data?.data || data || {}
+        const sched = Array.isArray(d.stores) ? d.stores : []
+        const wd = d.weekday || ''
+        if (!sched.length) {
+          setSelectedStores([])
+          toast(`No stores scheduled for ${fmtRunDate(pickingDt)}${wd ? ` (${wd})` : ''} in the BDC schedule.`, { icon: '⚠️' })
+          return
+        }
+        const avail = new Set(config?.stores || [])
+        const valid = sched.filter(s => avail.has(s))
+        const dropped = sched.length - valid.length
+        setSelectedStores(valid)
+        toast.success(
+          `Loaded ${valid.length} store(s) scheduled for ${wd} ${fmtRunDate(pickingDt)}` +
+          (dropped > 0 ? ` (${dropped} not in this run config, skipped)` : '')
+        )
+      } catch (e) {
+        if (!cancelled) toast.error('Failed to load scheduled stores for the picking date.')
+      }
+    })()
+    return () => { cancelled = true }
+  }, [pickingDt, config?.stores])
+  // TBL hold *suppression* toggles (FSD FS-05/FS-06) — uniform semantics:
+  // unchecked = hold applied (default, current prod); checked = skip hold, so
+  // the row ships like RL/TBC (OPT_MBQ_WH = OPT_MBQ, HOLD_QTY = 0).
+  // NOTE: backend contract is apply_hold_seg_* (true = hold); the payload
+  // inverts these skip_* flags so the engine side is unchanged.
+  // Initial state matches the default pool (FRESH) via the pool→hold mapping
+  // below (2026-07-18) so a fresh page load is already consistent and the
+  // user can't miss a Hold Control selection: FRESH ⇒ skip hold on UPC + GM
+  // (APP off); GRT ⇒ skip hold on all three. Still fully editable.
+  const [skipHoldUPC, setSkipHoldUPC] = useState(true)
+  const [skipHoldSegApp, setSkipHoldSegApp] = useState(false)
+  const [skipHoldSegGm, setSkipHoldSegGm] = useState(true)
   // MJ_MBQ growth headroom (Allocation Gate).  Slider value applies only
   // when mbqGrowthUseDefault is OFF.  Checked = force 100% (strict cap).
   // Unchecked = scale MJ_MBQ → MJ_MBQ_REV by this %, then MJ_REQ_REV is
@@ -750,15 +995,11 @@ export default function ListingPage() {
   }
 
   // ── Parallel allocation (Part 8) ─────────────────────────────────────
-  // 'pandas'   – legacy cumulative-window race
-  // 'per_opt'  – one-OPT-at-a-time sequential engine with pre-validated gates (default)
-  // 'sequential' – single-thread SQL fallback
-  const [allocationMode, setAllocationMode] = useState('per_opt')
-  // Execution order for per_opt mode. opt_type_first matches today's loop nesting
-  // (RL all rounds → TBC all rounds → TBL all rounds). round_first reorders to
-  // round outermost (everyone gets 1× MBQ before anyone gets 2×). Backend wiring
-  // for round_first is pending — current per_opt engine always runs opt_type_first.
-  const [execOrder, setExecOrder] = useState('opt_type_first')
+  // per_opt is the ONLY allocation engine (2026-07-10 removal — see
+  // backend/app/docs/REMOVAL_PLAN_PER_OPT_ONLY.md). The Pandas/Sequential
+  // mode radios and the Order A/B selector were removed with it; the
+  // payload sends allocation_mode='per_opt' explicitly and the backend
+  // hard-400s on anything else.
   const [allocOtFilter, setAllocOtFilter]   = useState('all')   // 'all' | 'rl' | 'rl_tbc'
   // Default 4 (not 8) — on Azure SQL with a small SKU, 8 workers cause
   // 'generic waitable object' deadlocks (tempdb metadata + memory-grant
@@ -859,13 +1100,11 @@ export default function ListingPage() {
           setPriCheckTBC(s.pri_ct_check_tbc === 'true' || s.pri_ct_check_tbc === true)
         if (s.rl_mbq_cap_pct !== undefined)  setRlMbqCapPct(parseFloat(s.rl_mbq_cap_pct) || 110)
         if (s.tbc_mbq_cap_pct !== undefined) setTbcMbqCapPct(parseFloat(s.tbc_mbq_cap_pct) || 110)
-        // Unified dispatch mode — prefer tbc_dispatch_mode, fall back to rl,
-        // else COMPLETE. If the two were set differently via direct API, the
-        // UI surfaces tbc's value; the user can re-pick to re-sync both.
-        if (s.tbc_dispatch_mode !== undefined || s.rl_dispatch_mode !== undefined) {
-          const v = String(s.tbc_dispatch_mode ?? s.rl_dispatch_mode).toUpperCase()
-          setDispatchMode(v === 'SCALED' ? 'SCALED' : 'COMPLETE')
-        }
+        // Dispatch mode is locked to COMPLETE (2026-07-17). SCALED was
+        // disabled, so any stale saved value — including a legacy 'SCALED' —
+        // is normalized to COMPLETE. The backend field_validator coerces it
+        // too; this just keeps the (now single-option) radio consistent.
+        setDispatchMode('COMPLETE')
         if (s.mj_req_growth_pct !== undefined) {
           const v = parseFloat(s.mj_req_growth_pct) || 100
           // Reflect persisted value: 100 → use-default checked; >100 → unchecked + slider.
@@ -1036,6 +1275,62 @@ export default function ListingPage() {
   const autoRdcs = [...new Set((selectedStores || []).map(s => storeRdcMap[s]).filter(Boolean))]
   const otherRdcs = (config?.rdcs || []).filter(r => !autoRdcs.includes(r))
 
+  // Store search metadata: per-store "RDC HUB" tokens (searchable + shown as
+  // row suffix) and RDC/HUB groups for one-click bulk selection.
+  const storeSearchExtra = useMemo(() => {
+    const hubMap = config?.store_hub_map || {}
+    const rdcMap = config?.store_rdc_map || {}
+    const out = {}
+    ;(config?.stores || []).forEach(s => {
+      const parts = [rdcMap[s], hubMap[s]].filter(Boolean)
+      if (parts.length) out[s] = parts.join(' ')
+    })
+    return out
+  }, [config])
+  const storeGroups = useMemo(() => {
+    const hubMap = config?.store_hub_map || {}
+    const rdcMap = config?.store_rdc_map || {}
+    const byKey = {}
+    ;(config?.stores || []).forEach(s => {
+      [['RDC', rdcMap[s]], ['HUB', hubMap[s]]].forEach(([kind, code]) => {
+        if (!code) return
+        const key = `${kind}:${code}`
+        if (!byKey[key]) byKey[key] = { kind, code, stores: [] }
+        byKey[key].stores.push(s)
+      })
+    })
+    return Object.values(byKey)
+  }, [config])
+
+  // MAJ_CAT search metadata: per-MAJ_CAT "SEG DIV SUB_DIV SSN" tokens and
+  // hierarchy groups for one-click bulk selection (mirrors the store filter).
+  const majCatSearchExtra = useMemo(() => {
+    const attr = config?.maj_cat_attr_map || {}
+    const out = {}
+    ;(config?.maj_cats || []).forEach(mc => {
+      const a = attr[mc]
+      if (!a) return
+      const parts = [a.seg, a.div, a.sub_div, a.ssn].filter(Boolean)
+      if (parts.length) out[mc] = parts.join(' ')
+    })
+    return out
+  }, [config])
+  const majCatGroups = useMemo(() => {
+    const attr = config?.maj_cat_attr_map || {}
+    const byKey = {}
+    ;(config?.maj_cats || []).forEach(mc => {
+      const a = attr[mc]
+      if (!a) return
+      ;[['SEG', a.seg], ['DIV', a.div], ['SUB_DIV', a.sub_div], ['SSN', a.ssn]].forEach(([kind, code]) => {
+        if (!code) return
+        const key = `${kind}:${code}`
+        if (!byKey[key]) byKey[key] = { kind, code, stores: [] }
+        byKey[key].stores.push(mc)
+      })
+    })
+    return Object.values(byKey)
+  }, [config])
+
   const handlePause = () => {
     setPaused(p => !p)
     toast(paused ? 'Resumed' : 'Paused — click Resume to continue', { icon: paused ? '\u25b6' : '\u23f8' })
@@ -1106,6 +1401,18 @@ export default function ListingPage() {
   }
 
   const handleGenerate = async () => {
+    if (!allocType) {
+      toast.error('Select allocation type (Fresh or GRT) before generating.')
+      return
+    }
+    if (!stockConsiderDt) {
+      toast.error('Enter the Stock Consider Date before generating (it is mandatory).')
+      return
+    }
+    if (!pickingDt) {
+      toast.error('Enter the Picking Date before generating (it is mandatory).')
+      return
+    }
     if (parkedRuns.length > 0 && !allowMultiParked) {
       toast.error('A parked session is awaiting review — approve or reject it from the Parked Runs section, or enable "Allow multiple parked" to stack snapshots.')
       return
@@ -1160,14 +1467,24 @@ export default function ListingPage() {
         // params so direct-API callers can still split them if they want.
         rl_dispatch_mode:  dispatchMode,
         tbc_dispatch_mode: dispatchMode,
-        allocation_mode: allocationMode,
-        exec_order: execOrder,
+        // per_opt is the only engine — sent explicitly for clarity; the
+        // backend 400s on any other value (removal 2026-07-10).
+        allocation_mode: 'per_opt',
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
         use_writer_queue: useWriterQueue,
         ssn_values: selectedSsn,
         opt_types: ({ all: ['RL','TBC','TBL'], rl: ['RL'], rl_tbc: ['RL','TBC'] })[allocOtFilter] || ['RL','TBC','TBL'],
         allow_multi_parked: !!allowMultiParked,
         cont_fallback_mode: contFallbackMode,
+        // Run dates (information-only) — stamped onto allocation output rows.
+        stock_consider_dt: stockConsiderDt,
+        picking_dt: pickingDt || null,
+        // Fresh/GRT pool + hold suppression (FSD FS-03) — snake_case, no bridge.
+        alloc_type: allocType,
+        skip_hold_upc: !!skipHoldUPC,
+        // UI toggles are "skip hold"; backend expects "apply hold" — invert.
+        apply_hold_seg_app: !skipHoldSegApp,
+        apply_hold_seg_gm: !skipHoldSegGm,
       }
       if (rdcMode === 'own') {
         payload.rdc_values = autoRdcs
@@ -1329,7 +1646,7 @@ export default function ListingPage() {
           setAllocBatchId(job.batch_id)
           setAllocProgress(job.progress || null)
           setAllocFailed(job.failed || [])
-          if (job.mode) setAllocationMode(job.mode)
+          // job.mode no longer adopted — per_opt is the only engine.
         }
       } catch { /* ignore — keep polling */ }
     }
@@ -1398,8 +1715,6 @@ export default function ListingPage() {
     try {
       const { data } = await listingAPI.retryFailed({
         batch_id: allocBatchId,
-        allocation_mode: allocationMode,
-        exec_order: execOrder,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
       })
       // The backend now returns one of:
@@ -1569,7 +1884,9 @@ export default function ListingPage() {
       {hierHasGaps && (
         <div style={{
           background: hierGapsDismissed ? '#fffbeb' : '#fef3c7',
-          border: `1px solid ${hierGapsDismissed ? '#fcd34d' : '#f59e0b'}`,
+          borderTop: `1px solid ${hierGapsDismissed ? '#fcd34d' : '#f59e0b'}`,
+          borderRight: `1px solid ${hierGapsDismissed ? '#fcd34d' : '#f59e0b'}`,
+          borderBottom: `1px solid ${hierGapsDismissed ? '#fcd34d' : '#f59e0b'}`,
           borderLeft: `4px solid #d97706`,
           borderRadius: 8, padding: '10px 14px',
           boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
@@ -1677,6 +1994,7 @@ export default function ListingPage() {
       {/* ═══════════ Page Header + Primary Actions ═══════════ */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        flexWrap: 'wrap', gap: 8,
         background: 'linear-gradient(135deg, #fff 0%, #f8fafc 100%)',
         border: `1px solid ${C.cardBorder}`, borderRadius: 10, padding: '10px 14px',
         boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
@@ -1693,7 +2011,7 @@ export default function ListingPage() {
             Score, rank, list, and allocate options across stores · output → ARS_LISTING / ARS_LISTING_WORKING / ARS_ALLOC_WORKING
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           {generating ? (
             <>
               <button onClick={handlePause}
@@ -1718,88 +2036,61 @@ export default function ListingPage() {
               <div style={{
                 display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px',
                 background: '#fff', border: `1px solid ${C.cardBorder}`,
-                borderRadius: 8, height: 38,
+                borderRadius: 8, minHeight: 38, flexWrap: 'wrap',
               }}>
                 <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
                   textTransform: 'uppercase', letterSpacing: 0.4 }}>OPT Types</span>
                 {[['all','All (RL→TBC→TBL)'],['rl','RL only'],['rl_tbc','RL + TBC']].map(([val, label]) => (
-                  <button key={val} onClick={() => setAllocOtFilter(val)}
-                    style={{ height: 26, padding: '0 9px', fontSize: 10, fontWeight: 600,
-                      borderRadius: 5, cursor: 'pointer',
-                      border: allocOtFilter === val ? `1.5px solid #4f46e5` : `1px solid ${C.cardBorder}`,
-                      background: allocOtFilter === val ? '#ede9fe' : '#fff',
-                      color: allocOtFilter === val ? '#4f46e5' : C.textSub }}>
+                  <label key={val}
+                    style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
+                      cursor: 'pointer', whiteSpace: 'nowrap',
+                      color: allocOtFilter === val ? '#4f46e5' : C.textSub,
+                      fontWeight: allocOtFilter === val ? 700 : 500 }}>
+                    <input type="radio" name="alloc_ot_filter"
+                      checked={allocOtFilter === val}
+                      onChange={() => setAllocOtFilter(val)}
+                      style={{ margin: 0, cursor: 'pointer', accentColor: '#4f46e5' }}/>
                     {label}
-                  </button>
+                  </label>
                 ))}
-                <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
-                  textTransform: 'uppercase', letterSpacing: 0.4 }}>Alloc</span>
-                <select value={allocationMode}
-                  onChange={(e) => setAllocationMode(e.target.value)}
-                  title="pandas = today's vectorized cumulative-window race. per_opt = sequential one-OPT-at-a-time with pre-validated gates and honest SKIP_REASONs (R07_SIZE_RATIO_LIVE / POOL_EMPTY / MBQ_CAP_*). sequential = single-thread SQL fallback."
-                  style={{ height: 26, fontSize: 11, fontWeight: 600,
+                {/* per_opt is the only allocation engine (2026-07-10 removal —
+                    see backend/app/docs/REMOVAL_PLAN_PER_OPT_ONLY.md). The
+                    Pandas/Sequential radios and the Order A/B selector were
+                    removed with it; Workers + Writer-Q still apply. */}
+                <span style={{ width: 1, alignSelf: 'stretch', background: '#e2e8f0' }}/>
+                <span style={{ fontSize: 10, color: C.textMuted }}
+                  title='Number of parallel worker threads. Capped at 8 — more would saturate the Python GIL in this uvicorn process and freeze unrelated requests like /auth/login.'>
+                  workers
+                </span>
+                <input type="number" min={2} max={8}
+                  value={parallelWorkers}
+                  onChange={(e) => setParallelWorkers(e.target.value)}
+                  style={{ width: 48, height: 26, fontSize: 11,
                     border: `1px solid ${C.cardBorder}`, borderRadius: 6,
-                    padding: '0 6px', background: '#fff', color: C.text,
-                    cursor: 'pointer' }}>
-                  <option value="pandas">Pandas (in-memory)</option>
-                  <option value="per_opt">Per-OPT (sequential, new)</option>
-                  <option value="sequential">Sequential (fallback)</option>
-                </select>
-                {allocationMode === 'per_opt' && (
-                  <>
-                    <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
-                      textTransform: 'uppercase', letterSpacing: 0.4, marginLeft: 4 }}
-                      title="Order A (opt_type_first): RL all rounds → TBC all rounds → TBL all rounds. Order B (round_first): R1 across RL/TBC/TBL → R2 across all → R3. Order B fairer to TBL; backend wiring pending — currently both run as opt_type_first.">
-                      Order
-                    </span>
-                    <select value={execOrder}
-                      onChange={(e) => setExecOrder(e.target.value)}
-                      style={{ height: 26, fontSize: 11, fontWeight: 600,
-                        border: `1px solid ${C.cardBorder}`, borderRadius: 6,
-                        padding: '0 6px', background: '#fff', color: C.text,
-                        cursor: 'pointer' }}>
-                      <option value="opt_type_first">A · OPT_TYPE first</option>
-                      <option value="round_first">B · Round first (preview)</option>
-                    </select>
-                  </>
-                )}
-                {allocationMode !== 'sequential' && (
-                  <>
-                    <span style={{ fontSize: 10, color: C.textMuted }}
-                      title="Number of parallel worker threads. Capped at 8 — more would saturate the Python GIL in this uvicorn process and freeze unrelated requests like /auth/login.">
-                      workers
-                    </span>
-                    <input type="number" min={2} max={8}
-                      value={parallelWorkers}
-                      onChange={(e) => setParallelWorkers(e.target.value)}
-                      style={{ width: 48, height: 26, fontSize: 11,
-                        border: `1px solid ${C.cardBorder}`, borderRadius: 6,
-                        padding: '0 6px', textAlign: 'center' }}/>
-                    {/* Writer-queue toggle (Pattern A) — routes all DB writes
-                        through one thread to eliminate worker-worker deadlocks.
-                        Recommended ON for 4+ workers. */}
-                    <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
-                      textTransform: 'uppercase', letterSpacing: 0.4, marginLeft: 4 }}
-                      title="Routes all DB writes through a single thread to prevent the &quot;deadlocked on lock | generic waitable object&quot; failures. Recommended ON for 4+ workers. OFF reverts to the legacy direct-write path.">
-                      Writer-Q
-                    </span>
-                    <button type="button"
-                      onClick={() => setUseWriterQueue(v => !v)}
-                      title={useWriterQueue
-                        ? 'ON — single-writer mode (no deadlocks). Click to switch off.'
-                        : 'OFF — legacy mode (workers write directly, risk of deadlocks). Click to switch on.'}
-                      style={{ height: 26, padding: '0 10px', fontSize: 10, fontWeight: 700,
-                        borderRadius: 5, cursor: 'pointer',
-                        border: `1.5px solid ${useWriterQueue ? '#059669' : C.cardBorder}`,
-                        background: useWriterQueue ? '#d1fae5' : '#fff',
-                        color: useWriterQueue ? '#065f46' : C.textSub,
-                        display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <span style={{ width: 6, height: 6, borderRadius: '50%',
-                        background: useWriterQueue ? '#059669' : '#cbd5e1' }}/>
-                      {useWriterQueue ? 'ON' : 'OFF'}
-                    </button>
-                  </>
-                )}
+                    padding: '0 6px', textAlign: 'center' }}/>
+                {/* Writer-queue toggle (Pattern A) — routes all DB writes
+                    through one thread to eliminate worker-worker deadlocks.
+                    Recommended ON for 4+ workers. */}
+                <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
+                  textTransform: 'uppercase', letterSpacing: 0.4, marginLeft: 4 }}
+                  title='Routes all DB writes through a single thread to prevent the "deadlocked on lock | generic waitable object" failures. Recommended ON for 4+ workers. OFF reverts to the legacy direct-write path.'>
+                  Writer-Q
+                </span>
+                <button type="button"
+                  onClick={() => setUseWriterQueue(v => !v)}
+                  title={useWriterQueue
+                    ? 'ON — single-writer mode (no deadlocks). Click to switch off.'
+                    : 'OFF — legacy mode (workers write directly, risk of deadlocks). Click to switch on.'}
+                  style={{ height: 26, padding: '0 10px', fontSize: 10, fontWeight: 700,
+                    borderRadius: 5, cursor: 'pointer',
+                    border: `1.5px solid ${useWriterQueue ? '#059669' : C.cardBorder}`,
+                    background: useWriterQueue ? '#d1fae5' : '#fff',
+                    color: useWriterQueue ? '#065f46' : C.textSub,
+                    display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%',
+                    background: useWriterQueue ? '#059669' : '#cbd5e1' }}/>
+                  {useWriterQueue ? 'ON' : 'OFF'}
+                </button>
               </div>
               {/* Parking mode moved to Settings → Application (admin-only).
                   `allowMultiParked` is still loaded from /listing/config and
@@ -1837,13 +2128,24 @@ export default function ListingPage() {
                   display: 'flex', alignItems: 'center', gap: 6 }}>
                 <FileText size={13}/> View Logs
               </button>
+              <button onClick={() => navigate(`/data-prep/listing/run-params${activeSessionId ? `?session=${activeSessionId}` : ''}`)}
+                title="Review every tunable + condition that produced a run (view or compare two runs)"
+                style={{ height: 38, borderRadius: 8, fontSize: 12, fontWeight: 600,
+                  color: C.text, padding: '0 14px',
+                  background: '#fff', border: `1px solid ${C.cardBorder}`,
+                  cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Sliders size={13}/> Run Parameters
+              </button>
             </>
           )}
         </div>
       </div>
 
       {/* ═══════════ KPI Tiles — top-line numbers ═══════════ */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 }}>
+      <Section id="kpi" title="Key Numbers" icon={Database}
+        hidden={!!hiddenSections.kpi} onToggle={toggleSection}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(165px, 1fr))', gap: 6 }}>
         <KpiTile icon={Database} label="MSA" value={config?.msa_gen_art_rows} accent="#0891b2"
           sub={(() => {
             const mcCount = (summary?.by_maj_cat || []).length
@@ -1878,6 +2180,7 @@ export default function ListingPage() {
           accent="#f59e0b"
           sub={totalHoldQty > 0 ? 'reserved for NL/TBL' : 'no hold'}/>
       </div>
+      </Section>
 
       {/* ═══════════ Parked Runs — review queue ═══════════ */}
       {(() => {
@@ -1886,8 +2189,12 @@ export default function ListingPage() {
         return (
           <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`,
             borderRadius: 10, boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
-            <button
+            {/* div with button semantics — a real <button> can't contain the
+                nested refresh <button> (invalid DOM nesting) */}
+            <div
+              role="button" tabIndex={0}
               onClick={() => setParkedExpanded(e => !e)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setParkedExpanded(x => !x) } }}
               style={{ width: '100%', background: 'transparent', border: 'none',
                 padding: '8px 12px', display: 'flex', justifyContent: 'space-between',
                 alignItems: 'center', cursor: 'pointer', borderBottom: parkedExpanded
@@ -1911,7 +2218,7 @@ export default function ListingPage() {
                 </button>
                 {parkedExpanded ? <ChevronUp size={14}/> : <ChevronDown size={14}/>}
               </span>
-            </button>
+            </div>
             {parkedExpanded && count > 0 && (
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
@@ -2113,10 +2420,8 @@ export default function ListingPage() {
 
       {/* ═══════════ Live Run Dashboard ═══════════ */}
       {(generating || (allocBatchId && allocProgress) || activeJob) && (() => {
-        const MODE_INFO = {
-          pandas:     { label: 'Pandas (in-memory)', color: '#06b6d4', icon: Database },
-          sequential: { label: 'Sequential',         color: '#64748b', icon: Loader2 },
-        }
+        // per_opt is the only allocation engine (2026-07-10 removal).
+        const m = { label: 'Per-OPT', color: '#4f46e5', icon: Database }
         // Server-detected stage (from /listing/active-job): listing → alloc → complete.
         // We expand the 3 server states into a 5-step visual breakup so the
         // user sees the natural sub-phases of each stage. Mapping:
@@ -2135,7 +2440,6 @@ export default function ListingPage() {
                               ? (allocProgress.pending > 0 || allocProgress.in_progress > 0
                                  ? 'alloc' : 'complete')
                               : (generating ? 'listing' : null))
-        const m = MODE_INFO[allocationMode] || MODE_INFO.pandas
         const ModeIcon = m.icon
         const isRunning = generating
                        || (allocProgress && (allocProgress.pending > 0 || allocProgress.in_progress > 0))
@@ -2187,9 +2491,7 @@ export default function ListingPage() {
             }}>
               <ModeIcon size={11} className={isRunning ? 'animate-spin' : ''}/>
               {m.label}
-              {allocationMode === 'pandas' && (
-                <span style={{ opacity: 0.85 }}>· {parallelWorkers}w</span>
-              )}
+              <span style={{ opacity: 0.85 }}>· {parallelWorkers}w</span>
             </div>
             {/* Status pill */}
             <span style={{
@@ -2405,92 +2707,59 @@ export default function ListingPage() {
         )
       })()}
 
-      {/* ═══════════ Run Setup (filters + scope + mix + run mode) ═══════════ */}
-      <div style={{ ..._card, padding: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-          <div style={{ ..._lbl, marginBottom: 0 }}>RUN SETUP</div>
-          <div style={{ flex: 1, height: 1, background: '#f1f5f9' }}/>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1.1fr 220px', gap: 10 }}>
-          <SearchSelect label="Select Store"   items={config?.stores || []}
-            selected={selectedStores}  setSelected={setSelectedStores}  placeholder="Search store..."/>
-          <SearchSelect label="Select MAJ_CAT" items={config?.maj_cats || []}
-            selected={selectedMajCats} setSelected={setSelectedMajCats} placeholder="Search MAJ_CAT..."/>
-          <div>
-            <div style={{ ..._lbl, display: 'flex', alignItems: 'center', gap: 4 }}>
-              <Play size={9} color={C.primary}/> RUN MODE
+      {/* ═══════════ Run Setup (store + MAJ_CAT filters) ═══════════ */}
+      <Section id="runsetup" title="Run Setup" icon={Filter}
+        hidden={!!hiddenSections.runsetup} onToggle={toggleSection}>
+        {/* Option B layout (2026-07-18): two labelled groups — "Scope"
+            (store + MAJ_CAT) and "Run dates" (stock + picking). Scope takes
+            ~2× the width of Run dates; both wrap to full width on narrow
+            screens (flex-basis + wrap). Run dates are information-only,
+            stamped onto every allocation output row (ARS_ALLOC_WORKING →
+            PARKED → HISTORY) and never used in any calculation. */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'stretch' }}>
+          {/* ── Group: Scope ── */}
+          <div style={{ flex: '2 1 360px', background: C.statBg, border: `1px solid ${C.cardBorder}`, borderRadius: 12, padding: 10 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.6, textTransform: 'uppercase', color: C.primary, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 5 }}>
+              <Filter size={11} color={C.primary}/> Scope
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, marginTop: 4 }}>
-              {[['listing','Listing only', C.primary],
-                ['full','Full Pipeline', '#7c3aed']].map(([v, l, clr]) => (
-                <button key={v} onClick={() => setRunMode(v)}
-                  style={{ ..._btn(runMode===v, clr), height: 26, fontSize: 10 }}>{l}</button>
-              ))}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 10 }}>
+              <SearchSelect label="Select Store"   items={config?.stores || []}
+                labels={config?.store_name_map}
+                extra={storeSearchExtra} groups={storeGroups}
+                selected={selectedStores}  setSelected={setSelectedStores}
+                placeholder="Search store, name, RDC or hub..."/>
+              <SearchSelect label="Select MAJ_CAT" items={config?.maj_cats || []}
+                extra={majCatSearchExtra} groups={majCatGroups} unit="MAJ_CATs"
+                selected={selectedMajCats} setSelected={setSelectedMajCats}
+                placeholder="Search MAJ_CAT, SEG, DIV, SUB_DIV or SSN..."/>
             </div>
-            <div style={{ fontSize: 8.5, color: C.textMuted, marginTop: 4, lineHeight: 1.3 }}>
-              {runMode === 'full'
-                ? 'MSA → Grid → Listing → Allocation'
-                : 'Listing → Allocation (skip MSA & Grid)'}
-            </div>
-          </div>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10,
-          paddingTop: 8, borderTop: '1px dashed #e2e8f0' }}>
-          <div>
-            <div style={_lbl}>RDC SCOPE</div>
-            <div style={{ display: 'flex', gap: 4, marginTop: 3 }}>
-              {[['all','All RDCs','See every RDC'],
-                ['own','Own','Auto-detected from selected stores'],
-                ['cross','Cross','Pull stock from other RDCs']].map(([v, l, hint]) => (
-                <button key={v} onClick={() => { setRdcMode(v); setCrossFrom([]) }}
-                  title={hint}
-                  style={{ ..._btn(rdcMode===v), height: 26, padding: '0 12px', fontSize: 10 }}>{l}</button>
-              ))}
-            </div>
-            {rdcMode === 'own' && autoRdcs.length > 0 && (
-              <div style={{ marginTop: 5, display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, flexWrap: 'wrap' }}>
-                <span style={{ color: C.textMuted }}>Detected:</span>
-                {autoRdcs.map(r => <span key={r} style={pillStyle(C.primary)}>{r}</span>)}
-              </div>
-            )}
-            {rdcMode === 'cross' && otherRdcs.length > 0 && (
-              <div style={{ marginTop: 5, display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, flexWrap: 'wrap' }}>
-                <span style={{ color: C.textMuted }}>Pull from:</span>
-                {otherRdcs.map(r => {
-                  const on = crossFrom.includes(r)
-                  return <button key={r}
-                    onClick={() => setCrossFrom(p => on ? p.filter(x=>x!==r) : [...p, r])}
-                    style={{ ..._btn(on, C.amber), height: 22, fontSize: 9, padding: '0 8px' }}>{r}</button>
-                })}
+            {pickingDt && (
+              <div style={{ marginTop: 6, fontSize: 9, color: C.textMuted, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Calendar size={10} color={C.textMuted}/>
+                Stores auto-loaded from the BDC schedule for {fmtRunDate(pickingDt)}
               </div>
             )}
           </div>
-
-          <div>
-            <div style={_lbl}>MIX-LINE AGGREGATION</div>
-            <div style={{ display: 'flex', gap: 4, marginTop: 3 }}>
-              {[['st_maj_rng','MAJ + RNG','1 row per store × MAJ_CAT × RNG_SEG'],
-                ['st_maj','MAJ only','1 row per store × MAJ_CAT'],
-                ['each','Each','Keep every MIX line']].map(([v, l, hint]) => (
-                <button key={v} onClick={() => setMixMode(v)} title={hint}
-                  style={{ ..._btn(mixMode===v, '#0891b2'), height: 26, padding: '0 12px', fontSize: 10 }}>{l}</button>
-              ))}
+          {/* ── Group: Run dates ── */}
+          <div style={{ flex: '1 1 260px', background: C.statBg, border: `1px solid ${C.cardBorder}`, borderRadius: 12, padding: 10 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.6, textTransform: 'uppercase', color: C.primary, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 5 }}>
+              <Calendar size={11} color={C.primary}/> Run dates
             </div>
-            <div style={{ fontSize: 8.5, color: C.textMuted, marginTop: 4, lineHeight: 1.3 }}>
-              {mixMode === 'st_maj_rng' && '1 line per store × MAJ_CAT × range segment'}
-              {mixMode === 'st_maj'     && '1 line per store × MAJ_CAT (collapses range segments)'}
-              {mixMode === 'each'       && 'No aggregation — every MIX line preserved'}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 }}>
+              <RunDateField label="Stock Consider Date" required
+                value={stockConsiderDt} setValue={setStockConsiderDt}
+                hint="Mandatory · defaults to D-1 (yesterday) · info only, not used in calculation"/>
+              <RunDateField label="Picking Date" required
+                value={pickingDt} setValue={setPickingDt}
+                hint="Mandatory · planned picking / dispatch date (blank by default)"/>
             </div>
           </div>
         </div>
-      </div>
+      </Section>
 
       {/* ═══════════ Tunable Parameters (grouped) ═══════════ */}
-      <div style={{ ..._card, padding: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-          <div style={{ ..._lbl, marginBottom: 0 }}>TUNABLE PARAMETERS</div>
-          <div style={{ flex: 1, height: 1, background: '#f1f5f9' }}/>
-        </div>
+      <Section id="params" title="Tunable Parameters" icon={Zap}
+        hidden={!!hiddenSections.params} onToggle={toggleSection}>
         {/*
           3-column layout (down from 5).  Each column is a flex stack of
           ParamGroups so the 11-control "Allocation Gates" column from the
@@ -2498,122 +2767,284 @@ export default function ListingPage() {
           knobs) and "Sizing" (size-coverage gates + sec-grid + season),
           with Stock & Excess + Store Ranking stacking in column 1.
         */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.15fr 1fr', gap: 16 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            <ParamGroup title="Stock & Excess" color="#0891b2">
-              <ParamInput label="Stock %"    value={stockThresholdPct} setter={setStockThresholdPct} step={0.05}
-                hint={`${Math.round(stockThresholdPct*100)}%`}    tip="OPT_TYPE classification: STK ≥ X × ACS_D → RL (else TBC/TBL/MIX). Does NOT affect R07 — see Size Cov % under Sizing."/>
-              <ParamInput label="Excess ×"   value={excessMultiplier}  setter={setExcessMultiplier}  step={0.5}
-                hint={`${excessMultiplier}× OPT_MBQ`}             tip="Excess if STK > X × OPT_MBQ"/>
-              <ParamInput label="Hold Days"  value={holdDays}          setter={setHoldDays}          step={1}
-                hint={`${holdDays}d`}                             tip="OPT_MBQ_WH hold lookback window"/>
-              <ParamInput label="AGE <"      value={ageThreshold}      setter={setAgeThreshold}      step={1}
-                hint={`${ageThreshold}d`}                         tip="Use PER_OPT_SALE if AGE < X days"/>
-            </ParamGroup>
+        {/* Banded layout (2026-07-18): three purpose-bands replace the flat
+            auto-fit grid so grouping no longer depends on column count.
+            Band 1 Run scope (what/where), Band 2 Listing & classification,
+            Band 3 Allocation gates. Each band tiles its ParamGroups via an
+            inner auto-fit grid. Pure presentation — no control logic changed. */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
 
-            <ParamGroup title="Store Ranking" color={C.blue}>
-              <ParamInput label="Req %"  value={reqWeight}   setter={setReqWeight}   step={0.1}
-                hint={`${Math.round(reqWeight*100)}%`}  tip="Weight for OPT_REQ"/>
-              <ParamInput label="Fill %" value={fillWeight}  setter={setFillWeight}  step={0.1}
-                hint={`${Math.round(fillWeight*100)}%`} tip="Weight for fill rate"/>
-              <ParamInput label="ACS_D"  value={defaultAcsD} setter={setDefaultAcsD} step={1}
-                hint={`def=${defaultAcsD}`}             tip="Default AGE-of-Comparable-Stock fallback"/>
-            </ParamGroup>
-          </div>
+          {/* ═══════════ Band 1 — Run scope ═══════════ */}
+          <div style={{ background: '#faf5ff', border: '1px solid #ede4fb', borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: '.06em', color: '#7c3aed', marginBottom: 10 }}>RUN SCOPE</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, alignItems: 'start' }}>
 
-          <ParamGroup title="Caps & Growth" color={C.green}>
-            <ToggleRow checked={priCheckRL}  setChecked={setPriCheckRL}
-              label="PRI ≥ 100% (RL)"  color="#0891b2"
-              hint={priCheckRL
-                ? `ON — RL listed only if PRI_CT% ≥ 100; cap = Grid Growth (${mbqGrowthUseDefault ? 100 : mjReqGrowthPct}%)`
-                : `OFF — RL cap = user-set Dispatch Cap (${rlMbqCapPct}%)`}/>
-            {!priCheckRL && (
-              <ParamInput label="RL Cap %" value={rlMbqCapPct} setter={setRlMbqCapPct} step={5} min={50} max={200}
-                hint={`Ship up to ${rlMbqCapPct}% × MJ_MBQ_ORIG`}
-                tip="When PRI ≥ 100% (RL) is OFF, this caps the total RL SHIP_QTY at cap% × MJ_MBQ_ORIG per (WERKS, MAJ_CAT). When the toggle is ON, the RL cap follows the Grid MBQ Growth % (default) instead."/>
-            )}
-            <ToggleRow checked={priCheckTBC} setChecked={setPriCheckTBC}
-              label="PRI ≥ 100% (TBC)" color="#0891b2"
-              hint={priCheckTBC
-                ? `ON — TBC listed only if PRI_CT% ≥ 100; cap = Grid Growth (${mbqGrowthUseDefault ? 100 : mjReqGrowthPct}%)`
-                : `OFF — TBC cap = user-set Dispatch Cap (${tbcMbqCapPct}%)`}/>
-            {!priCheckTBC && (
-              <ParamInput label="TBC Cap %" value={tbcMbqCapPct} setter={setTbcMbqCapPct} step={5} min={50} max={200}
-                hint={`Ship up to ${tbcMbqCapPct}% × MJ_MBQ_ORIG`}
-                tip="When PRI ≥ 100% (TBC) is OFF, this caps the total TBC SHIP_QTY at cap% × MJ_MBQ_ORIG per (WERKS, MAJ_CAT). When the toggle is ON, the TBC cap follows the Grid MBQ Growth % (default) instead."/>
-            )}
-            <SelectRow label="Dispatch"
-              value={dispatchMode} setter={setDispatchMode}
-              options={[
-                { value: 'COMPLETE', label: 'COMPLETE (all-or-skip)' },
-                { value: 'SCALED',   label: 'SCALED (round-then-shave)' },
-              ]}
-              hint={dispatchMode === 'COMPLETE'
-                ? 'Skip OPT if need > cap (RL+TBC)'
-                : 'Round per-size to cap (RL+TBC)'}
-              tip="Applies to both RL and TBC bands. Decides what happens when an OPT's total need exceeds its per-WERKS MBQ budget. COMPLETE: skip whole OPT, leave werks_cap for next OPT in band (preserves rod-completion). SCALED: shrink each size by round(need × scale) and shave back any pak overshoot, ships partial up to werks_cap (recovers units the old floor lost — e.g. the GEN=1114058292 case)."/>
-            <ToggleRow checked={mbqGrowthUseDefault} setChecked={setMbqGrowthUseDefault}
-              label="Use Default 100% (MBQ)" color={C.green}
-              hint={mbqGrowthUseDefault
-                ? "strict cap — MBQ growth disabled"
-                : `All non-pivot grid MBQs → *_MBQ_REV at ${mjReqGrowthPct}% (per MAJ_CAT)`}/>
-            {!mbqGrowthUseDefault && (
-              <ParamInput label="Growth %" value={mjReqGrowthPct} setter={setMjReqGrowthPct} step={5} min={100} max={200}
-                hint={`+${mjReqGrowthPct - 100}% headroom (all grids); RL/TBC/TBL caps inherit this %`}
-                tip="Scale every non-pivot grid's MBQ to *_MBQ_REV per MAJ_CAT (MJ + FAB + MICRO_MVGR + M_VND_CD + RNG_SEG …). Multiplier reads *_MBQ_ORIG so re-runs never compound. *_REQ_REV is re-derived as MAX(0, MBQ_REV − STK_TTL); engine consumes the lifted columns via *_MBQ / *_REQ. Sec-cap automatically widens to max(130%, growth%). Per-OPT_TYPE dispatch caps follow this %; override per OPT_TYPE only via the PRI ≥ 100% toggles above."/>
-            )}
-          </ParamGroup>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            <ParamGroup title="Sizing" color={C.amber}>
-              <ParamInput label="Size Cov %" value={sizeThreshold} setter={setSizeThreshold} step={0.05} min={0} max={1}
-                hint={`${Math.round(sizeThreshold*100)}%`}
-                tip="R07 size-coverage gate. Skip TBL when VAR_FNL_COUNT / VAR_COUNT below this ratio AND VAR_FNL_COUNT < Min size #. Independent of Stock %."/>
-              <ToggleRow checked={enableMinSize} setChecked={setEnableMinSize}
-                label="Min sizes for TBL" color="#7c3aed"
-                hint="Reject TBL options that have fewer than X distinct sizes"/>
-              {enableMinSize && (
-                <ParamInput label="Min size #" value={minSizeCount} setter={setMinSizeCount} step={1} min={1}
-                  hint={`≥ ${minSizeCount} sizes`}/>
-              )}
-              <ToggleRow checked={applySecCapInNormal} setChecked={setApplySecCapInNormal}
-                label="Sec-grid Cap" color={C.primary}
-                hint="Per-grid cap: max(0, MBQ_ORIG × cap% − STK_TTL); breach = block. Per-grid % set in Grid Builder."/>
-              <div style={{ display: 'grid', gridTemplateColumns: '78px 1fr', alignItems: 'center', gap: 4 }}
-                   title="CONT fallback for SZ_APPLICABLE='N' MAJ_CATs. Always fills so Σ=1 per OPT — one-size categories will never leave 100% unallocated. Applied AFTER the Site + CO ladder. SZ_APPLICABLE='Y' MAJ_CATs are untouched — Rule 3 of the 2026-07-02 spec still holds.">
-                <span style={{ fontSize: 10, color: C.textSub }}>SZ='N' fill</span>
-                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                  {[
-                    { value: 'P4_UNIFORM', label: 'Uniform 1/N' },
-                    { value: 'P3_FNL_Q',   label: 'Based on Stock' },
-                  ].map(opt => (
-                    <label key={opt.value}
-                           style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
-                                    cursor: 'pointer', color: contFallbackMode === opt.value ? C.primary : C.textSub,
-                                    fontWeight: contFallbackMode === opt.value ? 700 : 500 }}>
-                      <input type="radio" name="cont_fallback_mode"
-                             checked={contFallbackMode === opt.value}
-                             onChange={() => setContFallbackMode(opt.value)}
-                             style={{ margin: 0, cursor: 'pointer', accentColor: C.primary }}/>
-                      {opt.label}
-                    </label>
+              <ParamGroup title="Run Mode" color="#7c3aed">
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+                  {[['listing','Listing only', C.primary],
+                    ['full','Full Pipeline', '#7c3aed']].map(([v, l, clr]) => (
+                    <button key={v} onClick={() => setRunMode(v)}
+                      style={{ ..._btn(runMode===v, clr), height: 26, fontSize: 10 }}>{l}</button>
                   ))}
                 </div>
-              </div>
-            </ParamGroup>
+                <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.3 }}>
+                  {runMode === 'full'
+                    ? 'MSA → Grid → Listing → Allocation'
+                    : 'Listing → Allocation (skip MSA & Grid)'}
+                </div>
+              </ParamGroup>
 
-            <ParamGroup title="Season (SSN)" color="#0891b2">
-              <CheckboxGroup label="" items={ssnOptions}
-                selected={selectedSsn} setSelected={setSelectedSsn} color="#0891b2"/>
-            </ParamGroup>
+              <ParamGroup title="RDC Scope" color={C.primary}>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {[['all','All RDCs','See every RDC'],
+                    ['own','Own','Auto-detected from selected stores'],
+                    ['cross','Cross','Pull stock from other RDCs']].map(([v, l, hint]) => (
+                    <button key={v} onClick={() => { setRdcMode(v); setCrossFrom([]) }}
+                      title={hint}
+                      style={{ ..._btn(rdcMode===v), height: 26, padding: '0 12px', fontSize: 10 }}>{l}</button>
+                  ))}
+                </div>
+                {rdcMode === 'own' && autoRdcs.length > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, flexWrap: 'wrap' }}>
+                    <span style={{ color: C.textMuted }}>Detected:</span>
+                    {autoRdcs.map(r => <span key={r} style={pillStyle(C.primary)}>{r}</span>)}
+                  </div>
+                )}
+                {rdcMode === 'cross' && otherRdcs.length > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, flexWrap: 'wrap' }}>
+                    <span style={{ color: C.textMuted }}>Pull from:</span>
+                    {otherRdcs.map(r => {
+                      const on = crossFrom.includes(r)
+                      return <button key={r}
+                        onClick={() => setCrossFrom(p => on ? p.filter(x=>x!==r) : [...p, r])}
+                        style={{ ..._btn(on, C.amber), height: 22, fontSize: 9, padding: '0 8px' }}>{r}</button>
+                    })}
+                  </div>
+                )}
+              </ParamGroup>
+
+              <ParamGroup title="Run Pool (Fresh / GRT)" color="#7c3aed">
+                <div style={{ display: 'grid', gridTemplateColumns: '78px 1fr', alignItems: 'center', gap: 4 }}
+                     title="Required. One MSA carries every SLOC as its own column; the run allocates only from SLOCs classified as the chosen pool in ARS_SLOC_SETTINGS. Pend/hold deductions are typed — a GRT approval reduces only the GRT pool.">
+                  <span style={{ fontSize: 10, color: allocType ? C.textSub : '#dc2626', fontWeight: allocType ? 500 : 700 }}>Pool *</span>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                    {[
+                      { value: 'FRESH', label: 'Fresh' },
+                      { value: 'GRT',   label: 'GRT' },
+                    ].map(opt => (
+                      <label key={opt.value}
+                             style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
+                                      cursor: 'pointer', color: allocType === opt.value ? '#7c3aed' : C.textSub,
+                                      fontWeight: allocType === opt.value ? 700 : 500 }}>
+                        <input type="radio" name="alloc_type"
+                               checked={allocType === opt.value}
+                               onChange={() => {
+                                 setAllocType(opt.value)
+                                 // Pre-fill Hold Control per pool so a selection
+                                 // is never missed (2026-07-18). Still editable
+                                 // afterward. FRESH ⇒ skip hold on UPC + GM
+                                 // (APP off); GRT ⇒ skip hold on all three.
+                                 if (opt.value === 'GRT') {
+                                   setSkipHoldUPC(true); setSkipHoldSegApp(true); setSkipHoldSegGm(true)
+                                 } else {
+                                   setSkipHoldUPC(true); setSkipHoldSegApp(false); setSkipHoldSegGm(true)
+                                 }
+                               }}
+                               style={{ margin: 0, cursor: 'pointer', accentColor: '#7c3aed' }}/>
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </ParamGroup>
+
+              <ParamGroup title="Season (SSN)" color="#0891b2">
+                <CheckboxGroup label="" items={ssnOptions}
+                  selected={selectedSsn} setSelected={setSelectedSsn} color="#0891b2"/>
+              </ParamGroup>
+
+              <ParamGroup title="Mix-Line Aggregation" color="#0891b2">
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {[['st_maj_rng','MAJ + RNG','1 row per store × MAJ_CAT × RNG_SEG'],
+                    ['st_maj','MAJ only','1 row per store × MAJ_CAT'],
+                    ['each','Each','Keep every MIX line']].map(([v, l, hint]) => (
+                    <button key={v} onClick={() => setMixMode(v)} title={hint}
+                      style={{ ..._btn(mixMode===v, '#0891b2'), height: 26, padding: '0 12px', fontSize: 10 }}>{l}</button>
+                  ))}
+                </div>
+                <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.3 }}>
+                  {mixMode === 'st_maj_rng' && '1 line per store × MAJ_CAT × range segment'}
+                  {mixMode === 'st_maj'     && '1 line per store × MAJ_CAT (collapses range segments)'}
+                  {mixMode === 'each'       && 'No aggregation — every MIX line preserved'}
+                </div>
+              </ParamGroup>
+
+            </div>
           </div>
+
+          {/* ═══════════ Band 2 — Listing & classification ═══════════ */}
+          <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: '.06em', color: C.textSub, marginBottom: 10 }}>LISTING &amp; CLASSIFICATION</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16, alignItems: 'start' }}>
+
+              <ParamGroup title="Stock & Excess" color="#0891b2">
+                <ParamInput label="Stock %"    value={stockThresholdPct} setter={setStockThresholdPct} step={0.05}
+                  hint={`${Math.round(stockThresholdPct*100)}%`}    tip="OPT_TYPE classification: STK ≥ X × ACS_D → RL (else TBC/TBL/MIX). Does NOT affect R07 — see Size Cov % under Sizing."/>
+                <ParamInput label="Excess ×"   value={excessMultiplier}  setter={setExcessMultiplier}  step={0.5}
+                  hint={`${excessMultiplier}× OPT_MBQ`}             tip="Excess if STK > X × OPT_MBQ"/>
+                <ParamInput label="Hold Days"  value={holdDays}          setter={setHoldDays}          step={1}
+                  hint={`${holdDays}d`}                             tip="OPT_MBQ_WH hold lookback window"/>
+                <ParamInput label="AGE <"      value={ageThreshold}      setter={setAgeThreshold}      step={1}
+                  hint={`${ageThreshold}d`}                         tip="Use PER_OPT_SALE if AGE < X days"/>
+              </ParamGroup>
+
+              <ParamGroup title="Store Ranking" color={C.blue}>
+                <ParamInput label="Req %"  value={reqWeight}   setter={setReqWeight}   step={0.1}
+                  hint={`${Math.round(reqWeight*100)}%`}  tip="Weight for OPT_REQ"/>
+                <ParamInput label="Fill %" value={fillWeight}  setter={setFillWeight}  step={0.1}
+                  hint={`${Math.round(fillWeight*100)}%`} tip="Weight for fill rate"/>
+                <ParamInput label="ACS_D"  value={defaultAcsD} setter={setDefaultAcsD} step={1}
+                  hint={`def=${defaultAcsD}`}             tip="Default AGE-of-Comparable-Stock fallback"/>
+              </ParamGroup>
+
+              <ParamGroup title="Sizing" color={C.amber}>
+                <ParamInput label="Size Cov %" value={sizeThreshold} setter={setSizeThreshold} step={0.05} min={0} max={1}
+                  hint={`${Math.round(sizeThreshold*100)}%`}
+                  tip="R07 size-coverage gate. Skip TBL when VAR_FNL_COUNT / VAR_COUNT below this ratio AND VAR_FNL_COUNT < Min size #. Independent of Stock %."/>
+                <ToggleRow checked={enableMinSize} setChecked={setEnableMinSize}
+                  label="Min sizes for TBL" color="#7c3aed"
+                  hint="Reject TBL options that have fewer than X distinct sizes"/>
+                {enableMinSize && (
+                  <ParamInput label="Min size #" value={minSizeCount} setter={setMinSizeCount} step={1} min={1}
+                    hint={`≥ ${minSizeCount} sizes`}/>
+                )}
+                <div style={{ display: 'grid', gridTemplateColumns: '78px 1fr', alignItems: 'center', gap: 4 }}
+                     title="CONT fallback for SZ_APPLICABLE='N' MAJ_CATs. Always fills so Σ=1 per OPT — one-size categories will never leave 100% unallocated. Applied AFTER the Site + CO ladder. SZ_APPLICABLE='Y' MAJ_CATs are untouched — Rule 3 of the 2026-07-02 spec still holds.">
+                  <span style={{ fontSize: 10, color: C.textSub }}>SZ='N' fill</span>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                    {[
+                      { value: 'P4_UNIFORM', label: 'Uniform 1/N' },
+                      { value: 'P3_FNL_Q',   label: 'Based on Stock' },
+                    ].map(opt => (
+                      <label key={opt.value}
+                             style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
+                                      cursor: 'pointer', color: contFallbackMode === opt.value ? C.primary : C.textSub,
+                                      fontWeight: contFallbackMode === opt.value ? 700 : 500 }}>
+                        <input type="radio" name="cont_fallback_mode"
+                               checked={contFallbackMode === opt.value}
+                               onChange={() => setContFallbackMode(opt.value)}
+                               style={{ margin: 0, cursor: 'pointer', accentColor: C.primary }}/>
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </ParamGroup>
+
+            </div>
+          </div>
+
+          {/* ═══════════ Band 3 — Allocation gates ═══════════ */}
+          <div style={{ background: '#f0fdf9', border: '1px solid #d5f0e5', borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: '.06em', color: C.green, marginBottom: 10 }}>ALLOCATION GATES</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 16, alignItems: 'start' }}>
+
+              <ParamGroup title="Caps & Growth" color={C.green}>
+                <ToggleRow checked={priCheckRL}  setChecked={setPriCheckRL}
+                  label="PRI ≥ 100% (RL)"  color="#0891b2"
+                  hint={priCheckRL
+                    ? `ON — RL listed only if PRI_CT% ≥ 100; cap = Grid Growth (${mbqGrowthUseDefault ? 100 : mjReqGrowthPct}%)`
+                    : `OFF — RL cap = user-set Dispatch Cap (${rlMbqCapPct}%)`}/>
+                {!priCheckRL && (
+                  <ParamInput label="RL Cap %" value={rlMbqCapPct} setter={setRlMbqCapPct} step={5} min={50} max={200}
+                    hint={`Ship up to ${rlMbqCapPct}% × MJ_MBQ_ORIG`}
+                    tip="When PRI ≥ 100% (RL) is OFF, this caps the total RL SHIP_QTY at cap% × MJ_MBQ_ORIG per (WERKS, MAJ_CAT). When the toggle is ON, the RL cap follows the Grid MBQ Growth % (default) instead."/>
+                )}
+                <ToggleRow checked={priCheckTBC} setChecked={setPriCheckTBC}
+                  label="PRI ≥ 100% (TBC)" color="#0891b2"
+                  hint={priCheckTBC
+                    ? `ON — TBC listed only if PRI_CT% ≥ 100; cap = Grid Growth (${mbqGrowthUseDefault ? 100 : mjReqGrowthPct}%)`
+                    : `OFF — TBC cap = user-set Dispatch Cap (${tbcMbqCapPct}%)`}/>
+                {!priCheckTBC && (
+                  <ParamInput label="TBC Cap %" value={tbcMbqCapPct} setter={setTbcMbqCapPct} step={5} min={50} max={200}
+                    hint={`Ship up to ${tbcMbqCapPct}% × MJ_MBQ_ORIG`}
+                    tip="When PRI ≥ 100% (TBC) is OFF, this caps the total TBC SHIP_QTY at cap% × MJ_MBQ_ORIG per (WERKS, MAJ_CAT). When the toggle is ON, the TBC cap follows the Grid MBQ Growth % (default) instead."/>
+                )}
+                <div style={{ display: 'grid', gridTemplateColumns: '78px 1fr', alignItems: 'center', gap: 4 }}
+                     title="Applies to both RL and TBC bands. Decides what happens when an OPT's total need exceeds its per-WERKS MBQ budget. COMPLETE: skip whole OPT (or admit a bounded overshoot when the remaining cap covers ≥ half the need), leaving werks_cap for the next OPT in band — preserves rod-completion. SCALED (round-then-shave) was DISABLED 2026-07-17; COMPLETE is the only supported dispatch mode.">
+                  <span style={{ fontSize: 10, color: C.textSub }}>Dispatch</span>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                    {[
+                      // SCALED disabled 2026-07-17 (visible but not selectable) —
+                      // see backend field_validator _force_complete_dispatch.
+                      // COMPLETE is the only mode the engine honors.
+                      { value: 'COMPLETE', label: 'Complete (all-or-skip)',        disabled: false },
+                      { value: 'SCALED',   label: 'Scaled (round-then-shave) — disabled', disabled: true },
+                    ].map(opt => (
+                      <label key={opt.value}
+                             title={opt.disabled ? 'Disabled 2026-07-17 — COMPLETE is the only supported dispatch mode.' : undefined}
+                             style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
+                                      cursor: opt.disabled ? 'not-allowed' : 'pointer',
+                                      opacity: opt.disabled ? 0.45 : 1,
+                                      color: (!opt.disabled && dispatchMode === opt.value) ? C.green : C.textSub,
+                                      fontWeight: (!opt.disabled && dispatchMode === opt.value) ? 700 : 500 }}>
+                        <input type="radio" name="dispatch_mode"
+                               disabled={opt.disabled}
+                               checked={dispatchMode === opt.value}
+                               onChange={() => { if (!opt.disabled) setDispatchMode(opt.value) }}
+                               style={{ margin: 0, cursor: opt.disabled ? 'not-allowed' : 'pointer', accentColor: C.green }}/>
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <ToggleRow checked={mbqGrowthUseDefault} setChecked={setMbqGrowthUseDefault}
+                  label="Use Default 100% (MBQ)" color={C.green}
+                  hint={mbqGrowthUseDefault
+                    ? "strict cap — MBQ growth disabled"
+                    : `All non-pivot grid MBQs → *_MBQ_REV at ${mjReqGrowthPct}% (per MAJ_CAT)`}/>
+                {!mbqGrowthUseDefault && (
+                  <ParamInput label="Growth %" value={mjReqGrowthPct} setter={setMjReqGrowthPct} step={5} min={100} max={200}
+                    hint={`+${mjReqGrowthPct - 100}% headroom (all grids); RL/TBC/TBL caps inherit this %`}
+                    tip="Scale every non-pivot grid's MBQ to *_MBQ_REV per MAJ_CAT (MJ + FAB + MICRO_MVGR + M_VND_CD + RNG_SEG …). Multiplier reads *_MBQ_ORIG so re-runs never compound. *_REQ_REV is re-derived as MAX(0, MBQ_REV − STK_TTL); engine consumes the lifted columns via *_MBQ / *_REQ. Sec-cap automatically widens to max(130%, growth%). Per-OPT_TYPE dispatch caps follow this %; override per OPT_TYPE only via the PRI ≥ 100% toggles above."/>
+                )}
+              </ParamGroup>
+
+              <ParamGroup title="Hold Control" color="#0891b2">
+                <ToggleRow checked={skipHoldUPC} setChecked={setSkipHoldUPC}
+                  label="Skip hold — UPC stores" color="#dc2626"
+                  hint={skipHoldUPC
+                    ? 'ON — TBL rows for upcoming (UPC) stores ship like RL/TBC: OPT_MBQ_WH = OPT_MBQ, no warehouse hold parked'
+                    : 'OFF — UPC stores follow the normal TBL hold rule (current behavior)'}/>
+                <ToggleRow checked={skipHoldSegApp} setChecked={setSkipHoldSegApp}
+                  label="Skip hold — APP" color="#dc2626"
+                  hint={skipHoldSegApp
+                    ? 'ON — no TBL hold for apparel (SEG=APP); rows ship like RL/TBC'
+                    : 'OFF — apparel (SEG=APP) TBL rows park warehouse hold normally (current behavior)'}/>
+                <ToggleRow checked={skipHoldSegGm} setChecked={setSkipHoldSegGm}
+                  label="Skip hold — GM" color="#dc2626"
+                  hint={skipHoldSegGm
+                    ? 'ON — no TBL hold for general merchandise (SEG=GM); rows ship like RL/TBC'
+                    : 'OFF — general merchandise (SEG=GM) TBL rows park warehouse hold normally (current behavior)'}/>
+              </ParamGroup>
+
+              <ParamGroup title="Sec-Grid Cap" color={C.primary}>
+                <ToggleRow checked={applySecCapInNormal} setChecked={setApplySecCapInNormal}
+                  label="Sec-grid Cap" color={C.primary}
+                  hint="Per-grid cap: max(0, MBQ_ORIG × cap% − STK_TTL); breach = block. Per-grid % set in Grid Builder."/>
+              </ParamGroup>
+
+            </div>
+          </div>
+
         </div>
-      </div>
+      </Section>
 
       {/* ═══════════ Insight tiles + Charts ═══════════ */}
       {summary && (
-        <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 8 }}>
+        <Section id="insights" title="Insights & Charts" icon={BarChart3}
+          hidden={!!hiddenSections.insights} onToggle={toggleSection}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 8 }}>
             <InsightTile label="Stores covered"   value={summary.totals?.stores}            accent={C.blue}/>
             <InsightTile label="RDCs"             value={summary.totals?.rdcs}              accent={C.primary}/>
             <InsightTile label="Distinct Options" value={summary.totals?.options}           accent="#0891b2"/>
@@ -2623,7 +3054,7 @@ export default function ListingPage() {
             <InsightTile label="Allocated rows"   value={summary.alloc_rows}                accent={C.green}/>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 8 }}>
             <ChartCard title="OPT_TYPE Distribution" subtitle="Listing rows split by classification">
               {(h) => optTypeChartData.length > 0 ? (
                 <ResponsiveContainer width="100%" height={h}>
@@ -2926,7 +3357,7 @@ export default function ListingPage() {
               ))}
             </div>
           )}
-        </>
+        </Section>
       )}
 
       {/* ═══════════ Preview Table ═══════════ */}

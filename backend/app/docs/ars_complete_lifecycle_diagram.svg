@@ -1,0 +1,243 @@
+<svg viewBox="0 0 960 1585" width="960" height="1585" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t5 d5" font-family="Segoe UI, Roboto, sans-serif">
+  <title id="t5">ARS complete lifecycle: MSA calculation to post-approval manipulation</title>
+  <desc id="d5">Five bands: MSA calculation with SLOC classification, listing run with typed pool override and hold gate, approval with seven writes, post-approval manipulation of pending allocations and holds, and the feedback loops back to MSA.</desc>
+  <defs>
+    <style>
+      .box{fill:#f5f4ee; stroke:#d0ccbf; stroke-width:1}
+      .new{fill:#fff4d6; stroke:#c99a2e; stroke-width:1.2}
+      .out{fill:#e8f0e6; stroke:#5f8a4f; stroke-width:1.2}
+      .band{fill:none; stroke:#d0ccbf; stroke-width:1; stroke-dasharray:4 3}
+      .h{font-size:13px; font-weight:600; fill:#1a1a1a}
+      .band-h{font-size:12px; font-weight:700; letter-spacing:1px; fill:#666}
+      .p{font-size:11.5px; fill:#3a3a3a}
+      .m{font-family:Consolas, Menlo, monospace; font-size:10.5px; fill:#3a3a3a}
+      .mb{font-family:Consolas, Menlo, monospace; font-size:10.5px; font-weight:700; fill:#1a1a1a}
+      .lbl{font-size:10.5px; fill:#666; font-style:italic}
+      .arrow{stroke:#8b8778; stroke-width:1.4; fill:none}
+      .loop{stroke:#5f8a4f; stroke-width:1.5; fill:none; stroke-dasharray:5 3}
+      .rev{stroke:#c99a2e; stroke-width:1.5; fill:none; stroke-dasharray:5 3}
+    </style>
+    <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b8778"/>
+    </marker>
+    <marker id="a5g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5f8a4f"/>
+    </marker>
+    <marker id="a5y" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c99a2e"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="1585" fill="#ffffff"/>
+
+  <!-- Legend -->
+  <rect x="560" y="12" width="12" height="12" rx="2" class="new"/>
+  <text x="578" y="22" class="p">new / changed</text>
+  <rect x="688" y="12" width="12" height="12" rx="2" class="out"/>
+  <text x="706" y="22" class="p">pools · ledgers</text>
+  <line x1="820" y1="18" x2="850" y2="18" class="loop"/>
+  <text x="856" y="22" class="p">re-sync</text>
+
+  <!-- ===== BAND 1: MSA CALCULATION ===== -->
+  <rect x="20" y="34" width="920" height="196" rx="10" class="band"/>
+  <text x="38" y="56" class="band-h">1 · MSA CALCULATION  /msa — run once per cycle</text>
+
+  <rect x="38" y="70" width="200" height="146" rx="8" class="box"/>
+  <text x="52" y="92" class="h">Source</text>
+  <text x="52" y="110" class="m">VW_ET_MSA_STK_</text>
+  <text x="52" y="124" class="m">WITH_MASTER</text>
+  <text x="52" y="144" class="p">(et_msa_stk + master)</text>
+  <text x="52" y="164" class="m">A1-M rows:</text>
+  <text x="52" y="179" class="m">V02_FRESH 140</text>
+  <text x="52" y="193" class="m">V02_GRT 90 · 0042 20</text>
+
+  <rect x="256" y="70" width="300" height="146" rx="8" class="box"/>
+  <text x="270" y="92" class="h">9 steps (unchanged)</text>
+  <text x="270" y="112" class="p">filter SLOC → clean → fill dims →</text>
+  <text x="270" y="128" class="p">SEG ∈ {APP,GM} → pivot by SLOC →</text>
+  <text x="270" y="144" class="p">merge PEND + HOLD → FNL_Q →</text>
+  <text x="270" y="160" class="p">colour variants → aggregate</text>
+  <text x="270" y="184" class="m">FNL_Q = max(250−10−5, 0) = 235</text>
+  <text x="270" y="202" class="lbl">per-SLOC columns preserved</text>
+
+  <rect x="574" y="70" width="180" height="146" rx="8" class="out"/>
+  <text x="588" y="92" class="h">MSA tables</text>
+  <text x="588" y="110" class="m">ARS_MSA_TOTAL</text>
+  <text x="588" y="124" class="m">ARS_MSA_GEN_ART</text>
+  <text x="588" y="138" class="m">ARS_MSA_VAR_ART</text>
+  <text x="588" y="158" class="m">V02_FRESH│V02_GRT│0042</text>
+  <text x="588" y="172" class="m">PEND│HOLD│FNL_Q 235</text>
+  <text x="588" y="192" class="lbl">one row per SKU</text>
+
+  <rect x="772" y="70" width="150" height="146" rx="8" class="new"/>
+  <text x="786" y="92" class="h">SLOC settings</text>
+  <text x="786" y="110" class="m">V02_GRT → GRT</text>
+  <text x="786" y="124" class="m">others → FRESH</text>
+  <text x="786" y="144" class="p">exclusive — no</text>
+  <text x="786" y="158" class="p">shared type</text>
+  <text x="786" y="178" class="lbl">unknown → FRESH</text>
+  <text x="786" y="192" class="lbl">+ warning</text>
+
+  <path d="M238,143 L256,143" class="arrow" marker-end="url(#a5)"/>
+  <path d="M556,143 L574,143" class="arrow" marker-end="url(#a5)"/>
+  <path d="M664,216 L664,244" class="arrow" marker-end="url(#a5)"/>
+
+  <!-- ===== BAND 2: LISTING RUN ===== -->
+  <rect x="20" y="246" width="920" height="252" rx="10" class="band"/>
+  <text x="38" y="268" class="band-h">2 · LISTING RUN  /data-prep/listing — repeat per need (Grid Builder budgets feed in)</text>
+
+  <rect x="38" y="282" width="250" height="132" rx="8" class="new"/>
+  <text x="52" y="304" class="h">Run controls</text>
+  <text x="52" y="324" class="p">◉ Fresh  ○ GRT  (required)</text>
+  <text x="52" y="342" class="p">☑ Skip hold — UPC stores</text>
+  <text x="52" y="358" class="p">☑ Hold APP    ☑ Hold GM</text>
+  <text x="52" y="378" class="m">POST /listing/generate</text>
+  <text x="52" y="398" class="lbl">blocked until Fresh/GRT picked</text>
+
+  <rect x="306" y="282" width="310" height="132" rx="8" class="new"/>
+  <text x="320" y="304" class="h">Typed pool override — Stage A/B</text>
+  <text x="320" y="322" class="m">PEND_T, HOLD_T = live typed Σ (type or NULL)</text>
+  <text x="320" y="342" class="mb">FRESH: max(160−10−5, 0) = 145</text>
+  <text x="320" y="358" class="mb">GRT:   max( 90−10−5, 0) =  75</text>
+  <text x="320" y="378" class="p">pools disjoint · capped by FNL_Q 235</text>
+  <text x="320" y="398" class="lbl">covers per_opt AND pandas (shared)</text>
+
+  <rect x="634" y="282" width="288" height="132" rx="8" class="box"/>
+  <text x="648" y="304" class="h">Waterfall RL→TBC→TBL</text>
+  <rect x="648" y="314" width="260" height="88" rx="4" class="new"/>
+  <text x="660" y="332" class="h" font-size="11.5">TBL hold gate (per row)</text>
+  <text x="660" y="350" class="m">suppress: UPC&amp;skip | APP off | GM off</text>
+  <text x="660" y="368" class="m">S001 OLD/APP → SHIP 8, HOLD 12</text>
+  <text x="660" y="384" class="m">S003 UPC     → SHIP 8, HOLD 0</text>
+  <text x="660" y="398" class="lbl">suppressed: OPT_MBQ_WH = OPT_MBQ</text>
+
+  <path d="M288,348 L306,348" class="arrow" marker-end="url(#a5)"/>
+  <path d="M616,348 L634,348" class="arrow" marker-end="url(#a5)"/>
+  <path d="M778,414 L778,436" class="arrow" marker-end="url(#a5)"/>
+
+  <rect x="306" y="438" width="616" height="48" rx="8" class="out"/>
+  <text x="320" y="458" class="h">ARS_ALLOC_WORKING (parked)  ·  ALLOC_TYPE stamped  ·  → Alloc Review</text>
+  <text x="320" y="476" class="m">FRESH run: S001 SHIP 8 HOLD 12 · S003 SHIP 8 HOLD 0</text>
+
+  <path d="M480,498 L480,524" class="arrow" marker-end="url(#a5)"/>
+
+  <!-- ===== BAND 3: APPROVAL ===== -->
+  <rect x="20" y="526" width="920" height="238" rx="10" class="band"/>
+  <text x="38" y="548" class="band-h">3 · APPROVAL  /alc-review — 7 writes in order (serialized per session)</text>
+
+  <rect x="38" y="562" width="150" height="120" rx="8" class="box"/>
+  <text x="52" y="584" class="h">Alloc Review</text>
+  <text x="52" y="604" class="p">Approve ↓</text>
+  <text x="52" y="622" class="p">Reject →</text>
+  <text x="52" y="642" class="lbl">reject: snapshot</text>
+  <text x="52" y="656" class="lbl">restore only</text>
+
+  <rect x="206" y="562" width="716" height="140" rx="8" class="box"/>
+  <text x="220" y="584" class="h">Approve writes</text>
+  <text x="220" y="604" class="m">① parked → 4 history tables (+ALLOC_TYPE)   ② ARS_PEND_ALC typed rows</text>
+  <text x="220" y="622" class="m">③ hold snapshot (fixed DDL — 4 edits)        ④ tracking Step A draw↓ / Step B MERGE (typed key)</text>
+  <text x="220" y="640" class="m">⑤ MSA PEND/FNL_Q delta + ARS_GRID_MJ* rollups (totals, pool-agnostic)</text>
+  <text x="220" y="658" class="m">⑥ MSA HOLD/FNL_Q re-sync (totals)            ⑦ ops log OP_TYPE='APPROVE'</text>
+  <text x="220" y="682" class="mb">GRT approve 30  →  PEND(GRT)=30  →  next GRT pool 45 · FRESH pool still 145</text>
+
+  <path d="M188,610 L206,610" class="arrow" marker-end="url(#a5)"/>
+
+  <rect x="206" y="712" width="716" height="42" rx="8" class="new"/>
+  <text x="220" y="730" class="h" font-size="12">Revert (Operations Log): −1 MSA/grid delta → DELETE typed pend → snapshot restore (keeps type) → back to parked</text>
+  <text x="220" y="746" class="lbl">approve → revert → re-approve must be indistinguishable (TC-18)</text>
+
+  <path d="M564,702 L564,712" class="rev" marker-end="url(#a5y)"/>
+  <path d="M206,733 L112,733 L112,682" class="rev" marker-end="url(#a5y)"/>
+  <path d="M480,764 L480,790" class="arrow" marker-end="url(#a5)"/>
+
+  <!-- ===== BAND 4: LEDGERS + MANIPULATION ===== -->
+  <rect x="20" y="792" width="920" height="560" rx="10" class="band"/>
+  <text x="38" y="814" class="band-h">4 · POST-APPROVAL — TYPED LEDGERS &amp; THEIR MANIPULATION</text>
+
+  <rect x="38" y="828" width="440" height="92" rx="8" class="out"/>
+  <text x="52" y="850" class="h">ARS_PEND_ALC  (typed pend ledger)</text>
+  <text x="52" y="868" class="m">PEND_QTY = ALLOC_QTY − DO_QTY (computed)</text>
+  <text x="52" y="884" class="m">ALLOC_TYPE: FRESH | GRT | NULL (manual/legacy → both pools)</text>
+  <text x="52" y="904" class="lbl">read LIVE by the pool override — always current</text>
+
+  <rect x="498" y="828" width="424" height="92" rx="8" class="out"/>
+  <text x="512" y="850" class="h">ARS_NL_TBL_HOLD_TRACKING  (typed hold ledger)</text>
+  <text x="512" y="868" class="m">key: WERKS × VAR_ART × SZ × ALLOC_TYPE</text>
+  <text x="512" y="884" class="m">HOLD_REM · IS_CLOSED · draws match run type (+NULL)</text>
+  <text x="512" y="904" class="lbl">FRESH + GRT holds coexist per article</text>
+
+  <!-- Pend manipulation row -->
+  <text x="38" y="948" class="band-h" font-size="11">PENDING-ALLOCATION MANIPULATION  (/pend-alc/*)</text>
+
+  <rect x="38" y="960" width="170" height="108" rx="8" class="new"/>
+  <text x="52" y="982" class="h" font-size="12">Manual Entry</text>
+  <text x="52" y="1000" class="m">SOURCE='MANUAL'</text>
+  <text x="52" y="1014" class="m">ALLOC_TYPE=NULL</text>
+  <text x="52" y="1032" class="p">→ reduces both pools</text>
+  <text x="52" y="1052" class="lbl">bypasses approve</text>
+
+  <rect x="222" y="960" width="170" height="108" rx="8" class="box"/>
+  <text x="236" y="982" class="h" font-size="12">Reco / BDC push</text>
+  <text x="236" y="1000" class="m">BDC_QTY = PEND_QTY</text>
+  <text x="236" y="1018" class="p">→ SAP upload</text>
+  <text x="236" y="1052" class="lbl">no change</text>
+
+  <rect x="406" y="960" width="170" height="108" rx="8" class="box"/>
+  <text x="420" y="982" class="h" font-size="12">Daily DO Entry</text>
+  <text x="420" y="1000" class="m">DO_QTY ↑ FIFO</text>
+  <text x="420" y="1014" class="m">rows close</text>
+  <text x="420" y="1032" class="p">no MSA delta at DO</text>
+  <text x="420" y="1052" class="lbl">pool self-corrects (live)</text>
+
+  <rect x="590" y="960" width="160" height="108" rx="8" class="box"/>
+  <text x="604" y="982" class="h" font-size="12">Adhoc Close</text>
+  <text x="604" y="1000" class="m">close rows +</text>
+  <text x="604" y="1014" class="m">cancel open BDC</text>
+  <text x="604" y="1032" class="p">MSA pend re-sync</text>
+  <text x="604" y="1052" class="lbl">no change</text>
+
+  <rect x="764" y="960" width="158" height="108" rx="8" class="new"/>
+  <text x="778" y="982" class="h" font-size="12">Operations Log</text>
+  <text x="778" y="1000" class="m">revert: APPROVE,</text>
+  <text x="778" y="1014" class="m">MANUAL, DO,</text>
+  <text x="778" y="1028" class="m">HOLD_CLEAR/REVISE</text>
+  <text x="778" y="1052" class="lbl">typed state restored</text>
+
+  <path d="M123,960 L123,920" class="arrow" marker-end="url(#a5)"/>
+  <path d="M307,960 L307,920" class="arrow" marker-end="url(#a5)"/>
+  <path d="M491,960 L491,920" class="arrow" marker-end="url(#a5)"/>
+  <path d="M670,960 L670,935 L478,935 L478,920" class="arrow" marker-end="url(#a5)"/>
+
+  <!-- Hold manipulation row -->
+  <text x="38" y="1102" class="band-h" font-size="11">HOLD MANIPULATION  (/reports/hold)</text>
+
+  <rect x="38" y="1114" width="440" height="104" rx="8" class="new"/>
+  <text x="52" y="1136" class="h" font-size="12">Hold Dashboard — clear-hold / revise-hold (+ file upload)</text>
+  <text x="52" y="1156" class="m">clear: HOLD_REM ↓, IS_CLOSED  ·  revise: HOLD_REM ↑, re-open</text>
+  <text x="52" y="1174" class="m">drain order: NULL first, then oldest LISTED_DATE</text>
+  <text x="52" y="1192" class="p">detail + export show ALLOC_TYPE  ·  reason mandatory · revertable</text>
+  <text x="52" y="1208" class="lbl">every mutation re-syncs MSA HOLD/FNL_Q inline</text>
+
+  <rect x="498" y="1114" width="424" height="104" rx="8" class="box"/>
+  <text x="512" y="1136" class="h" font-size="12">Read-only views</text>
+  <text x="512" y="1156" class="p">Pend Alc: Overview · Report · Open BDC · Schedule · Audit</text>
+  <text x="512" y="1174" class="p">Hold: summary · by-store · by-RDC · by-article · by-status</text>
+  <text x="512" y="1192" class="lbl">no change — ALLOC_TYPE column is a candidate addition</text>
+
+  <path d="M258,1114 L258,1078 L700,1078 L700,920" class="arrow" marker-end="url(#a5)"/>
+
+  <!-- Cycle close -->
+  <rect x="38" y="1240" width="884" height="96" rx="8" class="out"/>
+  <text x="52" y="1262" class="h">Cycle closes — feedback into the next run and next MSA</text>
+  <text x="52" y="1282" class="m">next run pool(T) = Σ SLOC cols(T) − live typed pend/hold, capped by FNL_Q</text>
+  <text x="52" y="1300" class="m">DO confirms → typed rows close → that pool grows back automatically</text>
+  <text x="52" y="1318" class="lbl">next MSA generation re-bakes STK/PEND/HOLD/FNL_Q from physical stock — any DO mis-attribution (IM-9) self-heals here</text>
+
+  <!-- Re-sync loop arrows to MSA band -->
+  <path d="M922,874 C952,874 952,160 754,143" class="loop" marker-end="url(#a5g)"/>
+  <text x="932" y="500" class="lbl" transform="rotate(90 932 500)">MSA HOLD/PEND re-sync + next generation</text>
+
+  <text x="38" y="1372" class="lbl">Unaffected (verified): MSA 9 steps · Grid Builder · Merge Rules · GAP Report · ARS Dashboard · BDC push · Adhoc Close · Schedules.</text>
+  <text x="38" y="1390" class="lbl">Typed writes: pend rows ② · hold rows ④ · history ① — everything else stays total-based / pool-agnostic.</text>
+  <text x="38" y="1408" class="lbl">Flags: generic Upload page bypasses sync/type discipline (IM-10) · SAP DO carries no type → FIFO cross-type possible, self-heals at next MSA (IM-9).</text>
+</svg>

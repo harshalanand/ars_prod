@@ -43,6 +43,7 @@ const MergeRulesPage         = lazy(() => import('@/pages/MergeRulesPage'))
 const LookupArtMasterPage    = lazy(() => import('@/pages/LookupArtMasterPage'))
 const ListingPage            = lazy(() => import('@/pages/ListingPage'))
 const ListingLogsPage        = lazy(() => import('@/pages/ListingLogsPage'))
+const RunParamsPage          = lazy(() => import('@/pages/RunParamsPage'))
 const PendAlcReportPage          = lazy(() => import('@/pages/PendAlcReportPage'))
 const PendingAllocationPage      = lazy(() => import('@/pages/PendingAllocationPage'))
 const PendingDeliveryOrderPage   = lazy(() => import('@/pages/PendingDeliveryOrderPage'))
@@ -68,7 +69,11 @@ const PTDashboardPage        = lazy(() => import('@/pages/pt/PTDashboardPage'))
 const PTProjectsPage         = lazy(() => import('@/pages/pt/PTProjectsPage'))
 const PTProjectDetailPage    = lazy(() => import('@/pages/pt/PTProjectDetailPage'))
 const PTMyTasksPage          = lazy(() => import('@/pages/pt/PTMyTasksPage'))
-const ProcessPage            = lazy(() => import('@/pages/ProcessPage'))
+const TrainingManualPage     = lazy(() => import('@/pages/TrainingManualPage'))
+const ManualGalleryPage      = lazy(() => import('@/pages/ManualGalleryPage'))
+const DataDictionaryPage     = lazy(() => import('@/pages/DataDictionaryPage'))
+const ReportGenerationPage   = lazy(() => import('@/pages/ReportGenerationPage'))
+const DailyActivityLogPage   = lazy(() => import('@/pages/DailyActivityLogPage'))
 
 function PageLoader() {
   return (
@@ -141,6 +146,7 @@ export default function App() {
         <Route path="export" element={<ProtectedRoute permission="DATA_EXPORT"><ExportPage /></ProtectedRoute>} />
         <Route path="jobs" element={<ProtectedRoute permission="JOBS_VIEW"><JobsDashboardPage /></ProtectedRoute>} />
         <Route path="editor" element={<ProtectedRoute permission="DATA_EDITOR"><DataEditorPage /></ProtectedRoute>} />
+        <Route path="data-dictionary" element={<ErrorBoundary><DataDictionaryPage /></ErrorBoundary>} />
         {/* Data Preparation */}
         <Route path="msa" element={<ProtectedRoute permission="MSA_VIEW"><MSAStockCalculationPage /></ProtectedRoute>} />
         <Route path="contribution/presets" element={<ProtectedRoute permission="CONTRIB_PRESETS"><ContribPresetsPage /></ProtectedRoute>} />
@@ -168,9 +174,14 @@ export default function App() {
         <Route path="data-prep/lookup-art-master" element={<ProtectedRoute permission="LOOKUP_VIEW"><LookupArtMasterPage /></ProtectedRoute>} />
         <Route path="data-prep/listing" element={<ErrorBoundary><ListingPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />
+        <Route path="data-prep/listing/run-params" element={<ErrorBoundary><RunParamsPage /></ErrorBoundary>} />
         {/* Process docs — in-app explanation of Listing + Allocation pipeline */}
-        <Route path="process"             element={<Navigate to="/process/overview" replace />} />
-        <Route path="process/:slug"       element={<ErrorBoundary><ProcessPage /></ErrorBoundary>} />
+        <Route path="manual"              element={<Navigate to="/manual/start" replace />} />
+        <Route path="manual/gallery"      element={<ErrorBoundary><ManualGalleryPage /></ErrorBoundary>} />
+        <Route path="manual/:module"      element={<ErrorBoundary><TrainingManualPage /></ErrorBoundary>} />
+        {/* Back-compat: old Process routes → new Manual */}
+        <Route path="process"             element={<Navigate to="/manual/start" replace />} />
+        <Route path="process/:module"     element={<Navigate to="/manual/start" replace />} />
         {/* Project Tracker */}
         <Route path="pt"                   element={<ErrorBoundary><PTDashboardPage /></ErrorBoundary>} />
         <Route path="pt/projects"          element={<ErrorBoundary><PTProjectsPage /></ErrorBoundary>} />
@@ -182,6 +193,7 @@ export default function App() {
         <Route path="trends/review" element={<ProtectedRoute permission="TRENDS_REVIEW"><ErrorBoundary><TrendReviewPage /></ErrorBoundary></ProtectedRoute>} />
         <Route path="trends/admin" element={<ErrorBoundary><TrendAdminPage /></ErrorBoundary>} />
         {/* Reports */}
+        <Route path="reports/generation" element={<ErrorBoundary><ReportGenerationPage /></ErrorBoundary>} />
         <Route path="reports/pend-alc" element={<PendAlcReportPage />} />
         <Route path="reports/hold" element={<ErrorBoundary><HoldDashboardPage /></ErrorBoundary>} />
         <Route path="reports/gap" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><GapReportPage /></ErrorBoundary></ProtectedRoute>} />
@@ -205,6 +217,7 @@ export default function App() {
         <Route path="settings/rls" element={<ProtectedRoute permission="ADMIN_RLS_MANAGE"><RLSPage /></ProtectedRoute>} />
         <Route path="settings/audit" element={<ProtectedRoute permission="ADMIN_AUDIT_READ"><AuditPage /></ProtectedRoute>} />
         <Route path="settings/tempdb" element={<ErrorBoundary><TempDBAdminPage /></ErrorBoundary>} />
+        <Route path="settings/activity-log" element={<ProtectedRoute superadminOnly><ErrorBoundary><DailyActivityLogPage /></ErrorBoundary></ProtectedRoute>} />
         {/* Legacy routes - redirect to new paths */}
         <Route path="admin/users" element={<Navigate to="/settings/users" replace />} />
         <Route path="admin/roles" element={<Navigate to="/settings/roles" replace />} />

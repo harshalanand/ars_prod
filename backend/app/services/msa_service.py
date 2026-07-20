@@ -9,6 +9,10 @@ from sqlalchemy import text, MetaData, Table as SQLTable
 from typing import Dict, List, Any, Optional, Tuple
 from loguru import logger
 
+from app.core.config import get_settings
+
+settings = get_settings()
+
 
 def _df_to_native_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """Convert a DataFrame to list-of-dicts with **pure Python** scalar types.
@@ -137,6 +141,311 @@ class MSAService:
         except Exception as e:
             logger.warning(f"_load_open_holds failed (skipping hold deduction): {e}")
             return pd.DataFrame(columns=["RDC", "ARTICLE_NUMBER", "HOLD_QTY"])
+
+    # ------------------------------------------------------------------
+    # Row-per-type (FRESH/GRT) expansion  (Step 12 of calculate)
+    # ------------------------------------------------------------------
+    # MSA output mirrors alloc/pend/hold: one row per SKU *per pool type*.
+    # A SKU with both fresh and grt stock (or typed pend/hold) yields two
+    # rows. Per-type STK is the sum of that type's SLOC pivot columns; the
+    # other type's SLOC columns are zeroed on the row. PEND/HOLD are
+    # re-derived LIVE from the open ledgers, folded to the row's type
+    # (legacy ALLOC_TYPE NULL/'' → FRESH — see migration 016). FNL_Q is
+    # recomputed per typed row = max(STK − PEND − HOLD, 0).
+
+    @staticmethod
+    def _k_txt(v) -> str:
+        """Canonical text merge key (RDC / CLR)."""
+        return "" if v is None else str(v).strip()
+
+    @staticmethod
+    def _k_num(v) -> str:
+        """Canonical numeric-id merge key — strips a trailing '.0' so a
+        float-typed '12345.0' matches a string '12345' across sources."""
+        s = str(v).strip()
+        if s == "" or s.lower() in ("nan", "none"):
+            return ""
+        try:
+            return str(int(float(s)))
+        except (ValueError, TypeError):
+            return s
+
+    def _load_typed_pend(self, grain: str) -> pd.DataFrame:
+        """Open ARS_PEND_ALC remaining qty, summed per type.
+
+        Open row: not closed and (ALLOC_QTY − DO_QTY) > 0 (parity with
+        alloc_pool.pend_agg_sql). ALLOC_TYPE folds NULL/''/unknown → FRESH,
+        only 'GRT' → GRT (only V02_GRT is a GRT SLOC).
+
+        grain 'var' → (RDC, ARTICLE_NUMBER, ALLOC_TYPE, TYPED_VAL)
+        grain 'gen' → (RDC, GEN_ART_NUMBER, CLR, ALLOC_TYPE, TYPED_VAL)
+        """
+        cols = (["RDC", "ARTICLE_NUMBER", "ALLOC_TYPE", "TYPED_VAL"]
+                if grain == "var"
+                else ["RDC", "GEN_ART_NUMBER", "CLR", "ALLOC_TYPE", "TYPED_VAL"])
+        fold = ("CASE WHEN UPPER(LTRIM(RTRIM(ISNULL(ALLOC_TYPE,'')))) = 'GRT' "
+                "THEN 'GRT' ELSE 'FRESH' END")
+        qty = ("(ISNULL(TRY_CAST(ALLOC_QTY AS FLOAT),0) "
+               "- ISNULL(TRY_CAST(DO_QTY AS FLOAT),0))")
+        where = f"ISNULL(IS_CLOSED,0) = 0 AND {qty} > 0"
+        try:
+            if grain == "var":
+                keys = ("LTRIM(RTRIM(CAST(RDC AS NVARCHAR(50)))), "
+                        "LTRIM(RTRIM(CAST(ARTICLE_NUMBER AS NVARCHAR(30))))")
+            else:
+                keys = ("LTRIM(RTRIM(CAST(RDC AS NVARCHAR(50)))), "
+                        "LTRIM(RTRIM(CAST(GEN_ART_NUMBER AS NVARCHAR(50)))), "
+                        "LTRIM(RTRIM(CAST(ISNULL(CLR,'') AS NVARCHAR(200))))")
+            sql = (f"SELECT {keys}, {fold} AS ALLOC_TYPE, "
+                   f"SUM({qty}) AS TYPED_VAL "
+                   f"FROM ARS_PEND_ALC WITH (NOLOCK) WHERE {where} "
+                   f"GROUP BY {keys}, {fold}")
+            rows = self.db.execute(text(sql)).fetchall()
+            df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+            df["TYPED_VAL"] = pd.to_numeric(df["TYPED_VAL"], errors="coerce").fillna(0)
+            return df
+        except Exception as e:
+            logger.warning(f"[msa] _load_typed_pend({grain}) failed: {e}")
+            return pd.DataFrame(columns=cols)
+
+    def _load_typed_hold(self, grain: str) -> pd.DataFrame:
+        """Open ARS_NL_TBL_HOLD_TRACKING HOLD_REM, summed per type.
+
+        RDC resolves via the store master (ST_CD = WERKS), mirroring
+        _load_open_holds so typed holds land on the same warehouse grain as
+        the untyped Step 8 merge. ALLOC_TYPE folds ''/NULL/unknown → FRESH.
+
+        grain 'var' → (RDC, ARTICLE_NUMBER, ALLOC_TYPE, TYPED_VAL)
+        grain 'gen' → (RDC, GEN_ART_NUMBER, CLR, ALLOC_TYPE, TYPED_VAL)
+        """
+        cols = (["RDC", "ARTICLE_NUMBER", "ALLOC_TYPE", "TYPED_VAL"]
+                if grain == "var"
+                else ["RDC", "GEN_ART_NUMBER", "CLR", "ALLOC_TYPE", "TYPED_VAL"])
+        try:
+            cols_result = self.db.execute(text(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = :t"
+            ), {"t": self.st_master_table})
+            cols_set = {str(r[0]).upper() for r in cols_result.fetchall()}
+            rdc_col = next((c for c in ("RDC", "WAREHOUSE", "HUB", "WH_CD")
+                            if c in cols_set), None)
+            if not rdc_col:
+                logger.warning(
+                    f"[msa] _load_typed_hold: no RDC column on "
+                    f"{self.st_master_table}; returning empty"
+                )
+                return pd.DataFrame(columns=cols)
+
+            fold = ("CASE WHEN UPPER(LTRIM(RTRIM(ISNULL(H.ALLOC_TYPE,'')))) = 'GRT' "
+                    "THEN 'GRT' ELSE 'FRESH' END")
+            where = ("ISNULL(H.[IS_CLOSED],0) = 0 "
+                     "AND ISNULL(TRY_CAST(H.[HOLD_REM] AS FLOAT),0) > 0")
+            if grain == "var":
+                keys = (f"S.[{rdc_col}], "
+                        "LTRIM(RTRIM(CAST(H.[VAR_ART] AS NVARCHAR(30))))")
+            else:
+                keys = (f"S.[{rdc_col}], "
+                        "LTRIM(RTRIM(CAST(H.[GEN_ART_NUMBER] AS NVARCHAR(50)))), "
+                        "LTRIM(RTRIM(CAST(ISNULL(H.[CLR],'') AS NVARCHAR(200))))")
+            sql = (f"SELECT {keys}, {fold} AS ALLOC_TYPE, "
+                   f"SUM(ISNULL(TRY_CAST(H.[HOLD_REM] AS FLOAT),0)) AS TYPED_VAL "
+                   f"FROM [{self.hold_table}] H "
+                   f"INNER JOIN [{self.st_master_table}] S "
+                   f"    ON S.[ST_CD] = H.[WERKS] "
+                   f"WHERE {where} GROUP BY {keys}, {fold}")
+            rows = self.db.execute(text(sql)).fetchall()
+            df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+            df["TYPED_VAL"] = pd.to_numeric(df["TYPED_VAL"], errors="coerce").fillna(0)
+            return df
+        except Exception as e:
+            logger.warning(f"[msa] _load_typed_hold({grain}) failed: {e}")
+            return pd.DataFrame(columns=cols)
+
+    def _merge_typed_obligation(
+        self,
+        typed: pd.DataFrame,
+        agg: pd.DataFrame,
+        target_col: str,
+        grain: str,
+    ) -> pd.DataFrame:
+        """LEFT-merge a typed PEND/HOLD aggregate onto the expanded rows,
+        overwriting `target_col` with the per-(row, ALLOC_TYPE) value.
+        Merge keys are normalized identically on both sides."""
+        keys = (["RDC", "ARTICLE_NUMBER", "ALLOC_TYPE"] if grain == "var"
+                else ["RDC", "GEN_ART_NUMBER", "CLR", "ALLOC_TYPE"])
+        if agg is None or agg.empty:
+            typed[target_col] = 0.0
+            return typed
+
+        typed = typed.copy()
+        agg = agg.copy()
+        for k in keys:
+            if k in ("ARTICLE_NUMBER", "GEN_ART_NUMBER"):
+                typed[k] = typed[k].map(self._k_num)
+                agg[k] = agg[k].map(self._k_num)
+            elif k == "ALLOC_TYPE":
+                typed[k] = typed[k].map(lambda v: self._k_txt(v).upper())
+                agg[k] = agg[k].map(lambda v: self._k_txt(v).upper())
+            else:  # RDC, CLR
+                typed[k] = typed[k].map(self._k_txt)
+                agg[k] = agg[k].map(self._k_txt)
+
+        merged = typed.merge(agg[keys + ["TYPED_VAL"]], on=keys, how="left")
+        merged[target_col] = pd.to_numeric(
+            merged["TYPED_VAL"], errors="coerce"
+        ).fillna(0.0)
+        return merged.drop(columns=["TYPED_VAL"])
+
+    def _expand_frame(
+        self,
+        df: pd.DataFrame,
+        fresh_cols: List[str],
+        grt_cols: List[str],
+        pend_agg: pd.DataFrame,
+        hold_agg: pd.DataFrame,
+        grain: str,
+    ) -> pd.DataFrame:
+        """Expand one result frame into FRESH + GRT rows per the contract."""
+        if df is None or df.empty:
+            return df
+
+        f_cols = [c for c in fresh_cols if c in df.columns]
+        g_cols = [c for c in grt_cols if c in df.columns]
+
+        def _stk(cols: List[str]) -> pd.Series:
+            if not cols:
+                return pd.Series(0.0, index=df.index)
+            return (df[cols].apply(pd.to_numeric, errors="coerce")
+                    .fillna(0).sum(axis=1))
+
+        fresh_stk = _stk(f_cols)
+        grt_stk = _stk(g_cols)
+
+        fresh = df.copy()
+        fresh["ALLOC_TYPE"] = "FRESH"
+        fresh["STK_QTY"] = fresh_stk.values
+        for c in g_cols:            # zero the OTHER pool's SLOC cols
+            fresh[c] = 0
+
+        grt = df.copy()
+        grt["ALLOC_TYPE"] = "GRT"
+        grt["STK_QTY"] = grt_stk.values
+        for c in f_cols:
+            grt[c] = 0
+
+        typed = pd.concat([fresh, grt], ignore_index=True)
+
+        typed = self._merge_typed_obligation(typed, pend_agg, "PEND_QTY", grain)
+        typed = self._merge_typed_obligation(typed, hold_agg, "HOLD_QTY", grain)
+
+        typed["FNL_Q"] = np.maximum(
+            typed["STK_QTY"].astype(float)
+            - typed["PEND_QTY"].astype(float)
+            - typed["HOLD_QTY"].astype(float),
+            0,
+        )
+
+        # Per-row signal (this variant carries stock / pend / hold in the pool).
+        sig = (
+            (typed["STK_QTY"].astype(float) > 0)
+            | (typed["PEND_QTY"].astype(float) > 0)
+            | (typed["HOLD_QTY"].astype(float) > 0)
+        )
+
+        # FRESH rows are ALWAYS kept — they carry the universe/placeholder
+        # role of the old untyped output (zero-stock rows are the DENOMINATOR
+        # of the listing size-coverage ratio VAR_FNL_COUNT/VAR_COUNT; dropping
+        # them inflated the ratio and over-listed options — baseline-parity
+        # fix, 2026-07-10).
+        #
+        # GRT rows are kept PER-OPT, not per-variant (2026-07-13). If an OPT
+        # (colour = RDC, MAJ_CAT, GEN_ART_NUMBER, CLR) participates in GRT at
+        # ANY size, keep its WHOLE GRT size-ladder — the zero sizes are the
+        # denominator of the GRT size-coverage ratio / CONT curve, exactly like
+        # the FRESH placeholders. Keeping GRT per-variant fragmented the ladder
+        # (an OPT with GRT stock in only 2XL surfaced a 1-size GRT pool → wrong
+        # CONT / SZ_MBQ on a GRT allocation). Pure-FRESH OPTs still emit NO GRT
+        # rows. For the 'gen' grain the group IS the row, so this is a no-op
+        # there (per-OPT == per-row). Fresh/GRT completed independently: each
+        # pool's ladder is filled only when THAT pool has signal in the OPT.
+        group_keys = [
+            k for k in ("RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR")
+            if k in typed.columns
+        ]
+        if group_keys:
+            # Light temp frame (group keys + type + signal only) so the
+            # groupby stays cheap on 1M+ row pivots. typed has a RangeIndex
+            # (ignore_index concat), so positional .values alignment is safe.
+            _grp = pd.DataFrame({k: typed[k].values for k in group_keys})
+            _grp["ALLOC_TYPE"] = typed["ALLOC_TYPE"].values
+            _grp["_sig"] = sig.values
+            grp_sig = (
+                _grp.groupby(group_keys + ["ALLOC_TYPE"], dropna=False)["_sig"]
+                .transform("max")
+                .astype(bool)
+                .values
+            )
+        else:
+            grp_sig = sig.values  # no group keys — fall back to per-row
+
+        keep = (typed["ALLOC_TYPE"].values == "FRESH") | grp_sig
+        dropped = int((~keep).sum())
+        typed = typed[keep].reset_index(drop=True)
+        n_fresh = int((typed["ALLOC_TYPE"] == "FRESH").sum())
+        n_grt = int((typed["ALLOC_TYPE"] == "GRT").sum())
+        logger.info(
+            f"[msa] typed-expand [{grain}]: {len(df)} → {len(typed)} rows "
+            f"(FRESH={n_fresh}, GRT={n_grt}; dropped {dropped} "
+            f"non-participating GRT)"
+        )
+        return typed
+
+    def _expand_to_typed_rows(
+        self,
+        msa_pivot: pd.DataFrame,
+        msa_gen_clr: pd.DataFrame,
+        msa_gen_clr_var: pd.DataFrame,
+        sloc_cols: List[str],
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Step 12 transform: turn the 3 single-row result frames into
+        row-per-type (FRESH/GRT) frames. Returns them in the same order
+        (total, gen_art, var_art)."""
+        from app.services.alloc_pool import get_sloc_type_map
+
+        try:
+            type_map = get_sloc_type_map(self.db)
+        except Exception as e:
+            logger.warning(
+                f"[msa] typed-expand: get_sloc_type_map failed ({e}); "
+                f"all SLOCs treated FRESH"
+            )
+            type_map = {}
+        upper_map = {
+            str(k).strip().upper(): str(v).strip().upper()
+            for k, v in type_map.items()
+        }
+
+        present = [c for c in sloc_cols if c in msa_pivot.columns]
+        grt_cols = [c for c in present
+                    if upper_map.get(str(c).strip().upper()) == "GRT"]
+        fresh_cols = [c for c in present if c not in grt_cols]  # unknown → FRESH
+        logger.info(
+            f"[msa] typed-expand: SLOC classification — "
+            f"FRESH={fresh_cols}, GRT={grt_cols}"
+        )
+
+        pend_var = self._load_typed_pend("var")
+        hold_var = self._load_typed_hold("var")
+        pend_gen = self._load_typed_pend("gen")
+        hold_gen = self._load_typed_hold("gen")
+
+        msa_t = self._expand_frame(
+            msa_pivot, fresh_cols, grt_cols, pend_var, hold_var, "var")
+        var_t = self._expand_frame(
+            msa_gen_clr_var, fresh_cols, grt_cols, pend_var, hold_var, "var")
+        gen_t = self._expand_frame(
+            msa_gen_clr, fresh_cols, grt_cols, pend_gen, hold_gen, "gen")
+        return msa_t, gen_t, var_t
 
     # ------------------------------------------------------------------
     # Universe discovery (Step 0 — drives variant backfill in Step 6)
@@ -285,6 +594,7 @@ class MSAService:
                 "ARTICLE_NUMBER", "GEN_ART_NUMBER", "MAJ_CAT", "CLR", "SZ",
                 "SEG", "M_VND_NM", "M_VND_CD", "MACRO_MVGR", "MICRO_MVGR",
                 "FAB", "MVGR_MATRIX", "SSN", "SUB_DIV", "DIV", "MRP", "RSP",
+                "ATT_TYP",
             ]
             cols_result = self.db.execute(text(
                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
@@ -302,6 +612,23 @@ class MSAService:
                 )
                 return pd.DataFrame()
             col_list = ", ".join(f"mp.[{c}]" for c in select_cols)
+
+            # ATT_TYP gate — seed only real sellable SKUs (config allowlist,
+            # default 00 single + 02 variant). Drops 01 generic headers and 11
+            # structured/prepack articles at the source so the backfill can
+            # never introduce them. Only applied when vw_master_product exposes
+            # ATT_TYP; codes are config-controlled tokens, quote-sanitized
+            # defensively before inlining.
+            att_filter = ""
+            att_allow = [
+                str(a).strip() for a in (settings.MSA_ALLOWED_ATT_TYP or [])
+                if str(a).strip()
+            ]
+            if att_allow and "ATT_TYP" in available:
+                quoted = ", ".join(
+                    "'" + a.replace("'", "") + "'" for a in att_allow
+                )
+                att_filter = f"WHERE mp.ATT_TYP IN ({quoted})"
 
             # Bulk-load gen_arts into a session-local #tmp and JOIN.
             # vw_master_product is a slow VIEW — hitting it once with all
@@ -365,6 +692,7 @@ class MSAService:
                                 FROM dbo.vw_master_product mp WITH (NOLOCK)
                                 INNER JOIN {tmp} t
                                   ON t.gen_art = mp.GEN_ART_NUMBER
+                                {att_filter}
                             """), conn)
                         finally:
                             try:
@@ -406,6 +734,118 @@ class MSAService:
                 f"Cause: {type(e).__name__}: {str(e)[:200]}"
             )
             return pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # ATT_TYP resolver (used by Step 6b article-category gate)
+    # ------------------------------------------------------------------
+    def _load_att_typ_map(self, article_numbers: List[str]) -> Dict[str, str]:
+        """Return {ARTICLE_NUMBER: ATT_TYP} from vw_master_product.
+
+        ATT_TYP (SAP article category) is a master attribute that the MSA
+        source view VW_ET_MSA_STK_WITH_MASTER does not carry, so the Step 6b
+        gate resolves it per-article here. Returns an empty dict on any error
+        so the caller can skip the gate (fail-open: keep rows). Uses the same
+        connection-scoped #tmp + chunked-insert + transient-retry hardening as
+        _load_master_variants (on-prem SQL Server drops one giant batch under
+        MSA-calc load)."""
+        if not article_numbers:
+            return {}
+        try:
+            cleaned = [
+                str(a).strip() for a in article_numbers
+                if a is not None
+                and str(a).strip()
+                and str(a).strip().lower() != "nan"
+            ]
+            if not cleaned:
+                return {}
+
+            cols = {
+                str(r[0]).upper()
+                for r in self.db.execute(text(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME = 'vw_master_product'"
+                )).fetchall()
+            }
+            if "ATT_TYP" not in cols or "ARTICLE_NUMBER" not in cols:
+                logger.warning(
+                    "[msa] _load_att_typ_map: vw_master_product missing "
+                    "ATT_TYP or ARTICLE_NUMBER — cannot resolve"
+                )
+                return {}
+
+            import uuid as _uuid
+            import time as _time
+            unique_arts = list({v for v in cleaned})
+            INSERT_BATCH = 5000
+            MAX_ATTEMPTS = 3
+
+            def _is_transient(err: Exception) -> bool:
+                s = str(err)
+                return any(code in s for code in
+                           ("10054", "10053", "08S01", "Communication link"))
+
+            df = pd.DataFrame()
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                tmp = f"#at_{_uuid.uuid4().hex[:8]}"
+                try:
+                    with self.db.bind.connect() as conn:
+                        conn.execute(text(
+                            f"CREATE TABLE {tmp} ("
+                            f"art NVARCHAR(50) COLLATE DATABASE_DEFAULT "
+                            f"NOT NULL PRIMARY KEY)"
+                        ))
+                        try:
+                            raw_cur = conn.connection.cursor()
+                            try:
+                                try:
+                                    raw_cur.fast_executemany = True
+                                except Exception:
+                                    pass
+                                for i in range(0, len(unique_arts),
+                                               INSERT_BATCH):
+                                    batch = unique_arts[i:i + INSERT_BATCH]
+                                    raw_cur.executemany(
+                                        f"INSERT INTO {tmp} (art) VALUES (?)",
+                                        [(v,) for v in batch],
+                                    )
+                            finally:
+                                raw_cur.close()
+                            df = pd.read_sql(text(f"""
+                                SELECT DISTINCT
+                                    CAST(mp.ARTICLE_NUMBER AS NVARCHAR(50))
+                                        AS ARTICLE_NUMBER,
+                                    mp.ATT_TYP AS ATT_TYP
+                                FROM dbo.vw_master_product mp WITH (NOLOCK)
+                                INNER JOIN {tmp} t
+                                  ON t.art =
+                                     CAST(mp.ARTICLE_NUMBER AS NVARCHAR(50))
+                            """), conn)
+                        finally:
+                            try:
+                                conn.execute(text(f"DROP TABLE {tmp}"))
+                            except Exception:
+                                pass
+                    break  # success
+                except Exception as e:
+                    if attempt < MAX_ATTEMPTS and _is_transient(e):
+                        _time.sleep(0.5 * (2 ** (attempt - 1)))
+                        continue
+                    raise
+
+            if df is None or df.empty:
+                return {}
+            keys = df["ARTICLE_NUMBER"].astype(str).str.strip()
+            vals = df["ATT_TYP"].fillna("").astype(str).str.strip()
+            out = dict(zip(keys, vals))
+            logger.info(
+                f"[msa] _load_att_typ_map: resolved ATT_TYP for {len(out)} "
+                f"of {len(cleaned)} articles"
+            )
+            return out
+        except Exception as e:
+            logger.warning(f"[msa] _load_att_typ_map failed: {e}")
+            return {}
 
     # ========================================================================
     # Data Discovery Methods
@@ -1050,6 +1490,77 @@ class MSAService:
                     f"{type(e).__name__}: {str(e)[:200]}"
                 )
 
+            # ============ STEP 6b: ATT_TYP GATE (00/02 ONLY) ============
+            # Keep only real sellable SKUs per the config allowlist
+            # (default 00 single + 02 variant); drop 01 generic headers and
+            # 11 structured/prepack articles. ATT_TYP is a master attribute
+            # not carried by the MSA source view, so it is looked up per
+            # ARTICLE_NUMBER from VW_MASTER_PRODUCT. Applied AFTER Step 6 so
+            # the same gate covers both stocked and backfilled rows, and
+            # BEFORE the PEND/HOLD merges so no obligation lands on an
+            # excluded (header/structured) article. Downstream Grid / Listing
+            # / Allocation inherit this filter automatically.
+            try:
+                att_allow = [
+                    str(a).strip()
+                    for a in (settings.MSA_ALLOWED_ATT_TYP or [])
+                    if str(a).strip()
+                ]
+                if (
+                    att_allow
+                    and not msa_pivot.empty
+                    and "ARTICLE_NUMBER" in msa_pivot.columns
+                ):
+                    arts = (
+                        msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                        .unique().tolist()
+                    )
+                    att_map = self._load_att_typ_map(arts)
+                    if att_map:
+                        before = len(msa_pivot)
+                        key = (
+                            msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                        )
+                        # Unknown ATT_TYP (article absent from master) is
+                        # dropped — an allocatable SKU must resolve to an
+                        # allowed category. allow-set membership decides.
+                        allow_set = set(att_allow)
+                        mask = key.map(
+                            lambda a: att_map.get(a) in allow_set
+                        )
+                        msa_pivot = msa_pivot[mask].reset_index(drop=True)
+                        dropped = before - len(msa_pivot)
+                        if dropped:
+                            logger.info(
+                                f"[msa] Step 6b ATT_TYP gate: kept "
+                                f"{len(msa_pivot)}/{before} rows "
+                                f"(allow={att_allow}); dropped {dropped} "
+                                f"non-allowed / unmapped rows"
+                            )
+                        else:
+                            logger.info(
+                                f"[msa] Step 6b ATT_TYP gate: all {before} "
+                                f"rows already within allow={att_allow}"
+                            )
+                    else:
+                        logger.warning(
+                            "[msa] Step 6b ATT_TYP gate: no ATT_TYP resolved "
+                            "from VW_MASTER_PRODUCT — gate skipped (rows kept)"
+                        )
+                        self.warnings.append(
+                            "Step 6b: could not resolve ATT_TYP from "
+                            "VW_MASTER_PRODUCT — article-category gate skipped."
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[msa] Step 6b ATT_TYP gate failed (skipping): {e}",
+                    exc_info=True,
+                )
+                self.warnings.append(
+                    f"Step 6b ATT_TYP gate raised "
+                    f"{type(e).__name__}: {str(e)[:200]}"
+                )
+
             # ============ STEP 7: MERGE ARS_PEND_ALC → PEND_QTY ============
             # Stamp PEND onto every row (existing + universe-backfilled)
             # by joining ARS_PEND_ALC on (RDC, ARTICLE_NUMBER). Every
@@ -1286,6 +1797,28 @@ class MSAService:
             else:
                 msa_gen_clr = pd.DataFrame()
                 logger.warning("Could not aggregate - using empty DataFrame")
+
+            # ============ STEP 12: ROW-PER-TYPE (FRESH/GRT) EXPANSION =====
+            # MSA output becomes row-per-type like alloc/pend/hold: each SKU
+            # emits a FRESH and/or GRT row (STK split by SLOC pool, PEND/HOLD
+            # re-derived typed from the open ledgers, FNL_Q recomputed). Runs
+            # on all 3 frames. Non-fatal: on failure keep untyped output.
+            try:
+                msa_pivot, msa_gen_clr, msa_gen_clr_var = (
+                    self._expand_to_typed_rows(
+                        msa_pivot, msa_gen_clr, msa_gen_clr_var, sloc_cols
+                    )
+                )
+            except Exception as _typed_err:
+                logger.error(
+                    f"[msa] Step 12 row-per-type expansion failed — keeping "
+                    f"untyped single-row output: {_typed_err}", exc_info=True
+                )
+                self.warnings.append(
+                    f"Step 12 row-per-type expansion raised "
+                    f"{type(_typed_err).__name__}: {str(_typed_err)[:200]}; "
+                    f"MSA output is untyped."
+                )
 
             # ============ CONVERT TO DICTS AND RETURN ============
             # _df_to_native_records strips numpy/pandas scalar types via a

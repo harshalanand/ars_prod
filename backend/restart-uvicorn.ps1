@@ -39,5 +39,5 @@ if ($NoStart) {
     exit 0
 }
 
-Write-Host "Starting uvicorn on port $Port ..." -ForegroundColor Green
-& $pythonExe -m uvicorn $AppModule --host 0.0.0.0 --port $Port
+Write-Host "Starting uvicorn on port $Port (hot-reload) ..." -ForegroundColor Green
+& $pythonExe -m uvicorn $AppModule --host 0.0.0.0 --port $Port --reload --reload-dir app

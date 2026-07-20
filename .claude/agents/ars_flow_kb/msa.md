@@ -7,10 +7,11 @@
 - `backend/app/api/v1/endpoints/msa.py`
 - `backend/app/api/v1/endpoints/msa_stock.py`
 
-## Output tables (rep_data DB, NOT system DB)
-- `ARS_MSA_TOTAL` (was `cl_msa`) — variant grain: one row per `(RDC, ARTICLE_NUMBER, …, SZ)`
+## Output tables (rep_data DB, NOT system DB) — row-per-type since 2026-07-10
+- `ARS_MSA_TOTAL` (was `cl_msa`) — variant×type grain: one row per `(RDC, ARTICLE_NUMBER, …, SZ, ALLOC_TYPE)`
 - `ARS_MSA_VAR_ART` (was `cl_generated_color`) — same grain as TOTAL, filtered by threshold (Step 10)
-- `ARS_MSA_GEN_ART` — color grain: one row per `(RDC, MAJ_CAT, GEN_ART_NUMBER, CLR)`
+- `ARS_MSA_GEN_ART` — color×type grain: one row per `(RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, ALLOC_TYPE)`
+- `ALLOC_TYPE ∈ {'FRESH','GRT'}` (Step 12): FRESH row ALWAYS emitted per SKU (placeholder/denominator role — dropping zero FRESH rows over-lists options); GRT row only with stock/pend/hold. `STK(T)=Σ` that type's SLOCs per `ARS_MSA_SLOC_SETTINGS.sloc_type`; legacy pend/hold (NULL/'') fold to FRESH; FNL_Q per typed row. Approve/revert deltas + pend/hold re-syncs update the MATCHING typed row only.
 - `MSA_Calculation_Sequence` — sequence/run tracker (also in rep_data DB)
 - Output column `RDC` (renamed from `ST_CD`)
 
@@ -86,3 +87,5 @@ After the universe-anchored build (June 2026), all five should sit at zero delta
 
 ## Recorded rules
 <!-- ars_flow appends dated bullets below. One rule per line. -->
+- **2026-07-13 — ATT_TYP gate (00/02 only).** MSA keeps only real sellable SKUs: `ATT_TYP ∈ settings.MSA_ALLOWED_ATT_TYP` (default `['00','02']` = single + variant). Drops `01` generic headers (never allocate a header directly, only its 02 variants) and `11` structured/prepack. Step 6b in `calculate()` via `_load_att_typ_map` (ATT_TYP resolved per ARTICLE_NUMBER from `vw_master_product` — the MSA source view lacks it); the Step-6 backfill loader also filters `ATT_TYP IN (allowlist)`. Runs after Step 6, before PEND/HOLD merges → Grid/Listing/Alloc inherit it. Unmapped→dropped; fail-open. Diagnostic: `SELECT mp.ATT_TYP, COUNT(*) FROM ARS_MSA_VAR_ART v LEFT JOIN MASTER_PRODUCT mp ON CAST(mp.ARTICLE_NUMBER AS NVARCHAR(30))=CAST(v.ARTICLE_NUMBER AS NVARCHAR(30)) WHERE v.SEQUENCE_ID=<seq> GROUP BY mp.ATT_TYP` — should return only 00/02.
+- **2026-07-13 — GRT size-ladder completed per-OPT (Step 12).** Row-per-type expansion (`_expand_frame`) now keeps GRT rows **per-OPT, not per-variant**: if an OPT `(RDC,MAJ_CAT,GEN_ART_NUMBER,CLR)` has GRT signal at any size, keep its whole GRT size-ladder (zero sizes as placeholders — GRT coverage/CONT denominator), mirroring the always-on FRESH ladder. Pure-FRESH OPTs still emit no GRT rows; each pool completed independently. Fixes fragmented GRT pools (e.g. GRT stock only in 2XL surfaced a 1-size GRT ladder → wrong CONT/SZ_MBQ on GRT allocation). Only active when both pools are generated (FRESH-only MSA unchanged). Diagnostic: for GRT-participating OPTs, `COUNT(DISTINCT SZ WHERE ALLOC_TYPE='GRT') == COUNT(DISTINCT SZ WHERE ALLOC_TYPE='FRESH')` must hold per colour.

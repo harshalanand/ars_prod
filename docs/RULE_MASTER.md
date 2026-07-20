@@ -3,7 +3,8 @@
 **Audience:** anyone reviewing an ARS run output (MSA generate, grid build, listing, allocation, hold/pend). Use this as the single reference to answer "is the system following the rules?" and to suggest new rules where you see gaps.
 
 **Authoritative sources (deep dives, kept in sync):**
-- [.claude/agents/ars_flow_kb/INDEX.md](../.claude/agents/ars_flow_kb/INDEX.md) — per-module rule files
+- ⭐ **[frontend/public/docs/manual/](../frontend/public/docs/manual/)** — the canonical ARS Manual dossiers (BRD + FSD per module), also viewable in-app at `/manual/*`. Start here.
+- [.claude/agents/ars_flow_kb/INDEX.md](../.claude/agents/ars_flow_kb/INDEX.md) — per-module quick-rule extracts
 - [backend/app/services/](../backend/app/services/) — implementation
 - [backend/app/api/v1/endpoints/listing.py](../backend/app/api/v1/endpoints/listing.py) — OPT_TYPE classification + listing pipeline
 
@@ -56,7 +57,7 @@ These apply across MSA / Grid / Listing / Allocation. A run that violates any of
 **Trigger:** `POST /api/v1/msa/calculate` (via `msa_job_service`)
 **Outputs (rep_data DB):** `ARS_MSA_TOTAL`, `ARS_MSA_VAR_ART`, `ARS_MSA_GEN_ART`, `MSA_Calculation_Sequence`
 
-### 3.1 11-step MSA flow (universe-anchored, June 2026)
+### 3.1 12-step MSA flow (universe-anchored + row-per-type, July 2026)
 
 | Step | Action | Rule |
 |---|---|---|
@@ -65,12 +66,14 @@ These apply across MSA / Grid / Listing / Allocation. A run that violates any of
 | 3 | Fill missing dims | Apply column defaults (e.g. `CLR='NA'`) |
 | 4 | SEG filter | Keep `SEG IN ('APP','GM')` |
 | 5 | Pivot by SLOC | Rename `ST_CD → RDC` **immediately after pivot** (must happen before any downstream column lookup — see § 3.5 bug) |
-| 6 | **Universe backfill** | `_load_universe(slocs, date)` returns `(RDC, GEN_ART)` union of: (A) stock in selected SLOCs, (B) open `ARS_PEND_ALC`, (C) open `ARS_NL_TBL_HOLD_TRACKING`. Backfill VAR_ARTs from `vw_master_product` so every PEND/HOLD has a row. |
+| 6 | **Universe backfill** | `_load_universe(slocs, date)` returns `(RDC, GEN_ART)` union of: (A) stock in selected SLOCs, (B) open `ARS_PEND_ALC`, (C) open `ARS_NL_TBL_HOLD_TRACKING`. Backfill VAR_ARTs from `vw_master_product` (loader itself only pulls `ATT_TYP IN` allowlist) so every PEND/HOLD has a row. |
+| 6b | **ATT_TYP gate (00/02 only)** (2026-07-13) | Keep only articles whose `ATT_TYP` (SAP category, from `vw_master_product` via `_load_att_typ_map`) ∈ `settings.MSA_ALLOWED_ATT_TYP` (default `['00','02']` = single + variant). Drops `01` generic headers (never allocate a header directly — only its 02 variants) and `11` structured/prepack (not individually replenished). Runs after Step 6 (covers stocked + backfilled), before Step 7 (no obligation lands on an excluded article). Unmapped → dropped; fail-open if unresolvable. Fixed config rule; Grid/Listing/Alloc inherit it. |
 | 7 | Merge PEND | `ARS_PEND_ALC` → `PEND_QTY` on `(RDC, ARTICLE_NUMBER)` |
 | 8 | Merge HOLD | `ARS_NL_TBL_HOLD_TRACKING` → `HOLD_QTY` (map `WERKS → RDC`) |
 | 9 | Compute `FNL_Q` | `FNL_Q = max(STK − PEND − HOLD, 0)` |
 | 10 | Threshold | Keep groups where `Σ FNL_Q + Σ PEND_QTY + Σ HOLD_QTY > threshold` (admits pend-only / hold-only groups) |
 | 11 | Aggregate to GEN_ART | Group VAR_ART → GEN_ART by `(RDC, MAJ_CAT, GEN_ART_NUMBER, CLR)` |
+| 12 | **Row-per-type expansion** (2026-07-10; GRT-ladder fix 2026-07-13) | Every SKU → one `ALLOC_TYPE='FRESH'` row (**always**, even all-zero — placeholder/denominator role) + `'GRT'` rows kept **per-OPT**: if the OPT `(RDC,MAJ_CAT,GEN_ART,CLR)` has GRT signal at **any** size, keep its **whole GRT size-ladder** (zero sizes as placeholders — GRT coverage/CONT denominator), mirroring FRESH; pure-FRESH OPTs emit no GRT rows. Each pool's ladder completed independently. `STK(T)=Σ` that type's SLOC cols per `ARS_MSA_SLOC_SETTINGS.sloc_type` (FRESH xor GRT, no BOTH; unknown→FRESH); PEND/HOLD re-derived typed from open ledgers (legacy NULL/''→FRESH); `FNL_Q(T)=max(STK(T)−PEND(T)−HOLD(T),0)`; other type's SLOC cols zeroed per row. Non-fatal: falls back untyped + warning. |
 
 ### 3.2 Universe rule (post-correction, June 2026)
 
@@ -86,7 +89,10 @@ Stock contribution stays **SLOC-scoped**. Products with stock only on *non-selec
 | R4 | `count(distinct VAR_ART.ARTICLE_NUMBER) == count(distinct TOTAL.ARTICLE_NUMBER)` per passing group | Equal |
 | R5 | Per `(RDC, MAJ_CAT, GEN_ART, CLR)`: `GEN_ART.X == Σ VAR_ART.X` for X ∈ {STK_QTY, PEND_QTY, HOLD_QTY, FNL_Q} | Equal |
 
-> If any of R1–R5 ≠ 0, the bug is upstream of allocation — fix MSA first.
+| R6 | Per folded type T: `Σ TOTAL.PEND_QTY WHERE ALLOC_TYPE=T == Σ open pend WHERE folded(ALLOC_TYPE)=T` (same for HOLD); exactly one FRESH row per SKU, ≤ one GRT row; `STK(FRESH)+STK(GRT) == STK(total)`; **for a GRT-participating OPT the GRT size-ladder == the FRESH size-ladder** (no fragmented GRT pool) | Δ = 0 |
+
+> If any of R1–R6 ≠ 0, the bug is upstream of allocation — fix MSA first.
+> R5 now reconciles per `(colour key, ALLOC_TYPE)`.
 
 ### 3.4 Eight write paths to `ARS_MSA_TOTAL / VAR_ART / GEN_ART`
 
@@ -194,6 +200,8 @@ Legacy aliases: `aggregate → st_maj`, `mark → each`.
 
 Working / alloc rows are ordered: `ST_RANK → MAJ_CAT → OPT_TYPE (RL=1, TBC=2, TBL=3) → OPT_PRIORITY_RANK → WERKS [→ SZ for alloc]`. `ST_RANK` is the per-MAJ_CAT priority rank of the store.
 
+**Manual store priority:** `MANUAL_ST_PRIORITY` (positive int) on `Master_ALC_INPUT_ST_MASTER` pins a store to `ST_RANK = P` in every MAJ_CAT it is listed in; non-manual stores keep score order but skip the pinned slots (literal + skip-used-slots, per MAJ_CAT). Duplicate `P` in a MAJ_CAT → best `W_SCORE` holds the slot, other shifts (warning). Because `ST_RANK` is the cross-MAJ_CAT allocation tiebreaker, pinned stores also fill first on equal `OPT_PRIORITY_RANK`.
+
 ### 5.4 OPT_MBQ rules
 
 | Rule | Where |
@@ -253,15 +261,14 @@ Also: `TBL_LISTED_DATE = GETDATE()` when `OPT_TYPE='TBL'` AND `ALLOC_QTY > 0`.
 
 **Source:** [backend/app/services/rule_engine_per_opt.py](../backend/app/services/rule_engine_per_opt.py), [backend/app/services/rule_engine_new.py](../backend/app/services/rule_engine_new.py), [backend/app/services/rule_engine_pandas.py](../backend/app/services/rule_engine_pandas.py)
 
-### 6.1 Mode selection
+### 6.1 Mode selection — REMOVED 2026-07-10
 
-| `allocation_mode` | What runs |
-|---|---|
-| `pandas` (default) | Vectorized cumulative-window race |
-| `per_opt` | One-OPT-at-a-time sequential engine; flips `ARS_PER_OPT_MODE=1` |
-| `sequential` | Single-thread SQL fallback |
-
-`exec_order = opt_type_first` (default) = RL all rounds → TBC all rounds → TBL all rounds. `round_first` (R1 across all → R2 …) is configured but wiring still maps to `opt_type_first` today — **gap flagged below**.
+**per_opt is the ONLY engine.** `allocation_mode != 'per_opt'` → HTTP 400. The pandas band,
+sequential branch, parallel variants, the env switch (`ARS_PER_OPT_MODE`/`ARS_EXEC_ORDER`) and the
+`exec_order` field were all removed (see `backend/app/docs/REMOVAL_PLAN_PER_OPT_ONLY.md`). Execution
+order is fixed at RL all rounds → TBC all rounds → TBL all rounds. `rule_engine_pandas.py` survives
+only as the orchestration host (loads, worker pool, writer queue, Stage D, write-back); the band math
+lives in `rule_engine_per_opt.py`; Stage A/B in `rule_engine_new.py`.
 
 ### 6.2 Per-size dispatch formula (RL / TBC)
 

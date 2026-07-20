@@ -6,7 +6,7 @@
  * timeline, drill-down detail, reconciliation banner.
  */
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { holdDashboardAPI } from '@/services/api'
+import api, { holdDashboardAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
   Lock, RefreshCw, Building2, Boxes, AlertTriangle, Calendar,
@@ -242,6 +242,9 @@ export default function HoldDashboardPage() {
   const [timeline, setTimeline] = useState([])
   const [recon, setRecon] = useState(null)
 
+  // Allocation-type filter: '' = all, FRESH / GRT / LEGACY ('' ALLOC_TYPE rows).
+  const [allocType, setAllocType] = useState('')
+
   // Detail filters & pagination
   const [filters, setFilters] = useState({ werks: '', rdc: '', gen_art: '', status: '', only_open: true })
   const [page, setPage] = useState(1)
@@ -272,12 +275,15 @@ export default function HoldDashboardPage() {
 
   const loadAll = useCallback(async () => {
     try {
+      // summary/byStatus helpers don't take params yet — call the endpoints
+      // directly so the alloc_type filter reaches them (see api.js handoff).
+      const tp = allocType ? { alloc_type: allocType } : {}
       const [s, st, rdc, art, status, age, tl, rc] = await Promise.all([
-        holdDashboardAPI.summary(),
-        holdDashboardAPI.byStore({ limit: 15, only_open: true }),
-        holdDashboardAPI.byRdc({ only_open: true }),
-        holdDashboardAPI.byArticle({ limit: 15, only_open: true }),
-        holdDashboardAPI.byStatus(),
+        api.get('/hold-dashboard/summary', { params: tp }),
+        holdDashboardAPI.byStore({ limit: 15, only_open: true, ...tp }),
+        holdDashboardAPI.byRdc({ only_open: true, ...tp }),
+        holdDashboardAPI.byArticle({ limit: 15, only_open: true, ...tp }),
+        api.get('/hold-dashboard/by-status', { params: tp }),
         holdDashboardAPI.byAge(),
         holdDashboardAPI.timeline({ days: 60 }),
         holdDashboardAPI.reconciliation(),
@@ -296,7 +302,7 @@ export default function HoldDashboardPage() {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [])
+  }, [allocType])
 
   const loadDetail = useCallback(async () => {
     setDetailLoading(true)
@@ -306,6 +312,7 @@ export default function HoldDashboardPage() {
       if (filters.rdc) params.rdc = filters.rdc
       if (filters.gen_art) params.gen_art = filters.gen_art
       if (filters.status) params.status = filters.status
+      if (allocType) params.alloc_type = allocType
       const r = await holdDashboardAPI.detail(params)
       setDetail(r.data?.data || { items: [], total: 0 })
     } catch (e) {
@@ -313,7 +320,7 @@ export default function HoldDashboardPage() {
     } finally {
       setDetailLoading(false)
     }
-  }, [page, pageSize, filters])
+  }, [page, pageSize, filters, allocType])
 
   useEffect(() => { loadAll() }, [loadAll])
   useEffect(() => { loadDetail() }, [loadDetail])
@@ -397,6 +404,7 @@ export default function HoldDashboardPage() {
       if (filters.rdc)     params.rdc     = filters.rdc
       if (filters.gen_art) params.gen_art = filters.gen_art
       if (filters.status)  params.status  = filters.status
+      if (allocType)       params.alloc_type = allocType
 
       const res = await holdDashboardAPI.detailExport(params)
       // Pull filename from Content-Disposition if present
@@ -588,13 +596,36 @@ export default function HoldDashboardPage() {
             Review TBL/NL hold reservations from ARS_NL_TBL_HOLD_TRACKING. Last updated: {lastUpdated}
           </p>
         </div>
-        <button
-          onClick={handleRefresh}
-          disabled={refreshing}
-          className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50"
-        >
-          <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} /> Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Allocation-type filter pills — apply to KPIs, breakdowns, detail & export */}
+          <div className="inline-flex border border-gray-200 rounded-lg overflow-hidden bg-white">
+            {[
+              { v: '',       l: 'All'    },
+              { v: 'FRESH',  l: 'Fresh'  },
+              { v: 'GRT',    l: 'GRT'    },
+              { v: 'LEGACY', l: 'Legacy' },
+            ].map(o => (
+              <button key={o.v || 'all'}
+                      onClick={() => { setAllocType(o.v); setPage(1) }}
+                      title={o.v === 'LEGACY'
+                          ? 'Rows created before Fresh/GRT typing (blank ALLOC_TYPE)'
+                          : o.v ? `Only ${o.l} holds` : 'All allocation types'}
+                      className={`px-3 py-1.5 text-xs font-medium ${
+                        allocType === o.v ? 'bg-indigo-600 text-white'
+                                          : 'text-gray-600 hover:bg-gray-50'
+                      }`}>
+                {o.l}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+          >
+            <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} /> Refresh
+          </button>
+        </div>
       </div>
 
       {/* Reconciliation banner */}
@@ -639,6 +670,25 @@ export default function HoldDashboardPage() {
         <Card icon={Calendar} label="Oldest open"      value={`${fmt(summary?.oldest_open_days)}d`}
               sub="days since first listed" color={summary?.oldest_open_days > 30 ? 'rose' : 'green'} />
       </div>
+
+      {/* FRESH / GRT / LEGACY split — always the full open book, regardless
+          of the type filter above (this row IS the split). */}
+      {Array.isArray(summary?.by_type) && summary.by_type.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {['FRESH', 'GRT', 'LEGACY'].map(t => {
+            const b = summary.by_type.find(x => x.alloc_type === t)
+                      || { open_rows: 0, open_qty: 0 }
+            const color = t === 'FRESH' ? 'green' : t === 'GRT' ? 'amber' : 'indigo'
+            return (
+              <Card key={t} icon={Boxes}
+                    label={`${t === 'LEGACY' ? 'Legacy (untyped)' : t} holds`}
+                    value={fmt(b.open_qty)}
+                    sub={`${fmt(b.open_rows)} open rows`}
+                    color={color} />
+            )
+          })}
+        </div>
+      )}
 
       {/* Row 1: by-RDC + by-status */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -849,6 +899,7 @@ export default function HoldDashboardPage() {
                 <th className="text-left py-2 font-medium px-2">VAR_ART</th>
                 <th className="text-left py-2 font-medium px-2">SZ</th>
                 <th className="text-center py-2 font-medium px-2">Status</th>
+                <th className="text-center py-2 font-medium px-2">Type</th>
                 <th className="text-right py-2 font-medium px-2">Initial</th>
                 <th className="text-right py-2 font-medium px-2">Remaining</th>
                 <th className="text-right py-2 font-medium px-2">Age (d)</th>
@@ -860,11 +911,11 @@ export default function HoldDashboardPage() {
             </thead>
             <tbody>
               {detailLoading ? (
-                <tr><td colSpan={14} className="py-8 text-center text-gray-400">
+                <tr><td colSpan={15} className="py-8 text-center text-gray-400">
                   <Loader2 size={18} className="inline animate-spin" />
                 </td></tr>
               ) : detail.items.length === 0 ? (
-                <tr><td colSpan={14} className="py-8 text-center text-gray-400">No rows match the filters</td></tr>
+                <tr><td colSpan={15} className="py-8 text-center text-gray-400">No rows match the filters</td></tr>
               ) : detail.items.map((r, i) => (
                 <tr key={i} className={`border-b border-gray-100 hover:bg-gray-50 ${r.is_closed ? 'opacity-60' : ''}`}>
                   <td className="px-2 py-1.5">{r.werks}</td>
@@ -879,6 +930,13 @@ export default function HoldDashboardPage() {
                       r.opt_status === 'TBL' ? 'bg-amber-100 text-amber-700'    :
                                               'bg-gray-100 text-gray-600'
                     }`}>{r.opt_status || '—'}</span>
+                  </td>
+                  <td className="px-2 py-1.5 text-center">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                      r.alloc_type === 'FRESH' ? 'bg-sky-100 text-sky-700'       :
+                      r.alloc_type === 'GRT'   ? 'bg-purple-100 text-purple-700' :
+                                                 'bg-gray-100 text-gray-500'
+                    }`}>{r.alloc_type || 'LEGACY'}</span>
                   </td>
                   <td className="px-2 py-1.5 text-right">{fmt(r.hold_qty_initial)}</td>
                   <td className="px-2 py-1.5 text-right font-semibold">{fmt(r.hold_rem)}</td>

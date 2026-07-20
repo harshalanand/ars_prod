@@ -23,3 +23,4 @@
 
 ## Recorded rules
 <!-- ars_flow appends dated bullets below. One rule per line. -->
+- 2026-07-08 — `ARS_NL_TBL_HOLD_TRACKING` carries NO session/run metadata: PK is `(WERKS, VAR_ART, SZ)` and the only non-qty columns are `RDC`, `OPT_STATUS`, dates, `IS_CLOSED` (DDL listing.py:2932-2949). Session attribution for revert lives entirely in `ARS_NL_TBL_HOLD_TRACKING_SNAPSHOT` + `ARS_NL_TBL_HOLD_SNAPSHOT_SESSIONS` (parked_history.py:1302-1303). Why: any per-run ALLOC_TYPE tag cannot ride the tracking table without a schema change. see also: pend_alc.md

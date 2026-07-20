@@ -62,6 +62,14 @@ def load_app_settings() -> Dict[str, Any]:
             "use_tls": True,
             "notifications_enabled": False,
         },
+        "snowflake": {
+            "account": "",
+            "user": "",
+            "password": "",
+            "warehouse": "",
+            "role": "",
+            "enabled": False,
+        },
         "application": {
             "app_name": "ARS - Allocation & Reporting System",
             "max_upload_size_mb": settings.MAX_UPLOAD_SIZE_MB,
@@ -185,6 +193,8 @@ def _mask_passwords(data: Dict[str, Any]) -> Dict[str, Any]:
         data["email"]["smtp_password"] = PASSWORD_MASK
     if data.get("database", {}).get("password"):
         data["database"]["password"] = PASSWORD_MASK
+    if data.get("snowflake", {}).get("password"):
+        data["snowflake"]["password"] = PASSWORD_MASK
     return data
 
 
@@ -225,6 +235,8 @@ async def update_settings(
         incoming["smtp_password"] = all_settings.get("email", {}).get("smtp_password", "")
     if body.category == "database" and incoming.get("password") == PASSWORD_MASK:
         incoming["password"] = all_settings.get("database", {}).get("password", "")
+    if body.category == "snowflake" and incoming.get("password") == PASSWORD_MASK:
+        incoming["password"] = all_settings.get("snowflake", {}).get("password", "")
 
     all_settings[body.category].update(incoming)
     save_app_settings(all_settings)

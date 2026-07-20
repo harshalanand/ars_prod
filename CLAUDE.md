@@ -1,5 +1,13 @@
 # CLAUDE.md — Instructions for Claude Code + Claude Desktop
 
+## ARS MANUAL = SOURCE OF TRUTH (read before changing any ARS module)
+The canonical spec for every ARS module lives in **`frontend/public/docs/manual/<module>.md`** — one dossier per module (`msa, grid, merge, listing, review, hold, pendalc, start, dictionary`) with **BRD** (business why), **FSD** (rules, formulas, validation gates), and appendable **Recorded rules**. These same files render in-app at `/manual/*` for humans AND are Claude's memory.
+
+- **Before** developing/changing an ARS area, READ its dossier and conform to it. It says how MSA is calculated and why, each column's relevance, how Grid/Listing/Pending-Allocation work, and the "validate first, then create" gates.
+- **After** changing logic, UPDATE that dossier's FSD + `## Recorded rules`, keep `ARS_DATA_DICTIONARY` in sync, and re-run screenshots if the UI changed. See `tools/manual/REFRESH.md`.
+- A PostToolUse hook (`tools/manual/doc_drift_hook.mjs`) reminds which dossier to update when you edit a backend ARS source file.
+- The terse per-area files in `.claude/agents/ars_flow_kb/` and `docs/RULE_MASTER.md` are extracts of these dossiers — keep them consistent, dossiers win.
+
 ## UNIVERSAL MCP SERVER (connect this first — gives Claude live access to all systems)
 ```
 URL:  https://universal-mcp.akash-bab.workers.dev

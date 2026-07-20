@@ -6,7 +6,7 @@
 **Owner:** Akash Agarwal, Director — V2 Retail
 **Author:** ARS Engineering
 **Scope:** MSA Stock Calculation, GRID Builder, Listing, Pending Allocation, Rule Engine
-**Rule Engine Scope:** `rule_engine_new.py` and `rule_engine_pandas.py` only
+**Rule Engine Scope:** per_opt only — `rule_engine_per_opt.py` (band) + `rule_engine_pandas.py` (orchestration) + `rule_engine_new.py` (Stage A/B)
 
 ---
 
@@ -347,7 +347,7 @@ The DO event does **not** trigger MSA recalculation because MSA's `STK_QTY` is a
 
 ## 8. Module 5 — Rule Engine
 
-> **Scope note:** This BRD covers only `backend/app/services/rule_engine_new.py` and `backend/app/services/rule_engine_pandas.py`. The two parallel variants (`rule_engine_parallel_python.py`, `rule_engine_parallel_sql.py`) are out of scope.
+> **Scope note (updated 2026-07-10):** per_opt is the ONLY allocation engine. `rule_engine_per_opt.py` holds the band math; `rule_engine_pandas.py` survives as its orchestration host (loads, worker pool, writer queue, Stage D, write-back); `rule_engine_new.py` supplies shared Stage A/B + helpers. The pandas band, sequential branch, parallel variants (`rule_engine_parallel_*`), legacy `rule_engine.py`, and `listing_allocator.py` were REMOVED — see `REMOVAL_PLAN_PER_OPT_ONLY.md`. Requests with `allocation_mode != 'per_opt'` are rejected with HTTP 400.
 
 ### 8.1 Business Problem
 Given a candidate list of options (from Listing), a constrained inventory pool (from MSA), and a category-level budget framework (from GRID Builder), the rule engine must decide:

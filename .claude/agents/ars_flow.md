@@ -8,8 +8,10 @@ You are **ars_flow**, the umbrella subagent for the ARS listing-allocation flow 
 
 ## Start every invocation by loading the KB
 
-1. Read `.claude/agents/ars_flow_kb/INDEX.md` first.
-2. Then read the KB file(s) for the area(s) the user mentioned. If unsure, read all six — they are short.
+**Canonical source = the ARS Manual dossiers** at `frontend/public/docs/manual/<module>.md` (`msa, grid, merge, listing, review, hold, pendalc`). They hold the full BRD + FSD (rules, formulas, validation gates) and are the same files humans read at `/manual/*`. **Read the relevant dossier first**, then the terse extract below. When they disagree, the dossier wins. Record new rules in the dossier's `## Recorded rules` (mirror to the extract if useful).
+
+1. Read `frontend/public/docs/manual/<module>.md` for the area(s) the user mentioned.
+2. Read `.claude/agents/ars_flow_kb/INDEX.md` and the matching quick-extract file(s). If unsure, read all six — they are short.
    - MSA Stock Calc → `ars_flow_kb/msa.md`
    - Grid Builder → `ars_flow_kb/grid.md`
    - Listing → `ars_flow_kb/listing.md`
@@ -39,7 +41,7 @@ You are **ars_flow**, the umbrella subagent for the ARS listing-allocation flow 
 
 ### Merge Rules
 - `backend/app/api/v1/endpoints/merge_rules.py`
-- `backend/app/services/rule_engine.py`, `rule_engine_new.py`, `rule_engine_pandas.py`, `rule_engine_parallel_python.py`, `rule_engine_parallel_sql.py`, `rule_engine_per_opt.py`
+- `backend/app/services/rule_engine_per_opt.py` (the ONLY band since 2026-07-10), `rule_engine_pandas.py` (orchestration host), `rule_engine_new.py` (shared Stage A/B) — rule_engine.py / parallel variants / listing_allocator.py were REMOVED
 - For deep internals of `rule_engine_*.py`, **defer to the `rule_ars` specialist** — it owns those files.
 
 ### Hold Process / Manage

@@ -18,6 +18,12 @@ const C = {
 
 const AGING_ACCENT = { '0-7d': C.green, '8-30d': C.blue, '31-60d': C.amber, '60d+': C.red }
 
+// FS-13 fix #2 — mirrors POLL_ERROR_TOLERANCE in PendingDeliveryOrderPage:
+// tolerate this many CONSECUTIVE polling errors before declaring the job
+// failed. A transient 502/504 — or a 404 from a gunicorn worker that doesn't
+// own the job — must not abort a BDC generate whose stamps already committed.
+const POLL_ERROR_TOLERANCE = 5
+
 function fmt(n) {
   return typeof n === 'number' ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'
 }
@@ -158,6 +164,8 @@ export default function PendAlcRecoPage() {
   const [fRdc,      setFRdc]      = useState('')
   const [fMajCat,   setFMajCat]   = useState('')
   const [fMode,     setFMode]     = useState('')
+  // Typed pend filter — '' | FRESH | GRT | LEGACY (rows with no ALLOC_TYPE).
+  const [fAllocType, setFAllocType] = useState('')
   const [fClosed,   setFClosed]   = useState('open') // 'open' | 'closed' | 'all'
   const [fSession,  setFSession]  = useState('')
   // Tile-driven filters — set by clicking a status / aging tile. Empty
@@ -181,6 +189,14 @@ export default function PendAlcRecoPage() {
   const [gapSortDir, setGapSortDir]     = useState('desc')
   const [gapStatusFilter, setGapStatusFilter] = useState('') // '' | NO_MSA | SHORT
   const [gapExporting, setGapExporting] = useState(false)
+
+  // Dispatch-control gap — pending lines HELD from BDC by the 3 control tables
+  // (article-hold / division-delete / store×maj_cat). Distinct from the MSA gap.
+  const [dcCollapsed, setDcCollapsed] = useState(false)
+  const [dcData, setDcData]           = useState(null)
+  const [dcLoading, setDcLoading]     = useState(false)
+  const [dcRule, setDcRule]           = useState('')   // '' | ARTICLE_HOLD | DIV_DELETE | STORE_MAJCAT
+  const [dcExporting, setDcExporting] = useState(false)
 
   // BDC
   const [bdcLoading, setBdcLoading] = useState(false)
@@ -258,6 +274,54 @@ export default function PendAlcRecoPage() {
     setGapPage(1)
   }
 
+  const loadDispatchGap = useCallback(async () => {
+    setDcLoading(true)
+    try {
+      const params = {}
+      if (fRdc) params.rdc = fRdc
+      const { data } = await pendAlcAPI.dispatchGap(params)
+      setDcData(data || null)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Failed to load dispatch-control gap')
+      setDcData(null)
+    } finally {
+      setDcLoading(false)
+    }
+  }, [fRdc])
+
+  const exportDispatchGap = async () => {
+    setDcExporting(true)
+    try {
+      const params = {}
+      if (fRdc) params.rdc = fRdc
+      const { data: blob } = await pendAlcAPI.exportDispatchGap(params)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a'); a.href = url
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+      a.download = `DISPATCH_CONTROL_GAP_${today}.xlsx`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      toast.success('Excel downloaded')
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Export failed')
+    } finally {
+      setDcExporting(false)
+    }
+  }
+
+  // Rule metadata for tiles + labels.
+  const DC_RULES = [
+    ['ARTICLE_HOLD', 'ARTICLE HOLD',   C.amber, 'GEN_ART + CLR in ARS_HOLD_ARTICLE_BDC'],
+    ['DIV_DELETE',   'DIVISION DELETE', C.red,   'Store division (e.g. KIDS) in ARS_DIVISION_DELETE_BDC'],
+    ['STORE_MAJCAT', 'STORE × MAJ_CAT', C.blue,  'Store + MAJ_CAT in ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC'],
+  ]
+  const dcSummaryFor = (rule) =>
+    (dcData?.summary || []).find(s => s.rule === rule) || { rows: 0, pend_qty: 0 }
+  const dcDetailFiltered = useMemo(() => {
+    const rows = dcData?.detail || []
+    return dcRule ? rows.filter(r => (r.blocked_by || []).includes(dcRule)) : rows
+  }, [dcData, dcRule])
+
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true)
     try {
@@ -282,19 +346,20 @@ export default function PendAlcRecoPage() {
     if (fRdc)      params.rdc        = fRdc
     if (fMajCat)   params.maj_cat    = fMajCat
     if (fMode)     params.alloc_mode = fMode
+    if (fAllocType) params.alloc_type = fAllocType
     if (fSession)  params.session_id = fSession
     if (fClosed === 'open')   params.closed = false
     if (fClosed === 'closed') params.closed = true
     if (fBdcStatus) params.f_bdc_status = fBdcStatus
     if (fAgingBand) params.f_aging_band = fAgingBand
     return pendAlcAPI.reco(params)
-  }, [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession,
+  }, [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fAllocType, fClosed, fSession,
       fBdcStatus, fAgingBand])
 
   // Bump this to make the grid re-fetch from page 1.
   const recoRefreshKey = useMemo(
-    () => `${fDateFrom}|${fDateTo}|${fRdc}|${fMajCat}|${fMode}|${fClosed}|${fSession}|${fBdcStatus}|${fAgingBand}`,
-    [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fClosed, fSession,
+    () => `${fDateFrom}|${fDateTo}|${fRdc}|${fMajCat}|${fMode}|${fAllocType}|${fClosed}|${fSession}|${fBdcStatus}|${fAgingBand}`,
+    [fDateFrom, fDateTo, fRdc, fMajCat, fMode, fAllocType, fClosed, fSession,
      fBdcStatus, fAgingBand]
   )
 
@@ -303,6 +368,7 @@ export default function PendAlcRecoPage() {
   // or the page-level RDC/MAJ_CAT filters. Skipped while the section is
   // collapsed so we don't hammer the DB unnecessarily.
   useEffect(() => { if (!gapCollapsed) loadGap() }, [loadGap, gapCollapsed])
+  useEffect(() => { if (!dcCollapsed) loadDispatchGap() }, [loadDispatchGap, dcCollapsed])
 
   // Tile → filter mapping. Each tile sets `closed`, `f_bdc_status`,
   // `f_aging_band` to scope the detail grid + Excel export. Click the same
@@ -366,6 +432,7 @@ export default function PendAlcRecoPage() {
       if (fRdc)      params.rdc        = fRdc
       if (fMajCat)   params.maj_cat    = fMajCat
       if (fMode)     params.alloc_mode = fMode
+      if (fAllocType) params.alloc_type = fAllocType
       if (fSession)  params.session_id = fSession
       if (fClosed === 'open')   params.closed = false
       if (fClosed === 'closed') params.closed = true
@@ -475,11 +542,15 @@ export default function PendAlcRecoPage() {
       if (!jobId) throw new Error('No job_id in response')
       setBdcJobStatus({ status: 'pending', progress: 'queued' })
 
-      // Poll every 2s until completed / failed.
+      // Poll every 2s until completed / failed. Errors (incl. 404 from a
+      // worker that doesn't own the job) are retryable — only abort after
+      // POLL_ERROR_TOLERANCE consecutive failures.
       const poll = () => new Promise((resolve, reject) => {
+        let consecErrors = 0
         const timer = setInterval(async () => {
           try {
             const s = await pendAlcAPI.asyncJobStatus(jobId)
+            consecErrors = 0
             const j = s.data?.data
             if (!j) return
             setBdcJobStatus(j)
@@ -489,7 +560,9 @@ export default function PendAlcRecoPage() {
               reject(new Error(j.error || 'Job failed'))
             }
           } catch (err) {
-            clearInterval(timer); reject(err)
+            if (++consecErrors >= POLL_ERROR_TOLERANCE) {
+              clearInterval(timer); reject(err)
+            }
           }
         }, 2000)
       })
@@ -965,6 +1038,133 @@ export default function PendAlcRecoPage() {
         )}
       </div>
 
+      {/* Dispatch Control — Held from BDC. Open pending lines that Generate
+          BDC will SKIP because they match a control table (article hold /
+          division delete / store × maj_cat). Held stock stays pending. */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`,
+                    borderRadius: 8, overflow: 'hidden', marginBottom: 14 }}>
+        <div onClick={() => setDcCollapsed(v => !v)}
+             role="button" tabIndex={0}
+             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') setDcCollapsed(v => !v) }}
+             style={{ padding: '8px 12px',
+                      borderBottom: dcCollapsed ? 'none' : `1px solid ${C.border}`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      cursor: 'pointer', userSelect: 'none' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {dcCollapsed
+              ? <ChevronRight size={12} color={C.textSub}/>
+              : <ChevronDown  size={12} color={C.textSub}/>}
+            <AlertTriangle size={12} color={C.amber}/>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
+              DISPATCH CONTROL — HELD FROM BDC
+            </div>
+            <div style={{ fontSize: 9, color: C.textMuted, marginLeft: 6 }}>
+              open pending that Generate BDC will skip (article-hold / division-delete / store×maj_cat)
+            </div>
+          </div>
+          <div style={{ fontSize: 9, color: C.textMuted }}>
+            {dcLoading
+              ? 'loading…'
+              : dcData
+                ? `${(dcData.count || 0).toLocaleString()} line${dcData.count === 1 ? '' : 's'} · held ${fmt(dcData.total_held_qty)}`
+                : '—'}
+          </div>
+        </div>
+
+        {dcCollapsed ? null : (
+          <div style={{ padding: 12 }}>
+            {/* Per-rule tiles — click to filter the detail below. */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)',
+                          gap: 8, marginBottom: 10 }}>
+              {DC_RULES.map(([rule, label, color, hint]) => {
+                const s = dcSummaryFor(rule)
+                return (
+                  <StatusTile key={rule} color={color} label={label} hint={hint}
+                    rows={s.rows || 0} qty={s.pend_qty || 0}
+                    active={dcRule === rule}
+                    onClick={() => setDcRule(r => r === rule ? '' : rule)}/>
+                )
+              })}
+            </div>
+
+            {/* Action row */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <div style={{ fontSize: 9, color: C.textMuted }}>
+                Honours page-level RDC filter{dcRule ? <> · filtered to <b>{dcRule}</b></> : null}
+              </div>
+              <div style={{ flex: 1 }}/>
+              <button style={_btn()} onClick={loadDispatchGap} disabled={dcLoading}>
+                <RefreshCw size={10}
+                  style={{ animation: dcLoading ? 'spin 1s linear infinite' : 'none' }}/>
+                Refresh
+              </button>
+              <button onClick={exportDispatchGap} disabled={dcExporting || dcLoading}
+                style={_btn('primary')}>
+                <Download size={10}/>
+                {dcExporting ? 'Exporting…' : 'Export Excel'}
+              </button>
+            </div>
+
+            {/* Detail table */}
+            {dcLoading && !dcData ? (
+              <div style={{ padding: 20, textAlign: 'center', color: C.textMuted, fontSize: 11 }}>
+                Loading dispatch-control gap…
+              </div>
+            ) : dcDetailFiltered.length === 0 ? (
+              <div style={{ padding: 20, textAlign: 'center', fontSize: 11,
+                            background: C.green + '12', border: `1px solid ${C.green}40`,
+                            borderRadius: 4, color: C.green, fontWeight: 600 }}>
+                Nothing held — no open pending matches a dispatch-control rule.
+              </div>
+            ) : (
+              <div style={{ maxHeight: 420, overflow: 'auto',
+                            border: `1px solid ${C.border}`, borderRadius: 4 }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+                  <thead><tr style={{ background: C.bg, position: 'sticky', top: 0 }}>
+                    {['RDC', 'STORE', 'GEN_ART', 'CLR', 'MAJ_CAT', 'DIV', 'PEND', 'BLOCKED BY'].map((h, i) => (
+                      <th key={i} style={{ padding: '7px 10px',
+                                textAlign: h === 'PEND' ? 'right' : 'left',
+                                fontSize: 9, fontWeight: 700, color: C.textSub,
+                                letterSpacing: '.05em', whiteSpace: 'nowrap',
+                                borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {dcDetailFiltered.slice(0, 500).map((r, i) => (
+                      <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
+                        <td style={{ padding: '5px 10px' }}>{r.rdc}</td>
+                        <td style={{ padding: '5px 10px' }}>{r.st_cd}</td>
+                        <td style={{ padding: '5px 10px', fontFamily: 'monospace' }}>{r.gen_art_number}</td>
+                        <td style={{ padding: '5px 10px' }}>{r.clr}</td>
+                        <td style={{ padding: '5px 10px' }}>{r.maj_cat}</td>
+                        <td style={{ padding: '5px 10px' }}>{r.div || '—'}</td>
+                        <td style={{ padding: '5px 10px', textAlign: 'right', fontWeight: 700 }}>{fmt(r.pend_qty)}</td>
+                        <td style={{ padding: '5px 10px' }}>
+                          {(r.blocked_by || []).map(b => {
+                            const meta = DC_RULES.find(x => x[0] === b)
+                            const col = meta ? meta[2] : C.textSub
+                            return (
+                              <span key={b} style={{ fontSize: 8, fontWeight: 700, color: col,
+                                background: col + '18', border: `1px solid ${col}40`,
+                                borderRadius: 3, padding: '1px 5px', marginRight: 3 }}>{b}</span>
+                            )
+                          })}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {dcDetailFiltered.length > 500 && (
+                  <div style={{ padding: 8, textAlign: 'center', fontSize: 9, color: C.textMuted }}>
+                    showing first 500 of {dcDetailFiltered.length.toLocaleString()} — use Export for all
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Pending vs MSA — Gap report. Surfaces open pending qty whose
           RDC+article has NO MSA row (bot mis-allocated) or where the
           MSA pool (STK − HOLD) is smaller than the pending. These are
@@ -1181,6 +1381,12 @@ export default function PendAlcRecoPage() {
             <option value="AUTO">AUTO</option>
             <option value="MANUAL">MANUAL</option>
           </select>
+          <select value={fAllocType} onChange={e => setFAllocType(e.target.value)} style={inp}>
+            <option value="">All Types</option>
+            <option value="FRESH">FRESH</option>
+            <option value="GRT">GRT</option>
+            <option value="LEGACY">Legacy (untyped)</option>
+          </select>
           <select value={fClosed} onChange={e => setFClosed(e.target.value)} style={inp}>
             <option value="open">Open only</option>
             <option value="closed">Closed only</option>
@@ -1227,6 +1433,13 @@ export default function PendAlcRecoPage() {
           { key:'alloc_mode', label:'MODE', sortable:true, filterType:'multi',
             filterOptions:['AUTO','MANUAL','RL','TBL','NL'],
             render:r => <ModeBadge value={r.alloc_mode}/> },
+          { key:'alloc_type', label:'TYPE', sortable:true,
+            render:r => r.alloc_type
+              ? <span style={{fontSize:8, fontWeight:700, padding:'2px 6px', borderRadius:3,
+                              background:(r.alloc_type==='GRT'?C.amber:C.green)+'22',
+                              color:r.alloc_type==='GRT'?C.amber:C.green}}>{r.alloc_type}</span>
+              : <span style={{fontSize:8, fontWeight:700, padding:'2px 6px', borderRadius:3,
+                              background:'#f1f5f9', color:C.textMuted}}>LEGACY</span> },
           { key:'alloc_qty', label:'ALLOC', sortable:true, align:'right',
             render:r => fmt(r.alloc_qty) },
           { key:'bdc_qty', label:'BDC', sortable:true, align:'right',

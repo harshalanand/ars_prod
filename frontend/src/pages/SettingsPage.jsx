@@ -7,6 +7,7 @@ import toast from 'react-hot-toast'
 const tabs = [
   { id: 'database', label: 'Database', icon: Database },
   { id: 'email', label: 'Email', icon: Mail },
+  { id: 'snowflake', label: 'Snowflake', icon: Database },
   { id: 'application', label: 'Application', icon: Settings },
   { id: 'tables', label: 'Table Permissions', icon: Table2 },
   { id: 'ui', label: 'UI Preferences', icon: Palette },
@@ -146,6 +147,7 @@ export default function SettingsPage() {
           trust_cert: 'yes', encrypt: 'no',
         },
         email: { smtp_server: '', smtp_port: 587, smtp_username: '', smtp_password: '', from_address: '', use_tls: true, notifications_enabled: false },
+        snowflake: { account: '', user: '', password: '', warehouse: '', role: '', enabled: false },
         application: { app_name: 'ARS', max_upload_size_mb: 500, session_timeout_minutes: 60, enable_audit_logging: true, enable_row_level_security: true, default_page_size: 50, max_export_rows: 500000, shift_all_to_working: false },
         ui: { primary_color: '#4f46e5', sidebar_collapsed: false, show_row_numbers: true, date_format: 'YYYY-MM-DD', number_format: 'en-US' },
       })
@@ -571,6 +573,78 @@ export default function SettingsPage() {
                   </button>
                 </div>
                 <button onClick={() => handleSave('email')} disabled={saving} className="btn-primary">
+                  <Save size={16} /> Save Changes
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Snowflake Settings */}
+          {activeTab === 'snowflake' && (
+            <div className="card p-6 space-y-6">
+              <h3 className="font-semibold text-gray-900 text-lg flex items-center gap-2">
+                <Database size={20} /> Snowflake Connection
+              </h3>
+              <p className="text-sm text-gray-500 -mt-3">
+                Used by Report Generation when a report delivers to Snowflake. The connector
+                must be installed on the server (<code>snowflake-connector-python[pandas]</code>).
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="label">Account</label>
+                  <input
+                    value={settings.snowflake?.account || ''}
+                    onChange={e => updateSetting('snowflake', 'account', e.target.value)}
+                    className="input" placeholder="orgname-accountname"
+                  />
+                </div>
+                <div>
+                  <label className="label">Warehouse</label>
+                  <input
+                    value={settings.snowflake?.warehouse || ''}
+                    onChange={e => updateSetting('snowflake', 'warehouse', e.target.value)}
+                    className="input" placeholder="COMPUTE_WH"
+                  />
+                </div>
+                <div>
+                  <label className="label">User</label>
+                  <input
+                    value={settings.snowflake?.user || ''}
+                    onChange={e => updateSetting('snowflake', 'user', e.target.value)}
+                    className="input" placeholder="svc_ars"
+                  />
+                </div>
+                <div>
+                  <label className="label">Password</label>
+                  <input
+                    type="password"
+                    value={settings.snowflake?.password || ''}
+                    onChange={e => updateSetting('snowflake', 'password', e.target.value)}
+                    className="input" placeholder="••••••••"
+                  />
+                </div>
+                <div>
+                  <label className="label">Role (optional)</label>
+                  <input
+                    value={settings.snowflake?.role || ''}
+                    onChange={e => updateSetting('snowflake', 'role', e.target.value)}
+                    className="input" placeholder="SYSADMIN"
+                  />
+                </div>
+                <div className="flex items-center gap-4 pt-6">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={settings.snowflake?.enabled || false}
+                      onChange={e => updateSetting('snowflake', 'enabled', e.target.checked)}
+                      className="w-4 h-4 rounded border-gray-300"
+                    />
+                    <span className="text-sm text-gray-700">Enable Snowflake sync</span>
+                  </label>
+                </div>
+              </div>
+              <div className="flex justify-end pt-4 border-t">
+                <button onClick={() => handleSave('snowflake')} disabled={saving} className="btn-primary">
                   <Save size={16} /> Save Changes
                 </button>
               </div>

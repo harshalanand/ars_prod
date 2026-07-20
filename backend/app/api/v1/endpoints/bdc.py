@@ -140,14 +140,16 @@ def _process_bdc(df: pd.DataFrame, engine, allocation_no="", alloc_batch: str = 
     if combined.empty:
         raise ValueError("No matching articles found after joining with master product data.")
 
-    # Step 2: Remove hold articles (ARS_HOLD_ARTICLE_BDC) by GEN_ART_NUMBER + CLR
+    # Step 2: Remove hold articles (ARS_HOLD_ARTICLE_BDC) by GEN_ART_NUMBER + CLR.
+    # FIX 2026-07-18: the table's column is GEN_ART_NUMBER (was mis-referenced
+    # as GEN_ART_CLR → 'Invalid column name' once the table had rows).
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT GEN_ART_CLR, CLR FROM ARS_HOLD_ARTICLE_BDC WITH (NOLOCK)"))
+        result = conn.execute(text("SELECT GEN_ART_NUMBER, CLR FROM ARS_HOLD_ARTICLE_BDC WITH (NOLOCK)"))
         hold_rows = result.fetchall()
 
     if hold_rows:
-        hold_df = pd.DataFrame(hold_rows, columns=["GEN_ART_CLR", "CLR_HOLD"])
-        hold_df["GEN_ART_CLR"] = hold_df["GEN_ART_CLR"].astype(str).str.strip()
+        hold_df = pd.DataFrame(hold_rows, columns=["GEN_ART_HOLD", "CLR_HOLD"])
+        hold_df["GEN_ART_HOLD"] = hold_df["GEN_ART_HOLD"].astype(str).str.strip()
         hold_df["CLR_HOLD"] = hold_df["CLR_HOLD"].astype(str).str.strip()
 
         combined["_GEN_ART_STR"] = combined["GEN_ART_NUMBER"].astype(str).str.strip()
@@ -158,37 +160,43 @@ def _process_bdc(df: pd.DataFrame, engine, allocation_no="", alloc_batch: str = 
         combined = combined.merge(
             hold_df,
             left_on=["_GEN_ART_STR", "_CLR_STR"],
-            right_on=["GEN_ART_CLR", "CLR_HOLD"],
+            right_on=["GEN_ART_HOLD", "CLR_HOLD"],
             how="left",
             indicator=True,
         )
-        combined = combined[combined["_merge"] == "left_only"].drop(columns=["GEN_ART_CLR", "CLR_HOLD", "_merge"])
+        combined = combined[combined["_merge"] == "left_only"].drop(columns=["GEN_ART_HOLD", "CLR_HOLD", "_merge"])
         stats["hold_article_removed"] = before - len(combined)
         stats["hold_article_removed_qty"] = before_qty - int(combined["ALLOC-QTY"].sum())
 
-    # Step 3: Remove KIDS division for stores in ARS_DIVISION_DELETE_BDC
+    # Step 3: Remove a store's division for stores in ARS_DIVISION_DELETE_BDC.
+    # FIX 2026-07-18: read the division from the DIV column (was hardcoded to
+    # 'KIDS'); STATUS was renamed to DIV and normalised (KIDS-DEL → KIDS).
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT STORE FROM ARS_DIVISION_DELETE_BDC WITH (NOLOCK)"))
+        result = conn.execute(text("SELECT STORE, DIV FROM ARS_DIVISION_DELETE_BDC WITH (NOLOCK)"))
         div_delete_rows = result.fetchall()
 
     if div_delete_rows:
-        div_delete_stores = set(r[0].strip() for r in div_delete_rows)
+        div_pairs = {(str(r[0]).strip(), str(r[1]).strip().upper()) for r in div_delete_rows}
         before = len(combined)
         before_qty = int(combined["ALLOC-QTY"].sum())
-        mask = (combined["ST-CD"].str.strip().isin(div_delete_stores)) & (combined["DIV"].str.strip().str.upper() == "KIDS")
-        combined = combined[~mask]
+        _st  = combined["ST-CD"].astype(str).str.strip()
+        _div = combined["DIV"].astype(str).str.strip().str.upper()
+        mask = [ (s, d) in div_pairs for s, d in zip(_st, _div) ]
+        combined = combined[~pd.Series(mask, index=combined.index)]
         stats["division_delete_removed"] = before - len(combined)
         stats["division_delete_removed_qty"] = before_qty - int(combined["ALLOC-QTY"].sum())
 
-    # Step 4: Remove store + MAJ_CAT matches from ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC
+    # Step 4: Remove store + MAJ_CAT matches from ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC.
+    # FIX 2026-07-18: the table's column is MAJ_CAT (was mis-referenced as MAJCAT
+    # → 'Invalid column name'; this branch runs whenever the table has rows).
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT STORE, MAJCAT FROM ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC WITH (NOLOCK)"))
+        result = conn.execute(text("SELECT STORE, MAJ_CAT FROM ARS_DIVISION_DELETE_ON_MAJ_CAT_BDC WITH (NOLOCK)"))
         majcat_rows = result.fetchall()
 
     if majcat_rows:
-        majcat_df = pd.DataFrame(majcat_rows, columns=["STORE", "MAJCAT"])
-        majcat_df["STORE"] = majcat_df["STORE"].astype(str).str.strip()
-        majcat_df["MAJCAT"] = majcat_df["MAJCAT"].astype(str).str.strip()
+        majcat_df = pd.DataFrame(majcat_rows, columns=["STORE_DEL", "MAJCAT_DEL"])
+        majcat_df["STORE_DEL"] = majcat_df["STORE_DEL"].astype(str).str.strip()
+        majcat_df["MAJCAT_DEL"] = majcat_df["MAJCAT_DEL"].astype(str).str.strip()
 
         before = len(combined)
         before_qty = int(combined["ALLOC-QTY"].sum())
@@ -198,11 +206,11 @@ def _process_bdc(df: pd.DataFrame, engine, allocation_no="", alloc_batch: str = 
         combined = combined.merge(
             majcat_df,
             left_on=["_ST_CD_STR", "_MAJ_CAT_STR"],
-            right_on=["STORE", "MAJCAT"],
+            right_on=["STORE_DEL", "MAJCAT_DEL"],
             how="left",
             indicator=True,
         )
-        combined = combined[combined["_merge"] == "left_only"].drop(columns=["STORE", "MAJCAT", "_merge"])
+        combined = combined[combined["_merge"] == "left_only"].drop(columns=["STORE_DEL", "MAJCAT_DEL", "_merge"])
         stats["majcat_delete_removed"] = before - len(combined)
         stats["majcat_delete_removed_qty"] = before_qty - int(combined["ALLOC-QTY"].sum())
 

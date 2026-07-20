@@ -20,6 +20,36 @@ from app.audit.service import get_client_ip
 
 router = APIRouter(prefix="/upload", tags=["File Upload"])
 
+# ---------------------------------------------------------------------------
+# Typed-table guard (Package 3). These tables carry ALLOC_TYPE and/or feed
+# the typed MSA / pending-allocation lifecycle: writing them through the
+# generic upsert bypasses type validation, typed MSA deltas and the
+# operations log, silently corrupting FRESH/GRT accounting. They must only
+# be written through their dedicated screens.
+# ---------------------------------------------------------------------------
+TYPED_TABLES = {
+    "ARS_PEND_ALC",
+    "ARS_NL_TBL_HOLD_TRACKING",
+    "ARS_ALLOC_PARKED",
+    "ARS_ALLOC_HISTORY",
+    "ARS_MSA_TOTAL",
+    "ARS_MSA_GEN_ART",
+    "ARS_MSA_VAR_ART",
+}
+
+
+def _reject_typed_table(table_name: str) -> None:
+    """400 when the generic upload targets a type-governed table."""
+    bare = (table_name or "").split(".")[-1].strip().strip("[]").upper()
+    if bare in TYPED_TABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{bare} is governed; use its dedicated screen "
+                f"(Manual Entry / Hold Dashboard / MSA)"
+            ),
+        )
+
 
 # ============================================================================
 # Bulk File Upload → Upsert
@@ -59,6 +89,7 @@ async def upload_file(
       -F "primary_key_columns=store_code,variant_code"
     ```
     """
+    _reject_typed_table(table_name)
     try:
         # Parse inputs
         pk_cols = [c.strip() for c in primary_key_columns.split(",")]
@@ -148,7 +179,8 @@ async def upload_file_async(
     Ideal for large files (100K+ rows) where sync processing would timeout.
     """
     from app.services.upload_job_service import create_upload_job
-    
+
+    _reject_typed_table(table_name)
     try:
         pk_cols = [c.strip() for c in primary_key_columns.split(",")]
 

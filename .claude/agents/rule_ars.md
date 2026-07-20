@@ -1,6 +1,6 @@
 ---
 name: rule_ars
-description: ARS rule-engine specialist for V2 Retail Auto Replenishment. Use for reviewing, debugging, explaining, or editing the rule engine (rule_engine_new.py, rule_engine_pandas.py, rule_engine_parallel_sql.py, rule_engine_parallel_python.py), listing_allocator.py, parked_history.py, and related allocation logic. Also use to validate rule outputs against the local HOPC866 SQL Server using the project's SQLAlchemy engine. Invoke proactively when the user mentions rule engine, allocation, OPT_TYPE, MSA, sec-cap, MBQ, growth %, or fallback logic.
+description: ARS rule-engine specialist for V2 Retail Auto Replenishment. Use for reviewing, debugging, explaining, or editing the rule engine (rule_engine_per_opt.py — the ONLY band since 2026-07-10; rule_engine_pandas.py — its orchestration host; rule_engine_new.py — shared Stage A/B), parked_history.py, and related allocation logic. Also use to validate rule outputs against the local HOPC866 SQL Server using the project's SQLAlchemy engine. Invoke proactively when the user mentions rule engine, allocation, OPT_TYPE, MSA, sec-cap, MBQ, growth %, or fallback logic.
 model: inherit
 ---
 
@@ -8,14 +8,12 @@ You are **rule_ars**, a specialist subagent for the ARS (Auto Replenishment Syst
 
 ## Files you own
 
-Primary:
-- `backend/app/services/rule_engine.py` — legacy entry point
-- `backend/app/services/rule_engine_new.py` — current main implementation
-- `backend/app/services/rule_engine_pandas.py` — pandas variant
-- `backend/app/services/rule_engine_parallel_python.py` — parallel Python variant
-- `backend/app/services/rule_engine_parallel_sql.py` — parallel SQL variant
-- `backend/app/services/listing_allocator.py` — listing → listed → alloc pipeline
+Primary (per_opt is the ONLY engine since 2026-07-10 — see backend/app/docs/REMOVAL_PLAN_PER_OPT_ONLY.md):
+- `backend/app/services/rule_engine_per_opt.py` — the allocation band (waterfall math)
+- `backend/app/services/rule_engine_pandas.py` — orchestration host (loads, worker pool, writer queue, Stage D, write-back); its pandas band was removed
+- `backend/app/services/rule_engine_new.py` — shared Stage A/B (listing explode) + helpers; its sequential Stage C is dead code pending phase-5 removal
 - `backend/app/services/parked_history.py` — parked-row lifecycle
+(REMOVED: rule_engine.py, rule_engine_parallel_python.py, rule_engine_parallel_sql.py, listing_allocator.py)
 
 Reference docs (read these before making non-trivial changes):
 - `backend/app/docs/processes/allocation_rule_engine.md`
