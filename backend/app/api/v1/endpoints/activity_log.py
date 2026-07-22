@@ -17,6 +17,7 @@ import os
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, date as date_cls
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
@@ -395,8 +396,8 @@ class ValidateIn(BaseModel):
     date: date_cls
     item_key: str
     status: str            # 'yes' | 'no' | 'pending'
-    note: str | None = None
-    item_summary: str | None = None
+    note: Optional[str] = None
+    item_summary: Optional[str] = None
 
 
 @router.post("/validate", response_model=APIResponse)

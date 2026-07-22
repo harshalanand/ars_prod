@@ -4,6 +4,8 @@ Maintenance Endpoints
 Superadmin-only API for TempDB monitoring, manual cleanup, aggressive
 reclaim, trend history, and session diagnostics.
 """
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
 from pydantic import BaseModel
@@ -420,7 +422,7 @@ def db_shrink_log(
         for log_name, before_mb in log_files:
             current_mb = float(before_mb or 0)
             passes = 0
-            error: str | None = None
+            error: Optional[str] = None
             try:
                 # Up to 3 CHECKPOINT+SHRINK passes — when the active VLF sits
                 # at the end of the file the first SHRINK only reorganises;
