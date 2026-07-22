@@ -140,12 +140,22 @@ msa AS (                            -- MSA total per (RDC, MAJ_CAT)
     WHERE SESSION_ID = (SELECT SESSION_ID FROM sid)
     GROUP BY RDC, MAJ_CAT
 ),
-opt_gt50 AS (                       -- # of OPTs (GEN_ART+CLR) with MSA qty > 50, per (RDC, MAJ_CAT)
+opt_gt50_op AS (                    -- OPENING: # of OPTs (GEN_ART+CLR) with MSA qty > 50, per (RDC, MAJ_CAT)
     SELECT RDC, MAJ_CAT, COUNT(*) AS OPT_GT50_CNT
     FROM (
         SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, SUM(FNL_Q) AS OPT_MSA_QTY
         FROM ARS_MSA_TOTAL_HISTORY WITH (NOLOCK)
         WHERE SESSION_ID = (SELECT SESSION_ID FROM sid)
+        GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
+        HAVING SUM(FNL_Q) > 50
+    ) o
+    GROUP BY RDC, MAJ_CAT
+),
+opt_gt50_cl AS (                    -- CLOSING: same but from the live ARS_MSA_TOTAL (no SESSION_ID)
+    SELECT RDC, MAJ_CAT, COUNT(*) AS OPT_GT50_CNT
+    FROM (
+        SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, SUM(FNL_Q) AS OPT_MSA_QTY
+        FROM ARS_MSA_TOTAL WITH (NOLOCK)
         GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
         HAVING SUM(FNL_Q) > 50
     ) o
@@ -191,7 +201,8 @@ SELECT
     -- RDC-level MSA vs ALLOC (repeated per store/dim row in the RDC)
     ISNULL(msa.OP_MSA_QTY, 0)                         AS MSA_OP_Q,
     ISNULL(msa.OP_MSA_QTY, 0) - ISNULL(alloc.consumed, 0) AS MSA_CL_Q,
-    ISNULL(opt_gt50.OPT_GT50_CNT, 0)                 AS [OPT_CNT_>50_PCS],
+    ISNULL(opt_gt50_op.OPT_GT50_CNT, 0)              AS [OP_OPT_CNT_>50_PCS],
+    ISNULL(opt_gt50_cl.OPT_GT50_CNT, 0)              AS [CL_OPT_CNT_>50_PCS],
     -- HOLD movement (store, split by grid dim on secondary grids)
     ISNULL(hold.CLOSE_REM, 0)
       - ISNULL(hmov.HOLD_QTY, 0)
@@ -205,7 +216,8 @@ LEFT JOIN MASTER_ALC_INPUT_ST_MASTER s WITH (NOLOCK)
 LEFT JOIN lst      ON lst.WERKS    = g.WERKS AND lst.MAJ_CAT     = g.MAJ_CAT
 LEFT JOIN msa      ON msa.RDC      = s.RDC   AND msa.MAJ_CAT     = g.MAJ_CAT
 LEFT JOIN alloc    ON alloc.RDC    = s.RDC   AND alloc.MAJ_CAT   = g.MAJ_CAT
-LEFT JOIN opt_gt50 ON opt_gt50.RDC = s.RDC   AND opt_gt50.MAJ_CAT = g.MAJ_CAT
+LEFT JOIN opt_gt50_op ON opt_gt50_op.RDC = s.RDC AND opt_gt50_op.MAJ_CAT = g.MAJ_CAT
+LEFT JOIN opt_gt50_cl ON opt_gt50_cl.RDC = s.RDC AND opt_gt50_cl.MAJ_CAT = g.MAJ_CAT
 ' + @hmovJoin + N'
 ' + @holdJoin + N'
 LEFT JOIN prod   p ON p.MAJ_CAT    = g.MAJ_CAT' + @where + N'

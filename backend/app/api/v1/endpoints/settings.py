@@ -70,6 +70,21 @@ def load_app_settings() -> Dict[str, Any]:
             "role": "",
             "enabled": False,
         },
+        "whatsapp": {
+            "provider": "meta_cloud",
+            "phone_number_id": "",
+            "access_token": "",
+            "default_template": "",
+            "enabled": False,
+        },
+        "sms": {
+            "provider": "msg91",
+            "api_key": "",
+            "sender_id": "",
+            "dlt_template_id": "",
+            "route": "",
+            "enabled": False,
+        },
         "application": {
             "app_name": "ARS - Allocation & Reporting System",
             "max_upload_size_mb": settings.MAX_UPLOAD_SIZE_MB,
@@ -195,6 +210,10 @@ def _mask_passwords(data: Dict[str, Any]) -> Dict[str, Any]:
         data["database"]["password"] = PASSWORD_MASK
     if data.get("snowflake", {}).get("password"):
         data["snowflake"]["password"] = PASSWORD_MASK
+    if data.get("whatsapp", {}).get("access_token"):
+        data["whatsapp"]["access_token"] = PASSWORD_MASK
+    if data.get("sms", {}).get("api_key"):
+        data["sms"]["api_key"] = PASSWORD_MASK
     return data
 
 
@@ -237,6 +256,10 @@ async def update_settings(
         incoming["password"] = all_settings.get("database", {}).get("password", "")
     if body.category == "snowflake" and incoming.get("password") == PASSWORD_MASK:
         incoming["password"] = all_settings.get("snowflake", {}).get("password", "")
+    if body.category == "whatsapp" and incoming.get("access_token") == PASSWORD_MASK:
+        incoming["access_token"] = all_settings.get("whatsapp", {}).get("access_token", "")
+    if body.category == "sms" and incoming.get("api_key") == PASSWORD_MASK:
+        incoming["api_key"] = all_settings.get("sms", {}).get("api_key", "")
 
     all_settings[body.category].update(incoming)
     save_app_settings(all_settings)

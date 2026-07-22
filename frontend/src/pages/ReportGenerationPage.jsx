@@ -11,7 +11,7 @@ import {
   FileText, RefreshCw, Plus, Play, Trash2, Pencil, Clock, Link2,
   MousePointerClick, X, CheckCircle, AlertTriangle, Loader2, ChevronDown,
   Mail, Scissors, CalendarClock, Zap, Hand, LayoutList, FolderOutput, Database,
-  Square,
+  Square, MessageCircle, MessageSquare,
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 
@@ -30,6 +30,8 @@ const EMPTY_FORM = {
     attach_format: 'xlsx', attach_scope: 'all', zip: false, notify_on_fail: false,
   },
   snowflake_config: { database: '', schema: '', warehouse: '', targets: [] },
+  whatsapp_config: { enabled: false, to: [], message: 'Report {report} is ready — {rows} rows.', attach: true, attach_format: 'xlsx', template: '' },
+  sms_config: { enabled: false, to: [], message: 'ARS {report}: {status}, {rows} rows on {when}' },
 }
 
 const statusColor = (s) => ({
@@ -101,6 +103,29 @@ export default function ReportGenerationPage() {
     } catch { toast.error('Could not stop report') }
   }
 
+  const removeRun = async (reportId, runId) => {
+    if (!confirm('Delete this run from history? Its per-run export folder is also removed.')) return
+    try {
+      await reportGenAPI.deleteRun(reportId, runId)
+      toast.success('Run deleted')
+      const { data } = await reportGenAPI.runs(reportId)
+      setRuns(r => ({ ...r, [reportId]: data?.data || [] }))
+      load()
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Delete failed') }
+  }
+
+  const removeRuns = async (reportId, runIds) => {
+    if (!runIds.length) return
+    if (!confirm(`Delete ${runIds.length} run(s) from history? Per-run export folders are also removed.`)) return
+    try {
+      const { data } = await reportGenAPI.bulkDeleteRuns(reportId, runIds)
+      toast.success(data?.message || `Deleted ${runIds.length} run(s)`)
+      const { data: rd } = await reportGenAPI.runs(reportId)
+      setRuns(r => ({ ...r, [reportId]: rd?.data || [] }))
+      load()
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Delete failed') }
+  }
+
   const toggle = async (r) => {
     try { await reportGenAPI.toggle(r.REPORT_ID, !r.ENABLED); load() }
     catch { toast.error('Toggle failed') }
@@ -126,6 +151,8 @@ export default function ReportGenerationPage() {
       split_config: r.SPLIT_CONFIG || { ...EMPTY_FORM.split_config },
       email_config: r.EMAIL_CONFIG || { ...EMPTY_FORM.email_config },
       snowflake_config: r.SNOWFLAKE_CONFIG || { ...EMPTY_FORM.snowflake_config },
+      whatsapp_config: r.WHATSAPP_CONFIG || { ...EMPTY_FORM.whatsapp_config },
+      sms_config: r.SMS_CONFIG || { ...EMPTY_FORM.sms_config },
     })
     window.scrollTo({ top: 9999, behavior: 'smooth' })
   }
@@ -164,6 +191,8 @@ export default function ReportGenerationPage() {
         ? form.split_config : null,
       email_config: form.email_config?.enabled ? form.email_config : null,
       snowflake_config: ['snowflake', 'both'].includes(form.output_type) ? form.snowflake_config : null,
+      whatsapp_config: form.whatsapp_config?.enabled ? form.whatsapp_config : null,
+      sms_config: form.sms_config?.enabled ? form.sms_config : null,
     }
     try {
       if (form.report_id) { await reportGenAPI.update(form.report_id, body); toast.success('Report updated') }
@@ -291,6 +320,8 @@ export default function ReportGenerationPage() {
                       <span style={{ color: C.textSub, textTransform: 'capitalize' }}>{r.OUTPUT_TYPE}</span>
                       {r.SPLIT_CONFIG?.enabled && <Scissors size={13} color={C.textMuted} title="Split into multiple files" />}
                       {r.EMAIL_CONFIG?.enabled && <Mail size={13} color={C.primary} title={`Emailed to ${(r.EMAIL_CONFIG.to || []).join(', ')}`} />}
+                      {r.WHATSAPP_CONFIG?.enabled && <MessageCircle size={13} color={C.green} title={`WhatsApp to ${(r.WHATSAPP_CONFIG.to || []).join(', ')}`} />}
+                      {r.SMS_CONFIG?.enabled && <MessageSquare size={13} color={C.amber} title={`SMS to ${(r.SMS_CONFIG.to || []).join(', ')}`} />}
                     </span>
                   </td>
                   <td style={td}>
@@ -320,7 +351,7 @@ export default function ReportGenerationPage() {
                 {expanded === r.REPORT_ID && (
                   <tr style={{ background: '#f8fafc' }}>
                     <td colSpan={6} style={{ padding: '12px 16px' }}>
-                      <RunHistory runs={runs[r.REPORT_ID]} onStop={() => stop(r.REPORT_ID)} />
+                      <RunHistory runs={runs[r.REPORT_ID]} onStop={() => stop(r.REPORT_ID)} onDelete={(runId) => removeRun(r.REPORT_ID, runId)} onBulkDelete={(runIds) => removeRuns(r.REPORT_ID, runIds)} />
                     </td>
                   </tr>
                 )}
@@ -345,13 +376,31 @@ export default function ReportGenerationPage() {
   )
 }
 
-function RunHistory({ runs, onStop }) {
+function RunHistory({ runs, onStop, onDelete, onBulkDelete }) {
+  const [sel, setSel] = useState(() => new Set())
   if (!runs) return <div style={{ color: C.textMuted, fontSize: 11 }}>Loading runs…</div>
   if (!runs.length) return <div style={{ color: C.textMuted, fontSize: 11 }}>No runs yet.</div>
+  const deletable = runs.filter(r => r.STATUS !== 'running')
+  const allSelected = deletable.length > 0 && deletable.every(r => sel.has(r.RUN_ID))
+  const toggle = (id) => setSel(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+  const toggleAll = () => setSel(allSelected ? new Set() : new Set(deletable.map(r => r.RUN_ID)))
+  const bulk = () => { onBulkDelete([...sel]); setSel(new Set()) }
   return (
-    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+    <>
+      {onBulkDelete && sel.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <button onClick={bulk} style={btn(C.red, '#fff')}><Trash2 size={12} /> Delete selected ({sel.size})</button>
+          <button onClick={() => setSel(new Set())} style={btn()}>Clear</button>
+        </div>
+      )}
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
       <thead>
         <tr style={{ color: C.textMuted }}>
+          <th style={{ ...th, fontSize: 10, width: 24 }}>
+            {onBulkDelete && deletable.length > 0 && (
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} title="Select all" style={{ cursor: 'pointer' }} />
+            )}
+          </th>
           <th style={{ ...th, fontSize: 10 }}>Status</th>
           <th style={{ ...th, fontSize: 10 }}>Trigger</th>
           <th style={{ ...th, fontSize: 10 }}>Session code</th>
@@ -360,11 +409,17 @@ function RunHistory({ runs, onStop }) {
           <th style={{ ...th, fontSize: 10 }}>Ended</th>
           <th style={{ ...th, fontSize: 10, textAlign: 'right' }}>Duration</th>
           <th style={{ ...th, fontSize: 10 }}>Folder</th>
+          <th style={{ ...th, fontSize: 10 }}></th>
         </tr>
       </thead>
       <tbody>
         {runs.map(run => (
-          <tr key={run.RUN_ID} style={{ borderTop: `1px solid ${C.cardBorder}` }}>
+          <tr key={run.RUN_ID} style={{ borderTop: `1px solid ${C.cardBorder}`, background: sel.has(run.RUN_ID) ? C.primaryLight : 'transparent' }}>
+            <td style={{ ...td, textAlign: 'center' }}>
+              {onBulkDelete && run.STATUS !== 'running' && (
+                <input type="checkbox" checked={sel.has(run.RUN_ID)} onChange={() => toggle(run.RUN_ID)} style={{ cursor: 'pointer' }} />
+              )}
+            </td>
             <td style={td}>
               <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: statusColor(run.STATUS), textTransform: 'capitalize' }}>
                 {statusIcon(run.STATUS, 11)} {run.STATUS}
@@ -382,11 +437,17 @@ function RunHistory({ runs, onStop }) {
             <td style={{ ...td, color: C.textMuted }}>{fmtTime(run.STARTED_AT)}</td>
             <td style={{ ...td, color: C.textMuted }}>{fmtTime(run.COMPLETED_AT)}</td>
             <td style={{ ...td, textAlign: 'right', color: C.textSub }}>{fmtDuration(run.DURATION_MS)}</td>
-            <td style={{ ...td, fontFamily: 'monospace', color: C.textMuted, maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={run.EXPORT_DIR}>{run.EXPORT_DIR || '—'}</td>
+            <td style={{ ...td, fontFamily: 'monospace', color: C.textMuted, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={run.EXPORT_DIR}>{run.EXPORT_DIR || '—'}</td>
+            <td style={{ ...td, textAlign: 'right' }}>
+              {onDelete && run.STATUS !== 'running' && (
+                <button onClick={() => onDelete(run.RUN_ID)} title="Delete this run (and its folder)" style={iconBtn(C.red)}><Trash2 size={12} /></button>
+              )}
+            </td>
           </tr>
         ))}
       </tbody>
     </table>
+    </>
   )
 }
 
@@ -395,6 +456,8 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
   const setSched = (k, v) => setForm(f => ({ ...f, schedule_config: { ...f.schedule_config, [k]: v } }))
   const setSplit = (k, v) => setForm(f => ({ ...f, split_config: { ...f.split_config, [k]: v } }))
   const setEmail = (k, v) => setForm(f => ({ ...f, email_config: { ...f.email_config, [k]: v } }))
+  const setWa = (k, v) => setForm(f => ({ ...f, whatsapp_config: { ...f.whatsapp_config, [k]: v } }))
+  const setSms = (k, v) => setForm(f => ({ ...f, sms_config: { ...f.sms_config, [k]: v } }))
   const setSnow = (k, v) => setForm(f => ({ ...f, snowflake_config: { ...f.snowflake_config, [k]: v } }))
   const parseAddrs = (s) => s.split(/[,;]/).map(x => x.trim()).filter(Boolean)
   const sc = form.schedule_config || {}
@@ -410,6 +473,10 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
   const dFolder = form.output_type === 'folder' || form.output_type === 'both'
   const dSnow = form.output_type === 'snowflake' || form.output_type === 'both'
   const dEmail = !!em.enabled
+  const wa = form.whatsapp_config || {}
+  const sms = form.sms_config || {}
+  const dWa = !!wa.enabled
+  const dSms = !!sms.enabled
   const setDeliver = (folder, snow) =>
     set('output_type', folder && snow ? 'both' : snow ? 'snowflake' : folder ? 'folder' : 'email')
   const [showQuery, setShowQuery] = useState(false)
@@ -633,6 +700,10 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
           onClick={() => setDeliver(dFolder, !dSnow)} />
         <DeliverChip active={dEmail} icon={<Mail size={14} />} label="Email"
           onClick={() => setEmail('enabled', !dEmail)} />
+        <DeliverChip active={dWa} icon={<MessageCircle size={14} />} label="WhatsApp"
+          onClick={() => setWa('enabled', !dWa)} />
+        <DeliverChip active={dSms} icon={<MessageSquare size={14} />} label="SMS"
+          onClick={() => setSms('enabled', !dSms)} />
       </div>
       {!dFolder && !dSnow && dEmail && (
         <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 12 }}>
@@ -841,6 +912,71 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
             </div>
             <div style={{ fontSize: 10, color: C.textMuted, marginTop: 6 }}>
               Multiple addresses separated by comma. Requires SMTP to be configured on the server.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* WhatsApp settings */}
+      {dWa && (
+        <div style={{ marginBottom: 16 }}>
+          <label style={lbl}>WhatsApp settings</label>
+          <div style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: 12, marginTop: 6, background: '#f8fafc' }}>
+            <div style={{ marginBottom: 10 }}>
+              <label style={lbl}>To (numbers with country code, comma-separated)</label>
+              <input value={(wa.to || []).join(', ')} onChange={e => setWa('to', parseAddrs(e.target.value))}
+                     placeholder="+91 9800000001, +91 9800000002" style={{ ...inp, fontSize: 12, fontFamily: 'monospace' }} />
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <label style={lbl}>Message</label>
+              <input value={wa.message || ''} onChange={e => setWa('message', e.target.value)}
+                     placeholder="Report {report} is ready — {rows} rows." style={{ ...inp, fontSize: 12 }} />
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 10, alignItems: 'end' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: C.textSub, cursor: 'pointer' }}>
+                <input type="checkbox" checked={!!wa.attach} onChange={e => setWa('attach', e.target.checked)} style={{ width: 14, height: 14, cursor: 'pointer' }} />
+                Attach the report file (as a document)
+              </label>
+              {wa.attach && (
+                <div>
+                  <label style={lbl}>Attach as</label>
+                  <select value={wa.attach_format || 'xlsx'} onChange={e => setWa('attach_format', e.target.value)} style={{ ...inp, fontSize: 12 }}>
+                    <option value="xlsx">Excel (.xlsx)</option>
+                    <option value="pdf">PDF (.pdf)</option>
+                    <option value="source">Original files</option>
+                  </select>
+                </div>
+              )}
+            </div>
+            <div>
+              <label style={lbl}>Template name (for scheduled/business-initiated sends)</label>
+              <input value={wa.template || ''} onChange={e => setWa('template', e.target.value)}
+                     placeholder="ars_report_ready (blank = free-form, only within 24h window)" style={{ ...inp, fontSize: 12, fontFamily: 'monospace' }} />
+            </div>
+            <div style={{ fontSize: 10, color: C.textMuted, marginTop: 6 }}>
+              Placeholders: {'{report} {status} {rows} {when}'}. Meta Cloud creds set in Settings → WhatsApp.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SMS settings */}
+      {dSms && (
+        <div style={{ marginBottom: 16 }}>
+          <label style={lbl}>SMS settings</label>
+          <div style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: 12, marginTop: 6, background: '#f8fafc' }}>
+            <div style={{ marginBottom: 10 }}>
+              <label style={lbl}>To (numbers, comma-separated)</label>
+              <input value={(sms.to || []).join(', ')} onChange={e => setSms('to', parseAddrs(e.target.value))}
+                     placeholder="+91 9800000001" style={{ ...inp, fontSize: 12, fontFamily: 'monospace' }} />
+            </div>
+            <div>
+              <label style={lbl}>Message (text only — no file)</label>
+              <input value={sms.message || ''} onChange={e => setSms('message', e.target.value)}
+                     placeholder="ARS {report}: {status}, {rows} rows on {when}" style={{ ...inp, fontSize: 12 }} />
+            </div>
+            <div style={{ fontSize: 10, color: C.textMuted, marginTop: 6 }}>
+              Placeholders: {'{report} {status} {rows} {when}'}. Maps to your MSG91 DLT template variable. Creds/template in Settings → SMS.
             </div>
           </div>
         </div>

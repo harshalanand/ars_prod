@@ -271,6 +271,9 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        # Tolerate operational keys written to .env that aren't modelled here
+        # (e.g. APP_ENC_KEY for secret encryption, DB_PORT from the DB-apply flow).
+        extra = "ignore"
 
 
 @lru_cache()

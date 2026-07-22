@@ -445,7 +445,7 @@ def _step_sal_pd(conn, steps):
     _ensure_col(conn, CALC, COL_SAL_PD)
     try:
         _run(conn, f"""
-            UPDATE [{CALC}] SET [{COL_SAL_PD}] =
+            UPDATE [{CALC}] SET [{COL_SAL_PD}] = ROUND(
                 CASE
                     WHEN ISNULL([{COL_CM_REM_D}],0)=0 THEN 0
                     WHEN [{COL_CM_REM_D}] >= ISNULL([{COL_SAL_D}],0) THEN
@@ -461,6 +461,7 @@ def _step_sal_pd(conn, steps):
                             ) / [{COL_SAL_D}]
                         END
                 END
+            , 2)
         """)
         cnt = conn.execute(text(f"SELECT COUNT(*) FROM [{CALC}] WHERE [{COL_SAL_PD}]>0")).scalar()
         steps.append({"step": "SAL_PD", "detail": f"{cnt} rows calculated", "status": "ok"})
@@ -908,7 +909,7 @@ def _step_art_sal_pd(conn, steps):
             return
         try:
             _run(conn, f"""
-                UPDATE [{CALC}] SET [SAL_PD] =
+                UPDATE [{CALC}] SET [SAL_PD] = ROUND(
                     CASE
                         WHEN ISNULL([{COL_CM_REM_D}],0)=0 THEN 0
                         WHEN [{COL_CM_REM_D}] >= ISNULL([ALC_D],0) THEN
@@ -924,6 +925,7 @@ def _step_art_sal_pd(conn, steps):
                                 ) / [ALC_D]
                             END
                     END
+                , 2)
             """)
             cnt = conn.execute(text(f"SELECT COUNT(*) FROM [{CALC}] WHERE [SAL_PD]>0")).scalar()
             steps.append({"step": "ART SAL_PD (fallback)", "detail": f"{cnt} rows", "status": "ok"})
@@ -971,7 +973,7 @@ def _step_art_sal_pd(conn, steps):
 
     try:
         _run(conn, f"""
-            UPDATE C SET C.[SAL_PD] =
+            UPDATE C SET C.[SAL_PD] = ROUND(
                 CASE
                     WHEN {cm_rem_expr}=0 THEN 0
                     WHEN {cm_rem_expr} >= ISNULL(C.[ALC_D],0) THEN
@@ -987,6 +989,7 @@ def _step_art_sal_pd(conn, steps):
                             ) / C.[ALC_D]
                         END
                 END
+            , 2)
             FROM [{CALC}] C
             INNER JOIN [{ART_SALE}] SA WITH (NOLOCK) ON {sale_join}
             {maj_join_clause}
@@ -1043,7 +1046,7 @@ def _step_master_sale_sal_pd(conn, steps):
 
     try:
         _run(conn, f"""
-            UPDATE S SET S.[{COL_SAL_PD}] =
+            UPDATE S SET S.[{COL_SAL_PD}] = ROUND(
                 CASE
                     WHEN ISNULL(MJ.[{COL_CM_REM_D}],0)=0 THEN 0
                     WHEN MJ.[{COL_CM_REM_D}] >= ISNULL(MJ.[{COL_SAL_D}],0) THEN
@@ -1059,6 +1062,7 @@ def _step_master_sale_sal_pd(conn, steps):
                             ) / MJ.[{COL_SAL_D}]
                         END
                 END
+            , 2)
             FROM [{SALE_T}] S
             INNER JOIN [{MAJ_T}] MJ WITH (NOLOCK)
                 ON S.[ST_CD] = MJ.[ST_CD] AND S.[MAJ_CAT] = MJ.[MAJ_CAT]

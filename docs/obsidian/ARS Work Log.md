@@ -54,8 +54,9 @@ Map of Content for the **V2 Retail Auto Replenishment System** (ARS). This vault
 | 2026-07-13 | [[Secondary-Grid Cap\|Sec-cap]] two-pass — hard-block veto beats Primary overshoot admit |
 | 2026-07-15 | End-to-end BRD authored + live-validated against `HOPC866`; DB target confirmed local `HOPC866` |
 | 2026-07-16 | `write_pend_alc` MAJ_CAT join fix (pending no longer fans out per MAJ_CAT) |
-| 2026-07-18 | Dispatch **COMPLETE-only** (SCALED disabled, fall-through double-stamp fixed); run-cockpit UX (Hold Control pre-fill, MAJ_CAT search ranking); **info-only run dates** `STOCK_CONSIDER_DT`+`PICKING_DT` on alloc output ([[2026-07-18]]) |
+| 2026-07-18 | Dispatch **COMPLETE-only** (SCALED disabled, fall-through double-stamp fixed); run-cockpit UX (Hold Control pre-fill, MAJ_CAT search ranking, banded Tunable Params, BDC-schedule store auto-load); **info-only run dates** `STOCK_CONSIDER_DT`+`PICKING_DT` on alloc output; **rounding** SAL_PD→2dp / CONT%→4dp; **data dictionary** audit + top-up + `.xlsx` export ([[2026-07-18]]) |
 | 2026-07-18 | [[Reports]] — Grid Report proc `usp_ars_grid_report` (any `ARS_GRID_MJ[_dim]`; dynamic type-aware ISNULL, store/product/listing/MSA/hold joins, dim-aware hold split, OPT>50 count) |
+| 2026-07-22 | [[UPC Store Tracking]] — store-opening lifecycle tracker (`/reports/upc-tracking`): upload ST_CD+proposed/share dates; event history (date/remark/status) with date+time; live MBQ/stock/SLOC/FR by segment (VW_MASTER_PRODUCT SEG, default APP+GM); dispatch-lead Bal Days (dispatch/opening) + Repl Days (1st-share/latest-share/layout/display) + **D.GAP** (last date shift); inline edit status/remark/layout/display/priority; priority synced to master `MANUAL_ST_PRIORITY`; charts value-labelled+clickable; column hide, sticky header, Export All/View, Help panel |
 
 ## Environment & verification
 - **Live DB (local):** SQL Server `HOPC866` (ex-`HOPC560`, commit `c68e10d`) — `Rep_Data` (business/MSA/grid/listing/alloc/pend/hold) + `Claude` (`rbac_*`, `rls_*`, jobs, audit).

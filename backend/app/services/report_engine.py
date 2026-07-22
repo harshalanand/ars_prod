@@ -271,7 +271,20 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     output_count = len(files)
 
     email_cfg = _parse_json(report.get("EMAIL_CONFIG"))
+    wa_cfg = _parse_json(report.get("WHATSAPP_CONFIG"))
+    sms_cfg = _parse_json(report.get("SMS_CONFIG"))
     report_name = report.get("NAME") or f"report {report_id}"
+
+    # Message context for WhatsApp/SMS templating ({report}/{status}/{rows}/…).
+    total_rows = sum(int(f.get("rows", 0) or 0) for f in files if f.get("file"))
+    msg_ctx = {
+        "report": report_name,
+        "status": "failed" if (run_had_errors and output_count == 0) else "completed",
+        "rows": f"{total_rows:,}",
+        "session": session_code,
+        "when": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "files": sum(1 for f in files if f.get("file")),
+    }
 
     # Optional email delivery — convert output to the chosen format and send.
     if not cancelled and email_cfg and email_cfg.get("enabled") and files:
@@ -285,6 +298,32 @@ def run_report(report: Dict[str, Any], trigger_source: str,
         except Exception as e:
             logger.error(f"[report {report_id}] email delivery failed: {e}")
             errors.append({"step": "email", "error": str(e)})
+
+    # Optional WhatsApp delivery (Meta Cloud) — message + optional document.
+    if not cancelled and wa_cfg and wa_cfg.get("enabled"):
+        try:
+            from app.services.report_delivery import send_whatsapp
+            wa = send_whatsapp(wa_cfg, report_name, files, export_dir, session_code, msg_ctx)
+            if wa.get("sent"):
+                files.append({"procedure": "whatsapp", "delivery": wa, "rows": 0})
+            else:
+                errors.append({"step": "whatsapp", "error": wa.get("error", "send failed")})
+        except Exception as e:
+            logger.error(f"[report {report_id}] whatsapp delivery failed: {e}")
+            errors.append({"step": "whatsapp", "error": str(e)})
+
+    # Optional SMS summary (MSG91) — text only.
+    if not cancelled and sms_cfg and sms_cfg.get("enabled"):
+        try:
+            from app.services.report_delivery import send_sms
+            sm = send_sms(sms_cfg, report_name, msg_ctx)
+            if sm.get("sent"):
+                files.append({"procedure": "sms", "delivery": sm, "rows": 0})
+            else:
+                errors.append({"step": "sms", "error": sm.get("error", "send failed")})
+        except Exception as e:
+            logger.error(f"[report {report_id}] sms delivery failed: {e}")
+            errors.append({"step": "sms", "error": str(e)})
 
     # Failure notification — alert recipients when the run had errors.
     if not cancelled and email_cfg and email_cfg.get("enabled") and email_cfg.get("notify_on_fail") and run_had_errors:

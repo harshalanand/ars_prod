@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from loguru import logger
 
 from app.database.session import get_data_engine
@@ -29,7 +29,8 @@ from app.services.report_scheduler_service import (
 
 router = APIRouter(prefix="/report-gen", tags=["Report Generation"])
 
-_JSON_COLS = ("STEPS", "SCHEDULE_CONFIG", "SNOWFLAKE_CONFIG", "SPLIT_CONFIG", "EMAIL_CONFIG")
+_JSON_COLS = ("STEPS", "SCHEDULE_CONFIG", "SNOWFLAKE_CONFIG", "SPLIT_CONFIG",
+              "EMAIL_CONFIG", "WHATSAPP_CONFIG", "SMS_CONFIG")
 _RUN_JSON_COLS = ("FILES", "ERRORS")
 
 
@@ -52,6 +53,8 @@ class ReportBody(BaseModel):
     snowflake_config: Optional[Dict[str, Any]] = None
     split_config: Optional[Dict[str, Any]] = None
     email_config: Optional[Dict[str, Any]] = None
+    whatsapp_config: Optional[Dict[str, Any]] = None
+    sms_config: Optional[Dict[str, Any]] = None
     trigger_type: str = Field("manual", pattern="^(schedule|event|manual)$")
     schedule_config: Optional[Dict[str, Any]] = None
     trigger_event: Optional[str] = None
@@ -162,10 +165,10 @@ def create_report(body: ReportBody, current_user: User = Depends(get_current_use
         row = conn.execute(text(f"""
             INSERT INTO {REPORTS_TABLE}
                 (NAME, DESCRIPTION, STEPS, OUTPUT_TYPE, BASE_DIR, FILE_FORMAT,
-                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, FOLDER_PER_RUN,
-                 TRIGGER_TYPE, SCHEDULE_CONFIG, TRIGGER_EVENT, ENABLED, NEXT_RUN_AT, CREATED_BY)
+                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, WHATSAPP_CONFIG, SMS_CONFIG,
+                 FOLDER_PER_RUN, TRIGGER_TYPE, SCHEDULE_CONFIG, TRIGGER_EVENT, ENABLED, NEXT_RUN_AT, CREATED_BY)
             OUTPUT inserted.REPORT_ID
-            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :fpr,
+            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :wa, :sms, :fpr,
                     :ttype, :sched, :tev, :en, :nr, :cb)
         """), {
             "name": body.name, "desc": body.description,
@@ -175,6 +178,8 @@ def create_report(body: ReportBody, current_user: User = Depends(get_current_use
             "sf": json.dumps(body.snowflake_config) if body.snowflake_config else None,
             "split": json.dumps(body.split_config) if body.split_config else None,
             "email": json.dumps(body.email_config) if body.email_config else None,
+            "wa": json.dumps(body.whatsapp_config) if body.whatsapp_config else None,
+            "sms": json.dumps(body.sms_config) if body.sms_config else None,
             "ttype": body.trigger_type,
             "sched": json.dumps(body.schedule_config) if body.schedule_config else None,
             "tev": body.trigger_event, "en": 1 if body.enabled else 0,
@@ -197,7 +202,8 @@ def update_report(report_id: int, body: ReportBody,
             UPDATE {REPORTS_TABLE} SET
                 NAME=:name, DESCRIPTION=:desc, STEPS=:steps, OUTPUT_TYPE=:otype,
                 BASE_DIR=:bdir, FILE_FORMAT=:fmt, SNOWFLAKE_CONFIG=:sf,
-                SPLIT_CONFIG=:split, EMAIL_CONFIG=:email, FOLDER_PER_RUN=:fpr,
+                SPLIT_CONFIG=:split, EMAIL_CONFIG=:email, WHATSAPP_CONFIG=:wa, SMS_CONFIG=:sms,
+                FOLDER_PER_RUN=:fpr,
                 TRIGGER_TYPE=:ttype, SCHEDULE_CONFIG=:sched, TRIGGER_EVENT=:tev,
                 ENABLED=:en, NEXT_RUN_AT=:nr, UPDATED_AT=SYSUTCDATETIME()
             WHERE REPORT_ID=:id
@@ -209,6 +215,8 @@ def update_report(report_id: int, body: ReportBody,
             "sf": json.dumps(body.snowflake_config) if body.snowflake_config else None,
             "split": json.dumps(body.split_config) if body.split_config else None,
             "email": json.dumps(body.email_config) if body.email_config else None,
+            "wa": json.dumps(body.whatsapp_config) if body.whatsapp_config else None,
+            "sms": json.dumps(body.sms_config) if body.sms_config else None,
             "ttype": body.trigger_type,
             "sched": json.dumps(body.schedule_config) if body.schedule_config else None,
             "tev": body.trigger_event, "en": 1 if body.enabled else 0,
@@ -313,6 +321,106 @@ def list_runs(report_id: int, limit: int = 50,
                 d[dt] = d[dt].isoformat()
         runs.append(d)
     return APIResponse(success=True, data=runs)
+
+
+@router.delete("/reports/{report_id}/runs/{run_id}", response_model=APIResponse)
+def delete_run(report_id: int, run_id: int,
+               current_user: User = Depends(get_current_user)):
+    """Delete one run (session) from a report's history. Also removes that run's
+    dedicated per-run session folder on disk (never a shared/date folder)."""
+    import os
+    import shutil
+    engine = get_data_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text(f"""
+            SELECT SESSION_CODE, EXPORT_DIR, STATUS FROM {RUNS_TABLE}
+            WHERE RUN_ID=:rid AND REPORT_ID=:pid
+        """), {"rid": run_id, "pid": report_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Run not found")
+    session_code, export_dir, status = row[0], row[1], row[2]
+    if status == "running":
+        raise HTTPException(409, "Run is still running — stop it first")
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DELETE FROM {RUNS_TABLE} WHERE RUN_ID=:rid"),
+                     {"rid": run_id})
+
+    # Remove the folder ONLY if it is this run's dedicated session folder
+    # (basename == session code). A shared date folder never matches, so it's
+    # left untouched.
+    removed_folder = False
+    try:
+        if export_dir and os.path.isdir(export_dir):
+            base = os.path.basename(os.path.normpath(export_dir))
+            if session_code and base == session_code:
+                shutil.rmtree(export_dir, ignore_errors=True)
+                removed_folder = not os.path.isdir(export_dir)
+    except Exception as e:
+        logger.warning(f"[report-gen] run {run_id} folder cleanup failed: {e}")
+
+    logger.info(f"[report-gen] deleted run {run_id} (report {report_id}), "
+                f"folder_removed={removed_folder}")
+    return APIResponse(success=True, message="Run deleted",
+                       data={"removed_folder": removed_folder})
+
+
+def _remove_run_folder(export_dir, session_code) -> bool:
+    """Remove a run's dedicated per-run folder only (never a shared folder)."""
+    import os
+    import shutil
+    try:
+        if export_dir and os.path.isdir(export_dir) and session_code and \
+           os.path.basename(os.path.normpath(export_dir)) == session_code:
+            shutil.rmtree(export_dir, ignore_errors=True)
+            return not os.path.isdir(export_dir)
+    except Exception as e:
+        logger.warning(f"[report-gen] folder cleanup failed for {export_dir}: {e}")
+    return False
+
+
+class BulkDeleteRuns(BaseModel):
+    run_ids: List[int]
+
+
+@router.post("/reports/{report_id}/runs/bulk-delete", response_model=APIResponse)
+def bulk_delete_runs(report_id: int, body: BulkDeleteRuns,
+                     current_user: User = Depends(get_current_user)):
+    """Delete several runs at once. Skips any that are still running; removes
+    each run's dedicated per-run folder (shared date folders are left alone)."""
+    ids = [int(x) for x in (body.run_ids or [])]
+    if not ids:
+        return APIResponse(success=False, message="No runs selected")
+    engine = get_data_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"""SELECT RUN_ID, SESSION_CODE, EXPORT_DIR, STATUS
+                     FROM {RUNS_TABLE}
+                     WHERE REPORT_ID=:pid AND RUN_ID IN :ids""")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"pid": report_id, "ids": ids}).fetchall()
+
+    deletable = [r for r in rows if r[3] != "running"]
+    skipped_running = len(rows) - len(deletable)
+    del_ids = [r[0] for r in deletable]
+    if del_ids:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"DELETE FROM {RUNS_TABLE} WHERE RUN_ID IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": del_ids})
+        folders = sum(_remove_run_folder(r[2], r[1]) for r in deletable)
+    else:
+        folders = 0
+
+    logger.info(f"[report-gen] bulk-deleted {len(del_ids)} run(s) of report "
+                f"{report_id}, folders_removed={folders}, skipped_running={skipped_running}")
+    msg = f"Deleted {len(del_ids)} run(s)"
+    if skipped_running:
+        msg += f" ({skipped_running} still running — skipped)"
+    return APIResponse(success=True, message=msg,
+                       data={"deleted": len(del_ids), "folders_removed": folders,
+                             "skipped_running": skipped_running})
 
 
 @router.get("/code-steps", response_model=APIResponse)

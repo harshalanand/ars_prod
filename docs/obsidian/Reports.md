@@ -47,7 +47,8 @@ EXEC dbo.usp_ars_grid_report @GridTable = N'ARS_GRID_MJ_M_YARN_02', @WERKS = N'H
 | `sid` | `ARS_LISTING_HISTORY` | — | latest `SESSION_ID` (referenced once) |
 | `lst` | `ARS_LISTING_WORKING_HISTORY` | WERKS,MAJ_CAT | ALC_Q, HOLD_ALC_Q, ALC_FROM_HOLD_Q, ART_EXCESS_QTY |
 | `msa` | `ARS_MSA_TOTAL_HISTORY` | RDC,MAJ_CAT | MSA_OP_Q (`SUM(FNL_Q)`) |
-| `opt_gt50` | `ARS_MSA_TOTAL_HISTORY` | RDC,MAJ_CAT | `OPT_CNT_>50_PCS` = # of (GEN_ART,CLR) with `SUM(FNL_Q)>50` |
+| `opt_gt50_op` | `ARS_MSA_TOTAL_HISTORY` (session-filtered) | RDC,MAJ_CAT | **OPENING** `OP_OPT_CNT_>50_PCS` = # of (GEN_ART,CLR) with `SUM(FNL_Q)>50` |
+| `opt_gt50_cl` | `ARS_MSA_TOTAL` (live, no SESSION_ID) | RDC,MAJ_CAT | **CLOSING** `CL_OPT_CNT_>50_PCS` = same count on the live MSA table |
 | `alloc` | `ARS_ALLOC_HISTORY` | RDC,MAJ_CAT | consumed → `MSA_CL_Q = MSA_OP_Q − consumed` |
 | `pdim`* | `vw_master_product` | ARTICLE_NUMBER | one dim value per variant (`MAX`, deduped) |
 | `hmov` | `ARS_ALLOC_HISTORY` | WERKS,MAJ_CAT[,dim] | added/consumed hold today |
@@ -56,8 +57,14 @@ EXEC dbo.usp_ars_grid_report @GridTable = N'ARS_GRID_MJ_M_YARN_02', @WERKS = N'H
 
 \* `pdim` only present on secondary grids. Store details join `MASTER_ALC_INPUT_ST_MASTER` on `ST_CD = WERKS`.
 
+### OPT>50 counts (opening vs closing)
+Two columns, both = count of `(GEN_ART, CLR)` OPTs whose `SUM(FNL_Q) > 50`, per RDC+MAJ_CAT:
+- **`OP_OPT_CNT_>50_PCS`** — from `ARS_MSA_TOTAL_HISTORY`, filtered to the latest session (**opening** MSA).
+- **`CL_OPT_CNT_>50_PCS`** — from the live `ARS_MSA_TOTAL` table (no `SESSION_ID` column) = **closing** MSA after consumption.
+- Verified DW01/M_JEANS: OP=156, CL=155.
+
 ### Grain rules (important)
-- `MSA_OP_Q` / `MSA_CL_Q` / `OPT_CNT_>50_PCS` are **RDC+MAJ_CAT totals** repeated on every store (and every dim) row — **do NOT SUM** across stores/dim.
+- `MSA_OP_Q` / `MSA_CL_Q` / `OP_OPT_CNT_>50_PCS` / `CL_OPT_CNT_>50_PCS` are **RDC+MAJ_CAT totals** repeated on every store (and every dim) row — **do NOT SUM** across stores/dim. (Not dimension-split; no FRESH/GRT filter.)
 - `HOLD_*` are **store-level**. On a **secondary grid** they are **split by the grid dimension** and reconcile to the MAJ_CAT total.
 
 ### Hold movement
@@ -72,5 +79,10 @@ Some categories are `[A-Z]-`-prefixed in grid/MSA/listing (`B-M_TEES_HS`) but ne
 
 ---
 
+---
+
+## App modules (not stored procs)
+- [[UPC Store Tracking]] — store-opening lifecycle tracker (`/reports/upc-tracking`): opening-date & remarks/status history, live MBQ/stock/SLOC/FR by segment, dispatch-lead-based Bal Days / Repl Days / **D.GAP**, priority synced to the store master.
+
 ## Cross-links
-[[ARS Work Log]] · [[Report Generation Hub]] · [[Grid Builder]] · [[Pending Allocation and Hold]] · [[Data Model]] · [[2026-07-18]]
+[[ARS Work Log]] · [[Report Generation Hub]] · [[UPC Store Tracking]] · [[Grid Builder]] · [[Pending Allocation and Hold]] · [[Data Model]] · [[2026-07-18]]

@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { dataDictionaryAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
-  BookOpen, Search, Plus, Pencil, Trash2, X, Save, Loader2, RefreshCw,
+  BookOpen, Search, Plus, Pencil, Trash2, X, Save, Loader2, RefreshCw, Download,
 } from 'lucide-react'
 
 const MODULE_COLORS = {
@@ -91,6 +91,26 @@ export default function DataDictionaryPage() {
   const [adding, setAdding] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [exporting, setExporting] = useState(false)
+
+  // Download the dictionary as .xlsx, honouring the active search filter.
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      const res = await dataDictionaryAPI.exportXlsx(search.trim() || undefined)
+      const url = window.URL.createObjectURL(new Blob([res.data]))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'ars_data_dictionary.xlsx'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+      toast.success('Data dictionary exported')
+    } catch (e) {
+      toast.error('Export failed')
+    } finally { setExporting(false) }
+  }
 
   const load = async () => {
     setLoading(true)
@@ -173,6 +193,10 @@ export default function DataDictionaryPage() {
           <button onClick={load} title="Reload"
             className="inline-flex items-center justify-center w-8 h-8 rounded-md border border-gray-200 bg-white text-gray-500 hover:text-gray-800 hover:bg-gray-50">
             <RefreshCw size={14} className={loading ? 'animate-spin' : ''}/>
+          </button>
+          <button onClick={handleExport} disabled={exporting} title="Download as Excel (.xlsx)"
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 disabled:opacity-50 rounded-md px-3 py-2">
+            {exporting ? <Loader2 size={14} className="animate-spin"/> : <Download size={14}/>} Export
           </button>
           <button onClick={() => { setAdding(a => !a); setEditingId(null) }}
             className="inline-flex items-center gap-1.5 text-xs font-bold text-white bg-primary-600 hover:bg-primary-700 rounded-md px-4 py-2">

@@ -542,9 +542,14 @@ def _compute_kpis(df, avg_days, grouping_column):
     kpi_cols = ['0001_STK_Q','0001_STK_V','FIX','DISP_AREA','GM_%','STR','SALES PSF',
                 'SALE_PSF_MJ','SALES_PSF_ACH%','GM PSF','GM_PSF_MJ','GM_PSF_ACH%',
                 'STOCK_CONT%','SALE_CONT%','ALGO','INITIAL AUTO CONT%']
+    # Contribution-% columns carry 4 decimals (2026-07-18 requirement);
+    # other KPI/display columns stay at 2. ALGO is an intermediate feeding
+    # INITIAL AUTO CONT% (computed above, pre-rounding) so it also keeps 4.
+    cont_pct_cols = {'STOCK_CONT%', 'SALE_CONT%', 'INITIAL AUTO CONT%', 'ALGO'}
     for col in kpi_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).round(2)
+            ndp = 4 if col in cont_pct_cols else 2
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).round(ndp)
     return df
 
 

@@ -65,6 +65,8 @@ def ensure_report_tables() -> None:
                 SNOWFLAKE_CONFIG NVARCHAR(MAX)  NULL,
                 SPLIT_CONFIG     NVARCHAR(MAX)  NULL,
                 EMAIL_CONFIG     NVARCHAR(MAX)  NULL,
+                WHATSAPP_CONFIG  NVARCHAR(MAX)  NULL,
+                SMS_CONFIG       NVARCHAR(MAX)  NULL,
                 FOLDER_PER_RUN   BIT            NOT NULL DEFAULT 1,
                 TRIGGER_TYPE     NVARCHAR(20)   NOT NULL DEFAULT 'manual',
                 SCHEDULE_CONFIG  NVARCHAR(MAX)  NULL,
@@ -90,6 +92,14 @@ def ensure_report_tables() -> None:
         conn.execute(text(f"""
             IF COL_LENGTH('dbo.{REPORTS_TABLE}','FOLDER_PER_RUN') IS NULL
             ALTER TABLE dbo.{REPORTS_TABLE} ADD FOLDER_PER_RUN BIT NOT NULL DEFAULT 1
+        """))
+        conn.execute(text(f"""
+            IF COL_LENGTH('dbo.{REPORTS_TABLE}','WHATSAPP_CONFIG') IS NULL
+            ALTER TABLE dbo.{REPORTS_TABLE} ADD WHATSAPP_CONFIG NVARCHAR(MAX) NULL
+        """))
+        conn.execute(text(f"""
+            IF COL_LENGTH('dbo.{REPORTS_TABLE}','SMS_CONFIG') IS NULL
+            ALTER TABLE dbo.{REPORTS_TABLE} ADD SMS_CONFIG NVARCHAR(MAX) NULL
         """))
         conn.execute(text(f"""
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_{REPORTS_TABLE}_due')
@@ -476,7 +486,7 @@ class ReportSchedulerService:
             row = conn.execute(text(f"""
                 SELECT REPORT_ID, NAME, STEPS, OUTPUT_TYPE, BASE_DIR,
                        FILE_FORMAT, SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG,
-                       FOLDER_PER_RUN, CREATED_BY
+                       WHATSAPP_CONFIG, SMS_CONFIG, FOLDER_PER_RUN, CREATED_BY
                 FROM {REPORTS_TABLE} WHERE REPORT_ID = :rid
             """), {"rid": report_id}).mappings().fetchone()
         return dict(row) if row else None
@@ -487,7 +497,7 @@ class ReportSchedulerService:
             rows = conn.execute(text(f"""
                 SELECT REPORT_ID, NAME, STEPS, OUTPUT_TYPE, BASE_DIR,
                        FILE_FORMAT, SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG,
-                       FOLDER_PER_RUN, CREATED_BY
+                       WHATSAPP_CONFIG, SMS_CONFIG, FOLDER_PER_RUN, CREATED_BY
                 FROM {REPORTS_TABLE}
                 WHERE TRIGGER_TYPE='event' AND ENABLED=1 AND TRIGGER_EVENT=:ev
             """), {"ev": event_name}).mappings().fetchall()

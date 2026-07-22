@@ -110,8 +110,10 @@ SEED = [
      "ARS_ALLOC_WORKING, ARS_ALLOC_PARKED, ARS_ALLOC_HISTORY", "User-entered at run time; constant across the run's rows", "Allocation"),
     ("PICKING_DT", "Picking Date", "Information-only run date: the planned warehouse picking / dispatch date (mandatory since 2026-07-18; UI leaves it blank so the user picks it consciously each run). Stamped on every allocation output row; does NOT enter any calculation.",
      "ARS_ALLOC_WORKING, ARS_ALLOC_PARKED, ARS_ALLOC_HISTORY", "User-entered at run time; constant across the run's rows", "Allocation"),
-    ("CONT", "Contribution %", "Share of each size within an option; always sums to 1 per option. For SZ_APPLICABLE='N' categories the fallback fill is Uniform 1/N or stock-based.",
-     "Cont_presets, ARS_ALLOC_WORKING", "CONT ladder: Site → CO → fallback (P4_UNIFORM / P3_FNL_Q)", "Allocation"),
+    ("CONT", "Contribution %", "Share of each size within an option; always sums to 1 per option. For SZ_APPLICABLE='N' categories the fallback fill is Uniform 1/N or stock-based. Stored/rounded to 4 decimals (2026-07-18).",
+     "Cont_presets, ARS_ALLOC_WORKING", "CONT ladder: Site → CO → fallback (P4_UNIFORM / P3_FNL_Q); ROUND(…, 4)", "Allocation"),
+    ("STOCK_CONT% / SALE_CONT% / INITIAL AUTO CONT%", "Contribution percentages (stock / sale / algo)", "Auto-contribution shares per grain: STOCK_CONT% = stock share, SALE_CONT% = sales-value share, INITIAL AUTO CONT% = algorithm-blended final share. All rounded to 4 decimals (2026-07-18).",
+     "Cont_presets, Master_CONT_*, contribution output", "share = value / Σ(value) within group; INITIAL AUTO CONT% = ALGO / Σ ALGO; ROUND(…, 4)", "Contribution"),
     ("SHIP_QTY", "Ship Quantity", "Pieces the run decided to send to the store (per size / rolled up).",
      "ARS_ALLOC_WORKING, alloc detail history", "Waterfall result after budgets, sec-cap, pak rounding", "Allocation"),
     ("HOLD_QTY", "Hold Quantity", "Pieces reserved at the RDC instead of shipped (NL/TBL ramp-up, hold window). Subtracted from free stock but no delivery order yet.",
@@ -122,6 +124,53 @@ SEED = [
      "ARS_LISTING", None, "Listing"),
     ("FAB / MICRO_MVGR / M_VND_CD", "Fabric / Micro merchandise group / Vendor code", "Secondary-grid (sec-cap) dimensions — fences so one fabric/group/vendor cannot eat the whole MAJ_CAT budget. Must flow listing → alloc or the fence silently disappears.",
      "ARS_GRID_FAB, ARS_GRID_MICRO_MVGR, ARS_GRID_M_VND_CD", "cap = MAX(0, grid MBQ_ORIG × cap% − STK_TTL); value 0 = no fence", "Grid"),
+    # ── Grid pre-calc + budget columns (audit fill 2026-07-18) ──
+    ("ALC_D", "Allocation / sale-cover Days", "Number of days the grid budget should cover. SAL_PD is averaged over this window and MBQ multiplies by it.",
+     "ARS_CALC_ST_MAJ_CAT, ARS_CALC_ST_ART", "ALC_D = ISNULL(INT_DAYS,0)+ISNULL(PRD_DAYS,0)+ISNULL(SL_CVR,0); SL_CVR priority ST_MAJ_CAT > CO_MAJ_CAT > ST_MASTER", "Grid"),
+    ("SAL_PD", "Sale Per Day", "Blended per-day sale rate over the ALC_D window: current-month actuals, extended by the next-month daily rate for the remaining days. Rounded to 2 decimals (2026-07-18).",
+     "ARS_CALC_ST_MAJ_CAT, ARS_CALC_ST_ART, MASTER_GEN_ART_SALE", "if CM_REM_D=0→0; elif CM_REM_D≥ALC_D→CM_SAL_Q/CM_REM_D; elif ALC_D=0→0; elif NM_REM_D=0→CM_SAL_Q/CM_REM_D; else (CM_SAL_Q + (NM_SAL_Q/NM_REM_D)×(ALC_D−CM_REM_D))/ALC_D — ROUND(…, 2)", "Grid"),
+    ("DISP_Q", "Display Quantity", "Fixture display capacity at the grid grain. 0/NULL ⇒ no minimum buy (MBQ = 0). Feeds both MBQ and OPT_CNT.",
+     "ARS_CALC_ST_MAJ_CAT, ARS_GRID_*", None, "Grid"),
+    ("MBQ", "Minimum Buy Quantity (grid)", "Per-grid target stock for the store: demand over the cover window plus display capacity, scaled by contribution.",
+     "ARS_GRID_MJ_*, ARS_GRID_<grid>", "MBQ = (SAL_PD×BGT_SL_GR_DGR)×ALC_D + DISP_Q×DISP_GR_DGR; then ROUND(MBQ×CONT, 0); 0 if DISP_Q=0 or CONT=0", "Grid"),
+    ("OPT_CNT", "Option Count", "How many options the fixture can hold at the grid grain (display ÷ accessories density).",
+     "ARS_GRID_*", "OPT_CNT = ROUND(DISP_Q×DISP_GR_DGR×CONT / ACS_D, 0)", "Grid"),
+    ("BGT_SL_GR_DGR / DISP_GR_DGR", "Budget-sale / Display growth degree", "Grid-level growth multipliers baked into MBQ. Growth lives at MAJ_CAT + grid only — never per OPT_TYPE.",
+     "ARS_CALC_ST_MAJ_CAT, ARS_GRID_*", None, "Grid"),
+    ("I_ROD", "Items per Rod", "Pack/rod multiple; per-size ship is capped at SZ_MBQ × I_ROD. Defaults to 1.",
+     "ARS_CALC_ST_MAJ_CAT", None, "Grid"),
+    # ── Listing columns ──
+    ("STK_TTL", "Total Store Stock", "Store on-hand at the grain (clamped ≥ 0 at article grain before rollup). Basis for OPT_TYPE classification and REQ.",
+     "ARS_LISTING, ARS_GRID_*", None, "Listing"),
+    ("MSA_FNL_Q", "MSA Free Quantity (listing copy)", "The MSA free-to-allocate quantity joined onto listing; > 0 is required for RL / TBC / TBL.",
+     "ARS_LISTING ← ARS_MSA_GEN_ART.FNL_Q", None, "Listing"),
+    ("ELIG_FLAG", "Eligibility Flag", "1 = option passes eligibility (E1–E7) and projects into ARS_LISTING_WORKING; 0 = excluded from the run.",
+     "ARS_LISTING, ARS_LISTING_WORKING", None, "Listing"),
+    ("RL_HOLD_QTY", "Refill Hold Quantity", "Prior-run NL/TBL hold carried into this run (pool-scoped). Lets a held option list as RL/TBC.",
+     "ARS_NL_TBL_HOLD_TRACKING → ARS_LISTING", None, "Listing"),
+    ("VAR_COUNT / VAR_FNL_COUNT", "Variant count / with-stock count", "Distinct sizes of the option, and how many have free stock. Drive the R07 size-coverage gate for TBL.",
+     "ARS_LISTING", "R07: skip TBL when VAR_FNL_COUNT/VAR_COUNT < Size Cov% AND VAR_FNL_COUNT < Min size #", "Listing"),
+    ("AGE", "Article age (days)", "Effective age of the option; when < the AGE threshold, PER_OPT_SALE may drive the demand rate. 0 when STK_TTL ≤ 0 and L-7 ≤ 0.",
+     "ARS_LISTING", None, "Listing"),
+    ("MAX_DAILY_SALE", "Max daily sale (velocity)", "Velocity term for OPT_MBQ demand (NOT ACS_D). Part of the rate_expr ladder (PER_OPT / L-7 / AUTO).",
+     "ARS_LISTING", None, "Listing"),
+    ("OPT_MBQ_WH / OPT_REQ_WH", "Option MBQ / REQ with warehouse hold", "TBL variant that adds hold_days lookback so the first dispatch parks a warehouse buffer. For RL/TBC the WH value equals the base.",
+     "ARS_LISTING", "OPT_MBQ_WH = ROUND(ACS_D + rate×(ALC_D + hold_days_if_TBL), 0); OPT_REQ_WH = MAX(0, OPT_MBQ_WH − STK_TTL)", "Listing"),
+    ("ART_EXCESS", "Article Excess", "Stock above the excess ceiling — surfaced for pull / cross-RDC. 0 for MIX options.",
+     "ARS_LISTING", "ART_EXCESS = MAX(0, STK_TTL − excess_multiplier × OPT_MBQ)", "Listing"),
+    ("ST_RANK / W_SCORE", "Store Rank / Weighted Score", "Per-MAJ_CAT store priority. W_SCORE blends the REQ and FILL ranks; ST_RANK orders stores by it (manual pins override). Also the cross-MAJ_CAT allocation tiebreaker.",
+     "ARS_STORE_RANKING, ARS_LISTING", "W_SCORE = ROUND(REQ_RANK×req_wt + FILL_RANK×fill_wt, 2); ST_RANK = ROW_NUMBER by W_SCORE DESC, WERKS ASC", "Listing"),
+    # ── Allocation columns ──
+    ("ALLOC_TYPE", "Allocation Pool Type", "FRESH or GRT — which warehouse SLOC pool the run allocated from. Stamped on every alloc output row; pend/hold deductions are typed to the pool.",
+     "ARS_ALLOC_WORKING, ARS_PEND_ALC, ARS_SLOC_SETTINGS", None, "Allocation"),
+    ("OPT_PRIORITY_RANK", "Option Priority Rank", "Waterfall order within a store × MAJ_CAT (RL→TBC→TBL, then rank). Lower ships first.",
+     "ARS_LISTING_WORKING, ARS_ALLOC_WORKING", None, "Allocation"),
+    ("MJ_REQ_REM", "MAJ_CAT Requirement Remaining", "Live remaining MJ_REQ during the per-OPT walk; each shipping OPT consumes it. Gates TBL admission and bounded overshoot.",
+     "rule engine (per_opt), ARS_ALLOC_WORKING", "starts at MJ_REQ; skip an OPT when req_rem < 0.5 × OPT_MBQ", "Allocation"),
+    ("ALLOC_REMARKS", "Allocation Remarks", "Per-row audit trace: band steps B[ot.rN.rkK], cap stamps (MBQ_CAP_OVERSHOOT / MBQ_CAP_SCALE / skip), and sec-cap veto/override reasons.",
+     "ARS_ALLOC_WORKING, ARS_ALLOC_HISTORY", None, "Allocation"),
+    ("FROM_HOLD", "From Hold", "Units drawn from the RDC hold buffer (consumed before pool stock) for RL/TBC rows.",
+     "ARS_ALLOC_WORKING", None, "Allocation"),
 ]
 
 
@@ -141,14 +190,25 @@ def _ensure_table(conn) -> None:
             updated_at     DATETIME2      NOT NULL DEFAULT SYSDATETIME()
         )
     """))
-    empty = conn.execute(text(f"SELECT COUNT(*) FROM [{TABLE}]")).scalar() == 0
-    if empty:
-        for col, abbr, purpose, tables, formula, module in SEED:
-            conn.execute(text(f"""
-                INSERT INTO [{TABLE}] (column_name, abbreviation, purpose, related_tables, formula, module, updated_by)
-                VALUES (:c, :a, :p, :t, :f, :m, 'seed')
-            """), {"c": col, "a": abbr, "p": purpose, "t": tables, "f": formula, "m": module})
-        logger.info(f"[data-dictionary] seeded {len(SEED)} entries")
+    # Idempotent top-up: insert any SEED column that isn't already present.
+    # Runs on first use (empty table) AND after the SEED list grows, so the
+    # live dictionary picks up newly-documented columns without wiping any
+    # user-edited rows (match is by column_name).
+    existing = {
+        (r[0] or "").strip().lower()
+        for r in conn.execute(text(f"SELECT column_name FROM [{TABLE}]")).fetchall()
+    }
+    added = 0
+    for col, abbr, purpose, tables, formula, module in SEED:
+        if (col or "").strip().lower() in existing:
+            continue
+        conn.execute(text(f"""
+            INSERT INTO [{TABLE}] (column_name, abbreviation, purpose, related_tables, formula, module, updated_by)
+            VALUES (:c, :a, :p, :t, :f, :m, 'seed')
+        """), {"c": col, "a": abbr, "p": purpose, "t": tables, "f": formula, "m": module})
+        added += 1
+    if added:
+        logger.info(f"[data-dictionary] seeded/topped-up {added} entries")
     conn.commit()
 
 
@@ -181,6 +241,59 @@ def list_entries(q: Optional[str] = None, current_user: User = Depends(get_curre
                 f"SELECT {COLS} FROM [{TABLE}] ORDER BY module, column_name"
             )).fetchall()
     return {"success": True, "data": [_row_to_dict(r) for r in rows]}
+
+
+@router.get("/export")
+def export_entries(q: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    """Download the data dictionary as an .xlsx (honours the same ?q= filter
+    as the list endpoint). One sheet, human-readable column headers."""
+    import io
+    import pandas as pd
+    from fastapi.responses import StreamingResponse
+
+    de = get_data_engine()
+    with de.connect() as conn:
+        _ensure_table(conn)
+        if q:
+            rows = conn.execute(text(f"""
+                SELECT {COLS} FROM [{TABLE}]
+                WHERE column_name LIKE :q OR abbreviation LIKE :q OR purpose LIKE :q
+                   OR related_tables LIKE :q OR formula LIKE :q OR module LIKE :q
+                ORDER BY module, column_name
+            """), {"q": f"%{q}%"}).fetchall()
+        else:
+            rows = conn.execute(text(
+                f"SELECT {COLS} FROM [{TABLE}] ORDER BY module, column_name"
+            )).fetchall()
+
+    df = pd.DataFrame([{
+        "Module":         r[6],
+        "Column":         r[1],
+        "Abbreviation":   r[2],
+        "Purpose":        r[3],
+        "Related tables": r[4],
+        "Formula":        r[5],
+        "Updated by":     r[7],
+        "Updated at":     str(r[8]) if r[8] else None,
+    } for r in rows], columns=[
+        "Module", "Column", "Abbreviation", "Purpose",
+        "Related tables", "Formula", "Updated by", "Updated at",
+    ])
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False, sheet_name="Data Dictionary")
+        # Widen columns for readability.
+        ws = xw.sheets["Data Dictionary"]
+        widths = {"A": 16, "B": 26, "C": 30, "D": 70, "E": 40, "F": 55, "G": 14, "H": 20}
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=ars_data_dictionary.xlsx"},
+    )
 
 
 @router.post("", response_model=APIResponse)

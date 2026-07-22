@@ -293,7 +293,7 @@ def send_failure_email(email_config: Dict[str, Any], report_name: str,
         return {"sent": False, "error": "no valid recipients"}
     smtp = _smtp_config()
     if not smtp["host"]:
-        return {"sent": False, "error": "SMTP not configured (Settings → Email)"}
+        return {"sent": False, "error": "SMTP not configured (Settings > Email)"}
 
     lines = [f"Report '{report_name}' had errors during its run.",
              f"Session: {session_code}", "", "Errors:"]
@@ -325,6 +325,185 @@ def send_failure_email(email_config: Dict[str, Any], report_name: str,
     except Exception as e:
         logger.error(f"[delivery] failure alert send failed: {e}")
         return {"sent": False, "error": str(e)}
+
+
+# ── WhatsApp (Meta Cloud API) + SMS (MSG91) ─────────────────────────────────
+_PHONE_RE = re.compile(r"\D")
+
+
+def _clean_phones(values) -> List[str]:
+    """Digits-only phone numbers with country code (e.g. 919800000001)."""
+    out = []
+    for v in (values or []):
+        d = _PHONE_RE.sub("", str(v))
+        if len(d) >= 7:
+            out.append(d)
+    return out
+
+
+def _render_template(text: str, ctx: Dict[str, Any]) -> str:
+    """Substitute {report} {status} {rows} {session} {when} {files} placeholders."""
+    out = str(text or "")
+    for k, v in (ctx or {}).items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
+def _provider_cfg(section: str) -> Dict[str, Any]:
+    # WhatsApp creds now live in the dedicated encrypted DB config
+    # (APP_WHATSAPP_SETTINGS). Prefer it; fall back to app_settings.json for
+    # back-compat if the DB row hasn't been set up yet.
+    if section == "whatsapp":
+        try:
+            from app.services import whatsapp_settings_service as _wa
+            c = _wa.get_config(reveal=True)
+            if c.get("phone_number_id") and c.get("access_token"):
+                return {
+                    "phone_number_id": c.get("phone_number_id"),
+                    "access_token": c.get("access_token"),
+                    "default_template": c.get("default_template"),
+                    "enabled": c.get("enabled"),
+                }
+        except Exception as e:
+            logger.debug(f"[delivery] whatsapp DB config read failed: {e}")
+    try:
+        from app.api.v1.endpoints.settings import load_app_settings
+        return (load_app_settings() or {}).get(section, {}) or {}
+    except Exception as e:
+        logger.debug(f"[delivery] {section} settings read failed: {e}")
+        return {}
+
+
+def send_whatsapp(cfg: Dict[str, Any], report_name: str,
+                  files: List[Dict[str, Any]], export_dir: str,
+                  session_code: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a report via WhatsApp (Meta Cloud API). Optionally uploads the
+    report file to Meta and delivers it as a document. Never raises."""
+    cfg = cfg or {}
+    to = _clean_phones(cfg.get("to"))
+    if not to:
+        return {"sent": False, "channel": "whatsapp", "error": "no valid recipients"}
+    wa = _provider_cfg("whatsapp")
+    pnid, token = wa.get("phone_number_id"), wa.get("access_token")
+    if not pnid or not token:
+        return {"sent": False, "channel": "whatsapp",
+                "error": "WhatsApp not configured (Settings > WhatsApp)"}
+    try:
+        import requests
+    except ImportError:
+        return {"sent": False, "channel": "whatsapp", "error": "requests not installed"}
+
+    message = _render_template(cfg.get("message") or "Report {report} is ready.", ctx)
+    template = cfg.get("template") or wa.get("default_template") or ""
+    base = f"https://graph.facebook.com/v20.0/{pnid}"
+    auth = {"Authorization": f"Bearer {token}"}
+
+    # Optionally upload the report file → media id (document delivery).
+    media_id, attach_name = None, None
+    if cfg.get("attach") and any(f.get("file") for f in files):
+        try:
+            fmt = str(cfg.get("attach_format", "source")).lower()
+            if fmt not in ("source", "xlsx", "pdf", "docx"):
+                fmt = "source"
+            paths = build_attachments(
+                files, fmt, export_dir,
+                base_name=f"{_safe(report_name)}_{session_code}",
+                zip_all=bool(cfg.get("zip")))
+            if paths:
+                attach_name = os.path.basename(paths[0])
+                with open(paths[0], "rb") as fh:
+                    up = requests.post(f"{base}/media", headers=auth,
+                                       data={"messaging_product": "whatsapp"},
+                                       files={"file": (attach_name, fh, "application/octet-stream")},
+                                       timeout=120)
+                up.raise_for_status()
+                media_id = up.json().get("id")
+        except Exception as e:
+            return {"sent": False, "channel": "whatsapp",
+                    "error": f"media upload failed: {e}"}
+
+    sent, errs = [], []
+    for num in to:
+        if template:
+            # Business-initiated: approved template. Standard shape = optional
+            # document header + one body text param. Adjust to your template.
+            components = []
+            if media_id:
+                components.append({"type": "header", "parameters": [
+                    {"type": "document",
+                     "document": {"id": media_id, "filename": attach_name}}]})
+            components.append({"type": "body", "parameters": [
+                {"type": "text", "text": message}]})
+            payload = {"messaging_product": "whatsapp", "to": num, "type": "template",
+                       "template": {"name": template, "language": {"code": "en"},
+                                    "components": components}}
+        elif media_id:
+            payload = {"messaging_product": "whatsapp", "to": num, "type": "document",
+                       "document": {"id": media_id, "filename": attach_name,
+                                    "caption": message}}
+        else:
+            payload = {"messaging_product": "whatsapp", "to": num, "type": "text",
+                       "text": {"body": message}}
+        try:
+            r = requests.post(f"{base}/messages",
+                              headers={**auth, "Content-Type": "application/json"},
+                              json=payload, timeout=30)
+            r.raise_for_status()
+            sent.append(num)
+        except Exception as e:
+            errs.append({"to": num, "error": str(e)[:200]})
+
+    ok = len(sent) > 0
+    res = {"sent": ok, "channel": "whatsapp", "to": len(sent),
+           "attached": attach_name, "template": template or None}
+    if errs:
+        res["errors"] = errs
+        if not ok:
+            res["error"] = errs[0]["error"]
+    if ok:
+        logger.info(f"[delivery] WhatsApp '{report_name}' → {len(sent)} recipient(s)"
+                    f"{' with ' + attach_name if attach_name else ''}")
+    return res
+
+
+def send_sms(cfg: Dict[str, Any], report_name: str,
+             ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a short SMS summary via MSG91 (flow API). Text only — no file."""
+    cfg = cfg or {}
+    to = _clean_phones(cfg.get("to"))
+    if not to:
+        return {"sent": False, "channel": "sms", "error": "no valid recipients"}
+    sms = _provider_cfg("sms")
+    if not sms.get("api_key"):
+        return {"sent": False, "channel": "sms",
+                "error": "SMS not configured (Settings > SMS)"}
+    if not sms.get("dlt_template_id"):
+        return {"sent": False, "channel": "sms",
+                "error": "SMS DLT template id not set (Settings → SMS)"}
+    try:
+        import requests
+    except ImportError:
+        return {"sent": False, "channel": "sms", "error": "requests not installed"}
+
+    message = _render_template(cfg.get("message") or "ARS {report}: {status}, {rows} rows", ctx)
+    # MSG91 flow: the message maps to the DLT template's first variable (var1).
+    recipients = [{"mobiles": m, "var1": message} for m in to]
+    body = {"template_id": sms["dlt_template_id"], "recipients": recipients}
+    if sms.get("sender_id"):
+        body["sender"] = sms["sender_id"]
+    if sms.get("route"):
+        body["route"] = sms["route"]
+    headers = {"authkey": sms["api_key"], "Content-Type": "application/json",
+               "accept": "application/json"}
+    try:
+        r = requests.post("https://control.msg91.com/api/v5/flow/",
+                          headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        logger.info(f"[delivery] SMS '{report_name}' → {len(to)} recipient(s)")
+        return {"sent": True, "channel": "sms", "to": len(to), "text": message[:160]}
+    except Exception as e:
+        logger.error(f"[delivery] SMS send failed: {e}")
+        return {"sent": False, "channel": "sms", "error": str(e)[:200]}
 
 
 def _safe(name: str) -> str:
