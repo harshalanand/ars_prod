@@ -64,6 +64,7 @@ const TrendReviewPage        = lazy(() => import('@/pages/TrendReviewPage'))
 const TrendAdminPage         = lazy(() => import('@/pages/TrendAdminPage'))
 const TrendDashboardPage     = lazy(() => import('@/pages/TrendDashboardPage'))
 const TempDBAdminPage        = lazy(() => import('@/pages/TempDBAdminPage'))
+const DevSyncManagerPage     = lazy(() => import('@/pages/DevSyncManagerPage'))
 // Project Tracker
 const PTDashboardPage        = lazy(() => import('@/pages/pt/PTDashboardPage'))
 const PTProjectsPage         = lazy(() => import('@/pages/pt/PTProjectsPage'))
@@ -74,6 +75,8 @@ const ManualGalleryPage      = lazy(() => import('@/pages/ManualGalleryPage'))
 const DataDictionaryPage     = lazy(() => import('@/pages/DataDictionaryPage'))
 const ReportGenerationPage   = lazy(() => import('@/pages/ReportGenerationPage'))
 const DailyActivityLogPage   = lazy(() => import('@/pages/DailyActivityLogPage'))
+const UpcStoreTrackingPage   = lazy(() => import('@/pages/UpcStoreTrackingPage'))
+const FaConsPlaceholderPage  = lazy(() => import('@/pages/FaConsPlaceholderPage'))
 
 function PageLoader() {
   return (
@@ -197,6 +200,13 @@ export default function App() {
         <Route path="reports/pend-alc" element={<PendAlcReportPage />} />
         <Route path="reports/hold" element={<ErrorBoundary><HoldDashboardPage /></ErrorBoundary>} />
         <Route path="reports/gap" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><GapReportPage /></ErrorBoundary></ProtectedRoute>} />
+        {/* UPC Store Tracking — store-opening lifecycle tracker */}
+        <Route path="reports/upc-tracking" element={<ErrorBoundary><UpcStoreTrackingPage /></ErrorBoundary>} />
+        {/* FA & CONS — Project-store & consumables allocation (scaffold; pages WIP, see manual/fa_cons.md) */}
+        <Route path="fa-cons/project-store" element={<ErrorBoundary><FaConsPlaceholderPage title="Project Store Allocation" description="Allocate the daily balance requirement for new/UPC project stores against DC + store stock, against an MBQ and priority master supplied by the project team, until the balance requirement reaches zero." /></ErrorBoundary>} />
+        <Route path="fa-cons/consumables" element={<ErrorBoundary><FaConsPlaceholderPage title="Consumables Allocation" description="Daily pan-India consumables allocation with an auto-computed MBQ = MIN(max-hold capacity, 15-day sale) + per-day sale × cover days." /></ErrorBoundary>} />
+        <Route path="fa-cons/mbq-master" element={<ErrorBoundary><FaConsPlaceholderPage title="MBQ Master" description="Upload, edit and audit MBQ per store × reference-article, with change-count control and a mandatory reason on every change." /></ErrorBoundary>} />
+        <Route path="fa-cons/gap-report" element={<ErrorBoundary><FaConsPlaceholderPage title="Gap Report" description="Compare current MBQ against dispatched and pending quantities and propose a final ATR action — hold picking-pending/PRD stock, or return from store." /></ErrorBoundary>} />
         {/* Pending Allocation Lifecycle */}
         <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />
@@ -218,6 +228,7 @@ export default function App() {
         <Route path="settings/audit" element={<ProtectedRoute permission="ADMIN_AUDIT_READ"><AuditPage /></ProtectedRoute>} />
         <Route path="settings/tempdb" element={<ErrorBoundary><TempDBAdminPage /></ErrorBoundary>} />
         <Route path="settings/activity-log" element={<ProtectedRoute superadminOnly><ErrorBoundary><DailyActivityLogPage /></ErrorBoundary></ProtectedRoute>} />
+        <Route path="settings/dev-sync" element={<ProtectedRoute superadminOnly><ErrorBoundary><DevSyncManagerPage /></ErrorBoundary></ProtectedRoute>} />
         {/* Legacy routes - redirect to new paths */}
         <Route path="admin/users" element={<Navigate to="/settings/users" replace />} />
         <Route path="admin/roles" element={<Navigate to="/settings/roles" replace />} />

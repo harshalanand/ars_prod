@@ -6,7 +6,7 @@ import {
   Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
   HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
   AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered,
-  XCircle,
+  XCircle, Store,
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -79,6 +79,16 @@ const reportsItems = [
   { label: 'Report Generation', path: '/reports/generation', icon: FileText },
   { label: 'Hold Dashboard',  path: '/reports/hold',     icon: Lock },
   { label: 'GAP Report',      path: '/reports/gap',      icon: AlertTriangle, permission: 'ALLOC_READ' },
+  { label: 'UPC Store Tracking', path: '/reports/upc-tracking', icon: Store },
+]
+
+// FA & CONS — Project-store & consumables allocation (BRD scaffold; pages WIP,
+// specced in public/docs/manual/fa_cons.md)
+const faConsItems = [
+  { label: 'Project Store Alloc', path: '/fa-cons/project-store', icon: Store },
+  { label: 'Consumables Alloc',   path: '/fa-cons/consumables',   icon: Boxes },
+  { label: 'MBQ Master',          path: '/fa-cons/mbq-master',    icon: ClipboardList },
+  { label: 'Gap Report',          path: '/fa-cons/gap-report',    icon: AlertTriangle },
 ]
 
 // Pending Allocation lifecycle submenu
@@ -134,6 +144,7 @@ const settingsItems = [
   { label: 'Audit Log', path: '/settings/audit', icon: ScrollText, permission: 'ADMIN_AUDIT_READ' },
   { label: 'Daily Activity Log', path: '/settings/activity-log', icon: ClipboardCheck, superadminOnly: true },
   { label: 'TempDB Maintenance', path: '/settings/tempdb', icon: HardDrive, superadminOnly: true },
+  { label: 'Dev Sync (PROD→DEV)', path: '/settings/dev-sync', icon: Database, superadminOnly: true },
 ]
 
 // Single registry drives rendering, the accordion, route detection, and
@@ -147,6 +158,7 @@ const SECTIONS = [
   { title: 'ALC_Fixture',       icon: Boxes,          items: alcFixtureItems },
   { title: 'Trends',            icon: TrendingUp,     items: trendsItems },
   { title: 'Reports',           icon: Activity,       items: reportsItems },
+  { title: 'FA & CONS',         icon: Store,          items: faConsItems },
   { title: 'Pending Allocation',icon: Truck,          items: pendAlcItems },
   { title: 'Data Validation',   icon: ClipboardCheck, items: dataValidationItems },
   { title: 'Project Tracker',   icon: FolderKanban,   items: projectTrackerItems },

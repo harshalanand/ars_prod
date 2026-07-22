@@ -38,8 +38,9 @@ Key columns: `hierarchy_columns` (ordered JSON; **last col = grain**), `seq`, `k
 **Pre-grid cascade** (`calculate_per_day_sale`) → `ARS_CALC_ST_MAJ_CAT` / `ARS_CALC_ST_ART` (masters never mutated). CO base → fill CO gaps → ST overlay (ST wins when non-blank) → defaults:
 ```
 ALC_D  = INT_DAYS + PRD_DAYS + SL_CVR    (SL_CVR priority: ST_MAJ_CAT > CO_MAJ_CAT > ST_MASTER)
-SAL_PD = piecewise CM/NM per-day sale blend
+SAL_PD = piecewise CM/NM per-day sale blend → ROUND(…, 2)   (2 dp since 2026-07-18)
 ACS_D  ← MANUAL_DENSITY when > 0 (article grain)
+CONT%  = STOCK_CONT% / SALE_CONT% / INITIAL AUTO CONT% → ROUND(…, 4)   (4 dp since 2026-07-18)
 ```
 **Grid-level calc** (order matters):
 ```

@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react'
-import { Settings, Database, Mail, Palette, Shield, Server, Check, AlertCircle, AlertTriangle, RefreshCw, Send, Save, HardDrive, Trash2, Download, Play, Users, Cpu, Clock, Table2, Eye, Upload, FileDown, Edit3 } from 'lucide-react'
-import { settingsAPI, tablesAPI, maintenanceAPI, listingAPI } from '@/services/api'
+import { Settings, Database, Mail, Palette, Shield, Server, Check, AlertCircle, AlertTriangle, RefreshCw, Send, Save, HardDrive, Trash2, Download, Play, Users, Cpu, Clock, Table2, Eye, Upload, FileDown, Edit3, MessageCircle, MessageSquare } from 'lucide-react'
+import { settingsAPI, tablesAPI, maintenanceAPI, listingAPI, whatsappConfigAPI } from '@/services/api'
 import useAuthStore from '@/store/authStore'
 import toast from 'react-hot-toast'
 
 const tabs = [
   { id: 'database', label: 'Database', icon: Database },
   { id: 'email', label: 'Email', icon: Mail },
+  { id: 'whatsapp', label: 'WhatsApp', icon: MessageCircle },
+  { id: 'sms', label: 'SMS', icon: MessageSquare },
   { id: 'snowflake', label: 'Snowflake', icon: Database },
   { id: 'application', label: 'Application', icon: Settings },
   { id: 'tables', label: 'Table Permissions', icon: Table2 },
@@ -39,6 +41,21 @@ export default function SettingsPage() {
   const [parkingLoading, setParkingLoading] = useState(false)
   const [parkingSaving, setParkingSaving] = useState(false)
 
+  // WhatsApp (Meta Cloud API) config — dedicated DB-backed tab
+  const isSuperAdmin = useAuthStore(s => s.isSuperAdmin?.())
+  const WA_MASK = '********'
+  const emptyWa = { phone_number_id: '', waba_id: '', access_token: '', default_template: '', enabled: false, has_token: false }
+  const [waCfg, setWaCfg] = useState(emptyWa)
+  const [waStatus, setWaStatus] = useState(null)
+  const [waLoading, setWaLoading] = useState(false)
+  const [waSaving, setWaSaving] = useState(false)
+  const [waTokenTouched, setWaTokenTouched] = useState(false)
+  const [waTesting, setWaTesting] = useState(false)
+  const [waVerifying, setWaVerifying] = useState(false)
+  const [waSending, setWaSending] = useState(false)
+  const [waTestMobile, setWaTestMobile] = useState('')
+  const [waTestMsg, setWaTestMsg] = useState('ARS test message.')
+
   // Danger Zone — transactional reset
   const [resetIncludeMsa, setResetIncludeMsa] = useState(false)
   const [resetPreview, setResetPreview] = useState(null)
@@ -62,7 +79,108 @@ export default function SettingsPage() {
     if (activeTab === 'application') {
       loadParkingMode()
     }
+    if (activeTab === 'whatsapp') {
+      loadWhatsApp()
+    }
   }, [activeTab])
+
+  const loadWhatsApp = async () => {
+    setWaLoading(true)
+    setWaTokenTouched(false)
+    try {
+      const [cfgRes, stRes] = await Promise.all([
+        whatsappConfigAPI.getConfig(),
+        whatsappConfigAPI.status(false),
+      ])
+      const cfg = cfgRes.data?.data || emptyWa
+      // Show the mask in the token field when a token is stored.
+      setWaCfg({ ...emptyWa, ...cfg, access_token: cfg.has_token ? WA_MASK : '' })
+      setWaStatus(stRes.data?.data || null)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Failed to load WhatsApp config')
+    } finally {
+      setWaLoading(false)
+    }
+  }
+
+  const updateWa = (key, value) => setWaCfg(prev => ({ ...prev, [key]: value }))
+
+  const saveWhatsApp = async () => {
+    setWaSaving(true)
+    try {
+      const payload = {
+        phone_number_id: waCfg.phone_number_id || '',
+        waba_id: waCfg.waba_id || '',
+        default_template: waCfg.default_template || '',
+        enabled: !!waCfg.enabled,
+        // Only send the token when the admin actually edited it; else send the
+        // mask so the backend preserves the stored (encrypted) value.
+        access_token: waTokenTouched ? (waCfg.access_token || '') : WA_MASK,
+      }
+      const { data } = await whatsappConfigAPI.saveConfig(payload)
+      toast.success(data?.message || 'Configuration Saved Successfully.')
+      await loadWhatsApp()
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Failed to save configuration')
+    } finally {
+      setWaSaving(false)
+    }
+  }
+
+  const testWhatsApp = async () => {
+    setWaTesting(true)
+    try {
+      const body = waTokenTouched && waCfg.access_token
+        ? { phone_number_id: waCfg.phone_number_id, access_token: waCfg.access_token }
+        : { phone_number_id: waCfg.phone_number_id }
+      const { data } = await whatsappConfigAPI.testConnection(body)
+      if (data?.success) {
+        toast.success(`${data.message} ${data.data?.display_phone_number || ''}`.trim())
+      } else {
+        toast.error(data?.message || 'Connection failed')
+      }
+      const st = await whatsappConfigAPI.status(false)
+      setWaStatus(st.data?.data || null)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Test connection failed')
+    } finally {
+      setWaTesting(false)
+    }
+  }
+
+  const verifyWhatsAppTemplate = async () => {
+    setWaVerifying(true)
+    try {
+      const body = { waba_id: waCfg.waba_id, template: waCfg.default_template }
+      if (waTokenTouched && waCfg.access_token) body.access_token = waCfg.access_token
+      const { data } = await whatsappConfigAPI.verifyTemplate(body)
+      if (data?.success) {
+        toast.success(`${data.message} (${data.data?.language || ''})`.trim())
+      } else {
+        toast.error(data?.message || 'Template not approved')
+      }
+      const st = await whatsappConfigAPI.status(false)
+      setWaStatus(st.data?.data || null)
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Verify template failed')
+    } finally {
+      setWaVerifying(false)
+    }
+  }
+
+  const sendWhatsAppTest = async () => {
+    if (!waTestMobile.trim()) { toast.error('Enter a test mobile number'); return }
+    setWaSending(true)
+    try {
+      const { data } = await whatsappConfigAPI.sendTest({ to: waTestMobile, message: waTestMsg })
+      if (data?.success) toast.success(data.message || 'Test Message Sent Successfully.')
+      else toast.error(data?.message || 'Failed to send test message')
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Failed to send test message')
+    } finally {
+      setWaSending(false)
+    }
+  }
 
   const loadParkingMode = async () => {
     setParkingLoading(true)
@@ -148,6 +266,8 @@ export default function SettingsPage() {
         },
         email: { smtp_server: '', smtp_port: 587, smtp_username: '', smtp_password: '', from_address: '', use_tls: true, notifications_enabled: false },
         snowflake: { account: '', user: '', password: '', warehouse: '', role: '', enabled: false },
+        whatsapp: { provider: 'meta_cloud', phone_number_id: '', access_token: '', default_template: '', enabled: false },
+        sms: { provider: 'msg91', api_key: '', sender_id: '', dlt_template_id: '', route: '', enabled: false },
         application: { app_name: 'ARS', max_upload_size_mb: 500, session_timeout_minutes: 60, enable_audit_logging: true, enable_row_level_security: true, default_page_size: 50, max_export_rows: 500000, shift_all_to_working: false },
         ui: { primary_color: '#4f46e5', sidebar_collapsed: false, show_row_numbers: true, date_format: 'YYYY-MM-DD', number_format: 'en-US' },
       })
@@ -645,6 +765,194 @@ export default function SettingsPage() {
               </div>
               <div className="flex justify-end pt-4 border-t">
                 <button onClick={() => handleSave('snowflake')} disabled={saving} className="btn-primary">
+                  <Save size={16} /> Save Changes
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* WhatsApp Settings (Meta Cloud API) — dedicated DB-backed config */}
+          {activeTab === 'whatsapp' && (() => {
+            const statusColor = (v) => {
+              const s = String(v || '').toUpperCase()
+              if (['CONNECTED', 'VALID', 'APPROVED'].includes(s)) return 'bg-green-100 text-green-700'
+              if (['EXPIRED', 'ERROR', 'REJECTED', 'NOT FOUND', 'INVALID'].includes(s)) return 'bg-red-100 text-red-700'
+              if (['PENDING'].includes(s)) return 'bg-amber-100 text-amber-700'
+              return 'bg-gray-100 text-gray-500'
+            }
+            const StatusPill = ({ label, value }) => (
+              <div className="flex items-center justify-between py-2 border-b last:border-0">
+                <span className="text-sm text-gray-600">{label}</span>
+                <span className={`text-xs font-medium px-2 py-1 rounded ${statusColor(value)}`}>
+                  {value || 'Not Verified'}
+                </span>
+              </div>
+            )
+            return (
+            <div className="space-y-6">
+              {/* Section 1 — Configuration */}
+              <div className="card p-6 space-y-6">
+                <h3 className="font-semibold text-gray-900 text-lg flex items-center gap-2">
+                  <MessageCircle size={20} /> WhatsApp (Meta Cloud API)
+                </h3>
+                <p className="text-sm text-gray-500 -mt-3">
+                  Configure Meta WhatsApp Business Cloud API for automated reports, alerts and
+                  documents. Business-initiated messages require a pre-approved template.
+                </p>
+                {waLoading ? (
+                  <div className="text-sm text-gray-500 py-6">Loading configuration…</div>
+                ) : (
+                <>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="label">Phone Number ID <span className="text-red-500">*</span></label>
+                    <input value={waCfg.phone_number_id || ''} inputMode="numeric"
+                      onChange={e => updateWa('phone_number_id', e.target.value)}
+                      className="input" placeholder="102938475600000" />
+                  </div>
+                  <div>
+                    <label className="label">WhatsApp Business Account ID <span className="text-red-500">*</span></label>
+                    <input value={waCfg.waba_id || ''}
+                      onChange={e => updateWa('waba_id', e.target.value)}
+                      className="input" placeholder="392710000000000" />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="label">
+                      Access Token <span className="text-red-500">*</span>
+                      {!isSuperAdmin && <span className="text-xs text-gray-400 ml-2">(SUPER_ADMIN only)</span>}
+                    </label>
+                    <input type="password" value={waCfg.access_token || ''}
+                      disabled={!isSuperAdmin}
+                      onChange={e => { setWaTokenTouched(true); updateWa('access_token', e.target.value) }}
+                      onFocus={() => { if (!waTokenTouched && waCfg.access_token === WA_MASK) { setWaTokenTouched(true); updateWa('access_token', '') } }}
+                      className="input disabled:bg-gray-50 disabled:text-gray-400"
+                      placeholder="EAAG…" />
+                  </div>
+                  <div>
+                    <label className="label">Default Template <span className="text-red-500">*</span></label>
+                    <input value={waCfg.default_template || ''}
+                      onChange={e => updateWa('default_template', e.target.value)}
+                      className="input" placeholder="ars_report_ready" />
+                  </div>
+                  <div>
+                    <label className="flex items-center gap-2 cursor-pointer pt-6">
+                      <input type="checkbox" checked={!!waCfg.enabled}
+                        onChange={e => updateWa('enabled', e.target.checked)}
+                        className="w-4 h-4 rounded border-gray-300" />
+                      <span className="text-sm text-gray-700">Enable WhatsApp Delivery</span>
+                    </label>
+                  </div>
+                </div>
+                <div className="flex justify-between items-center pt-4 border-t">
+                  <button onClick={testWhatsApp} disabled={waTesting} className="btn-secondary">
+                    <RefreshCw size={16} className={waTesting ? 'animate-spin' : ''} /> Test Connection
+                  </button>
+                  <button onClick={saveWhatsApp} disabled={waSaving} className="btn-primary">
+                    <Save size={16} /> {waSaving ? 'Saving…' : 'Save Changes'}
+                  </button>
+                </div>
+                </>
+                )}
+              </div>
+
+              {/* Section 2 — Status */}
+              <div className="card p-6">
+                <h3 className="font-semibold text-gray-900 text-base flex items-center gap-2 mb-3">
+                  <Shield size={18} /> Status
+                </h3>
+                <StatusPill label="API Status" value={waStatus?.api_status} />
+                <StatusPill label="Token Status" value={waStatus?.token_status} />
+                <StatusPill label="Template Status" value={waStatus?.template_status} />
+                <StatusPill label="Webhook Status" value={waStatus?.webhook_status} />
+                <div className="flex items-center justify-between py-2">
+                  <span className="text-sm text-gray-600">Last Verified</span>
+                  <span className="text-xs text-gray-500">
+                    {waStatus?.last_verified ? new Date(waStatus.last_verified).toLocaleString() : '—'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Section 3 — Testing */}
+              <div className="card p-6 space-y-4">
+                <h3 className="font-semibold text-gray-900 text-base flex items-center gap-2">
+                  <Send size={18} /> Testing
+                </h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="label">Test Mobile Number</label>
+                    <input value={waTestMobile} inputMode="numeric"
+                      onChange={e => setWaTestMobile(e.target.value)}
+                      className="input" placeholder="919876543210" />
+                  </div>
+                  <div>
+                    <label className="label">Test Message (free-form only within 24h window)</label>
+                    <input value={waTestMsg} onChange={e => setWaTestMsg(e.target.value)}
+                      className="input" placeholder="ARS test message." />
+                  </div>
+                </div>
+                <div className="flex gap-3 pt-2 border-t">
+                  <button onClick={verifyWhatsAppTemplate} disabled={waVerifying} className="btn-secondary">
+                    <Check size={16} /> {waVerifying ? 'Verifying…' : 'Verify Template'}
+                  </button>
+                  <button onClick={sendWhatsAppTest} disabled={waSending || !waCfg.enabled} className="btn-primary"
+                    title={!waCfg.enabled ? 'Enable WhatsApp delivery first' : 'Sends a real WhatsApp message'}>
+                    <Send size={16} /> {waSending ? 'Sending…' : 'Send Test Message'}
+                  </button>
+                </div>
+                {!waCfg.enabled && (
+                  <p className="text-xs text-amber-600">WhatsApp delivery is disabled — enable and save to send a test.</p>
+                )}
+              </div>
+            </div>
+            )
+          })()}
+
+          {/* SMS Settings (MSG91) */}
+          {activeTab === 'sms' && (
+            <div className="card p-6 space-y-6">
+              <h3 className="font-semibold text-gray-900 text-lg flex items-center gap-2">
+                <MessageSquare size={20} /> SMS (MSG91)
+              </h3>
+              <p className="text-sm text-gray-500 -mt-3">
+                Indian SMS requires a DLT-registered sender ID and template id (TRAI). SMS carries
+                a short text summary only — never a file.
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="col-span-2">
+                  <label className="label">API key (authkey)</label>
+                  <input type="password" value={settings.sms?.api_key || ''}
+                    onChange={e => updateSetting('sms', 'api_key', e.target.value)}
+                    className="input" placeholder="••••••••" />
+                </div>
+                <div>
+                  <label className="label">Sender ID (DLT header)</label>
+                  <input value={settings.sms?.sender_id || ''}
+                    onChange={e => updateSetting('sms', 'sender_id', e.target.value)}
+                    className="input" placeholder="V2RTL" />
+                </div>
+                <div>
+                  <label className="label">DLT template id</label>
+                  <input value={settings.sms?.dlt_template_id || ''}
+                    onChange={e => updateSetting('sms', 'dlt_template_id', e.target.value)}
+                    className="input" placeholder="1707xxxxxxxxxxxx" />
+                </div>
+                <div>
+                  <label className="label">Route (optional)</label>
+                  <input value={settings.sms?.route || ''}
+                    onChange={e => updateSetting('sms', 'route', e.target.value)}
+                    className="input" placeholder="4" />
+                </div>
+                <div>
+                  <label className="flex items-center gap-2 cursor-pointer pt-6">
+                    <input type="checkbox" checked={settings.sms?.enabled || false}
+                      onChange={e => updateSetting('sms', 'enabled', e.target.checked)}
+                      className="w-4 h-4 rounded border-gray-300" />
+                    <span className="text-sm text-gray-700">Enable SMS delivery</span>
+                  </label>
+                </div>
+              </div>
+              <div className="flex justify-end pt-4 border-t">
+                <button onClick={() => handleSave('sms')} disabled={saving} className="btn-primary">
                   <Save size={16} /> Save Changes
                 </button>
               </div>

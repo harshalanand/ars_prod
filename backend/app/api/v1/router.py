@@ -30,6 +30,7 @@ from app.api.v1.endpoints.bdc import router as bdc_router
 
 # Phase 5: Settings
 from app.api.v1.endpoints.settings import router as settings_router
+from app.api.v1.endpoints.whatsapp_config import router as whatsapp_config_router
 
 # Phase 6b: SLOC Validation / Data Validation
 from app.api.v1.endpoints.sloc_validation import router as store_stock_router
@@ -99,6 +100,7 @@ api_router.include_router(bdc_router)
 
 # Phase 5
 api_router.include_router(settings_router)
+api_router.include_router(whatsapp_config_router)
 
 # Phase 6b: Store Stock / Data Preparation
 api_router.include_router(store_stock_router)
@@ -150,3 +152,12 @@ api_router.include_router(project_tracker_router)
 # Daily Activity Log — audit_log rolled into review-ready daily pointers (superadmin)
 from app.api.v1.endpoints.activity_log import router as activity_log_router
 api_router.include_router(activity_log_router)
+
+# Dev Sync Manager — one-way table refresh PROD (HOPC866) → DEV (superadmin)
+from app.api.v1.endpoints.dev_sync import router as dev_sync_router
+api_router.include_router(dev_sync_router)
+
+# UPC Store Tracking — store-opening lifecycle tracker (dates/remarks history +
+# live MBQ/stock/SLOC/fill-rate from TREND_ST). Replaces the manual xlsx.
+from app.api.v1.endpoints.upc_store_track import router as upc_store_track_router
+api_router.include_router(upc_store_track_router)

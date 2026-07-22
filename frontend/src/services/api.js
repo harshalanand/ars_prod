@@ -241,6 +241,19 @@ export const settingsAPI = {
   deleteBackup: (filename) => api.delete(`/settings/backup/${filename}`),
 }
 
+// ============== WhatsApp (Meta Cloud API) Configuration ==============
+// Dedicated, DB-backed config (encrypted token) — separate from the generic
+// app_settings.json path. Powers the Settings → WhatsApp tab.
+export const whatsappConfigAPI = {
+  getConfig:      ()       => api.get('/settings/whatsapp/config'),
+  saveConfig:     (cfg)    => api.put('/settings/whatsapp/config', cfg || {}),
+  testConnection: (cfg)    => api.post('/settings/whatsapp/test-connection', cfg || {}, { timeout: 30000 }),
+  verifyTemplate: (cfg)    => api.post('/settings/whatsapp/verify-template', cfg || {}, { timeout: 30000 }),
+  sendTest:       (body)   => api.post('/settings/whatsapp/send-test', body || {}, { timeout: 30000 }),
+  status:         (live=false) => api.get('/settings/whatsapp/status', { params: { live } }),
+  audit:          (limit=50)   => api.get('/settings/whatsapp/audit', { params: { limit } }),
+}
+
 
 
 // ============== Store Stock (Data Preparation) ==============
@@ -289,6 +302,7 @@ export const dataDictionaryAPI = {
   create: (data)     => api.post('/data-dictionary', data),
   update: (id, data) => api.put(`/data-dictionary/${id}`, data),
   remove: (id)       => api.delete(`/data-dictionary/${id}`),
+  exportXlsx: (q)    => api.get('/data-dictionary/export', { params: q ? { q } : {}, responseType: 'blob' }),
 }
 
 // ============== Listing (Data Preparation) ==============
@@ -545,6 +559,37 @@ export const checklistAPI = {
   deleteItem:       (id)         => api.delete(`/checklist/items/${id}`),
 }
 
+// ============== Dev Sync Manager (PROD → DEV table refresh) ==============
+export const devSyncAPI = {
+  getSettings:     ()              => api.get('/dev-sync/settings'),
+  saveSettings:    (data)          => api.put('/dev-sync/settings', data),
+  testConnection:  (data)          => api.post('/dev-sync/test-connection', data),
+  setupLinkServer: ()              => api.post('/dev-sync/setup-linkserver'),
+  discover:        ()              => api.get('/dev-sync/discover'),
+  getTables:       ()              => api.get('/dev-sync/tables'),
+  addTables:       (items)         => api.post('/dev-sync/tables', { items }),
+  updateTable:     (id, data)      => api.put(`/dev-sync/tables/${id}`, data),
+  deleteTable:     (id)            => api.delete(`/dev-sync/tables/${id}`),
+  bulkToggle:      (ids, active)   => api.post('/dev-sync/tables/bulk-toggle', { table_ids: ids, active }),
+  bulkDelete:      (ids)           => api.post('/dev-sync/tables/bulk-delete', { table_ids: ids }),
+  clearAll:        ()              => api.post('/dev-sync/tables/clear'),
+  run:             (mode, ids, force) => api.post('/dev-sync/run', { mode, table_ids: ids || null, force: !!force }),
+}
+
+// ============== UPC Store Tracking ==============
+export const upcTrackAPI = {
+  list:      (segments)     => api.get('/upc-store-track', { params: segments?.length ? { segments: segments.join(',') } : {} }),
+  get:       (stCd)         => api.get(`/upc-store-track/${encodeURIComponent(stCd)}`),
+  charts:    (segments)     => api.get('/upc-store-track/charts', { params: segments?.length ? { segments: segments.join(',') } : {} }),
+  save:      (data)         => api.post('/upc-store-track', data),
+  update:    (stCd, data)   => api.put(`/upc-store-track/${encodeURIComponent(stCd)}`, data),
+  remove:    (stCd)         => api.delete(`/upc-store-track/${encodeURIComponent(stCd)}`),
+  upload:    (formData, onProgress) => api.post('/upc-store-track/upload', formData,
+                { headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: onProgress, timeout: 300000 }),
+  export:    (segments)     => api.get('/upc-store-track/export', { params: segments?.length ? { segments: segments.join(',') } : {}, responseType: 'blob', timeout: 300000 }),
+  template:  ()             => api.get('/upc-store-track/template', { responseType: 'blob' }),
+}
+
 // ============== Trends ==============
 export const trendsAPI = {
   listTables:      ()                    => api.get('/trends/tables'),
@@ -621,6 +666,8 @@ export const reportGenAPI = {
   runNow:      (id)           => api.post(`/report-gen/reports/${id}/run`),
   cancel:      (id)           => api.post(`/report-gen/reports/${id}/cancel`),
   runs:        (id, limit=50) => api.get(`/report-gen/reports/${id}/runs`, { params: { limit } }),
+  deleteRun:   (id, runId)    => api.delete(`/report-gen/reports/${id}/runs/${runId}`),
+  bulkDeleteRuns: (id, runIds) => api.post(`/report-gen/reports/${id}/runs/bulk-delete`, { run_ids: runIds }),
   codeSteps:   ()             => api.get('/report-gen/code-steps'),
   procedures:  (search='')    => api.get('/report-gen/procedures', { params: { search } }),
   procParams:  (name)         => api.get('/report-gen/proc-params', { params: { name } }),

@@ -521,7 +521,12 @@
       "PowerShell(cd D:\\\\ARS_PROD\\\\ars_prod\\\\backend; $env:PYTHONPATH=\".\"; & \".\\\\venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\4dc0add0-5e02-4763-a389-22fe2129a09c\\\\scratchpad\\\\smoke_procparams2.py\" 2>&1 | Select-String -NotMatch \"INFO|DEBUG\")",
       "Bash(PYTHONPATH=. nohup ./venv/Scripts/python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 > /tmp/ars_be19.log 2>&1 & *)",
       "Bash(cp \"C:/Users/SANTOS~1.KUM/AppData/Local/Temp/claude/D--ARS-PROD-ars-prod/fc905f0d-d039-4da4-88de-3d6f9ea0fcb8/scratchpad/usp_ars_grid_report.sql\" \"D:/ARS_PROD/ars_prod/backend/sql/usp_ars_grid_report.sql\" && echo \"copied to backend/sql/\" && ls -la \"D:/ARS_PROD/ars_prod/backend/sql/usp_ars_grid_report.sql\")",
-      "PowerShell(cd D:\\\\ARS_PROD\\\\ars_prod\\\\backend; $env:PYTHONPATH=\".\"; & \".\\\\venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\4dc0add0-5e02-4763-a389-22fe2129a09c\\\\scratchpad\\\\smoke_nullparam.py\" 2>&1 | Select-String -NotMatch \"INFO|DEBUG\")"
+      "PowerShell(cd D:\\\\ARS_PROD\\\\ars_prod\\\\backend; $env:PYTHONPATH=\".\"; & \".\\\\venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\4dc0add0-5e02-4763-a389-22fe2129a09c\\\\scratchpad\\\\smoke_nullparam.py\" 2>&1 | Select-String -NotMatch \"INFO|DEBUG\")",
+      "Bash(./venv/Scripts/python.exe \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\950be146-0c4e-43e9-8878-171bab91b784\\\\scratchpad\\\\inspect_servers.py\")",
+      "Bash(./venv/Scripts/python.exe \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\950be146-0c4e-43e9-8878-171bab91b784\\\\scratchpad\\\\compare.py\")",
+      "Bash(./venv/Scripts/python.exe \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\950be146-0c4e-43e9-8878-171bab91b784\\\\scratchpad\\\\freshness.py\")",
+      "Bash(./venv/Scripts/python.exe -c \"import cryptography; from cryptography.fernet import Fernet; print\\('cryptography', cryptography.__version__\\)\")",
+      "Bash(PYTHONPATH=. PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe \"C:\\\\Users\\\\SANTOS~1.KUM\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\D--ARS-PROD-ars-prod\\\\4dc0add0-5e02-4763-a389-22fe2129a09c\\\\scratchpad\\\\smoke_wa_config.py\")"
     ],
     "additionalDirectories": [
       "D:\\projects\\ars_prod",
