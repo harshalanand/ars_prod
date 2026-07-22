@@ -12,6 +12,7 @@ so the module is safe to introduce over existing plaintext columns.
 import os
 from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
+from typing import Optional
 
 _ENC_PREFIX = "enc:"
 _KEY_NAME = "APP_ENC_KEY"
@@ -19,7 +20,7 @@ _KEY_NAME = "APP_ENC_KEY"
 _BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _ENV_FILE = os.path.join(_BACKEND_ROOT, ".env")
 
-_fernet: Fernet | None = None
+_fernet: Optional[Fernet] = None
 
 
 def _load_or_create_key() -> bytes:
