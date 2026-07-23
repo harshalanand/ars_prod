@@ -23,6 +23,7 @@ from sqlalchemy import text
 from app.database.session import get_data_engine
 from app.services.data_export_service import (
     make_session_dir,
+    fanout_param_runs,
     run_procedure_to_files,
     run_query_to_files,
 )
@@ -223,10 +224,18 @@ def run_report(report: Dict[str, Any], trigger_source: str,
             label = f"step {idx} ({step['type']}:{step['name']})"
             try:
                 if step["type"] == "sql":
-                    files.extend(run_procedure_to_files(
-                        {"name": step["name"], "params": step["params"]},
-                        export_dir, file_format, split_config, cancel_token=token,
-                        output_name=step.get("label"), name_suffix=event_suffix))
+                    # A FANOUT param (e.g. usp_ars_msa_master.@Level) with a comma
+                    # list expands into one run per value -> a SEPARATE output file
+                    # suffixed with the value (e.g. MSA_OP_CL_DETAIL, _GEN_CLR, ...).
+                    for run_params, fo_sfx in fanout_param_runs(step["name"], step["params"]):
+                        if token.cancelled:
+                            cancelled = True
+                            break
+                        sfx = "_".join([p for p in (fo_sfx, event_suffix) if p]) or None
+                        files.extend(run_procedure_to_files(
+                            {"name": step["name"], "params": run_params},
+                            export_dir, file_format, split_config, cancel_token=token,
+                            output_name=step.get("label"), name_suffix=sfx))
                 elif step["type"] == "query":
                     # Raw read-only SQL pasted into the report. step["name"] is
                     # the output file label; the SQL lives in params.sql.

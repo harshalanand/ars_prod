@@ -479,6 +479,29 @@ def proc_params(name: str, current_user: User = Depends(get_current_user)):
             ORDER BY ORDINAL_POSITION
         """), {"proc": proc, "schema": schema}).fetchall()
     params = [{"name": str(r[0]).lstrip("@"), "type": r[1]} for r in rows]
+
+    # Attach any registered allowed-values (for a dropdown) from ARS_PROC_PARAM_VALUES.
+    # Matched case-insensitively on proc (no schema) + param name. Optional table.
+    try:
+        with engine.connect() as conn:
+            if conn.execute(text("SELECT OBJECT_ID('dbo.ARS_PROC_PARAM_VALUES')")).scalar():
+                vrows = conn.execute(text("""
+                    SELECT PARAM_NAME, VAL, LABEL
+                    FROM dbo.ARS_PROC_PARAM_VALUES
+                    WHERE LOWER(PROC_NAME) = LOWER(:proc)
+                    ORDER BY PARAM_NAME, SORT_ORDER, VAL
+                """), {"proc": proc}).fetchall()
+                allowed: dict = {}
+                for pn, val, lab in vrows:
+                    allowed.setdefault(str(pn).lstrip("@").lower(), []).append(
+                        {"value": val, "label": lab or val})
+                for p in params:
+                    opts = allowed.get(p["name"].lower())
+                    if opts:
+                        p["allowed"] = opts
+    except Exception:
+        pass  # registry is optional; never break the params editor
+
     return APIResponse(success=True, data=params)
 
 

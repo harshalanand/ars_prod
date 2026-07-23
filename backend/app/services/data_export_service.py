@@ -245,6 +245,50 @@ def write_frame_split(df, export_dir: str, base_name: str, file_format: str,
     return written
 
 
+def fanout_param_runs(
+    proc_name: str, params: Dict[str, Any]
+) -> List[tuple]:
+    """Expand a proc's params for FANOUT parameters.
+
+    If the proc has a parameter registered with FANOUT=1 in ARS_PROC_PARAM_VALUES
+    and its value is a comma list, return one (params, suffix) run per value so
+    the caller writes a SEPARATE output file per value (suffixed with the value).
+    Otherwise returns a single [(params, None)]. Only the first matching fan-out
+    param is expanded (no cross-product). Registry is optional — any error or a
+    single value falls back to one run.
+    """
+    params = dict(params or {})
+    pname = str(proc_name or "").strip().strip("[]").split(".")[-1].strip("[]")
+    try:
+        eng = get_data_engine()
+        with eng.connect() as conn:
+            if not conn.execute(text("SELECT OBJECT_ID('dbo.ARS_PROC_PARAM_VALUES')")).scalar():
+                return [(params, None)]
+            if not conn.execute(text("SELECT COL_LENGTH('dbo.ARS_PROC_PARAM_VALUES','FANOUT')")).scalar():
+                return [(params, None)]
+            fo = [r[0] for r in conn.execute(text("""
+                SELECT DISTINCT PARAM_NAME FROM dbo.ARS_PROC_PARAM_VALUES
+                WHERE LOWER(PROC_NAME) = LOWER(:p) AND ISNULL(FANOUT, 0) = 1
+            """), {"p": pname})]
+    except Exception:
+        return [(params, None)]
+
+    for fp in fo:
+        key = next((k for k in params if k.lower() == str(fp).lower()), None)
+        if not key or params.get(key) in (None, ""):
+            continue
+        vals = [v.strip() for v in str(params[key]).split(",") if v.strip()]
+        if len(vals) <= 1:
+            continue
+        runs = []
+        for v in vals:
+            p2 = dict(params)
+            p2[key] = v
+            runs.append((p2, v))
+        return runs
+    return [(params, None)]
+
+
 def run_procedure_to_files(
     proc: Union[str, Dict[str, Any]],
     export_dir: str,

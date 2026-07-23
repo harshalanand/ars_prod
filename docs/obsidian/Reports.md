@@ -15,6 +15,7 @@ Catalogue of hand-built analytics reports — ad-hoc queries and stored procs th
 | Report | Proc / file | What it does |
 |--------|-------------|--------------|
 | Grid Report | `dbo.usp_ars_grid_report` · `backend/sql/usp_ars_grid_report.sql` | Grid table enriched with store / product / listing / MSA / alloc / hold; any `ARS_GRID_MJ[_dim]` |
+| MSA Master | `dbo.usp_ars_msa_master` · `backend/sql/usp_ars_msa_master.sql` | Opening-vs-closing MSA reconciliation; multi-level rollup + ordered steps |
 
 ---
 
@@ -64,7 +65,8 @@ Two columns, both = count of `(GEN_ART, CLR)` OPTs whose `SUM(FNL_Q) > 50`, per 
 - Verified DW01/M_JEANS: OP=156, CL=155.
 
 ### Grain rules (important)
-- `MSA_OP_Q` / `MSA_CL_Q` / `OP_OPT_CNT_>50_PCS` / `CL_OPT_CNT_>50_PCS` are **RDC+MAJ_CAT totals** repeated on every store (and every dim) row — **do NOT SUM** across stores/dim. (Not dimension-split; no FRESH/GRT filter.)
+- `MSA_OP_Q` / `MSA_CL_Q` / `OP_OPT_CNT_>50_PCS` / `CL_OPT_CNT_>50_PCS` are **RDC+MAJ_CAT totals** (repeated per store/dim — **do NOT SUM** across stores/dim) and are **dimension-split on secondary grids** via `pdim` (article→dim mapping). No FRESH/GRT filter.
+- `ALC_Q` / `HOLD_ALC_Q` / `ALC_FROM_HOLD_Q` / `ART_EXCESS_QTY` (from listing) are **store-level**, **dimension-split** on secondary grids and reconcile to the base-grid MAJ_CAT total.
 - `HOLD_*` are **store-level**. On a **secondary grid** they are **split by the grid dimension** and reconcile to the MAJ_CAT total.
 
 ### Hold movement
@@ -80,6 +82,53 @@ Some categories are `[A-Z]-`-prefixed in grid/MSA/listing (`B-M_TEES_HS`) but ne
 ---
 
 ---
+
+## MSA Master — `dbo.usp_ars_msa_master`
+
+Opening → allocation-movement → closing reconciliation of MSA, rolled up to any grain. Source: `backend/sql/usp_ars_msa_master.sql` (built & live-validated on `HOPC866`, 2026-07-23). Related: [[MSA Stock Calculation]] · [[Fresh-GRT Allocation]] · [[Data Model]].
+
+### Parameters
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `@Level` | `DETAIL` | grain, or `'LIST'` for the catalogue, or a **comma list run in order** (steps) |
+| `@SESSION_ID` | latest `ARS_LISTING_HISTORY` | opening session |
+| `@RDC` / `@MAJ_CAT` | `NULL` | optional filters |
+
+```sql
+EXEC dbo.usp_ars_msa_master @Level = 'LIST';                                   -- discover levels
+EXEC dbo.usp_ars_msa_master @Level = 'GEN_CLR', @RDC = 'DW01', @MAJ_CAT = 'M_JEANS';
+EXEC dbo.usp_ars_msa_master @Level = 'RDC,MAJ_CAT,GEN_CLR,DETAIL', @RDC = 'DW01';  -- ordered steps
+```
+
+### Levels (`dbo.vw_ars_msa_master_levels` — single source of truth)
+| Code | Name | Grain |
+|------|------|-------|
+| `DETAIL` | Article + Size | …GEN_ART·CLR·ARTICLE·PAK_SZ·SZ·RNG_SEG·ALLOC_TYPE (finest) |
+| `ARTICLE` | Article (sizes merged) | …ARTICLE·PAK_SZ·RNG_SEG·ALLOC_TYPE |
+| `GEN_CLR` | Gen-Article + Colour | RDC·SEG·DIV·SUB_DIV·MAJ_CAT·GEN_ART·CLR (OPT grain) |
+| `MAJ_CAT` | Major Category | RDC·SEG·DIV·SUB_DIV·MAJ_CAT |
+| `RDC` | RDC grand total | RDC |
+
+Add a level = add a row to the view; the proc reads `KEY_COLS`/`KEY_SEL` from it and `@Level='LIST'` shows it automatically. **No native SQL param dropdown** — a UI/report (React page, SSRS, Power BI) binds its dropdown to `SELECT LEVEL_CODE, LEVEL_NAME FROM dbo.vw_ars_msa_master_levels ORDER BY SORT_ORDER`.
+
+### Column / source map
+| Column | Source |
+|--------|--------|
+| RDC/SEG/DIV/SUB DIV/MAJ CAT/GEN_ART/CLR/ARTICLE/PAK_SZ/SZ/RNG_SEG/ALLOC_TYPE | opening `ARS_MSA_TOTAL_HISTORY` |
+| FAB-MVGR-1 / FAB-MVGR-2 | `vw_master_product.M_YARN_02` / `WEAVE_2` (per ARTICLE_NUMBER) |
+| V02 BEFORE ALC | opening `V02_FRESH` (FRESH) / `V02_GRT` (GRT), via `SUM(CASE ALLOC_TYPE…)` |
+| PEND INT / HOLD INT / OP MSA-Q USE IN ALC | opening `PEND_QTY` / `HOLD_QTY` / `FNL_Q` |
+| ALC-Q / TD-ALC FROM HOLD_Q / TD-HOLD ALC-Q | `ARS_ALLOC_HISTORY` `SUM(ALLOC_QTY / FROM_HOLD_QTY / HOLD_QTY)` |
+| PEND AFT ALC / HOLD AFT ALC / REM MSA-Q | live `ARS_MSA_TOTAL` `PEND_QTY` / `HOLD_QTY` / `FNL_Q` |
+
+### Report Generation — dropdown + fan-out (one file per level)
+In the Report Generation hub, `@Level` shows a **multi-select dropdown** (chips, click order = run order) sourced from the registry `dbo.ARS_PROC_PARAM_VALUES` (seeded from the level catalog, `FANOUT=1`). Because `@Level` is `FANOUT=1`, selecting several levels makes the engine run the proc **once per level** and write a **separate output file suffixed with the level** — e.g. `MSA_OP_CL_DETAIL`, `MSA_OP_CL_GEN_CLR`, `MSA_OP_CL_MAJ_CAT` — instead of one combined file. Steps in a report reorder by **drag-and-drop**. Impl: `data_export_service.fanout_param_runs()` + `report_engine` sql-step loop; UI `ReportGenerationPage.jsx`. Gotcha: with **Folder-per-run off**, a stale pre-fan-out `MSA_OP_CL.csv` lingers beside the suffixed files — delete once or enable folder-per-run.
+
+### Design & gotchas
+- A `base` CTE resolves everything at finest grain; each level is a final `GROUP BY` (measures additive). FRESH/GRT are separate rows (`ALLOC_TYPE`) at DETAIL/ARTICLE; combined at higher levels.
+- **Zero rows dropped** — `HAVING` keeps only rows where some measure ≠ 0.
+- **Sequence/steps** — `@Level` accepts a comma list run in order (e.g. `'RDC,MAJ_CAT,GEN_CLR,DETAIL'`). Returns **one combined grid** (`UNION ALL` of the steps — *not* multiple result sets, which most clients don't show past the first), with leading `STEP` (1..n) + `LEVEL` columns; a key a level doesn't use is `NULL` on that step's rows; ordered by `STEP` then key so the steps read top-to-bottom. Parsed with `OPENJSON` (order-preserving); a superset of keys is projected per branch (real col if the level uses it, else `NULL`, all `CAST NVARCHAR` for UNION compatibility).
+- **Two perf traps (both fixed, both essential):** (1) `ARTICLE_NUMBER` is `nvarchar` in the MSA tables but `bigint` in `vw_master_product` → `CAST` to `NVARCHAR(50)` in `pmap` (else nested-loop over the 3.6M-row view). (2) `(@p IS NULL OR col=@p)` filters → `OPTION (RECOMPILE)` (else full scan of the 40M-row alloc table, minutes-long hang).
 
 ## App modules (not stored procs)
 - [[UPC Store Tracking]] — store-opening lifecycle tracker (`/reports/upc-tracking`): opening-date & remarks/status history, live MBQ/stock/SLOC/FR by segment, dispatch-lead-based Bal Days / Repl Days / **D.GAP**, priority synced to the store master.
