@@ -85,6 +85,12 @@ def load_app_settings() -> Dict[str, Any]:
             "route": "",
             "enabled": False,
         },
+        "reports": {
+            # Storage guardrails for Report Generation output folders.
+            "retention_days": 7,        # prune <base>/data/<YYYYMMDD> folders older than this (0 = never)
+            "min_free_mb": 500,         # pre-flight: fail a run early if the output volume is below this (0 = skip)
+            "cleanup_enabled": True,
+        },
         "application": {
             "app_name": "ARS - Allocation & Reporting System",
             "max_upload_size_mb": settings.MAX_UPLOAD_SIZE_MB,

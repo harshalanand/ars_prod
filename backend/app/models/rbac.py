@@ -125,3 +125,22 @@ class UserRole(Base):
     # Relationships - use selectin for eager loading
     user = relationship("User", back_populates="user_roles")
     role = relationship("Role", back_populates="user_roles", lazy="selectin")
+
+
+class UserSession(Base):
+    """One row per login (jti-keyed). Enables single-login enforcement,
+    remote revocation and an active-sessions view. Tokens carrying a jti
+    are only honoured while their session row is active; legacy tokens
+    without a jti stay valid until they expire (migration grace)."""
+    __tablename__ = "rbac_user_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("rbac_users.id"), nullable=False, index=True)
+    username = Column(String(100), nullable=False)
+    jti = Column(String(64), nullable=False, unique=True, index=True)
+    ip_address = Column(String(64))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True, index=True)
+    revoked_by = Column(String(100))
+    revoked_at = Column(DateTime)

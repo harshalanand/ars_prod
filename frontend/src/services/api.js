@@ -13,17 +13,60 @@ console.log(`🔌 API Configuration:
 
 const api = axios.create({ baseURL: API_BASE, timeout: 300000 }) // 5 minute timeout for complex calculations
 
+// ── FA & CONS global busy tracker ───────────────────────────────────────────
+// Counts in-flight /fa-cons/ requests so one shared progress bar can signal
+// "working…" on EVERY FA & CONS page + process (load, calculate, upload, run,
+// save, export) — no per-button wiring. Subscribe from <FaConsBusyBar/>.
+const _faBusy = { count: 0, label: '' }
+const _faSubs = new Set()
+const _faNotify = () => _faSubs.forEach(fn => { try { fn({ ..._faBusy }) } catch { /* noop */ } })
+export const faBusy = {
+  subscribe(fn) { _faSubs.add(fn); fn({ ..._faBusy }); return () => _faSubs.delete(fn) },
+  get: () => ({ ..._faBusy }),
+}
+const _faLabel = (config) => {
+  const u = String(config?.url || ''), m = String(config?.method || 'get').toLowerCase()
+  if (u.includes('/stock/calculate')) return 'Calculating stock & MSA…'
+  if (u.includes('/stock/results')) return 'Loading stock…'
+  if (u.includes('/mbq/upload')) return 'Uploading MBQ…'
+  if (u.includes('/store-list/upload')) return 'Uploading stores…'
+  if (u.includes('/alloc/run')) return 'Running allocation…'
+  if (u.includes('/gap')) return 'Building gap report…'
+  if (u.includes('/sloc-settings/sync')) return 'Syncing SLOCs…'
+  if (u.includes('/sloc-settings/stock-totals')) return 'Loading SLOC stock…'
+  if (u.includes('/export') || config?.responseType === 'blob') return 'Exporting…'
+  if (['post', 'put', 'delete'].includes(m)) return 'Saving…'
+  return 'Loading…'
+}
+const _faStart = (config) => {
+  if (String(config?.url || '').startsWith('/fa-cons/')) {
+    config._faBusy = true
+    _faBusy.count += 1
+    _faBusy.label = _faLabel(config)
+    _faNotify()
+  }
+}
+const _faEnd = (config) => {
+  if (config?._faBusy) {
+    _faBusy.count = Math.max(0, _faBusy.count - 1)
+    if (_faBusy.count === 0) _faBusy.label = ''
+    _faNotify()
+  }
+}
+
 // Request interceptor: attach JWT
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token')
   if (token) config.headers.Authorization = `Bearer ${token}`
+  _faStart(config)
   return config
 })
 
 // Response interceptor: handle 401, errors
 api.interceptors.response.use(
-  (res) => res,
+  (res) => { _faEnd(res.config); return res },
   async (error) => {
+    _faEnd(error.config)
     const status = error.response?.status
     if (status === 401) {
       // Try refresh
@@ -263,6 +306,76 @@ export const storeStockAPI = {
   syncSlocs:       ()           => api.post('/store-stock/sync'),
   updateSloc:      (sloc, data) => api.put(`/store-stock/sloc-settings/${encodeURIComponent(sloc)}`, data),
   bulkUpdate:      (items)      => api.put('/store-stock/sloc-settings', { items }),
+}
+
+// ============== FA & CONS (Project-store & consumables data foundation) ======
+export const faConsAPI = {
+  // SLOC selection (per stream FA/CONS, per scope STORE/MSA)
+  listSloc:   (stream, scope) => api.get('/fa-cons/sloc-settings', { params: { stream, ...(scope ? { scope } : {}) } }),
+  bulkSloc:   (items)         => api.put('/fa-cons/sloc-settings', { items }),
+  syncSloc:   (stream)        => api.post('/fa-cons/sloc-settings/sync', null, { params: { stream } }),
+  slocStockTotals: (stream, { date, force } = {}) => api.get('/fa-cons/sloc-settings/stock-totals', { params: { stream, ...(date ? { date } : {}), ...(force ? { force: true } : {}) }, timeout: 120000 }),
+  // Dedicated FA/CONS MSA + store-stock calc
+  stockCalc:  (stream, date, divs) => api.post('/fa-cons/stock/calculate', null, { params: { stream, ...(date ? { date } : {}), ...(divs && divs.length ? { divs: divs.join(',') } : {}) }, timeout: 600000 }),
+  stockResults: (stream, scope, sequence_id, grain) => api.get('/fa-cons/stock/results', { params: { stream, scope, ...(sequence_id ? { sequence_id } : {}), ...(grain ? { grain } : {}), limit: 200000 }, timeout: 120000 }),
+  stockSequences: (stream)    => api.get('/fa-cons/stock/sequences', { params: stream ? { stream } : {} }),
+  // MBQ master — single upload; system auto-segregates FA/CONS by DIV. stream optional (view filter).
+  listMbq:    (stream)        => api.get('/fa-cons/mbq', { params: stream ? { stream } : {} }),
+  saveMbq:    (data)          => api.post('/fa-cons/mbq', data),
+  removeMbq:  (id, reason)     => api.delete(`/fa-cons/mbq/${id}`, { params: reason ? { reason } : {} }),
+  mbqHistory: (st_cd, ref_art) => api.get('/fa-cons/mbq/history', { params: { ...(st_cd ? { st_cd } : {}), ...(ref_art ? { ref_art } : {}) } }),
+  mbqChangeReview: (params) => api.get('/fa-cons/mbq/change-review', { params }),
+  mbqChangeReviewExport: (params) => api.get('/fa-cons/mbq/change-review/export', { params, responseType: 'blob', timeout: 300000 }),
+  mbqSessions: (params) => api.get('/fa-cons/mbq/sessions', { params }),
+  uploadMbq:  (formData, { dryRun = false, reason, onProgress } = {}) => api.post('/fa-cons/mbq/upload', formData,
+                { params: { dry_run: dryRun, ...(reason ? { reason } : {}) }, headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: onProgress, timeout: 300000 }),
+  templateMbq: ()            => api.get('/fa-cons/mbq/template', { responseType: 'blob' }),
+  exportMbq:  (stream)        => api.get('/fa-cons/mbq/export', { params: stream ? { stream } : {}, responseType: 'blob', timeout: 300000 }),
+  setSourceType: (ref_art, value, stream) => api.post('/fa-cons/mbq/source-type', { ref_art, value, ...(stream ? { stream } : {}) }),
+  // UPC Store List
+  storeList:        ()          => api.get('/fa-cons/store-list'),
+  storeValidation:  ()          => api.get('/fa-cons/store-list/validation'),
+  storeAdd:         (body)      => api.post('/fa-cons/store-list', body),
+  storeAddMissing:  (source, status) => api.post('/fa-cons/store-list/add-missing', null, { params: { source, ...(status ? { status } : {}) } }),
+  storeRemove:      (id)        => api.delete(`/fa-cons/store-list/${id}`),
+  storeUpload:      (fd, { onProgress } = {}) => api.post('/fa-cons/store-list/upload', fd,
+                       { headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: onProgress, timeout: 300000 }),
+  storeHistory:     (st_cd)     => api.get('/fa-cons/store-list/history', { params: st_cd ? { st_cd } : {} }),
+  storeTemplate:    ()          => api.get('/fa-cons/store-list/template', { responseType: 'blob' }),
+  // Allocation (Phase B)
+  allocRun:      (stream, store_scope, run_date) => api.post('/fa-cons/alloc/run', null, { params: { stream, store_scope, ...(run_date ? { run_date } : {}) }, timeout: 300000 }),
+  allocSessions: ()            => api.get('/fa-cons/alloc/sessions'),
+  allocResults:  (session_id)  => api.get('/fa-cons/alloc/results', { params: { session_id } }),
+  allocArticles: (session_id, ref_id) => api.get('/fa-cons/alloc/articles', { params: { session_id, ref_id } }),
+  allocSaveArticles: (session_id, ref_id, items) => api.post('/fa-cons/alloc/articles', { session_id, ref_id, items }),
+  // Pending Allocation (Phase C — separate FA/CONS pipeline)
+  pendList:     (stream, status) => api.get('/fa-cons/pend', { params: { ...(stream ? { stream } : {}), ...(status ? { status } : {}) } }),
+  pendApprove:  (alloc_session_id) => api.post('/fa-cons/pend/approve-session', null, { params: { alloc_session_id } }),
+  pendManual:   (body)         => api.post('/fa-cons/pend/manual', body),
+  pendDeliver:  (id, body)     => api.post(`/fa-cons/pend/${id}/deliver`, body),
+  pendClose:    (id, body)     => api.post(`/fa-cons/pend/${id}/close`, body),
+  pendReopen:   (id)           => api.post(`/fa-cons/pend/${id}/reopen`),
+  pendGenerateDo: (body)       => api.post('/fa-cons/pend/generate-do', body),
+  pendUpdate:   (id, body)     => api.put(`/fa-cons/pend/${id}`, body),
+  pendOps:      (params)       => api.get('/fa-cons/pend/ops', { params: params || {} }),
+  // Gap Report
+  gapReport:    (stream, store_scope) => api.get('/fa-cons/gap', { params: { stream, store_scope }, timeout: 120000 }),
+}
+
+// ============== Release Notes / Changelog ==============
+export const releaseNotesAPI = {
+  list:   (params)      => api.get('/release-notes/entries', { params }),
+  days:   ()            => api.get('/release-notes/days'),
+  add:    (body)        => api.post('/release-notes/entries', body),
+  update: (id, body)    => api.put(`/release-notes/entries/${id}`, body),
+  remove: (id)          => api.delete(`/release-notes/entries/${id}`),
+}
+
+// ============== Business Rules (Settings > Business Rules) ==============
+export const businessRulesAPI = {
+  list:    ()            => api.get('/business-rules'),
+  update:  (key, body)   => api.put(`/business-rules/${key}`, body),
+  history: (key, limit)  => api.get(`/business-rules/${key}/history`, { params: { limit } }),
 }
 
 // ============== Grid Builder (Data Preparation > Store Stock) ==============
@@ -581,6 +694,7 @@ export const upcTrackAPI = {
   list:      (segments)     => api.get('/upc-store-track', { params: segments?.length ? { segments: segments.join(',') } : {} }),
   get:       (stCd)         => api.get(`/upc-store-track/${encodeURIComponent(stCd)}`),
   charts:    (segments)     => api.get('/upc-store-track/charts', { params: segments?.length ? { segments: segments.join(',') } : {} }),
+  compare:   ()             => api.get('/upc-store-track/compare'),
   save:      (data)         => api.post('/upc-store-track', data),
   update:    (stCd, data)   => api.put(`/upc-store-track/${encodeURIComponent(stCd)}`, data),
   remove:    (stCd)         => api.delete(`/upc-store-track/${encodeURIComponent(stCd)}`),
@@ -588,6 +702,41 @@ export const upcTrackAPI = {
                 { headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: onProgress, timeout: 300000 }),
   export:    (segments)     => api.get('/upc-store-track/export', { params: segments?.length ? { segments: segments.join(',') } : {}, responseType: 'blob', timeout: 300000 }),
   template:  ()             => api.get('/upc-store-track/template', { responseType: 'blob' }),
+  reset:     ()             => api.post('/upc-store-track/reset'),
+}
+
+// ============== SAP Integration (read-only pulls via MCP gateway) ==============
+export const sapAPI = {
+  // Connection
+  getConnection:  ()        => api.get('/sap/connection'),
+  saveConnection: (cfg)     => api.put('/sap/connection', cfg || {}),
+  testConnection: ()        => api.post('/sap/connection/test', {}, { timeout: 60000 }),
+  // Pull definitions
+  listPulls:  ()            => api.get('/sap/pulls'),
+  getPull:    (id)          => api.get(`/sap/pulls/${id}`),
+  createPull: (data)        => api.post('/sap/pulls', data),
+  updatePull: (id, data)    => api.put(`/sap/pulls/${id}`, data),
+  enablePull: (id, enabled) => api.post(`/sap/pulls/${id}/enable`, {}, { params: { enabled } }),
+  deletePull: (id)          => api.delete(`/sap/pulls/${id}`),
+  runPull:    (id)          => api.post(`/sap/pulls/${id}/run`, {}, { timeout: 300000 }),
+  // Runs / status
+  listRuns:   (params)      => api.get('/sap/runs', { params }),
+  schedStatus:()            => api.get('/sap/scheduler/status', { quiet: true }),
+  // Explorer (ad-hoc read — never lands data)
+  preview:    (body)        => api.post('/sap/preview', body || {}, { timeout: 120000 }),
+  odataServices: (env)      => api.get('/sap/odata-services', { params: env ? { env } : {} }),
+  // Snowflake door
+  snowflakeTest:   ()       => api.post('/sap/snowflake/test', {}, { timeout: 60000 }),
+  snowflakeTables: (params) => api.get('/sap/snowflake/tables', { params, timeout: 60000 }),
+}
+
+// ============== Snowflake connection (single app-wide config) ==============
+// Used by the SAP Snowflake door AND the Report Generation scheduler.
+export const snowflakeConfigAPI = {
+  getConfig:  ()        => api.get('/settings/snowflake/config'),
+  saveConfig: (cfg)     => api.put('/settings/snowflake/config', cfg || {}),
+  test:       ()        => api.post('/settings/snowflake/test', {}, { timeout: 60000 }),
+  tables:     (params)  => api.get('/settings/snowflake/tables', { params, timeout: 60000 }),
 }
 
 // ============== Trends ==============
@@ -683,7 +832,7 @@ export const holdDashboardAPI = {
   byRdc:          (params) => api.get('/hold-dashboard/by-rdc', { params }),
   byArticle:      (params) => api.get('/hold-dashboard/by-article', { params }),
   byStatus:       (params) => api.get('/hold-dashboard/by-status', { params }),
-  byAge:          () => api.get('/hold-dashboard/by-age'),
+  byAge:          (params) => api.get('/hold-dashboard/by-age', { params }),
   timeline:       (params) => api.get('/hold-dashboard/timeline', { params }),
   detail:         (params) => api.get('/hold-dashboard/detail', { params }),
   detailExport:   (params) => api.get('/hold-dashboard/detail/export', {
@@ -837,10 +986,15 @@ export const pendAlcAPI = {
   // history. Revertable via the same operations log (OP_TYPE='ADHOC_CLOSE').
   closeRows:     (payload)         => api.post('/pend-alc/close-rows', payload,
                                         { timeout: 10 * 60 * 1000 }),
-  closeRowsFile: (file, reason)    => {
+  // confirmCloseAllStores mirrors the JSON endpoint's guard: rows with a
+  // blank ST_CD close EVERY store for the (RDC, ARTICLE), so the backend
+  // 400s unless the caller opts in explicitly.
+  closeRowsFile: (file, reason, confirmCloseAllStores = false) => {
     const fd = new FormData()
     fd.append('file', file)
-    const params = reason ? { reason } : {}
+    const params = {}
+    if (reason) params.reason = reason
+    if (confirmCloseAllStores) params.confirm_close_all_stores = true
     return api.post('/pend-alc/close-rows-file', fd, {
       params, headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 10 * 60 * 1000,

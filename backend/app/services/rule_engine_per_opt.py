@@ -1305,13 +1305,17 @@ def _run_band_per_opt(
             hold_target = want_hold_pak.astype('float64') if want_hold_pak is not None else np.zeros_like(opt_need)
             round_ship = np.minimum(ship_target, live_pool)
             pool_after_ship = np.maximum(live_pool - round_ship, 0.0)
-            full_pak_ok = (pool_after_ship >= hold_target) & (hold_target > 0)
-            sliver_loose = (pool_after_ship > 0) & (pool_after_ship < pak) & (hold_target > 0)
+            # HOLD follows the same MIN rule as SHIP (2026-08-01): take the
+            # pak-converted hold target, or whatever the pool still holds,
+            # whichever is smaller — a partial remainder drains to the hold
+            # instead of being dropped. Still no orphan hold when SHIP got
+            # nothing. (Was: full pak only, else sliver-if-below-pak, else 0
+            # — which silently discarded a mid-size remainder, e.g. target 12
+            # with 8 left held nothing.)
             ship_done_mask = round_ship > 0
             round_hold = np.where(
                 ~ship_done_mask, 0.0,
-                np.where(full_pak_ok, hold_target,
-                         np.where(sliver_loose, pool_after_ship, 0.0)),
+                np.minimum(hold_target, pool_after_ship),
             )
             take_pool = round_ship + round_hold
         else:
@@ -1356,15 +1360,23 @@ def _run_band_per_opt(
             # from_hold, which inflates need_pool — the ceiling stops the
             # extra units from shipping, and the refund below puts the
             # over-take back into pool_dict.
-            ship_ceiling = np.ceil(need_ship_arr / pak) * pak
-            raw_ship = np.minimum(take_pool + from_hold, ship_ceiling)
-            combined_supply = live_pool + from_hold
-            supply_below_pak = combined_supply < pak
-            effective_ship = np.where(
-                supply_below_pak,
-                raw_ship,
-                np.floor(raw_ship / pak) * pak,
+            # PACK CONVERSION AT 50% + STOCK MIN (2026-08-01).
+            #   target = half-up pak conversion of need_ship:
+            #            remainder >= 0.5*pak  → round UP   to next whole pak
+            #            remainder <  0.5*pak  → round DOWN to whole paks
+            #            (pak=6: 7→6, 8→6, 9→12, 3→6, 2→0)
+            #   ship   = MIN(target, what the pool actually holds)
+            # The MIN is the invariant: the last partial pack drains as-is
+            # (req 3+, stock 3 → ship 3) and a round-up can never invent
+            # stock. Replaces the old ceil-ceiling + floor-to-pak pair, which
+            # rounded up blind of the pool and let the post-pass net ship
+            # phantom units (DW01/1241092244001: pool 3, shipped 6).
+            ship_target = np.where(
+                need_ship_arr < 0.5 * pak,
+                0.0,
+                np.floor((need_ship_arr + 0.5 * pak) / pak) * pak,
             )
+            effective_ship = np.minimum(take_pool + from_hold, ship_target)
             pool_used = np.maximum(effective_ship - from_hold, 0.0)
             excess_pool = take_pool - pool_used
             if excess_pool.any():
@@ -1388,8 +1400,8 @@ def _run_band_per_opt(
         #       the same grain see an inflated `already_shipped_this_run`
         #       and get skipped against a ceiling they shouldn't be measured
         #       against. RL/TBC round_ship already includes the from_hold
-        #       contribution (raw_ship = min(take_pool + from_hold,
-        #       ship_ceiling) in 5g), so it stands on its own; TBL round_ship
+        #       contribution (effective_ship = min(take_pool + from_hold,
+        #       ship_target) in 5g), so it stands on its own; TBL round_ship
         #       is the want_ship_pak draw, also MBQ-only. round_hold (TBL
         #       only) is intentionally dropped.
         if sec_cap_state is not None and participating_grids:

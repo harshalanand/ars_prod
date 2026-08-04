@@ -9,7 +9,7 @@ import { reportGenAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
   FileText, RefreshCw, Plus, Play, Trash2, Pencil, Clock, Link2,
-  MousePointerClick, X, CheckCircle, AlertTriangle, Loader2, ChevronDown,
+  MousePointerClick, X, CheckCircle, AlertTriangle, Loader2, ChevronDown, GripVertical,
   Mail, Scissors, CalendarClock, Zap, Hand, LayoutList, FolderOutput, Database,
   Square, MessageCircle, MessageSquare,
 } from 'lucide-react'
@@ -36,7 +36,7 @@ const EMPTY_FORM = {
 
 const statusColor = (s) => ({
   completed: C.green, failed: C.red, running: C.primary,
-  skipped: C.amber, cancelled: C.amber, pending: C.textMuted,
+  partial: C.amber, skipped: C.amber, cancelled: C.amber, pending: C.textMuted,
 }[s] || C.textMuted)
 
 const statusIcon = (s, size = 12) => {
@@ -44,6 +44,7 @@ const statusIcon = (s, size = 12) => {
   if (s === 'running') return <Loader2 size={size} style={st} className="spin" />
   if (s === 'completed') return <CheckCircle size={size} style={st} />
   if (s === 'failed') return <AlertTriangle size={size} style={st} />
+  if (s === 'partial') return <AlertTriangle size={size} style={st} />
   if (s === 'cancelled') return <Square size={size} style={st} />
   return <Clock size={size} style={st} />
 }
@@ -515,7 +516,7 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
       // keep any values the user already typed, add any missing declared params
       setProcParams(prev => {
         const byName = Object.fromEntries(prev.map(r => [r.name, r.value]))
-        return declared.map(d => ({ name: d.name, value: byName[d.name] ?? '', type: d.type }))
+        return declared.map(d => ({ name: d.name, value: byName[d.name] ?? '', type: d.type, allowed: d.allowed }))
       })
       if (!declared.length) toast('This procedure has no input parameters')
     } catch { toast.error('Could not load procedure parameters') }
@@ -543,6 +544,24 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
     setProcEditIdx(null); setProcParams([]); setProcOutName('')
   }
   const cancelProc = () => { setProcEditIdx(null); setProcParams([]); setProcOutName('') }
+  // Drag-and-drop reorder for "Steps (run in order)": move item from -> to.
+  const [dragIdx, setDragIdx] = useState(null)
+  const [overIdx, setOverIdx] = useState(null)
+  const moveStepTo = (from, to) => setForm(f => {
+    if (from == null || to == null || from === to) return f
+    const steps = [...f.steps]
+    const [moved] = steps.splice(from, 1)
+    steps.splice(to, 0, moved)
+    return { ...f, steps }
+  })
+  // Toggle a value in a comma-list param (multi-select); appends in click order.
+  const toggleParamValue = (i, val) => setProcParams(ps => ps.map((r, idx) => {
+    if (idx !== i) return r
+    const list = String(r.value || '').split(',').map(x => x.trim()).filter(Boolean)
+    const at = list.indexOf(val)
+    if (at >= 0) list.splice(at, 1); else list.push(val)
+    return { ...r, value: list.join(',') }
+  }))
   const stepBadge = (t) => t === 'sql' ? { bg: C.primaryLight, fg: C.primary }
     : t === 'query' ? { bg: '#dcfce7', fg: '#166534' }
     : { bg: '#fef3c7', fg: '#92400e' }
@@ -569,7 +588,18 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
       <div style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 8, overflow: 'hidden', marginBottom: 10 }}>
         {form.steps.length === 0 && <div style={{ padding: 12, color: C.textMuted, fontSize: 12 }}>No steps yet.</div>}
         {form.steps.map((s, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderBottom: i < form.steps.length - 1 ? `1px solid ${C.cardBorder}` : 'none' }}>
+          <div key={i}
+               draggable
+               onDragStart={() => setDragIdx(i)}
+               onDragOver={e => { e.preventDefault(); if (overIdx !== i) setOverIdx(i) }}
+               onDrop={() => { moveStepTo(dragIdx, i); setDragIdx(null); setOverIdx(null) }}
+               onDragEnd={() => { setDragIdx(null); setOverIdx(null) }}
+               style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
+                        borderBottom: i < form.steps.length - 1 ? `1px solid ${C.cardBorder}` : 'none',
+                        background: overIdx === i && dragIdx !== null && dragIdx !== i ? C.primaryLight : (dragIdx === i ? '#f1f5f9' : 'transparent'),
+                        borderTop: overIdx === i && dragIdx !== null && dragIdx !== i ? `2px solid ${C.primary}` : '2px solid transparent',
+                        opacity: dragIdx === i ? 0.5 : 1 }}>
+            <span title="Drag to reorder" style={{ cursor: 'grab', color: C.textMuted, display: 'inline-flex' }}><GripVertical size={14} /></span>
             <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
                            background: stepBadge(s.type).bg, color: stepBadge(s.type).fg }}>{s.type.toUpperCase()}</span>
             <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{s.name}</span>
@@ -675,9 +705,34 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
               <input value={p.name} onChange={e => setProcParam(i, 'name', e.target.value)} placeholder="param name"
                      style={{ ...inp, width: 200, fontFamily: 'monospace', fontSize: 12 }} />
               <span style={{ color: C.textMuted }}>=</span>
-              <input value={p.value} onChange={e => setProcParam(i, 'value', e.target.value)} placeholder="blank = NULL"
-                     style={{ ...inp, width: 220, fontSize: 12 }} />
-              {p.type && <span style={{ fontSize: 10, color: C.textMuted }}>{p.type}</span>}
+              {p.allowed?.length ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <input value={p.value} onChange={e => setProcParam(i, 'value', e.target.value)}
+                         placeholder="blank = NULL — click labels below (order = run order), or type"
+                         style={{ ...inp, width: 340, fontSize: 12 }} />
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {p.allowed.map(o => {
+                      const list = String(p.value || '').split(',').map(x => x.trim()).filter(Boolean)
+                      const pos = list.indexOf(o.value)
+                      const on = pos >= 0
+                      return (
+                        <button key={o.value} type="button" onClick={() => toggleParamValue(i, o.value)}
+                          title={o.label}
+                          style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11,
+                                   padding: '2px 8px', borderRadius: 20, cursor: 'pointer',
+                                   border: `1px solid ${on ? C.primary : C.cardBorder}`,
+                                   background: on ? C.primary : '#fff', color: on ? '#fff' : C.textSub }}>
+                          {on && <span style={{ fontWeight: 700 }}>{pos + 1}</span>}{o.value}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <input value={p.value} onChange={e => setProcParam(i, 'value', e.target.value)} placeholder="blank = NULL"
+                       style={{ ...inp, width: 220, fontSize: 12 }} />
+              )}
+              {p.type && <span style={{ fontSize: 10, color: C.textMuted, alignSelf: 'flex-start' }}>{p.type}</span>}
               <button onClick={() => removeProcParam(i)} style={iconBtn(C.textMuted)}><X size={13} /></button>
             </div>
           ))}
@@ -1117,7 +1172,7 @@ const statusPill = (s) => ({
   color: statusColor(s),
   background: s === 'completed' ? C.greenBg : s === 'failed' ? C.redBg
     : s === 'running' ? C.primaryLight
-    : (s === 'skipped' || s === 'cancelled') ? C.amberBg : C.grayBg,
+    : (s === 'partial' || s === 'skipped' || s === 'cancelled') ? C.amberBg : C.grayBg,
 })
 
 const DeliverChip = ({ active, icon, label, onClick }) => (

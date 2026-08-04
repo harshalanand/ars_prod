@@ -16,7 +16,7 @@ Usage (called automatically from main.py lifespan):
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List, Optional
 
 from loguru import logger
@@ -105,8 +105,11 @@ class TempDBCleanupService:
         alert_threshold_mb: int = 40960,
         aggressive_target_mb: int = 4096,
         history_size: int = 96,
+        schedule: str = "weekly_sunday_midnight",
     ) -> None:
         self._interval = interval_minutes * 60   # stored as seconds
+        self._schedule = schedule
+        self._next_run_at = None
         self._orphan_age = orphan_age_minutes
         self._shrink = shrink_after_cleanup
         self._aggressive_threshold_mb = aggressive_threshold_mb
@@ -139,6 +142,7 @@ class TempDBCleanupService:
             self._thread.start()
         logger.info(
             f"TempDB cleanup service started — "
+            f"schedule={self._schedule}, "
             f"interval={self._interval // 60} min, "
             f"orphan_age={self._orphan_age} min, "
             f"shrink={self._shrink}, "
@@ -198,6 +202,8 @@ class TempDBCleanupService:
         """Service state snapshot for the /maintenance/tempdb/status endpoint."""
         return {
             "running": self._running,
+            "schedule": self._schedule,
+            "next_run_at": self._next_run_at.isoformat() if self._next_run_at else None,
             "interval_minutes": self._interval // 60,
             "orphan_age_minutes": self._orphan_age,
             "shrink_enabled": self._shrink,
@@ -222,11 +228,46 @@ class TempDBCleanupService:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _loop(self) -> None:
-        """Thread body: wait one interval, then clean on each tick."""
-        # Initial delay — let the app finish starting up before first run
-        self._sleep_interruptible(self._interval)
+    def _seconds_to_next_sunday_midnight(self) -> int:
+        """Seconds from now until the next Sunday 00:00 local time.
+        If it IS Sunday but past midnight, targets NEXT Sunday."""
+        now = datetime.now()
+        days_ahead = (6 - now.weekday()) % 7  # Mon=0 … Sun=6
+        target = (now + timedelta(days=days_ahead)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        if target <= now:
+            target += timedelta(days=7)
+        return max(60, int((target - now).total_seconds()))
 
+    def _loop(self) -> None:
+        """Thread body.
+
+        schedule 'weekly_sunday_midnight' (default since 2026-08-01): one
+        cleanup per week at Sunday 00:00 local time — the old 5-minute tick
+        piled DBCC SHRINKFILE requests into a lock convoy behind long jobs.
+        schedule 'interval': legacy behavior, clean every `interval` seconds.
+        run_now() stays available for manual cleanups from the UI/API.
+        """
+        if self._schedule == "weekly_sunday_midnight":
+            while self._running:
+                wait_s = self._seconds_to_next_sunday_midnight()
+                self._next_run_at = datetime.now() + timedelta(seconds=wait_s)
+                logger.info(
+                    f"TempDB cleanup: next weekly run at "
+                    f"{self._next_run_at:%Y-%m-%d %H:%M} ({wait_s // 3600}h away)"
+                )
+                self._sleep_interruptible(wait_s)
+                if not self._running:
+                    break
+                try:
+                    self._do_cleanup()
+                except Exception as exc:
+                    logger.warning(f"TempDB cleanup cycle error: {exc}")
+            return
+
+        # Legacy interval mode
+        self._sleep_interruptible(self._interval)
         while self._running:
             try:
                 self._do_cleanup()
@@ -724,4 +765,6 @@ tempdb_cleaner = TempDBCleanupService(
     alert_threshold_mb      = settings.DB_TEMPDB_ALERT_THRESHOLD_MB,
     aggressive_target_mb    = settings.DB_TEMPDB_AGGRESSIVE_TARGET_MB,
     history_size            = settings.DB_TEMPDB_HISTORY_SIZE,
+    schedule                = getattr(settings, "DB_TEMPDB_CLEANUP_SCHEDULE",
+                                      "weekly_sunday_midnight"),
 )

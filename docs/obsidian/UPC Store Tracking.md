@@ -1,7 +1,7 @@
 ---
 title: UPC Store Tracking
 tags: [ars, report, module, tracking]
-updated: 2026-07-22
+updated: 2026-07-30
 ---
 
 # UPC Store Tracking
@@ -51,6 +51,11 @@ Full spec: `frontend/public/docs/manual/upc_tracking.md`. Related: [[Reports]] �
 | Status | `ACTIVE`(default)/`OPENED`/`HOLD`/`CANCELLED`; inline; OPENED asks actual-open date; a new/changed date auto-reactivates a dormant store |
 
 ## Behaviours
+- **Auto status on upload** (each upload = the full current schedule): date given →
+  ACTIVE (reactivates); blank date → CANCELLED; any ACTIVE store **not in the
+  upload** → CANCELLED (`auto-absent`, OPENED kept). Guarded on empty upload.
+- **Reconcile vs master** card: Missing (master `ST_STATUS='UPC'` not tracked) /
+  Extra (tracked but not a UPC store in the master). `GET /compare`.
 - **Event history** date+time; a date row is written only on baseline or genuine
   change (unchanged re-share bumps *given* count + `latest_share_dt` stays put).
 - **Inline editing** for status / remark / layout / display / priority.
@@ -58,8 +63,27 @@ Full spec: `frontend/public/docs/manual/upc_tracking.md`. Related: [[Reports]] �
 - **Charts** (value-labelled, clickable to filter, chart⇄table, CSV, zoom):
   Status distribution, Stores by month, Balance-days buckets, Date-changes over
   time (click a point → stores changed that date). Per-store date chart via Store click.
+- **Reset** (Settings → Application, superadmin): `POST /upc-store-track/reset` wipes the 4 owned tables only (TRUNCATE, or DELETE + `DBCC CHECKIDENT RESEED 0` — resets identity "from 0"; master/grid/view untouched; master priorities persist).
 - **Filters** cascade; default view = Active only. **Help** button documents all
   columns. **Export All** (Excel, full) / **Export View** (CSV, on-screen report).
+
+## SLOC columns are dynamic
+The SLOC-wise stock breakdown is **discovered at runtime**, never hardcoded.
+`_sloc_cols()` reads `INFORMATION_SCHEMA.COLUMNS` for `ARS_GRID_MJ` and returns
+every numeric column except an exclude set `_GRID_NON_SLOC` (the grain, the
+aggregates surfaced separately — MBQ / STK_TTL / DISP_Q — and derived metrics).
+Result is cached per process. A column added/dropped in the grid appears/
+disappears automatically, with no code change. `sloc` dict keys are the raw grid
+column names. To keep a *new non-stock* numeric grid column out of the SLOC list,
+add its name to `_GRID_NON_SLOC`.
+
+## Known issues / fixes
+- **2026-07-30 — SLOC column drift (500 on page open), now fixed permanently.**
+  The old hardcoded `SLOC_COLS` dict listed `DH24_PTL_V07_Q / V18_Q / V25_Q`,
+  which had been dropped from `ARS_GRID_MJ`. list_stores + charts threw pyodbc
+  `42S22` "Invalid column name" → the whole page blanked. Fixed by replacing the
+  hardcoded dict with runtime discovery (see *SLOC columns are dynamic* above), so
+  grid schema drift can never break the page again.
 
 ## Cross-links
 [[Reports]] · [[Report Generation Hub]] · [[ARS Work Log]] · [[Data Model]] · [[Known Risks and Doc Drift]]

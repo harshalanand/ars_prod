@@ -50,6 +50,30 @@ async def get_current_user(
             detail="Invalid token payload",
         )
 
+    # ── Session enforcement (2026-07-31) ────────────────────────────────
+    # Tokens minted after the session registry landed carry a jti; they are
+    # honoured only while their rbac_user_sessions row is active. A revoked
+    # or single-login-displaced session dies here on its next request.
+    # Legacy tokens without a jti stay valid until expiry (migration grace).
+    # Infra errors fail OPEN (never lock the app out on a DB blip); an
+    # explicitly deactivated session fails CLOSED.
+    jti = payload.get("jti")
+    if jti:
+        try:
+            from app.models.rbac import UserSession
+            _sess_active = db.query(UserSession.is_active).filter(
+                UserSession.jti == jti).scalar()
+            if _sess_active is False:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session terminated — signed in on another device or revoked by an admin",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # fail-open on infra errors
+
     # Query user with retry on connection drop
     user = None
     for attempt in range(2):

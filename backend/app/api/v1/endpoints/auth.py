@@ -109,3 +109,74 @@ async def update_profile(
     db.commit()
     db.refresh(current_user)
     return APIResponse(message="Profile updated successfully")
+
+
+# ── Session management (2026-07-31) ─────────────────────────────────────────
+# Server-side session registry (rbac_user_sessions, jti-keyed). Pairs with
+# the business rule SEC_SINGLE_LOGIN: ACTIVE = one live session per user
+# (new login displaces older ones); INACTIVE = unlimited concurrent logins.
+
+from fastapi import Header  # noqa: E402
+from app.security.dependencies import RequireRoles  # noqa: E402
+from app.security.jwt_handler import verify_access_token  # noqa: E402
+from app.models.rbac import UserSession  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+
+@router.post("/logout", response_model=APIResponse)
+async def logout(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    authorization: str = Header(None),
+):
+    """Deactivate the CALLING token's session. Legacy tokens without a jti
+    simply expire on their own — logout is then a client-side token drop."""
+    try:
+        token = (authorization or "").replace("Bearer ", "")
+        payload = verify_access_token(token) or {}
+        jti = payload.get("jti")
+        if jti:
+            db.query(UserSession).filter(UserSession.jti == jti).update(
+                {"is_active": False, "revoked_by": current_user.username,
+                 "revoked_at": datetime.now(timezone.utc)},
+                synchronize_session=False)
+            db.commit()
+    except Exception:
+        pass
+    return APIResponse(message="Logged out")
+
+
+@router.get("/sessions", response_model=APIResponse)
+async def list_sessions(
+    active_only: bool = True,
+    current_user: User = Depends(RequireRoles(["SUPER_ADMIN"])),
+    db: Session = Depends(get_db),
+):
+    """Superadmin: list login sessions across all users."""
+    qy = db.query(UserSession)
+    if active_only:
+        qy = qy.filter(UserSession.is_active == True)  # noqa: E712
+    rows = qy.order_by(UserSession.created_at.desc()).limit(500).all()
+    return APIResponse(message=f"{len(rows)} session(s)", data={"items": [
+        {"id": s.id, "user_id": s.user_id, "username": s.username,
+         "ip_address": s.ip_address,
+         "created_at": str(s.created_at), "last_seen": str(s.last_seen),
+         "is_active": bool(s.is_active), "revoked_by": s.revoked_by}
+        for s in rows]})
+
+
+@router.delete("/sessions/{session_id}", response_model=APIResponse)
+async def revoke_session(
+    session_id: int,
+    current_user: User = Depends(RequireRoles(["SUPER_ADMIN"])),
+    db: Session = Depends(get_db),
+):
+    """Superadmin: revoke one session — its tokens die on the next request."""
+    n = db.query(UserSession).filter(UserSession.id == session_id).update(
+        {"is_active": False, "revoked_by": current_user.username,
+         "revoked_at": datetime.now(timezone.utc)},
+        synchronize_session=False)
+    db.commit()
+    if not n:
+        raise HTTPException(404, detail="session not found")
+    return APIResponse(message="Session revoked")

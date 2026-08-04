@@ -28,6 +28,7 @@ from loguru import logger
 
 from app.database.session import get_data_engine
 from app.security.dependencies import get_current_user, RequireRoles
+from app.services.business_rules import rule_flag, rule_value
 from app.models.rbac import User
 from app.utils.db_helpers import (
     run_sql, table_exists, get_columns, msa_expr, msa_col,
@@ -523,12 +524,12 @@ def get_parking_mode(current_user: User = Depends(get_current_user)):
     """Return the active parking-mode setting.  Any authenticated user can read.
     `allow_multi_parked = True` → multi-parked (new runs stack alongside
     pending parked sessions).  False → single-parked (block new runs while a
-    session is awaiting review)."""
-    de = get_data_engine()
-    with de.connect() as conn:
-        s = _load_listing_settings(conn)
-    val = str(s.get("allow_multi_parked", "false")).lower() in ("true", "1", "yes")
-    return {"success": True, "data": {"allow_multi_parked": val}}
+    session is awaiting review).
+    Source of truth since 2026-07-31 = business rule ALC_MULTI_PARKED
+    (Settings → Business Rules); this endpoint reflects it so the legacy
+    Settings → Application toggle stays in sync."""
+    return {"success": True,
+            "data": {"allow_multi_parked": rule_flag('ALC_MULTI_PARKED', False)}}
 
 
 @router.put("/parking-mode")
@@ -536,18 +537,23 @@ def set_parking_mode(
     body: dict,
     current_user: User = Depends(RequireRoles(["ADMIN", "SUPER_ADMIN"])),
 ):
-    """Admin-only: set the parking-mode setting.  Body: `{"allow_multi_parked": bool}`."""
+    """Admin-only: set the parking-mode setting.  Body: `{"allow_multi_parked": bool}`.
+    Writes the business rule ALC_MULTI_PARKED (single source of truth) and
+    mirrors into the legacy AppSettings key for back-compat readers."""
     raw = body.get("allow_multi_parked")
     if raw is None:
         raise HTTPException(status_code=400, detail="allow_multi_parked required")
     val = bool(raw) if isinstance(raw, bool) else \
           str(raw).lower() in ("true", "1", "yes", "on")
+    from app.services.business_rules import update_rule as _br_update
+    _br_update('ALC_MULTI_PARKED', is_active=val,
+               user=getattr(current_user, "username", None) or "admin")
     de = get_data_engine()
     with de.connect() as conn:
         _save_listing_settings(conn, {"allow_multi_parked": str(val).lower()})
     logger.info(
         f"[parking-mode] changed by {current_user.username} → "
-        f"allow_multi_parked={val}"
+        f"allow_multi_parked={val} (business rule ALC_MULTI_PARKED)"
     )
     return {"success": True, "data": {"allow_multi_parked": val}}
 
@@ -597,10 +603,14 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     try:
         with de.connect() as _pc:
             _persisted = _load_listing_settings(_pc).get("allow_multi_parked", "false")
-        _allow_mp = str(_persisted).lower() in ("true", "1", "yes")
+        _legacy_mp = str(_persisted).lower() in ("true", "1", "yes")
     except Exception as _e:
         logger.warning(f"[generate] failed to read persisted parking mode: {_e}")
-        _allow_mp = False
+        _legacy_mp = False
+    # Business rule ALC_MULTI_PARKED is the source of truth (2026-07-31);
+    # the legacy AppSettings value only serves as the fallback default if
+    # the rules table is unreachable / the row is missing.
+    _allow_mp = rule_flag('ALC_MULTI_PARKED', _legacy_mp)
     # Reflect the persisted value back onto the request so downstream
     # consumers (audit log, persisted-settings rewrite at line ~585) see
     # the authoritative value.
@@ -1447,13 +1457,25 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 """)
                 logger.info(f"Part 3.5a: {[c for c in enrich_cols_art if c in art_cols]} cascaded from ARS_CALC_ST_ART")
 
-        # Part 3.5a override: CLR 'A' / 'A_MIX' → I_ROD = 2 (display-density floor)
-        _run(conn, f"""
-            UPDATE [{LISTING_TABLE}]
-            SET [I_ROD] = 2
-            WHERE UPPER(LTRIM(RTRIM([CLR]))) IN ('A', 'A_MIX')
-        """)
-        logger.info("Part 3.5a: I_ROD=2 forced for CLR in ('A','A_MIX')")
+        # Part 3.5a override: CLR 'A' / 'A_MIX' → I_ROD floor (TRUE floor,
+        # 2026-07-31: MAX semantics — a maintained I_ROD of 3/4 from
+        # ARS_CALC_ST_ART / ST_MAJ_CAT is KEPT, only lower values are lifted.
+        # Business rule LST_IROD_AMIX_FLOOR: active → floor value (default 2,
+        # bounds 1..4); INACTIVE → no floor at all (maintained I_ROD used
+        # as-is). The old unconditional SET silently downgraded maintained
+        # values.
+        _irod_floor = rule_value('LST_IROD_AMIX_FLOOR', None)
+        if _irod_floor:
+            _irod_floor = int(_irod_floor)
+            _run(conn, f"""
+                UPDATE [{LISTING_TABLE}]
+                SET [I_ROD] = {_irod_floor}
+                WHERE UPPER(LTRIM(RTRIM([CLR]))) IN ('A', 'A_MIX')
+                  AND ISNULL(TRY_CAST([I_ROD] AS FLOAT), 0) < {_irod_floor}
+            """)
+            logger.info(f"Part 3.5a: I_ROD floored to {_irod_floor} (MAX semantics) for CLR in ('A','A_MIX')")
+        else:
+            logger.info("Part 3.5a: LST_IROD_AMIX_FLOOR inactive — no A/A_MIX I_ROD floor applied")
         t0 = _time_step("Part 3.5a (LISTING/I_ROD/CLR/FOCUS)", t0)
 
         # Part 3.5b: Populate AUTO_GEN_ART_SALE from MASTER_GEN_ART_SALE.SAL_PD
@@ -1670,8 +1692,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
         # ── PART 3.6: Populate GEN_ART_DESC + tag OPT_TYPE (4-way classification) ──
         # Rules (applies to ALL rows — both IS_NEW=0 and IS_NEW=1):
-        #   MIX(a): low stock + no MSA   (b): poor color fill (VAR ratio < threshold)
+        #   MIX: low stock + no MSA + no NL hold (nothing to send) OR final ELSE
         #   RL: adequate stock   TBC: low stock + MSA   TBL: zero stock + MSA
+        #   (MIX(b) poor-color-fill rule removed 2026-07-30 — see _classify_opt_type)
         try:
             _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [GEN_ART_DESC] NVARCHAR(500) NULL")
         except Exception:
@@ -1693,8 +1716,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         # Order: MIX first (catch bad options early) → RL → TBC → TBL.
         #
         #   MIX (a): low stock + no MSA + no RL_HOLD_QTY (nothing to send)
-        #   MIX (b): poor color fill — gated by size_threshold (Size Cov %),
-        #            NOT stock_threshold_pct. This is a size-coverage test.
+        #   MIX (b): REMOVED 2026-07-30 — poor color fill no longer forces MIX here.
+        #            size_threshold / min_size_count now only drive the downstream
+        #            R07 size-coverage gate (skip poor-size TBL at alloc time).
         #   RL:  (adequate stock OR RL_HOLD_QTY > 0) AND MSA_FNL_Q > 0
         #        — RL requires fresh MSA supply to top up against; an open TBL
         #          hold alone is no longer enough to land in RL.
@@ -1707,29 +1731,42 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
                 SET [OPT_TYPE] = CASE
-                    -- MIX (a): low stock + no MSA AND no prior-run NL hold — nothing to send
+                    -- Classification universe (g = threshold × ACS_D|default_acs).
+                    -- MIX(b) poor-color-fill removed 2026-07-30. L added + TBL/RL
+                    -- reworked 2026-07-30 so no (STK, MSA, HOLD) combo falls through
+                    -- to the ELSE (which is now an unreachable safety net).
+                    --
+                    -- MIX (a): below-threshold stock, no MSA, no NL hold — nothing to send
                     WHEN ISNULL([STK_TTL], 0) < {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
                      AND ISNULL([MSA_FNL_Q], 0)    = 0
                      AND ISNULL([RL_HOLD_QTY], 0)  = 0
                         THEN 'MIX'
-                    -- MIX (b): poor color fill {f'OR count < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else '(MinSz off)'}
-                    WHEN ISNULL([VAR_COUNT], 0) > 0
-                     AND (CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT] < {size_threshold}
-                          {f'OR ISNULL([VAR_FNL_COUNT], 0) < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else ''})
-                        THEN 'MIX'
-                    -- RL: (adequate stock OR prior-run NL hold) AND fresh MSA supply available
+                    -- L: adequate stock, no fresh MSA, no NL hold — store already covered,
+                    --    nothing to replenish. Report-only: fails the ELIG stock-gate
+                    --    (MSA=0 AND HOLD=0) so it never enters the alloc working table,
+                    --    exactly like MIX. NOT processed by the RL/TBC/TBL waterfall.
+                    WHEN ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
+                     AND ISNULL([MSA_FNL_Q], 0)   = 0
+                     AND ISNULL([RL_HOLD_QTY], 0) = 0
+                        THEN 'L'
+                    -- RL: adequate stock with MSA or NL hold to work against, OR a
+                    --     sold-out (STK<=0) option carrying only a prior-run NL hold
+                    --     (no fresh MSA) — ships by releasing the held qty.
                     WHEN (ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                          OR ISNULL([RL_HOLD_QTY], 0) > 0)
-                     AND ISNULL([MSA_FNL_Q], 0) > 0
+                          AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0))
+                      OR (ISNULL([STK_TTL], 0) <= 0
+                          AND ISNULL([MSA_FNL_Q], 0)   = 0
+                          AND ISNULL([RL_HOLD_QTY], 0) > 0)
                         THEN 'RL'
-                    -- TBC: low stock but MSA or NL hold available
+                    -- TBC: below-threshold (but positive) stock with MSA or NL hold
                     WHEN ISNULL([STK_TTL], 0) > 0
                      AND [STK_TTL] < {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
                      AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)
                         THEN 'TBC'
-                    -- TBL: zero/negative stock + MSA or NL hold available
+                    -- TBL: zero/negative stock with fresh MSA supply (hold-only sold-out
+                    --      handled by the RL branch above)
                     WHEN ISNULL([STK_TTL], 0) <= 0
-                     AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)
+                     AND ISNULL([MSA_FNL_Q], 0) > 0
                         THEN 'TBL'
                     ELSE 'MIX'
                 END
@@ -1751,14 +1788,16 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             tbl_count  = _sum("TBL")
             toc_count  = _sum("TBC")
             rl_count   = _sum("RL")
-            tagged_total = mixl_count + tbl_count + toc_count + rl_count
+            l_count    = _sum("L")
+            tagged_total = mixl_count + tbl_count + toc_count + rl_count + l_count
             untagged = total - tagged_total
             logger.info(
                 f"Part 3.6: OPT_TYPE tagged — "
-                f"MIX={mixl_count}, TBL={tbl_count}, TBC={toc_count}, RL={rl_count}, "
+                f"MIX={mixl_count}, L={l_count}, TBL={tbl_count}, TBC={toc_count}, RL={rl_count}, "
                 f"untagged={untagged} "
                 f"[IS_NEW=1 breakdown: TBL={type_counts.get(('TBL',1),0)}, "
                 f"MIX={type_counts.get(('MIX',1),0)}, "
+                f"L={type_counts.get(('L',1),0)}, "
                 f"TBC={type_counts.get(('TBC',1),0)}, "
                 f"RL={type_counts.get(('RL',1),0)}]"
             )
@@ -2582,7 +2621,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         {manual_expr} AS MANUAL_PRI
                     FROM [{LISTING_TABLE}] L
                     {manual_join}
-                    WHERE ISNULL(L.[OPT_TYPE],'') <> 'MIX'
+                    WHERE ISNULL(L.[OPT_TYPE],'') NOT IN ('MIX','L')
                     GROUP BY L.[MAJ_CAT], L.[WERKS]
                 ),
                 Ranked AS (
@@ -2807,15 +2846,20 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 # above.  When the toggle is OFF we filter here; when ON the
                 # working table mirrors ARS_LISTING (audit mode) and downstream
                 # readers anchor on ELIG_FLAG = 1 themselves.
-                shift_all_to_working = False
+                # Audit mode — business rule LST_AUDIT_ALL_TO_WORKING is the
+                # source of truth (2026-07-31, migrated from Settings →
+                # Application). Legacy app_settings.json value only serves as
+                # the fallback default when the rules table is unreachable.
+                _legacy_shift = False
                 try:
                     from app.api.v1.endpoints.settings import load_app_settings as _load_app_settings
                     _app_cfg = _load_app_settings()
-                    shift_all_to_working = bool(
+                    _legacy_shift = bool(
                         (_app_cfg.get("application") or {}).get("shift_all_to_working", False)
                     )
                 except Exception as _cfg_err:
                     logger.warning(f"shift_all_to_working lookup failed, defaulting OFF: {_cfg_err}")
+                shift_all_to_working = rule_flag('LST_AUDIT_ALL_TO_WORKING', _legacy_shift)
                 if shift_all_to_working or "ELIG_FLAG" not in all_upper:
                     where_sql = ""
                 else:
@@ -3223,6 +3267,13 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             skip_hold_upc=req.skip_hold_upc,
             apply_hold_seg_app=req.apply_hold_seg_app,
             apply_hold_seg_gm=req.apply_hold_seg_gm,
+            # Post-TBL hold release + retry (Option B) — cover threshold
+            # mirrors the Part 3.6/8.5 classification inputs. Master switch =
+            # business rule ALC_TBL_HOLD_RETRY (inactive → freed pcs wait for
+            # the next run; Part 8.55 still releases post-run).
+            stock_threshold_pct=req.stock_threshold_pct,
+            default_acs_d=float(req.default_acs_d or 18.0),
+            tbl_hold_release_retry=rule_flag('ALC_TBL_HOLD_RETRY', True),
         )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")
@@ -3352,14 +3403,33 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     t0 = _time_step("Part 8.4 (park alloc + listing snapshots)", t0)
 
     # ── Part 8.5 — OPT_STATUS post-alloc classification + TBL_LISTED_DATE ──
-    # Rule (evaluated on post-alloc stock = STK_TTL + ALLOC_QTY):
-    #   RL                                              → RL
-    #   TBC alloc>0  & (STK+ALC) >= thr × eff_ACS_D     → RL    else MIX
-    #   TBC alloc=0                                      → MIX
-    #   TBL alloc>0  & (STK+ALC) >= thr × eff_ACS_D     → NL    else TBL
-    #   TBL alloc=0                                      → TBL
+    # Reworked 2026-07-30 (user-specified). Evaluated on post-alloc stock
+    # (post = STK_TTL + ALLOC_QTY) against the same threshold as OPT_TYPE
+    # (g = thr × eff_ACS_D). First match wins:
+    #   1. OPT_TYPE L    → L      (report-only passthrough)
+    #   2. OPT_TYPE MIX  → MIX    (passthrough)
+    #   3. RL  alloc=0   → WRL    (not allocated this run — Waiting RL)
+    #   4. TBL alloc=0   → UNQ    (not allocated this run — UNQualified;
+    #                              symmetric with RL→WRL. Renamed from
+    #                              'TBL' 2026-07-31 so the post-alloc status
+    #                              never collides with the OPT_TYPE value)
+    #   5. post < g      → MIX    (gate for rows that DID ship but remain
+    #                              under the display threshold; also catches
+    #                              TBC that got 0)
+    #   6. TBL           → NL     (shipped and covered — newly listed)
+    #   7. TBC           → RL     (shipped to full cover — graduated live)
+    #   8. RL            → RL     (refilled)
+    #   9. anything else → covered leftovers: alloc>0 → RL, else → L
+    # Every row gets a real status — there is NO 'NA' in the vocabulary.
     # TBL_LISTED_DATE = GETDATE() when OPT_TYPE='TBL' AND ALLOC_QTY>0.
+    # Business rule LST_OPT_STATUS_STAMP: inactive → skip Part 8.5 entirely
+    # (and with it 8.55, which keys on OPT_STATUS='MIX').
+    _opt_status_enabled = rule_flag('LST_OPT_STATUS_STAMP', True)
+    if not _opt_status_enabled:
+        logger.info("Part 8.5 skipped — business rule LST_OPT_STATUS_STAMP inactive")
     try:
+        if not _opt_status_enabled:
+            raise StopIteration("skip")  # caught below; clean rule-driven skip
         thr = float(req.stock_threshold_pct or 0.6)
         default_acs = float(req.default_acs_d or 18.0)
         with de.connect() as ac:
@@ -3387,22 +3457,29 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             _run(ac, f"""
                 UPDATE [{FINAL_TABLE}] WITH (ROWLOCK, UPDLOCK) SET
                   [OPT_STATUS] = CASE
-                    WHEN [OPT_TYPE] = 'RL' THEN 'RL'
-                    WHEN [OPT_TYPE] = 'TBC' AND ISNULL([ALLOC_QTY],0) > 0
-                         AND ISNULL([STK_TTL],0) + ISNULL([ALLOC_QTY],0)
-                             >= {thr} * ISNULL(NULLIF([ACS_D],0), {default_acs})
-                        THEN 'RL'
-                    WHEN [OPT_TYPE] = 'TBC' AND ISNULL([ALLOC_QTY],0) > 0
+                    -- 1-2. L / MIX pass through unchanged (never allocated)
+                    WHEN [OPT_TYPE] = 'L'   THEN 'L'
+                    WHEN [OPT_TYPE] = 'MIX' THEN 'MIX'
+                    -- 3-4. not allocated this run → per-type waiting status
+                    WHEN [OPT_TYPE] = 'RL'  AND ISNULL([ALLOC_QTY],0) = 0
+                        THEN 'WRL'
+                    WHEN [OPT_TYPE] = 'TBL' AND ISNULL([ALLOC_QTY],0) = 0
+                        THEN 'UNQ'
+                    -- 5. shipped but still under the display threshold → MIX
+                    --    (also catches TBC that got 0)
+                    WHEN ISNULL([STK_TTL],0) + ISNULL([ALLOC_QTY],0)
+                         < {thr} * ISNULL(NULLIF([ACS_D],0), {default_acs})
                         THEN 'MIX'
-                    WHEN [OPT_TYPE] = 'TBC' THEN 'MIX'
-                    WHEN [OPT_TYPE] = 'TBL' AND ISNULL([ALLOC_QTY],0) > 0
-                         AND ISNULL([STK_TTL],0) + ISNULL([ALLOC_QTY],0)
-                             >= {thr} * ISNULL(NULLIF([ACS_D],0), {default_acs})
-                        THEN 'NL'
-                    WHEN [OPT_TYPE] = 'TBL' AND ISNULL([ALLOC_QTY],0) > 0
-                        THEN 'TBL'
-                    WHEN [OPT_TYPE] = 'TBL' THEN 'TBL'
-                    ELSE ISNULL([OPT_TYPE], 'MIX')
+                    -- 6. TBL shipped and covered → newly listed
+                    WHEN [OPT_TYPE] = 'TBL' THEN 'NL'
+                    -- 7. TBC shipped to full cover → live
+                    WHEN [OPT_TYPE] = 'TBC' THEN 'RL'
+                    -- 8. RL refilled
+                    WHEN [OPT_TYPE] = 'RL' THEN 'RL'
+                    -- 9. covered leftovers (unknown/NULL type, post >= g):
+                    --    shipped → RL, untouched → L. Never 'NA'.
+                    WHEN ISNULL([ALLOC_QTY],0) > 0 THEN 'RL'
+                    ELSE 'L'
                   END,
                   [TBL_LISTED_DATE] = CASE
                     WHEN [OPT_TYPE] = 'TBL' AND ISNULL([ALLOC_QTY],0) > 0
@@ -3411,9 +3488,83 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     ELSE [TBL_LISTED_DATE]
                   END
             """)
+
+            # ── Part 8.55 — release warehouse holds on NOT-covered options ──
+            # An option whose post-alloc OPT_STATUS is MIX (it shipped
+            # something but the display is still under threshold) keeps NO
+            # warehouse hold: reserving RDC stock for a display that isn't
+            # viable just strands it. The released qty simply stays in the
+            # free pool for the next run (no counter-booking needed — holds
+            # only materialise in ARS_NL_TBL_HOLD_TRACKING at Approve).
+            #
+            # MUST zero three copies: the option row (FINAL_TABLE), the
+            # size rows (ALLOC_TABLE) and this session's ARS_ALLOC_PARKED
+            # rows — hold-tracking Step B reads HOLD_QTY from
+            # ARS_ALLOC_HISTORY, which is copied from PARKED at Approve
+            # (parking ran in Part 8.4, BEFORE this step), so zeroing only
+            # the working copies would still commit the hold.
+            # Audit: HOLD_RELEASED_QTY on the option row + ALLOC_REMARKS
+            # stamp on every size row.
+            try:
+                # Business rule ALC_HOLD_RELEASE_855: inactive → MIX options
+                # keep their holds (pre-2026-07-30 behavior).
+                if not rule_flag('ALC_HOLD_RELEASE_855', True):
+                    logger.info("Part 8.55 skipped — business rule ALC_HOLD_RELEASE_855 inactive")
+                    raise StopIteration("skip")
+                try:
+                    _run(ac, f"ALTER TABLE [{FINAL_TABLE}] ADD [HOLD_RELEASED_QTY] FLOAT NULL")
+                except Exception:
+                    pass  # column exists
+                # 1. option grain: remember the released qty, zero the hold
+                _run(ac, f"""
+                    UPDATE [{FINAL_TABLE}]
+                    SET [HOLD_RELEASED_QTY] = ISNULL([HOLD_QTY], 0),
+                        [HOLD_QTY] = 0
+                    WHERE [OPT_STATUS] = 'MIX'
+                      AND ISNULL([HOLD_QTY], 0) > 0
+                """)
+                # 2-3. size grain: alloc working + this session's parked copy
+                for _htbl, _hfilter in ((ALLOC_TABLE, ""),
+                                        ("ARS_ALLOC_PARKED",
+                                         "AND A.[SESSION_ID] = :sid")):
+                    if not _table_exists(ac, _htbl):
+                        continue
+                    ac.execute(text(f"""
+                        UPDATE A SET
+                            A.[ALLOC_REMARKS] = ISNULL(A.[ALLOC_REMARKS], '')
+                                + ';HOLD_RELEASED_NOT_COVERED('
+                                + CAST(CAST(ISNULL(A.[HOLD_QTY],0) AS INT) AS NVARCHAR(20)) + ')',
+                            A.[HOLD_QTY] = 0,
+                            A.[ROUND_HOLD] = 0
+                        FROM [{_htbl}] A
+                        INNER JOIN [{FINAL_TABLE}] L
+                            ON  L.[WERKS] = A.[WERKS]
+                            AND L.[MAJ_CAT] = A.[MAJ_CAT]
+                            AND L.[GEN_ART_NUMBER] = A.[GEN_ART_NUMBER]
+                            AND ISNULL(L.[CLR], '') = ISNULL(A.[CLR], '')
+                        WHERE L.[OPT_STATUS] = 'MIX'
+                          AND ISNULL(L.[HOLD_RELEASED_QTY], 0) > 0
+                          AND ISNULL(A.[HOLD_QTY], 0) > 0
+                          {_hfilter}
+                    """), ({"sid": session_id} if _hfilter else {}))
+                rel = ac.execute(text(
+                    f"SELECT COUNT(*), ISNULL(SUM([HOLD_RELEASED_QTY]),0) "
+                    f"FROM [{FINAL_TABLE}] WHERE ISNULL([HOLD_RELEASED_QTY],0) > 0 "
+                    f"AND [OPT_STATUS] = 'MIX'"
+                )).fetchone()
+                logger.info(
+                    f"Part 8.55: released warehouse holds on {rel[0]} "
+                    f"not-covered (MIX) options — {rel[1]:.0f} pcs back to pool"
+                )
+            except StopIteration:
+                pass  # rule-driven skip (ALC_HOLD_RELEASE_855 inactive) — logged above
+            except Exception as he:
+                logger.warning(f"Part 8.55 hold release failed: {he}")
+    except StopIteration:
+        pass  # rule-driven skip (LST_OPT_STATUS_STAMP inactive) — logged above
     except Exception as e:
         logger.warning(f"OPT_STATUS post-processing failed: {e}")
-    t0 = _time_step("Part 8.5 (OPT_STATUS + TBL_LISTED_DATE)", t0)
+    t0 = _time_step("Part 8.5 (OPT_STATUS + TBL_LISTED_DATE + hold release)", t0)
 
     # ── Part 8.6 — NL/TBL hold-tracking table (persistent, WERKS × VAR_ART × SZ) ─
     # NOTE: Hold-tracking WRITES (Step A decrement of consumed RL/TBC,
@@ -3708,6 +3859,14 @@ def retry_failed(req: RetryFailedRequest,
         _retry_skip_upc  = str(_saved.get("skip_hold_upc", "false")).lower() == "true"
         _retry_hold_app  = str(_saved.get("apply_hold_seg_app", "true")).lower() != "false"
         _retry_hold_gm   = str(_saved.get("apply_hold_seg_gm", "true")).lower() != "false"
+        try:
+            _retry_stock_thr = float(_saved.get("stock_threshold_pct") or 0.6)
+        except Exception:
+            _retry_stock_thr = 0.6
+        try:
+            _retry_dacs = float(_saved.get("default_acs_d") or 18.0)
+        except Exception:
+            _retry_dacs = 18.0
 
     logger.info(
         f"[retry-failed] batch={req.batch_id} mode=per_opt "
@@ -3726,6 +3885,8 @@ def retry_failed(req: RetryFailedRequest,
         skip_hold_upc=_retry_skip_upc,
         apply_hold_seg_app=_retry_hold_app,
         apply_hold_seg_gm=_retry_hold_gm,
+        stock_threshold_pct=_retry_stock_thr,
+        default_acs_d=_retry_dacs,
     )
 
     # Re-read progress so the UI can update without a separate poll round-trip.

@@ -22,6 +22,11 @@ pool and returns immediately, so approving a listing is never blocked.
 
 Times are treated as UTC (compared against SQL Server SYSUTCDATETIME()).
 """
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +43,33 @@ from app.services.report_engine import (
 )
 
 settings = get_settings()
+
+# Reports execute in a SEPARATE OS process (app.services.report_worker) so heavy
+# generation never holds the API worker's GIL. These locate the worker's cwd and
+# where its stdout/stderr log lands.
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_WORKER_LOG_DIR = os.path.join(_BACKEND_ROOT, "logs", "report_workers")
+
+
+def _safe(name: str) -> str:
+    """Sanitise a session code for use as a log filename."""
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(name))[:120] or "run"
+
+
+# Launch worker processes DETACHED from the parent's console. Without this, a
+# terminal CTRL_C/CTRL_BREAK aimed at the API process (e.g. the shell that
+# started uvicorn closing) propagates to the worker and kills it mid-run
+# (observed: worker exited 0xC000013A = CONTROL_C_EXIT). A new process group +
+# no-window console makes the worker's lifetime independent of the parent's
+# console. proc.terminate() still works for cancel (it's a direct TerminateProcess).
+_WORKER_POPEN_KWARGS: Dict[str, Any] = {}
+if os.name == "nt":
+    _WORKER_POPEN_KWARGS["creationflags"] = (
+        subprocess.CREATE_NEW_PROCESS_GROUP
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+else:  # POSIX: detach from the controlling terminal's session/signal group
+    _WORKER_POPEN_KWARGS["start_new_session"] = True
 
 EVENT_LISTING_APPROVED = "listing.approved"
 EVENT_PENDALC_APPROVED = "pendalc.approved"
@@ -298,6 +330,7 @@ class ReportSchedulerService:
         self._active: set = set()          # report_ids currently running
         self._queued: int = 0              # submitted, waiting for a worker slot
         self._active_lock = threading.Lock()
+        self._procs: Dict[int, subprocess.Popen] = {}  # report_id -> worker process
         self._last_tick: Optional[datetime] = None
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
@@ -326,6 +359,9 @@ class ReportSchedulerService:
             self._thread.join(timeout=10.0)
         if self._executor:
             self._executor.shutdown(wait=False)
+        # Leave running worker PROCESSES alone — they're independent of this
+        # process and will finalize their own run rows. reconcile_orphaned_runs()
+        # on next startup cleans up any that die with the machine.
         logger.info("[report-sched] stopped")
 
     # ── Public triggers ──────────────────────────────────────────────────────
@@ -456,13 +492,124 @@ class ReportSchedulerService:
                 logger.info(f"[report-sched] report {rid} already running — skipped")
                 return
             self._active.add(rid)
+
+        payload_path: Optional[str] = None
+        logf = None
         try:
-            run_report(report, trigger_source, session_code, user)
-        except Exception as e:
-            logger.error(f"[report-sched] report {rid} crashed: {e}")
-        finally:
+            # Execute the report in a SEPARATE process so its heavy CPU work
+            # (pandas / CSV writing) never holds the API worker's GIL — the web
+            # UI stays responsive while the report generates.
+            payload = {"report": report, "trigger_source": trigger_source,
+                       "session_code": session_code, "user": user}
+            fd, payload_path = tempfile.mkstemp(prefix="arsrpt_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, default=str)
+
+            os.makedirs(_WORKER_LOG_DIR, exist_ok=True)
+            log_path = os.path.join(
+                _WORKER_LOG_DIR, f"{_safe(session_code)}.log")
+            logf = open(log_path, "w", encoding="utf-8")
+
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "app.services.report_worker", payload_path],
+                cwd=_BACKEND_ROOT, env=os.environ.copy(),
+                stdout=logf, stderr=subprocess.STDOUT,
+                **_WORKER_POPEN_KWARGS,   # detach from parent console (survive CTRL_C)
+            )
             with self._active_lock:
+                self._procs[rid] = proc
+            logger.info(f"[report-sched] report {rid} -> worker pid={proc.pid} "
+                        f"(session={session_code}, log={log_path})")
+
+            rc = proc.wait()          # blocks THIS supervisor thread only (GIL free)
+            if rc != 0:
+                # Worker died before finalizing (crash / OOM / terminated). Its
+                # run row (if any) is stuck 'running' — reconcile it unless a
+                # cancel already marked it. rc<0 (POSIX signal) or the Windows
+                # terminate code both land here.
+                self._reconcile_dead_worker(rid, session_code, rc)
+        except Exception as e:
+            logger.error(f"[report-sched] report {rid} worker launch failed: {e}")
+            self._reconcile_dead_worker(rid, session_code, -1)
+        finally:
+            if logf:
+                try:
+                    logf.close()
+                except Exception:
+                    pass
+            with self._active_lock:
+                self._procs.pop(rid, None)
                 self._active.discard(rid)
+            if payload_path:
+                try:
+                    os.remove(payload_path)
+                except OSError:
+                    pass
+
+    def cancel_running(self, report_id: int) -> bool:
+        """Terminate the worker process for a report and mark its run cancelled.
+        Returns True if a live worker was found and signalled."""
+        with self._active_lock:
+            proc = self._procs.get(report_id)
+        # Mark the run cancelled FIRST so the reconcile-on-exit path doesn't flip
+        # it to 'failed' when the worker dies from our terminate().
+        try:
+            engine = get_data_engine()
+            with engine.begin() as conn:
+                conn.execute(text(f"""
+                    UPDATE {RUNS_TABLE}
+                    SET STATUS='cancelled',
+                        ERRORS='[{{"step":"cancel","error":"cancelled by user"}}]',
+                        COMPLETED_AT=SYSUTCDATETIME()
+                    WHERE REPORT_ID=:rid AND STATUS='running'
+                """), {"rid": report_id})
+        except Exception as e:
+            logger.warning(f"[report-sched] cancel mark failed for {report_id}: {e}")
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                logger.info(f"[report-sched] terminated worker pid={proc.pid} for report {report_id}")
+                return True
+            except Exception as e:
+                logger.warning(f"[report-sched] terminate failed for {report_id}: {e}")
+        return False
+
+    def _reconcile_dead_worker(self, report_id: int, session_code: str, rc: int) -> None:
+        """A worker exited non-zero without finalizing its run row. Mark that
+        run 'failed' (unless a cancel already set it 'cancelled')."""
+        try:
+            engine = get_data_engine()
+            with engine.begin() as conn:
+                res = conn.execute(text(f"""
+                    UPDATE {RUNS_TABLE}
+                    SET STATUS='failed',
+                        ERRORS='[{{"step":"worker","error":"worker process exited abnormally (code {rc})"}}]',
+                        COMPLETED_AT=SYSUTCDATETIME()
+                    WHERE REPORT_ID=:rid AND SESSION_CODE=:sc AND STATUS='running'
+                """), {"rid": report_id, "sc": session_code})
+                if res.rowcount == 0:
+                    # The worker may have died before it inserted the run row.
+                    exists = conn.execute(text(f"""
+                        SELECT COUNT(*) FROM {RUNS_TABLE}
+                        WHERE REPORT_ID=:rid AND SESSION_CODE=:sc
+                    """), {"rid": report_id, "sc": session_code}).scalar()
+                    if not exists:
+                        conn.execute(text(f"""
+                            INSERT INTO {RUNS_TABLE}
+                                (REPORT_ID, SESSION_CODE, TRIGGER_SOURCE, STATUS,
+                                 ERRORS, STARTED_AT, COMPLETED_AT)
+                            VALUES (:rid, :sc, 'manual', 'failed',
+                                    :err, SYSUTCDATETIME(), SYSUTCDATETIME())
+                        """), {"rid": report_id, "sc": session_code,
+                               "err": f'[{{"step":"worker","error":"worker failed to start (code {rc})"}}]'})
+            logger.warning(f"[report-sched] report {report_id} worker exited {rc} — run marked failed")
+        except Exception as e:
+            logger.error(f"[report-sched] reconcile of dead worker {report_id} failed: {e}")
+
+    def active_report_ids(self) -> List[int]:
+        """Report ids with a live worker process (source for running_report_ids)."""
+        with self._active_lock:
+            return sorted(rid for rid, p in self._procs.items() if p.poll() is None)
 
     def _record_skip(self, report_id: int, session_code: str,
                      trigger_source: str, user: Optional[str]) -> None:

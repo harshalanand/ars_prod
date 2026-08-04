@@ -141,6 +141,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Report scheduler failed to start: {e}")
 
+    # Start SAP pull scheduler (time-based SAP → SQL data pulls)
+    try:
+        from app.services.sap_scheduler_service import sap_scheduler
+        sap_scheduler.start()
+        logger.info("✅ SAP pull scheduler started")
+    except Exception as e:
+        logger.warning(f"SAP pull scheduler failed to start: {e}")
+
     yield
     logger.warning(f"Shutting down {settings.APP_NAME}...")
 
@@ -154,6 +162,13 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.report_scheduler_service import report_scheduler
         report_scheduler.stop()
+    except Exception:
+        pass
+
+    # Stop SAP pull scheduler
+    try:
+        from app.services.sap_scheduler_service import sap_scheduler
+        sap_scheduler.stop()
     except Exception:
         pass
 

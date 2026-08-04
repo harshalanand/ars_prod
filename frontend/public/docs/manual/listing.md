@@ -32,7 +32,7 @@ The `/listing/generate` endpoint runs one long transaction in numbered Parts. It
 
 ### Rules & invariants
 
-- **OPT uniqueness (inv 1).** One option = `(WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR)` = exactly one `OPT_TYPE`. RL / TBC / TBL / MIX are mutually exclusive; the classification CASE is first-match-wins.
+- **OPT uniqueness (inv 1).** One option = `(WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR)` = exactly one `OPT_TYPE`. RL / TBC / TBL / L / MIX are mutually exclusive; the classification CASE is first-match-wins. Only **RL / TBC / TBL** are processed by the allocation waterfall — **L and MIX** fail the ELIG stock-gate and are never allocated (L = adequately stocked/no supply, report-only; MIX = nothing to send).
 - **Growth at MJ+grid only (inv 2).** `mj_req_growth_pct` scales each grid's MBQ into `<prefix>_MBQ_REV`, promoted into the live `<prefix>_MBQ`/`<prefix>_REQ` only when ≠100. Applied at MJ and every non-pivot-only grid prefix — **never per OPT_TYPE**. The per-OPT_TYPE sliders (`rl/tbc/tbl_mbq_cap_pct`, `rl/tbc/tbl_mj_req_cap_pct`) are independent *downward* caps, not growth.
 - **MBQ empty-data hard-block (inv 3, per-OPT mode).** Superseded the old "MBQ=0 = no constraint". For a sec-cap-applicable grid with `GH_<grid>=1`, an empty grid value (`NULL`/`'NA'`/`'NONE'`/empty) or `<grid>_MBQ_ORIG = 0`/`NULL` now BLOCKS dispatch (rule engine, `rule_engine_per_opt`). Owned by `rule_ars`.
 - **Sec-cap propagation (inv 4).** `FAB`, `MACRO_MVGR`, `MICRO_MVGR`, `M_VND_CD`, `RNG_SEG` are in `_FINAL_KEEP_COLS` and must survive `listing → working → alloc`. Dropping any silently loses sec-cap grids.
@@ -43,13 +43,59 @@ The `/listing/generate` endpoint runs one long transaction in numbered Parts. It
 
 OPT_TYPE classification (Part 3.6, first match wins; `threshold`=`stock_threshold_pct`, `default_acs`=`default_acs_d`):
 ```
-MIX(a): STK_TTL < threshold × NULLIF(ACS_D,0)|default_acs  AND MSA_FNL_Q=0 AND RL_HOLD_QTY=0
-MIX(b): VAR_COUNT>0 AND (VAR_FNL_COUNT/VAR_COUNT < size_threshold  OR  VAR_FNL_COUNT < min_size_count)
-RL    : (STK_TTL >= threshold×ACS_D  OR RL_HOLD_QTY>0)  AND MSA_FNL_Q>0
-TBC   : 0 < STK_TTL < threshold×ACS_D  AND (MSA_FNL_Q>0 OR RL_HOLD_QTY>0)
-TBL   : STK_TTL <= 0                   AND (MSA_FNL_Q>0 OR RL_HOLD_QTY>0)
-ELSE  : MIX
+g = threshold × NULLIF(ACS_D,0)|default_acs
+MIX(a): STK_TTL < g          AND MSA_FNL_Q=0 AND RL_HOLD_QTY=0
+L     : STK_TTL >= g         AND MSA_FNL_Q=0 AND RL_HOLD_QTY=0
+RL    : (STK_TTL >= g        AND (MSA_FNL_Q>0 OR RL_HOLD_QTY>0))
+        OR (STK_TTL <= 0     AND MSA_FNL_Q=0 AND RL_HOLD_QTY>0)   # sold-out, hold-only → release hold
+TBC   : 0 < STK_TTL < g      AND (MSA_FNL_Q>0 OR RL_HOLD_QTY>0)
+TBL   : STK_TTL <= 0         AND MSA_FNL_Q>0
+ELSE  : MIX   (unreachable safety net — every combo above is covered)
+# MIX(b) (poor color/size fill) REMOVED 2026-07-30 — size_threshold / min_size_count
+#   now only drive the R07 TBL size-coverage gate, not classification.
+# L added 2026-07-30: adequately-stocked option with no MSA and no hold. Report-only —
+#   fails the ELIG stock-gate (MSA=0 AND HOLD=0) so it never enters ARS_ALLOC_WORKING;
+#   NOT processed by the RL/TBC/TBL waterfall, same as MIX. Excluded from store ranking
+#   (ARS_STORE_RANKING WHERE OPT_TYPE NOT IN ('MIX','L')). Kept as individual listing
+#   lines (NOT aggregated like MIX in Part 3.7) for per-option visibility.
+# TBL tightened to MSA-only 2026-07-30: a sold-out option carrying only a prior-run NL
+#   hold (no MSA) now classifies RL (release the hold), not TBL.
 ```
+
+OPT_STATUS — post-allocation verdict (Part 8.5, on `ARS_LISTING_WORKING`; reworked 2026-07-30).
+Complements OPT_TYPE (pre-alloc decision) and ALLOC_STATUS (mechanical row result).
+`post = STK_TTL + ALLOC_QTY`, same `g` as classification; first match wins:
+```
+1. OPT_TYPE=L    → L      (passthrough, never allocated)
+2. OPT_TYPE=MIX  → MIX    (passthrough)
+3. RL,  alloc=0  → WRL    (not allocated this run — Waiting RL; unconditional,
+                           the old OP_MSA>50 test is dropped)
+4. TBL, alloc=0  → UNQ    (not allocated this run — UNQualified; symmetric with
+                           RL→WRL. Renamed from 'TBL' 2026-07-31 so the status
+                           never collides with the OPT_TYPE value)
+5. post < g      → MIX    (shipped but still under the display threshold;
+                           also catches TBC that got 0)
+6. TBL           → NL     (shipped and covered — Newly Listed)
+7. TBC           → RL     (shipped to full cover — graduated live)
+8. RL            → RL     (refilled)
+9. else          → covered leftovers: alloc>0 → RL, untouched → L
+```
+Vocabulary: **NL / RL / WRL / UNQ / L / MIX** — there is NO 'NA'; every option gets a real status.
+Reading: WRL and UNQ are the two "not allocated this run" states (live vs new);
+MIX after alloc means "shipped something but the display is still under threshold".
+
+Hold release for not-covered options (Part 8.55, runs right after the OPT_STATUS stamp):
+an option that ends MIX after alloc keeps NO warehouse hold — reserving RDC stock for a
+non-viable display strands it. `HOLD_QTY → 0` on **three copies**: `ARS_LISTING_WORKING`
+(option grain, released qty audited in `HOLD_RELEASED_QTY`), `ARS_ALLOC_WORKING` +
+this session's `ARS_ALLOC_PARKED` (size grain, `ROUND_HOLD` zeroed too,
+`;HOLD_RELEASED_NOT_COVERED(n)` appended to `ALLOC_REMARKS`). The PARKED copy matters:
+hold-tracking Step B reads `HOLD_QTY` from `ARS_ALLOC_HISTORY` (copied from PARKED at
+Approve, and parking runs in Part 8.4 BEFORE 8.5) — zeroing only the working copies would
+still commit the hold. Released pieces need no counter-booking: holds only materialise in
+`ARS_NL_TBL_HOLD_TRACKING` at Approve, so the stock simply stays in the free pool for the
+next run. Covered (NL) options keep their holds unchanged.
+TBL_LISTED_DATE stamps GETDATE() on first TBL allocation (unchanged).
 
 Demand (Part 4c). `rate_expr` = MAX(PER_OPT_SALE, L-7/7, AUTO_GEN_ART_SALE) when effective AGE < `age_threshold`, else MAX(L-7/7, AUTO). Effective AGE = 0 when `STK_TTL<=0 AND L-7<=0`.
 ```
@@ -121,8 +167,8 @@ The screen tunables are `GenerateRequest` fields; they flow straight into the en
 | Screen tunable | Field | Effect |
 |---|---|---|
 | Stock % (OPT_TYPE) | `stock_threshold_pct` (0.6) | RL vs TBC/TBL STK-vs-ACS_D gate |
-| Size Cov % | `size_threshold` (0.6) | MIX(b) color-fill + TBL size gate |
-| Min sizes | `min_size_count` (3) | MIX(b) / TBL rescue |
+| Size Cov % | `size_threshold` (0.6) | R07 TBL size-coverage gate (MIX(b) removed 2026-07-30) |
+| Min sizes | `min_size_count` (3) | R07 TBL size rescue |
 | Excess × | `excess_multiplier` (2.0) | `ART_EXCESS` |
 | Hold days | `hold_days` (0) | `OPT_MBQ_WH` for TBL only |
 | Age threshold | `age_threshold` (15) | new-article rate branch |
@@ -166,6 +212,15 @@ The screen tunables are `GenerateRequest` fields; they flow straight into the en
 - 2026-07-18 — **Run Setup MAJ_CAT search: exact SSN/SEG/DIV group now surfaces.** `SearchSelect` bulk-select group matcher (`ListingPage.jsx`) used substring `.includes()` + `.slice(0,6)` over groups built in SEG→DIV→SUB_DIV→SSN order. A short query like `s` substring-matches many longer codes (`MENS`, `LADIES`, `SSNL`, …) that precede SSN groups, so the exact **SSN: S** bulk-select row was pushed past the 6-row cap and never rendered. Fix: rank matches exact → prefix → substring (shorter code wins ties) and raise the cap to 8, so an exact code match (any kind, e.g. SSN `S`) always shows first. `maj_cat_attr_map` source (`ARS_MSA_GEN_ART` SEG/DIV/SUB_DIV/SSN) was verified correct — the bug was purely UI ranking. Owned by `ars_flow`.
 - 2026-07-18 — **Hold Control pre-fill driven by Run Pool** (`ListingPage.jsx`, cockpit). Selecting the pool now pre-sets the three "Skip hold" toggles so a selection is never missed: **FRESH ⇒ Skip hold UPC + GM checked, APP unchecked**; **GRT ⇒ all three checked** (UPC + APP + GM). Toggles remain fully editable after selection (pre-fill, not lock). Initial page state matches the default FRESH pool (UPC + GM pre-checked). Reminder: a checked "Skip hold — X" toggle means that segment's TBL rows ship like RL/TBC with **no** warehouse hold (`OPT_MBQ_WH = OPT_MBQ`, `HOLD_QTY = 0`); the payload still inverts these to the backend `apply_hold_seg_*` contract. Engine hold math unchanged. Owned by `ars_flow`.
 - 2026-07-18 — **Run dates (information-only): `STOCK_CONSIDER_DT` + `PICKING_DT`.** Two date fields added to the Run Setup cockpit (`ListingPage.jsx`), **both mandatory** (generate guard blocks either empty): **Stock Consider Date** (UI defaults to **D-1 / yesterday**) and **Picking Date** (UI **blank by default** — no assumed date, user picks it consciously each run). `GenerateRequest` carries `stock_consider_dt: str` and `picking_dt: str` — both required, validated non-empty ISO `YYYY-MM-DD` by one shared validator (`_require_run_date`). Part 8.36 in `/generate` `ALTER`s `ARS_ALLOC_WORKING` to add both `DATE` columns (if missing) and `UPDATE`s every row with the two run constants — same pattern as the Part 8.35 ALLOC_TYPE stamp, and runs BEFORE Part 8.4 parking. The column-introspection copy in `parked_history.py` (`_reconcile_parked_columns` / `_reconcile_history_columns`) then carries both columns and values into `ARS_ALLOC_PARKED` and `ARS_ALLOC_HISTORY` with **no parking-code change**. Also written as two `LISTING` rows in `ARS_RUN_PARAMS_AUDIT`, and seeded into the data dictionary. **These dates never enter any stock/MSA/allocation math — pure traceability.** Owned by `ars_flow`.
+- 2026-07-30 — **OPT_STATUS post-alloc classification reworked** (`listing.py` Part 8.5, writes `ARS_LISTING_WORKING`). Source: user's Excel formula, refined over 3 iterations. Final verdict set **NL / RL / WRL / TBL / L / MIX** (no 'NA' — CASE is exhaustive). Order: L/MIX passthrough → **not-allocated waiting states first**: RL+alloc=0 → **WRL**, TBL+alloc=0 → **TBL** (symmetric pair, per user; the Excel's `OP_MSA>50` WRL test was explicitly dropped) → under-threshold gate `STK_TTL+ALLOC_QTY < g` → MIX (now only judges rows that shipped-but-under-cover, plus TBC that got 0) → TBL→NL, TBC→RL (graduated), RL→RL → covered leftovers alloc>0?RL:L. Dry-run on live working table (18,152 opts / 24,228 qty / 1,891 hold — totals reconcile): TBL 11,367 (0 shipped), WRL 2,843 (0 shipped), MIX 1,801 (260 partial-shipped, qty 1,519, hold 133), NL 1,214 (qty 17,859, hold 1,758), RL 927 (qty 4,850). NL matches old logic exactly (cover math cross-validated). Dictionary entry `OPT_STATUS` added. **Part 8.55 added same day:** MIX-after-alloc options release their warehouse hold (HOLD_QTY→0 on working + alloc + session's PARKED; audit `HOLD_RELEASED_QTY` + `;HOLD_RELEASED_NOT_COVERED(n)` remark; released stock stays in the free pool — no counter-booking since holds commit to `ARS_NL_TBL_HOLD_TRACKING` only at Approve). Dry-run: 99 options / 133 pcs released; 784 covered NL options keep 1,758 pcs. Owned by `ars_flow`.
+- 2026-07-31 — **In-run hold release + retry (Option B)** (`rule_engine_pandas.py` `_run_majcat_waterfall`, end of the RL→TBC→TBL loop). After TBL completes in a MAJ_CAT, options that shipped but did NOT reach cover (`STK_TTL + Σ SHIP < stock_threshold_pct × ACS_D` — same test as Part 8.5 MIX) release their `HOLD_QTY` **into the live `pool_dict`**, get the `;HOLD_RELEASED_NOT_COVERED(n)` remark, then **ONE extra TBL band pass** runs so still-hungry options (PARTIAL / POOL_EMPTY sizes — not SKIPPED-vetoed ones) consume the freed pieces in the SAME run, all gates re-applied (R07, MJ_REQ gate, MBQ caps, sec-cap, dispatch). Released OPTs can't re-take their own pieces (`POOL_CONSUMED` not decremented → `need_pool` stays spent; covered sizes have `need_ship=0`). Holds created BY the retry are not re-examined in-run — **Part 8.55 stays as the post-run safety net** (now catches only leftovers). Plumbing: `stock_threshold_pct`/`default_acs_d`/`tbl_hold_release_retry` params on `run_listing_and_allocation_pandas` → tuple elements 27–29 → worker → waterfall; `STK_TTL` added to `_select_working_cols` base (the `_STK_TTL` suffix scan missed the plain column); both listing.py call sites pass the request/saved values. Measured potential: 133/133 freed pcs had same-key takers (4,518 pcs unmet demand on 44 keys, 29 POOL_EMPTY rows). Owned by `ars_flow` / `rule_ars`.
+- 2026-07-31 — **Parking mode + audit mode migrated into Business Rules.** `ALC_MULTI_PARKED` (was Settings → Application "Parking Mode" / AppSettings `listing.allow_multi_parked`) now drives the one-parked-at-a-time /generate guard; the legacy `/listing/parking-mode` GET/PUT endpoints read/write the rule (PUT also mirrors the old key for back-compat readers) so the old toggle stays in sync. `LST_AUDIT_ALL_TO_WORKING` (was app_settings.json `application.shift_all_to_working`) now gates Part 7 audit mode; legacy value is fallback-default only. Both seeded ACTIVE to match live values at migration (multi-parked=true, audit=true) — behavior-identical. `UPC_TRACKING_ENABLED` registered unwired (module master switch, wiring pending). Registry now 15 rules / 6 wired. **Module names follow the sidebar father menus** (Listing & Alloc 12 · Pending Allocation 1 · Data Management 1 · Reports 1). The old Settings → Application toggles (Parking Mode, audit mode) were **removed from SettingsPage.jsx** and replaced by a pointer card linking to Business Rules; parking state/handlers deleted, legacy `/listing/parking-mode` API kept (reads/writes the rule). Owned by `ars_flow`.
+- 2026-08-01 — **PAK_SZ pack conversion reworked: 50% rule + MIN against pool, done per-OPT in-band** (`rule_engine_per_opt.py` 5e/5g; post-pass sweeps retired). **Rule:** `target = half-up pak conversion of the requirement` — remainder ≥ 0.5×pak rounds UP to the next whole pak, below it rounds DOWN (pak 6: 7→6, 8→6, 9→12, 3→6, 2→0); then **`SHIP = MIN(target, live pool)`** — the last partial pack drains as-is (req 3+, stock 3 → ship 3) and a round-up can never exceed stock. TBL HOLD follows the same MIN (was: full-pak-or-sliver-else-zero, which discarded mid-size remainders — target 12 with 8 left held nothing). RL/TBC lost the old `ceil` ship-ceiling + floor-to-pak pair. **Root cause fixed:** the blind post-pass nets `_apply_pak_sz_rounding_df` and `_stage_d_apply_pak_sz_rounding` rounded SHIP up with no pool reference; their only guard was "skip rows already carrying a PAK_SZ_ marker", but the engine stamps that marker only when target ≠ raw need — so rows whose need was already pak-aligned were re-rounded past the pool. Session 20260801_124142_212: 2 pool keys over-allocated / 4 phantom units (DW01·1241092244001 pool 3 → shipped 6; DH24·1240058807001 pool 3 → shipped 4). Both nets now gated off by `ENABLE_POST_PASS_PAK_ROUNDING = False` in `rule_engine_pandas.py` (flip to True only for legacy comparison). Owned by `rule_ars`.
+- 2026-07-31 — **OPT_STATUS 'TBL' renamed to 'UNQ'** (Part 8.5). The not-allocated-this-run status for TBL options is now `UNQ` (UNQualified) so the post-alloc status vocabulary never collides with the pre-alloc OPT_TYPE value `TBL`. Final vocabulary: **NL / RL / WRL / UNQ / L / MIX**. Stored `ARS_LISTING_WORKING.OPT_STATUS` values updated in place; historical parked snapshots keep the old label. Dictionary + rule-algorithm texts synced. Owned by `ars_flow`.
+- 2026-07-31 — **Business Rules registry (Settings → Business Rules) wired into listing.** New app-wide `ARS_BUSINESS_RULES` (+`_LOG`) table, service `app/services/business_rules.py` (`rule_flag`/`rule_value`, 30s cache, **inactive/missing = caller default = hardcoded behavior**, bounds-clamped numbers), API `/business-rules` (read any user, change SUPER_ADMIN, per-change audit log), page `BusinessRulesPage.jsx` at `/settings/business-rules`. 12 module-wise rules seeded; **4 wired in listing.py**: `LST_IROD_AMIX_FLOOR` (Part 3.5a floor value; inactive → NO floor), `LST_OPT_STATUS_STAMP` (gates Part 8.5+8.55), `ALC_HOLD_RELEASE_855` (gates Part 8.55), `ALC_TBL_HOLD_RETRY` (engine Option B master switch). Unwired rules show a "wiring pending" badge and are read-only. Seed self-heals metadata on seed-owned rows; IS_ACTIVE/RULE_VALUE are user state, never overwritten. Owned by `ars_flow`.
+- 2026-07-31 — **Part 3.5a I_ROD A/A_MIX override changed to a TRUE floor (MAX semantics).** The old rule was an unconditional `SET I_ROD = 2 WHERE CLR IN ('A','A_MIX')` — it silently DOWNGRADED a maintained I_ROD of 3/4 (from `ARS_CALC_ST_ART`/`ST_MAJ_CAT`, which cascade earlier in 3.5a) back to 2, cutting the option's rounds, per-size cap (`SZ_MBQ × I_ROD`) and excess ceiling. Now `AND ISNULL(TRY_CAST(I_ROD AS FLOAT),0) < 2` — NULL/0/1 lifts to 2, maintained ≥2 is kept. Dictionary `I_ROD` entry updated. Owned by `ars_flow`.
+- 2026-07-30 — **New `L` OPT_TYPE + TBL/RL rework** (`listing.py` Part 3.6 `_classify_opt_type`). The final `ELSE→MIX` region — `STK ≥ g AND MSA_FNL_Q=0` — is now split off explicitly: **`L`** = `STK≥g AND MSA=0 AND HOLD=0` (adequately stocked, no supply → nothing to replenish). **`L` is report-only and NOT allocated** — it fails the ELIG stock-gate (`MSA>0 OR HOLD>0`) so it never enters `ARS_ALLOC_WORKING`, and the RL/TBC/TBL waterfall (`OPT_TYPE_ORDER`) never touches it — same non-processing guarantee as MIX. Two supporting edits: store ranking excludes it (`ARS_STORE_RANKING` CTE `WHERE OPT_TYPE NOT IN ('MIX','L')`, `listing.py:~2586`); data dictionary OPT_TYPE description updated. `L` is **kept as individual listing lines** (not aggregated like MIX in Part 3.7) for per-option visibility. `ART_EXCESS` is computed for `L` (adequate/over-stock is meaningful). **Also reworked the sold-out region so no combo drops to MIX unintentionally:** **`TBL`** tightened to `STK≤0 AND MSA>0` (was `STK≤0 AND (MSA>0 OR HOLD>0)`), and **`RL`** extended with `OR (STK≤0 AND MSA=0 AND HOLD>0)` so a sold-out option carrying only a prior-run NL hold ships by releasing that hold instead of being orphaned. Net: all 12 (STK-region × MSA × HOLD) combos resolve to a real type; ELSE is an unreachable safety net. No rule-engine change required. Owned by `ars_flow`.
+- 2026-07-30 — **MIX(b) removed from OPT_TYPE classification** (`listing.py` Part 3.6 `_classify_opt_type`). The second branch that forced `OPT_TYPE='MIX'` on poor color/size fill (`VAR_COUNT>0 AND (VAR_FNL_COUNT/VAR_COUNT < size_threshold OR VAR_FNL_COUNT < min_size_count)`) is deleted. Poor-coverage options now classify purely on stock + MSA (MIX(a) → RL → TBC → TBL → ELSE MIX), exactly like every other row. `size_threshold` / `min_size_count` are **not** orphaned — they still drive the downstream **R07 size-coverage gate** (`listing.py:~2749`) which skips poor-size **TBL** at allocation time, and the Size Cov %/Min sizes knobs still surface for that. Net effect: options that used to be parked as MIP-b now flow into the RL/TBC/TBL waterfall (and are size-gated there if TBL) instead of being suppressed at listing. No other math changed. Owned by `ars_flow`.
 
 ## Recorded rules (engine)
 

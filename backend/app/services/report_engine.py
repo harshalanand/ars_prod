@@ -23,13 +23,48 @@ from sqlalchemy import text
 from app.database.session import get_data_engine
 from app.services.data_export_service import (
     make_session_dir,
+    fanout_param_runs,
     run_procedure_to_files,
     run_query_to_files,
+    cleanup_old_run_folders,
+    assert_free_space,
+    DEFAULT_BASE_DIR,
 )
 from app.services.report_code_steps import StepContext, run_code_step
 
 REPORTS_TABLE = "ARS_REPORTS"
 RUNS_TABLE = "ARS_REPORT_RUNS"
+
+
+def _report_storage_cfg() -> Dict[str, Any]:
+    """Storage guardrail settings (retention/min-free), tunable in app_settings
+    → 'reports'. Falls back to safe defaults if unavailable."""
+    cfg = {"retention_days": 7, "min_free_mb": 500, "cleanup_enabled": True}
+    try:
+        from app.api.v1.endpoints.settings import load_app_settings
+        cfg.update((load_app_settings() or {}).get("reports", {}) or {})
+    except Exception:
+        pass
+    return cfg
+
+
+def _storage_maintenance(base_dir: Optional[str]) -> None:
+    """Prune old run-date folders so the output location doesn't fill up."""
+    cfg = _report_storage_cfg()
+    if not cfg.get("cleanup_enabled", True):
+        return
+    base = base_dir or DEFAULT_BASE_DIR
+    try:
+        res = cleanup_old_run_folders(base, cfg.get("retention_days", 7))
+        if res.get("deleted"):
+            shown = res["deleted"][:5]
+            more = "…" if len(res["deleted"]) > 5 else ""
+            logger.info(f"[report] retention: pruned {len(res['deleted'])} old run "
+                        f"folder(s) from {base} ({', '.join(shown)}{more})")
+        for e in res.get("errors", [])[:3]:
+            logger.warning(f"[report] retention cleanup issue: {e}")
+    except Exception as e:
+        logger.warning(f"[report] storage maintenance skipped: {e}")
 
 
 # ── Cancellation ────────────────────────────────────────────────────────────
@@ -201,10 +236,26 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     split_config = _parse_split(report.get("SPLIT_CONFIG"))
     per_run = bool(report.get("FOLDER_PER_RUN", 1))
 
+    # Retention cleanup FIRST — prune old run folders so this run has room.
+    _storage_maintenance(base_dir)
+
     export_dir = make_session_dir(session_code, base_dir, per_run=per_run)
     run_id = _insert_run(report_id, session_code, export_dir,
                          trigger_source, created_by)
     token = _register_run(run_id, report_id)
+
+    # Disk pre-flight — fail fast (with the run recorded) if the output volume is
+    # too low, instead of producing a half-written report.
+    try:
+        assert_free_space(export_dir, _report_storage_cfg().get("min_free_mb", 500))
+    except Exception as e:
+        _unregister_run(run_id)
+        errs = [{"step": "preflight", "error": str(e)}]
+        _finalize_run(run_id, report_id, "failed", [], errs, 0)
+        logger.error(f"[report {report_id}] pre-flight failed: {e}")
+        return {"run_id": run_id, "report_id": report_id, "session_code": session_code,
+                "export_dir": export_dir, "status": "failed", "files": [],
+                "errors": errs, "duration_ms": 0}
 
     # For event-triggered runs, suffix output files with the triggering session
     # id so each export is tied to the process run that fired it.
@@ -223,10 +274,18 @@ def run_report(report: Dict[str, Any], trigger_source: str,
             label = f"step {idx} ({step['type']}:{step['name']})"
             try:
                 if step["type"] == "sql":
-                    files.extend(run_procedure_to_files(
-                        {"name": step["name"], "params": step["params"]},
-                        export_dir, file_format, split_config, cancel_token=token,
-                        output_name=step.get("label"), name_suffix=event_suffix))
+                    # A FANOUT param (e.g. usp_ars_msa_master.@Level) with a comma
+                    # list expands into one run per value -> a SEPARATE output file
+                    # suffixed with the value (e.g. MSA_OP_CL_DETAIL, _GEN_CLR, ...).
+                    for run_params, fo_sfx in fanout_param_runs(step["name"], step["params"]):
+                        if token.cancelled:
+                            cancelled = True
+                            break
+                        sfx = "_".join([p for p in (fo_sfx, event_suffix) if p]) or None
+                        files.extend(run_procedure_to_files(
+                            {"name": step["name"], "params": run_params},
+                            export_dir, file_format, split_config, cancel_token=token,
+                            output_name=step.get("label"), name_suffix=sfx))
                 elif step["type"] == "query":
                     # Raw read-only SQL pasted into the report. step["name"] is
                     # the output file label; the SQL lives in params.sql.
@@ -279,7 +338,8 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     total_rows = sum(int(f.get("rows", 0) or 0) for f in files if f.get("file"))
     msg_ctx = {
         "report": report_name,
-        "status": "failed" if (run_had_errors and output_count == 0) else "completed",
+        "status": ("failed" if (run_had_errors and output_count == 0)
+                   else "partial" if run_had_errors else "completed"),
         "rows": f"{total_rows:,}",
         "session": session_code,
         "when": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -336,12 +396,18 @@ def run_report(report: Dict[str, Any], trigger_source: str,
             logger.error(f"[report {report_id}] failure alert failed: {e}")
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    # cancelled > failed > completed. Failed = errored with no real output.
+    # cancelled > failed > partial > completed.
+    #   failed   = errored and produced NO output at all.
+    #   partial  = some steps produced output but at least one step errored
+    #              (e.g. a GEN_ART step OOM'd) — must NOT read as green.
+    #   completed= every step succeeded.
     if cancelled:
         db_status = "cancelled"
         errors.append({"step": "cancel", "error": "run cancelled by user"})
     elif run_had_errors and output_count == 0:
         db_status = "failed"
+    elif run_had_errors:
+        db_status = "partial"
     else:
         db_status = "completed"
     _finalize_run(run_id, report_id, db_status, files, errors, duration_ms)
