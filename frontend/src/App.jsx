@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { useEffect, Component, lazy, Suspense } from 'react'
 import useAuthStore from '@/store/authStore'
 import Layout from '@/components/layout/Layout'
+import FaConsBusyBar from '@/components/facons/FaConsBusyBar'
 
 // Eager-load: login (always needed on first paint)
 import LoginPage from '@/pages/LoginPage'
@@ -76,7 +77,23 @@ const DataDictionaryPage     = lazy(() => import('@/pages/DataDictionaryPage'))
 const ReportGenerationPage   = lazy(() => import('@/pages/ReportGenerationPage'))
 const DailyActivityLogPage   = lazy(() => import('@/pages/DailyActivityLogPage'))
 const UpcStoreTrackingPage   = lazy(() => import('@/pages/UpcStoreTrackingPage'))
+const ReleaseNotesPage       = lazy(() => import('@/pages/ReleaseNotesPage'))
+const BusinessRulesPage      = lazy(() => import('@/pages/BusinessRulesPage'))
+const SapConnectionPage      = lazy(() => import('@/pages/SapConnectionPage'))
+const SapPullsPage           = lazy(() => import('@/pages/SapPullsPage'))
+const SapExplorerPage        = lazy(() => import('@/pages/SapExplorerPage'))
+const SapRunsPage            = lazy(() => import('@/pages/SapRunsPage'))
 const FaConsPlaceholderPage  = lazy(() => import('@/pages/FaConsPlaceholderPage'))
+const FaConsMbqMasterPage    = lazy(() => import('@/pages/FaConsMbqMasterPage'))
+const FaConsSlocSettingsPage = lazy(() => import('@/pages/FaConsSlocSettingsPage'))
+const FaConsStockPage        = lazy(() => import('@/pages/FaConsStockPage'))
+const FaConsStoreListPage    = lazy(() => import('@/pages/FaConsStoreListPage'))
+const FaConsAllocPage        = lazy(() => import('@/pages/FaConsAllocPage'))
+const FaConsPendPage         = lazy(() => import('@/pages/FaConsPendPage'))
+const FaConsGapPage          = lazy(() => import('@/pages/FaConsGapPage'))
+const FaConsHelpPage         = lazy(() => import('@/pages/FaConsHelpPage'))
+const BinAllocHelpPage       = lazy(() => import('@/pages/BinAllocHelpPage'))
+const BinAllocPlaceholderPage = lazy(() => import('@/pages/BinAllocPlaceholderPage'))
 
 function PageLoader() {
   return (
@@ -132,6 +149,8 @@ export default function App() {
   }, [])
 
   return (
+    <>
+    <FaConsBusyBar />
     <Suspense fallback={<PageLoader />}>
     <Routes>
       <Route path="/login" element={<LoginPage />} />
@@ -202,11 +221,30 @@ export default function App() {
         <Route path="reports/gap" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><GapReportPage /></ErrorBoundary></ProtectedRoute>} />
         {/* UPC Store Tracking — store-opening lifecycle tracker */}
         <Route path="reports/upc-tracking" element={<ErrorBoundary><UpcStoreTrackingPage /></ErrorBoundary>} />
-        {/* FA & CONS — Project-store & consumables allocation (scaffold; pages WIP, see manual/fa_cons.md) */}
+        <Route path="release-notes" element={<ErrorBoundary><ReleaseNotesPage /></ErrorBoundary>} />
+        {/* SAP Integration — read-only pulls from SAP into local SAP_* tables */}
+        <Route path="sap/connection" element={<ErrorBoundary><SapConnectionPage /></ErrorBoundary>} />
+        <Route path="sap/pulls" element={<ErrorBoundary><SapPullsPage /></ErrorBoundary>} />
+        <Route path="sap/explorer" element={<ErrorBoundary><SapExplorerPage /></ErrorBoundary>} />
+        <Route path="sap/runs" element={<ErrorBoundary><SapRunsPage /></ErrorBoundary>} />
+        {/* FA & CONS — data foundation (built) + allocation pages (WIP, see manual/fa_cons.md) */}
+        <Route path="fa-cons/mbq-master" element={<ErrorBoundary><FaConsMbqMasterPage /></ErrorBoundary>} />
+        <Route path="fa-cons/sloc-settings" element={<ErrorBoundary><FaConsSlocSettingsPage /></ErrorBoundary>} />
+        <Route path="fa-cons/stock" element={<ErrorBoundary><FaConsStockPage /></ErrorBoundary>} />
+        <Route path="fa-cons/store-list" element={<ErrorBoundary><FaConsStoreListPage /></ErrorBoundary>} />
+        <Route path="fa-cons/allocation" element={<ErrorBoundary><FaConsAllocPage /></ErrorBoundary>} />
+        <Route path="fa-cons/pending" element={<ErrorBoundary><FaConsPendPage /></ErrorBoundary>} />
         <Route path="fa-cons/project-store" element={<ErrorBoundary><FaConsPlaceholderPage title="Project Store Allocation" description="Allocate the daily balance requirement for new/UPC project stores against DC + store stock, against an MBQ and priority master supplied by the project team, until the balance requirement reaches zero." /></ErrorBoundary>} />
         <Route path="fa-cons/consumables" element={<ErrorBoundary><FaConsPlaceholderPage title="Consumables Allocation" description="Daily pan-India consumables allocation with an auto-computed MBQ = MIN(max-hold capacity, 15-day sale) + per-day sale × cover days." /></ErrorBoundary>} />
-        <Route path="fa-cons/mbq-master" element={<ErrorBoundary><FaConsPlaceholderPage title="MBQ Master" description="Upload, edit and audit MBQ per store × reference-article, with change-count control and a mandatory reason on every change." /></ErrorBoundary>} />
-        <Route path="fa-cons/gap-report" element={<ErrorBoundary><FaConsPlaceholderPage title="Gap Report" description="Compare current MBQ against dispatched and pending quantities and propose a final ATR action — hold picking-pending/PRD stock, or return from store." /></ErrorBoundary>} />
+        <Route path="fa-cons/gap-report" element={<ErrorBoundary><FaConsGapPage /></ErrorBoundary>} />
+        <Route path="fa-cons/help" element={<ErrorBoundary><FaConsHelpPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/help" element={<ErrorBoundary><BinAllocHelpPage /></ErrorBoundary>} />
+        {/* Bin Allocation — greedy best-fit bin→store engine (WIP, see BRD/FSD Bin-Allocation) */}
+        <Route path="bin-alloc/bin-master"  element={<ErrorBoundary><BinAllocPlaceholderPage title="Bin Master" description="Load / review the bin master (BIN, MAJ_CAT, SIZE, qty). Multiple rows per bin — one per MAJ_CAT/SIZE combination. Sourced from the DC/vendor pack list." /></ErrorBoundary>} />
+        <Route path="bin-alloc/requirement" element={<ErrorBoundary><BinAllocPlaceholderPage title="Requirement (REQ)" description="Open store requirement at MAJ_CAT / SIZE / MAJ_CAT+SIZE level — reused from the latest allocation output rather than re-uploaded, so bins fit the live open REQ." /></ErrorBoundary>} />
+        <Route path="bin-alloc/run"         element={<ErrorBoundary><BinAllocPlaceholderPage title="Run Allocation" description="Configure level, strategy (one-bin→all-stores or one-store→all-bins), and a fixed or cascading eligibility threshold, then run the engine as an audited background job with pause / resume / stop." /></ErrorBoundary>} />
+        <Route path="bin-alloc/results"     element={<ErrorBoundary><BinAllocPlaceholderPage title="Results & Export" description="Aligned bins (store tag, aligned qty, excess %, threshold used), unaligned bins, and per-phase summary. Export to Excel / CSV / JSON, including partial results." /></ErrorBoundary>} />
+        <Route path="bin-alloc/log"         element={<ErrorBoundary><BinAllocPlaceholderPage title="Eligibility Log" description="Per (bin, store) evaluation audit: potential aligned qty, total bin qty, eligibility %, threshold, cascading step, and eligibility outcome." /></ErrorBoundary>} />
         {/* Pending Allocation Lifecycle */}
         <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />
@@ -221,6 +259,7 @@ export default function App() {
         <Route path="pend-alc/operations"      element={<ErrorBoundary><PendAlcOperationsPage /></ErrorBoundary>} />
         {/* Settings / Admin */}
         <Route path="settings" element={<ProtectedRoute permission="ADMIN_SETTINGS"><SettingsPage /></ProtectedRoute>} />
+        <Route path="settings/business-rules" element={<ProtectedRoute superadminOnly><ErrorBoundary><BusinessRulesPage /></ErrorBoundary></ProtectedRoute>} />
         <Route path="settings/tables" element={<ProtectedRoute permission="TABLE_CREATE"><TableManagementPage /></ProtectedRoute>} />
         <Route path="settings/users" element={<ProtectedRoute permission="ADMIN_USERS_READ"><UsersPage /></ProtectedRoute>} />
         <Route path="settings/roles" element={<ProtectedRoute permission="ADMIN_ROLES_MANAGE"><RolesPage /></ProtectedRoute>} />
@@ -238,5 +277,6 @@ export default function App() {
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
     </Suspense>
+    </>
   )
 }

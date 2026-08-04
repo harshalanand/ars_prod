@@ -161,3 +161,25 @@ api_router.include_router(dev_sync_router)
 # live MBQ/stock/SLOC/fill-rate from TREND_ST). Replaces the manual xlsx.
 from app.api.v1.endpoints.upc_store_track import router as upc_store_track_router
 api_router.include_router(upc_store_track_router)
+
+# FA & CONS — Project-store & consumables data foundation: per-stream SLOC
+# selection, dedicated MSA+store-stock calc, and the 3-col MBQ master.
+from app.api.v1.endpoints.facons import router as facons_router
+api_router.include_router(facons_router)
+
+# Release Notes / Changelog — recorded changes auto-compiled into daily notes.
+from app.api.v1.endpoints.release_notes import router as release_notes_router
+api_router.include_router(release_notes_router)
+
+from app.api.v1.endpoints.business_rules import router as business_rules_router
+api_router.include_router(business_rules_router)
+
+# SAP Integration — read-only, self-contained module that pulls data FROM SAP
+# into local SAP_* staging tables (via the universal-MCP gateway) on a schedule.
+from app.api.v1.endpoints.sap import router as sap_router
+api_router.include_router(sap_router)
+
+# Snowflake Configuration — the single app-wide Snowflake connection used by
+# the SAP Snowflake door AND the Report Generation engine/scheduler.
+from app.api.v1.endpoints.snowflake_config import router as snowflake_config_router
+api_router.include_router(snowflake_config_router)

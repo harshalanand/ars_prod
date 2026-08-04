@@ -383,14 +383,37 @@ AGE_BUCKETS = [
 ]
 
 
+def _age_bucket_cond(age_bucket: Optional[str], col: str = "LISTED_DATE") -> str:
+    """SQL predicate for an AGE_BUCKETS label (2026-08-03), so the Age
+    Buckets chart can drill into the detail table / export like the other
+    charts. Unknown or blank label -> no predicate."""
+    if not age_bucket:
+        return ""
+    for label, lo, hi in AGE_BUCKETS:
+        if label == age_bucket:
+            if hi is None:
+                return f"DATEDIFF(DAY, {col}, GETDATE()) >= {lo}"
+            return f"DATEDIFF(DAY, {col}, GETDATE()) BETWEEN {lo} AND {hi}"
+    return ""
+
+
 @router.get("/by-age", response_model=APIResponse)
 def hold_by_age(
+    alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Open holds bucketed by age (days since LISTED_DATE)."""
+    """Open holds bucketed by age (days since LISTED_DATE).
+
+    2026-08-03: now honours `alloc_type` like every other chart endpoint —
+    previously it ignored the FRESH/GRT/LEGACY selection, so the Age Buckets
+    chart stayed on the full book while the rest of the page filtered, which
+    read as "the chart isn't working".
+    """
     if not _table_exists(db, HOLD_TABLE):
         return _empty()
+    at_cond, at_params = _alloc_type_filter(db, alloc_type, col="ALLOC_TYPE")
+    at_sql = f" AND {at_cond}" if at_cond else ""
     items = []
     for label, lo, hi in AGE_BUCKETS:
         if hi is None:
@@ -402,8 +425,8 @@ def hold_by_age(
                 COUNT(*)                       AS skus,
                 ISNULL(SUM(HOLD_REM), 0)       AS open_qty
             FROM [{HOLD_TABLE}]
-            WHERE ISNULL(IS_CLOSED,0)=0 AND {cond}
-        """)).fetchone()
+            WHERE ISNULL(IS_CLOSED,0)=0 AND {cond}{at_sql}
+        """), at_params).fetchone()
         items.append({
             "bucket":   label,
             "skus":     int(row.skus or 0),
@@ -468,6 +491,7 @@ def hold_detail(
     gen_art: Optional[int] = None,
     status: Optional[str] = None,
     alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
+    age_bucket: Optional[str] = Query(None, description="AGE_BUCKETS label, e.g. '15-30 days'"),
     only_open: bool = Query(True),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
@@ -491,6 +515,9 @@ def hold_detail(
     if status:
         where.append("H.OPT_STATUS = :status")
         params["status"] = status
+    _age_sql = _age_bucket_cond(age_bucket, col="H.LISTED_DATE")
+    if _age_sql:
+        where.append(_age_sql)
     at_cond, at_params = _alloc_type_filter(db, alloc_type, col="H.ALLOC_TYPE")
     if at_cond:
         where.append(at_cond)
@@ -585,6 +612,7 @@ def hold_detail_export(
     gen_art: Optional[int] = None,
     status: Optional[str] = None,
     alloc_type: Optional[str] = Query(None, description="FRESH | GRT | LEGACY"),
+    age_bucket: Optional[str] = Query(None, description="AGE_BUCKETS label, e.g. '15-30 days'"),
     only_open: bool = Query(True),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
@@ -608,6 +636,9 @@ def hold_detail_export(
     if status:
         where.append("H.OPT_STATUS = :status")
         params["status"] = status
+    _age_sql = _age_bucket_cond(age_bucket, col="H.LISTED_DATE")
+    if _age_sql:
+        where.append(_age_sql)
     at_cond, at_params = _alloc_type_filter(db, alloc_type, col="H.ALLOC_TYPE")
     if at_cond:
         where.append(at_cond)

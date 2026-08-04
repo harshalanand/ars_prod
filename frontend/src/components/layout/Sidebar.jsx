@@ -6,7 +6,7 @@ import {
   Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
   HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
   AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered,
-  XCircle, Store,
+  XCircle, Store, Sparkles, Container, Server,
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -34,6 +34,18 @@ const dataPreparationItems = [
   { label: 'Grid Builder', path: '/data-prep/store-stock', icon: LayoutGrid, permission: 'GRID_VIEW' },
   { label: 'Merge Rules', path: '/data-prep/merge-rules', icon: GitMerge, permission: 'GRID_VIEW' },
   { label: 'Listing', path: '/data-prep/listing', icon: List },
+]
+
+// Bin Allocation submenu — greedy best-fit bin→store engine (no bin split),
+// fixed/cascading eligibility thresholds. ARS-native (server-side, job-driven,
+// audited); specced in the BRD/FSD (Bin-Allocation). Pages WIP.
+const binAllocItems = [
+  { label: 'Bin Master',       path: '/bin-alloc/bin-master',  icon: FileUp },
+  { label: 'Requirement',      path: '/bin-alloc/requirement', icon: ClipboardList },
+  { label: 'Run Allocation',   path: '/bin-alloc/run',         icon: Cpu },
+  { label: 'Results & Export', path: '/bin-alloc/results',     icon: ClipboardCheck },
+  { label: 'Eligibility Log',  path: '/bin-alloc/log',         icon: ScrollText },
+  { label: 'Help',             path: '/bin-alloc/help',        icon: BookOpen },
 ]
 
 // Adhoc submenu
@@ -85,10 +97,14 @@ const reportsItems = [
 // FA & CONS — Project-store & consumables allocation (BRD scaffold; pages WIP,
 // specced in public/docs/manual/fa_cons.md)
 const faConsItems = [
-  { label: 'Project Store Alloc', path: '/fa-cons/project-store', icon: Store },
-  { label: 'Consumables Alloc',   path: '/fa-cons/consumables',   icon: Boxes },
+  { label: 'SLOC Settings',       path: '/fa-cons/sloc-settings', icon: Sliders },
+  { label: 'Stock & MSA',         path: '/fa-cons/stock',         icon: BarChart3 },
   { label: 'MBQ Master',          path: '/fa-cons/mbq-master',    icon: ClipboardList },
+  { label: 'UPC Store List',      path: '/fa-cons/store-list',    icon: Store },
+  { label: 'Allocation',          path: '/fa-cons/allocation',    icon: Cpu },
+  { label: 'Pending Alloc',       path: '/fa-cons/pending',       icon: Truck },
   { label: 'Gap Report',          path: '/fa-cons/gap-report',    icon: AlertTriangle },
+  { label: 'Help',                path: '/fa-cons/help',          icon: BookOpen },
 ]
 
 // Pending Allocation lifecycle submenu
@@ -103,6 +119,17 @@ const pendAlcItems = [
   { label: 'BDC Schedule',     path: '/pend-alc/schedule',     icon: CalendarDays },
   { label: 'Schedule Audit',   path: '/pend-alc/schedule-audit', icon: History },
   { label: 'Operations Log',   path: '/pend-alc/operations',   icon: History },
+]
+
+// SAP Integration submenu — self-contained, read-only. Pulls data FROM SAP into
+// local SAP_* staging tables via the universal-MCP gateway, on a schedule or on
+// demand. No SAP SDK on the server; no impact on any other module.
+const sapItems = [
+  { label: 'Data Pulls',   path: '/sap/pulls',      icon: FileDown },
+  { label: 'SAP Explorer', path: '/sap/explorer',   icon: Search },
+  { label: 'Run History',  path: '/sap/runs',       icon: History },
+  // Connection now lives in Settings → SAP.
+  { label: 'Connection',   path: '/settings?tab=sap', icon: Cog },
 ]
 
 // Data Validation submenu
@@ -137,6 +164,7 @@ const processItems = [
 // Settings submenu (admin features)
 const settingsItems = [
   { label: 'App Settings', path: '/settings', icon: Cog, permission: 'ADMIN_SETTINGS', end: true },
+  { label: 'Business Rules', path: '/settings/business-rules', icon: Sliders, superadminOnly: true },
   { label: 'Table Management', path: '/settings/tables', icon: Columns, permission: 'TABLE_ALTER' },
   { label: 'Users', path: '/settings/users', icon: Users, permission: 'ADMIN_USERS_READ' },
   { label: 'Roles', path: '/settings/roles', icon: Shield, permission: 'ADMIN_ROLES_MANAGE' },
@@ -145,25 +173,28 @@ const settingsItems = [
   { label: 'Daily Activity Log', path: '/settings/activity-log', icon: ClipboardCheck, superadminOnly: true },
   { label: 'TempDB Maintenance', path: '/settings/tempdb', icon: HardDrive, superadminOnly: true },
   { label: 'Dev Sync (PROD→DEV)', path: '/settings/dev-sync', icon: Database, superadminOnly: true },
+  { label: "What's New (Release Notes)", path: '/release-notes', icon: Sparkles, superadminOnly: true },
 ]
 
 // Single registry drives rendering, the accordion, route detection, and
 // keyboard navigation — adding a section here is all that's needed.
 const SECTIONS = [
-  { title: 'Data Management',   icon: Database,       items: dataManagementItems },
-  { title: 'Listing & Alloc',   icon: Cpu,            items: dataPreparationItems },
-  { title: 'Adhoc',             icon: FolderOpen,     items: adhocItems },
-  { title: 'Contribution %',    icon: BarChart3,      items: contributionItems },
-  { title: 'Auto Cont %',       icon: Cpu,            items: autoContItems },
-  { title: 'ALC_Fixture',       icon: Boxes,          items: alcFixtureItems },
-  { title: 'Trends',            icon: TrendingUp,     items: trendsItems },
-  { title: 'Reports',           icon: Activity,       items: reportsItems },
-  { title: 'FA & CONS',         icon: Store,          items: faConsItems },
-  { title: 'Pending Allocation',icon: Truck,          items: pendAlcItems },
-  { title: 'Data Validation',   icon: ClipboardCheck, items: dataValidationItems },
-  { title: 'Project Tracker',   icon: FolderKanban,   items: projectTrackerItems },
-  { title: 'Training Manual',   icon: BookOpen,       items: processItems },
-  { title: 'Settings',          icon: Settings,       items: settingsItems },
+  { title: 'Data Management',   icon: Database,       items: dataManagementItems, permission: 'MOD_DATA_MGMT' },
+  { title: 'Listing & Alloc',   icon: Cpu,            items: dataPreparationItems, permission: 'MOD_LISTING_ALLOC' },
+  { title: 'GRT ALC',           icon: Container,      items: binAllocItems, permission: 'MOD_GRT_ALC' },
+  { title: 'Adhoc',             icon: FolderOpen,     items: adhocItems, permission: 'MOD_ADHOC' },
+  { title: 'Contribution %',    icon: BarChart3,      items: contributionItems, permission: 'MOD_CONTRIB' },
+  { title: 'Auto Cont %',       icon: Cpu,            items: autoContItems, permission: 'MOD_AUTO_CONT' },
+  { title: 'ALC_Fixture',       icon: Boxes,          items: alcFixtureItems, permission: 'MOD_ALC_FIXTURE' },
+  { title: 'Trends',            icon: TrendingUp,     items: trendsItems, permission: 'MOD_TRENDS' },
+  { title: 'Reports',           icon: Activity,       items: reportsItems, permission: 'MOD_REPORTS' },
+  { title: 'SAP',               icon: Server,         items: sapItems, permission: 'MOD_SAP' },
+  { title: 'FA & CONS',         icon: Store,          items: faConsItems, permission: 'MOD_FA_CONS' },
+  { title: 'Pending Allocation',icon: Truck,          items: pendAlcItems, permission: 'MOD_PEND_ALC' },
+  { title: 'Data Validation',   icon: ClipboardCheck, items: dataValidationItems, permission: 'MOD_DATA_VALIDATION' },
+  { title: 'Project Tracker',   icon: FolderKanban,   items: projectTrackerItems, permission: 'MOD_PROJECT_TRACKER' },
+  { title: 'Training Manual',   icon: BookOpen,       items: processItems, permission: 'MOD_TRAINING' },
+  { title: 'Settings',          icon: Settings,       items: settingsItems, permission: 'MOD_SETTINGS' },
 ]
 
 const OPEN_SECTION_LS_KEY = 'ars_sidebar_open_section'
@@ -502,7 +533,12 @@ export default function Sidebar({ collapsed, onToggle }) {
           .filter(item => !item.permission || hasPermission(item.permission))
           .map(item => <SideLink key={item.path} item={item} collapsed={collapsed} />)}
 
-        {SECTIONS.map(section => (
+        {/* Module gate (2026-07-31): each father menu carries a MOD_*
+            permission — one tick per role in Settings → Roles shows/hides
+            the whole module. Superadmin always sees everything. */}
+        {SECTIONS
+          .filter(section => superadmin || !section.permission || hasPermission(section.permission))
+          .map(section => (
           <SubMenu
             key={section.title}
             title={section.title}
@@ -515,7 +551,7 @@ export default function Sidebar({ collapsed, onToggle }) {
             onToggle={toggleSection}
             activeInside={section.items.some(i => itemMatchesPath(i, location.pathname))}
           />
-        ))}
+          ))}
       </nav>
 
       {/* Footer: Version + Collapse */}

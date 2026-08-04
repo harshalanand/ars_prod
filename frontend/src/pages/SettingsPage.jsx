@@ -1,8 +1,11 @@
 import { useState, useEffect } from 'react'
 import { Settings, Database, Mail, Palette, Shield, Server, Check, AlertCircle, AlertTriangle, RefreshCw, Send, Save, HardDrive, Trash2, Download, Play, Users, Cpu, Clock, Table2, Eye, Upload, FileDown, Edit3, MessageCircle, MessageSquare } from 'lucide-react'
-import { settingsAPI, tablesAPI, maintenanceAPI, listingAPI, whatsappConfigAPI } from '@/services/api'
+import { useSearchParams } from 'react-router-dom'
+import { settingsAPI, tablesAPI, maintenanceAPI, whatsappConfigAPI } from '@/services/api'
 import useAuthStore from '@/store/authStore'
 import toast from 'react-hot-toast'
+import SapConnectionPage from './SapConnectionPage'
+import SnowflakeConnectionPage from './SnowflakeConnectionPage'
 
 const tabs = [
   { id: 'database', label: 'Database', icon: Database },
@@ -10,6 +13,7 @@ const tabs = [
   { id: 'whatsapp', label: 'WhatsApp', icon: MessageCircle },
   { id: 'sms', label: 'SMS', icon: MessageSquare },
   { id: 'snowflake', label: 'Snowflake', icon: Database },
+  { id: 'sap', label: 'SAP', icon: Server },
   { id: 'application', label: 'Application', icon: Settings },
   { id: 'tables', label: 'Table Permissions', icon: Table2 },
   { id: 'ui', label: 'UI Preferences', icon: Palette },
@@ -19,7 +23,14 @@ const tabs = [
 ]
 
 export default function SettingsPage() {
-  const [activeTab, setActiveTab] = useState('database')
+  const [searchParams] = useSearchParams()
+  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'database')
+
+  // Allow deep-linking to a tab, e.g. /settings?tab=sap (used by the SAP menu).
+  useEffect(() => {
+    const t = searchParams.get('tab')
+    if (t && tabs.some(x => x.id === t)) setActiveTab(t)
+  }, [searchParams])
   const [settings, setSettings] = useState({})
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -32,14 +43,9 @@ export default function SettingsPage() {
   const [creatingBackup, setCreatingBackup] = useState(false)
   const [backupsLoading, setBackupsLoading] = useState(false)
 
-  // Parking mode (admin-only) — Single / Multiple parked sessions.
-  // Persisted server-side under AppSettings `listing.allow_multi_parked`.
-  // The toggle on the Listing page was removed in favour of this setting,
-  // so only ADMIN / SUPER_ADMIN can flip it.
-  const isAdmin = useAuthStore(s => s.isSuperAdmin?.() || s.hasRole?.('ADMIN'))
-  const [parkingMultiple, setParkingMultiple] = useState(false)
-  const [parkingLoading, setParkingLoading] = useState(false)
-  const [parkingSaving, setParkingSaving] = useState(false)
+  // Parking mode + audit mode moved to Settings → Business Rules
+  // (ALC_MULTI_PARKED / LST_AUDIT_ALL_TO_WORKING, 2026-07-31) — the
+  // Application-tab toggles were replaced by a pointer card.
 
   // WhatsApp (Meta Cloud API) config — dedicated DB-backed tab
   const isSuperAdmin = useAuthStore(s => s.isSuperAdmin?.())
@@ -75,9 +81,6 @@ export default function SettingsPage() {
     }
     if (activeTab === 'danger') {
       loadResetPreview(resetIncludeMsa)
-    }
-    if (activeTab === 'application') {
-      loadParkingMode()
     }
     if (activeTab === 'whatsapp') {
       loadWhatsApp()
@@ -179,38 +182,6 @@ export default function SettingsPage() {
       toast.error(e.response?.data?.detail || 'Failed to send test message')
     } finally {
       setWaSending(false)
-    }
-  }
-
-  const loadParkingMode = async () => {
-    setParkingLoading(true)
-    try {
-      const { data } = await listingAPI.getParkingMode()
-      setParkingMultiple(!!data?.data?.allow_multi_parked)
-    } catch (e) {
-      // Read is open to any user — surface unexpected errors only.
-      console.warn('parking-mode load failed', e)
-    } finally {
-      setParkingLoading(false)
-    }
-  }
-
-  const handleParkingChange = async (next) => {
-    if (!isAdmin) {
-      toast.error('Only admins can change the parking mode.')
-      return
-    }
-    setParkingSaving(true)
-    const prev = parkingMultiple
-    setParkingMultiple(next)  // optimistic
-    try {
-      await listingAPI.setParkingMode(next)
-      toast.success(`Parking mode → ${next ? 'Multiple' : 'Single'}`)
-    } catch (e) {
-      setParkingMultiple(prev)  // revert on failure
-      toast.error(e.response?.data?.detail || 'Failed to update parking mode')
-    } finally {
-      setParkingSaving(false)
     }
   }
 
@@ -437,6 +408,9 @@ export default function SettingsPage() {
 
         {/* Content */}
         <div className="flex-1">
+          {/* SAP — gateway + Snowflake connection (moved here from the SAP menu) */}
+          {activeTab === 'sap' && <SapConnectionPage embedded />}
+
           {/* Database Settings */}
           {activeTab === 'database' && (
             <div className="card p-6 space-y-6">
@@ -699,77 +673,8 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* Snowflake Settings */}
-          {activeTab === 'snowflake' && (
-            <div className="card p-6 space-y-6">
-              <h3 className="font-semibold text-gray-900 text-lg flex items-center gap-2">
-                <Database size={20} /> Snowflake Connection
-              </h3>
-              <p className="text-sm text-gray-500 -mt-3">
-                Used by Report Generation when a report delivers to Snowflake. The connector
-                must be installed on the server (<code>snowflake-connector-python[pandas]</code>).
-              </p>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="label">Account</label>
-                  <input
-                    value={settings.snowflake?.account || ''}
-                    onChange={e => updateSetting('snowflake', 'account', e.target.value)}
-                    className="input" placeholder="orgname-accountname"
-                  />
-                </div>
-                <div>
-                  <label className="label">Warehouse</label>
-                  <input
-                    value={settings.snowflake?.warehouse || ''}
-                    onChange={e => updateSetting('snowflake', 'warehouse', e.target.value)}
-                    className="input" placeholder="COMPUTE_WH"
-                  />
-                </div>
-                <div>
-                  <label className="label">User</label>
-                  <input
-                    value={settings.snowflake?.user || ''}
-                    onChange={e => updateSetting('snowflake', 'user', e.target.value)}
-                    className="input" placeholder="svc_ars"
-                  />
-                </div>
-                <div>
-                  <label className="label">Password</label>
-                  <input
-                    type="password"
-                    value={settings.snowflake?.password || ''}
-                    onChange={e => updateSetting('snowflake', 'password', e.target.value)}
-                    className="input" placeholder="••••••••"
-                  />
-                </div>
-                <div>
-                  <label className="label">Role (optional)</label>
-                  <input
-                    value={settings.snowflake?.role || ''}
-                    onChange={e => updateSetting('snowflake', 'role', e.target.value)}
-                    className="input" placeholder="SYSADMIN"
-                  />
-                </div>
-                <div className="flex items-center gap-4 pt-6">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settings.snowflake?.enabled || false}
-                      onChange={e => updateSetting('snowflake', 'enabled', e.target.checked)}
-                      className="w-4 h-4 rounded border-gray-300"
-                    />
-                    <span className="text-sm text-gray-700">Enable Snowflake sync</span>
-                  </label>
-                </div>
-              </div>
-              <div className="flex justify-end pt-4 border-t">
-                <button onClick={() => handleSave('snowflake')} disabled={saving} className="btn-primary">
-                  <Save size={16} /> Save Changes
-                </button>
-              </div>
-            </div>
-          )}
+          {/* Snowflake — the single app-wide connection (SAP door + report scheduler) */}
+          {activeTab === 'snowflake' && <SnowflakeConnectionPage embedded />}
 
           {/* WhatsApp Settings (Meta Cloud API) — dedicated DB-backed config */}
           {activeTab === 'whatsapp' && (() => {
@@ -1032,82 +937,6 @@ export default function SettingsPage() {
                   />
                   <span className="text-sm text-gray-700">Enable Row-Level Security</span>
                 </label>
-              </div>
-
-              {/* Listing audit mode — when ON, every ARS_LISTING row is copied
-                  into ARS_LISTING_WORKING (including ineligible OPTs). The
-                  allocation engine still only processes ELIG_FLAG=1 rows, so
-                  results are byte-identical to OFF — this toggle only changes
-                  what's visible in the working table preview. */}
-              <div className="pt-4 border-t">
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={settings.application?.shift_all_to_working || false}
-                    onChange={e => updateSetting('application', 'shift_all_to_working', e.target.checked)}
-                    className="w-4 h-4 rounded border-gray-300 mt-0.5"
-                  />
-                  <div>
-                    <div className="text-sm font-semibold text-gray-900">
-                      Audit mode — shift all rows to ARS_LISTING_WORKING
-                    </div>
-                    <div className="text-xs text-gray-500 mt-0.5 max-w-xl">
-                      When enabled, every row from ARS_LISTING is copied into the working table,
-                      including OPTs that fail eligibility (no stock, no demand, not listed, no
-                      display, or insufficient TBL size coverage). Allocation still respects the
-                      <span className="font-mono"> ELIG_FLAG </span>
-                      column — output is byte-identical to OFF. Use this for diagnostics: query
-                      <span className="font-mono"> ELIG_REASON </span>
-                      to see why a row was excluded. Larger snapshots / parked tables when ON.
-                    </div>
-                  </div>
-                </label>
-              </div>
-
-              {/* Parking mode — admin-only. Moved here from the Listing page. */}
-              <div className="pt-4 border-t">
-                <div className="flex items-center justify-between gap-4 flex-wrap">
-                  <div>
-                    <div className="text-sm font-semibold text-gray-900 flex items-center gap-2">
-                      <Shield size={14} className="text-amber-600"/> Parking Mode
-                      {!isAdmin && (
-                        <span className="text-xs font-normal text-gray-500 italic">
-                          (admin only — read-only for you)
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-xs text-gray-500 mt-0.5 max-w-xl">
-                      Controls whether new listing runs are blocked while a parked session is awaiting review.
-                      &nbsp;<b>Single</b> (default) — block until the pending parked session is approved/rejected.
-                      &nbsp;<b>Multiple</b> — allow new runs to stack alongside pending parked sessions.
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {[['single', 'Single', false], ['multi', 'Multiple', true]].map(([v, l, val]) => {
-                      const on = val === !!parkingMultiple
-                      return (
-                        <button
-                          key={v}
-                          type="button"
-                          disabled={!isAdmin || parkingLoading || parkingSaving}
-                          onClick={() => handleParkingChange(val)}
-                          className={
-                            'px-3 py-1.5 text-xs font-semibold rounded border transition ' +
-                            (on
-                              ? 'bg-amber-100 text-amber-800 border-amber-500'
-                              : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50') +
-                            (!isAdmin ? ' opacity-60 cursor-not-allowed' : '')
-                          }
-                        >
-                          {l}
-                        </button>
-                      )
-                    })}
-                    {(parkingLoading || parkingSaving) && (
-                      <span className="text-xs text-gray-400">…</span>
-                    )}
-                  </div>
-                </div>
               </div>
 
               <div className="flex justify-end pt-4 border-t">

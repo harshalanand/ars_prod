@@ -5,7 +5,7 @@
  * Sections: KPI cards, by-RDC, by-store, by-article, by-status, age buckets,
  * timeline, drill-down detail, reconciliation banner.
  */
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import api, { holdDashboardAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import {
@@ -24,7 +24,11 @@ const COLORS = ['#4f46e5', '#06b6d4', '#f59e0b', '#10b981', '#ef4444',
 const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-IN', { maximumFractionDigits: 0 }))
 const fmtFloat = (n) => (n == null ? '-' : Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 }))
 
-function Card({ icon: Icon, label, value, sub, color = 'indigo' }) {
+/* `onClick` turns the card into a filter control: clicking applies the
+ * card's filter to the detail table (and therefore to Export, which reads
+ * the same filter state). `active` rings the card so the current selection
+ * is obvious. Cards without onClick stay plain read-only tiles. */
+function Card({ icon: Icon, label, value, sub, color = 'indigo', onClick, active }) {
   const colors = {
     indigo: 'bg-indigo-50 text-indigo-600',
     cyan:   'bg-cyan-50 text-cyan-600',
@@ -32,15 +36,30 @@ function Card({ icon: Icon, label, value, sub, color = 'indigo' }) {
     green:  'bg-emerald-50 text-emerald-600',
     rose:   'bg-rose-50 text-rose-600',
   }
+  const clickable = typeof onClick === 'function'
   return (
-    <div className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm">
+    <div
+      onClick={onClick}
+      role={clickable ? 'button' : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      onKeyDown={clickable ? (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() }
+      } : undefined}
+      title={clickable ? (active ? 'Click to clear this filter' : 'Click to filter the detail table') : undefined}
+      className={
+        'bg-white border rounded-xl p-4 transition-colors ' +
+        (clickable ? 'cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/30 ' : '') +
+        (active ? 'border-indigo-500 bg-indigo-50/40' : 'border-gray-200/80')
+      }
+    >
       <div className="flex items-center gap-3">
         <div className={`p-2 rounded-lg ${colors[color]}`}>
           <Icon size={18} />
         </div>
-        <div className="text-xs font-medium text-gray-500 uppercase tracking-wide">{label}</div>
+        <div className="text-xs font-medium text-gray-500">{label}</div>
+        {active && <span className="ml-auto text-[10px] font-medium text-indigo-600">filtered</span>}
       </div>
-      <div className="mt-3 text-2xl font-bold text-gray-900">{value}</div>
+      <div className="mt-3 text-2xl font-medium text-gray-900 tabular-nums">{value}</div>
       {sub && <div className="mt-1 text-xs text-gray-500">{sub}</div>}
     </div>
   )
@@ -215,13 +234,15 @@ function DailyHoldConsumptionRow({ timeline, view, setView, onMaximize }) {
   )
 }
 
+/* Claude design system: flat white surface, single hairline border, no
+ * drop shadow, generous padding, sentence-case heading at medium weight. */
 function Section({ title, subtitle, children, right }) {
   return (
-    <div className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm">
-      <div className="flex items-start justify-between mb-3">
-        <div>
-          <h3 className="font-semibold text-gray-900 text-sm">{title}</h3>
-          {subtitle && <p className="text-xs text-gray-500 mt-0.5">{subtitle}</p>}
+    <div className="bg-white border border-gray-200/80 rounded-xl p-5">
+      <div className="flex items-start justify-between gap-3 mb-4">
+        <div className="min-w-0">
+          <h3 className="text-[15px] font-medium text-gray-900 leading-tight">{title}</h3>
+          {subtitle && <p className="text-xs text-gray-500 mt-1 leading-relaxed">{subtitle}</p>}
         </div>
         {right}
       </div>
@@ -237,7 +258,6 @@ export default function HoldDashboardPage() {
   const [byStore, setByStore] = useState([])
   const [byRdc, setByRdc] = useState([])
   const [byArticle, setByArticle] = useState([])
-  const [byStatus, setByStatus] = useState([])
   const [byAge, setByAge] = useState([])
   const [timeline, setTimeline] = useState([])
   const [recon, setRecon] = useState(null)
@@ -246,7 +266,7 @@ export default function HoldDashboardPage() {
   const [allocType, setAllocType] = useState('')
 
   // Detail filters & pagination
-  const [filters, setFilters] = useState({ werks: '', rdc: '', gen_art: '', status: '', only_open: true })
+  const [filters, setFilters] = useState({ werks: '', rdc: '', gen_art: '', status: '', age_bucket: '', only_open: true })
   const [page, setPage] = useState(1)
   const [pageSize] = useState(50)
   const [detail, setDetail] = useState({ items: [], total: 0 })
@@ -275,16 +295,15 @@ export default function HoldDashboardPage() {
 
   const loadAll = useCallback(async () => {
     try {
-      // summary/byStatus helpers don't take params yet — call the endpoints
+      // summary helper doesn't take params yet — call the endpoint
       // directly so the alloc_type filter reaches them (see api.js handoff).
       const tp = allocType ? { alloc_type: allocType } : {}
-      const [s, st, rdc, art, status, age, tl, rc] = await Promise.all([
+      const [s, st, rdc, art, age, tl, rc] = await Promise.all([
         api.get('/hold-dashboard/summary', { params: tp }),
         holdDashboardAPI.byStore({ limit: 15, only_open: true, ...tp }),
         holdDashboardAPI.byRdc({ only_open: true, ...tp }),
         holdDashboardAPI.byArticle({ limit: 15, only_open: true, ...tp }),
-        api.get('/hold-dashboard/by-status', { params: tp }),
-        holdDashboardAPI.byAge(),
+        holdDashboardAPI.byAge({ ...tp }),
         holdDashboardAPI.timeline({ days: 60 }),
         holdDashboardAPI.reconciliation(),
       ])
@@ -292,7 +311,6 @@ export default function HoldDashboardPage() {
       setByStore(st.data?.data?.items || [])
       setByRdc(rdc.data?.data?.items || [])
       setByArticle(art.data?.data?.items || [])
-      setByStatus(status.data?.data?.items || [])
       setByAge(age.data?.data?.items || [])
       setTimeline(tl.data?.data?.items || [])
       setRecon(rc.data?.data || null)
@@ -312,6 +330,7 @@ export default function HoldDashboardPage() {
       if (filters.rdc) params.rdc = filters.rdc
       if (filters.gen_art) params.gen_art = filters.gen_art
       if (filters.status) params.status = filters.status
+      if (filters.age_bucket) params.age_bucket = filters.age_bucket
       if (allocType) params.alloc_type = allocType
       const r = await holdDashboardAPI.detail(params)
       setDetail(r.data?.data || { items: [], total: 0 })
@@ -332,9 +351,45 @@ export default function HoldDashboardPage() {
   }
 
   const clearFilters = () => {
-    setFilters({ werks: '', rdc: '', gen_art: '', status: '', only_open: true })
+    setFilters({ werks: '', rdc: '', gen_art: '', status: '', age_bucket: '', only_open: true })
     setPage(1)
   }
+
+  /* ── Click-to-filter (cards + charts) ─────────────────────────────────
+   * Every KPI card, chart bar and pie slice calls drillTo() with the
+   * dimension it represents. Clicking the value that is already applied
+   * toggles it OFF, so a second click is always "undo". The detail table
+   * and the Export button both read `filters`, so a drill-down exports
+   * exactly what is on screen — no separate export filter to keep in sync. */
+  const detailRef = useRef(null)
+
+  const drillTo = (patch, { scroll = true } = {}) => {
+    setFilters(prev => {
+      const next = { ...prev }
+      for (const [k, v] of Object.entries(patch)) {
+        // toggle: same value clicked again clears it
+        next[k] = (prev[k] === v && k !== 'only_open') ? '' : v
+      }
+      return next
+    })
+    setPage(1)
+    if (scroll) {
+      // Let React commit the filter before scrolling to the results.
+      setTimeout(() => detailRef.current?.scrollIntoView(
+        { behavior: 'smooth', block: 'start' }), 60)
+    }
+  }
+
+  // Chart click handlers — recharts hands back the datum on the payload.
+  // `field` is the datum key on the chart; `as` is the filter key it maps
+  // to when they differ (age chart datum is `bucket`, filter is `age_bucket`).
+  const barClick = (field, as = null) => (data) => {
+    const v = data?.payload?.[field] ?? data?.[field]
+    if (v != null && v !== '') drillTo({ [as || field]: String(v) })
+  }
+
+  const activeFilterCount = ['werks', 'rdc', 'gen_art', 'status', 'age_bucket']
+    .filter(k => filters[k]).length + (filters.only_open ? 0 : 1)
 
   // Open the single-row clear-hold modal pre-populated with the row's key.
   const openRowClear = (row) => {
@@ -404,6 +459,7 @@ export default function HoldDashboardPage() {
       if (filters.rdc)     params.rdc     = filters.rdc
       if (filters.gen_art) params.gen_art = filters.gen_art
       if (filters.status)  params.status  = filters.status
+      if (filters.age_bucket) params.age_bucket = filters.age_bucket
       if (allocType)       params.alloc_type = allocType
 
       const res = await holdDashboardAPI.detailExport(params)
@@ -589,11 +645,13 @@ export default function HoldDashboardPage() {
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
-            <Lock size={22} className="text-indigo-600" /> Hold Dashboard
+          <h1 className="text-[22px] font-medium text-gray-900 flex items-center gap-2">
+            <Lock size={20} className="text-indigo-600" /> Hold dashboard
           </h1>
-          <p className="text-sm text-gray-500 mt-1">
-            Review TBL/NL hold reservations from ARS_NL_TBL_HOLD_TRACKING. Last updated: {lastUpdated}
+          <p className="text-sm text-gray-500 mt-1 leading-relaxed">
+            TBL/NL hold reservations from <span className="font-mono text-xs">ARS_NL_TBL_HOLD_TRACKING</span>.
+            Click any card, bar or article row to filter the detail table — Export always sends
+            exactly what you have selected. Last updated {lastUpdated}.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -658,15 +716,25 @@ export default function HoldDashboardPage() {
       {/* KPI cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <Card icon={Lock}     label="Open SKUs"        value={fmt(summary?.open_rows)}
-              sub={`${fmt(summary?.closed_rows)} closed`} color="indigo" />
+              sub={`${fmt(summary?.closed_rows)} closed — click to show open only`} color="indigo"
+              active={filters.only_open}
+              onClick={() => drillTo({ only_open: true })} />
         <Card icon={Boxes}    label="Open hold qty"    value={fmt(summary?.open_qty)}
-              sub={`${fmt(summary?.open_initial)} initial`} color="cyan" />
+              sub={`${fmt(summary?.open_initial)} initial`} color="cyan"
+              active={filters.only_open}
+              onClick={() => drillTo({ only_open: true })} />
         <Card icon={Boxes}    label="Consumed qty"     value={fmt(summary?.consumed_qty)}
-              sub="ever shipped from holds" color="green" />
+              sub="ever shipped — click to include closed rows" color="green"
+              active={!filters.only_open}
+              onClick={() => drillTo({ only_open: false })} />
         <Card icon={Building2} label="Stores"          value={fmt(summary?.distinct_stores)}
-              sub="with open holds" color="indigo" />
+              sub={filters.werks ? `filtered: ${filters.werks}` : 'with open holds'} color="indigo"
+              active={!!filters.werks}
+              onClick={filters.werks ? () => drillTo({ werks: filters.werks }) : undefined} />
         <Card icon={Boxes}    label="Articles"          value={fmt(summary?.distinct_articles)}
-              sub={`${fmt(summary?.distinct_skus)} unique SKUs`} color="amber" />
+              sub={filters.gen_art ? `filtered: ${filters.gen_art}` : `${fmt(summary?.distinct_skus)} unique SKUs`} color="amber"
+              active={!!filters.gen_art}
+              onClick={filters.gen_art ? () => drillTo({ gen_art: filters.gen_art }) : undefined} />
         <Card icon={Calendar} label="Oldest open"      value={`${fmt(summary?.oldest_open_days)}d`}
               sub="days since first listed" color={summary?.oldest_open_days > 30 ? 'rose' : 'green'} />
       </div>
@@ -684,89 +752,95 @@ export default function HoldDashboardPage() {
                     label={`${t === 'LEGACY' ? 'Legacy (untyped)' : t} holds`}
                     value={fmt(b.open_qty)}
                     sub={`${fmt(b.open_rows)} open rows`}
-                    color={color} />
+                    color={color}
+                    active={allocType === t}
+                    onClick={() => { setAllocType(allocType === t ? '' : t); setPage(1) }} />
             )
           })}
         </div>
       )}
 
-      {/* Row 1: by-RDC + by-status */}
+      {/* ── Distribution row ──────────────────────────────────────────
+          By Status removed 2026-08-03 (NL/TBL split duplicated the status
+          column already in the detail table). Three equal drill-down charts:
+          warehouse, store, age. Every bar filters the detail table below. */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Section title="By RDC (Warehouse)" subtitle="Open hold quantity per warehouse">
+        <Section title="By RDC (warehouse)"
+                 subtitle="Open hold qty per warehouse — click a bar to filter">
           {byRdc.length === 0 ? (
             <p className="text-sm text-gray-400 py-12 text-center">No data</p>
           ) : (
-            <ResponsiveContainer width="100%" height={260}>
+            <ResponsiveContainer width="100%" height={280}>
               <BarChart data={byRdc.slice(0, 10)} layout="vertical" margin={{ left: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" horizontal={false} />
                 <XAxis type="number" tick={{ fontSize: 11 }} />
                 <YAxis dataKey="rdc" type="category" tick={{ fontSize: 11 }} width={70} />
-                <Tooltip />
-                <Bar dataKey="open_qty" fill="#4f46e5" name="Open hold qty" radius={[0, 4, 4, 0]} />
+                <Tooltip formatter={(v) => fmt(v)} cursor={{ fill: '#f8fafc' }} />
+                <Bar dataKey="open_qty" name="Open hold qty" radius={[0, 4, 4, 0]}
+                     cursor="pointer" onClick={barClick('rdc')}>
+                  {byRdc.slice(0, 10).map((d, i) => (
+                    <Cell key={i} fill={filters.rdc && filters.rdc !== String(d.rdc)
+                                          ? '#c7d2fe' : '#4f46e5'} />
+                  ))}
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           )}
         </Section>
 
-        <Section title="By Status" subtitle="NL vs TBL split">
-          {byStatus.length === 0 ? (
+        <Section title="Top stores"
+                 subtitle="Stores holding the most qty — click a bar to filter">
+          {byStore.length === 0 ? (
             <p className="text-sm text-gray-400 py-12 text-center">No data</p>
           ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <PieChart>
-                <Pie
-                  data={byStatus.filter(s => s.open_qty > 0)}
-                  dataKey="open_qty" nameKey="status"
-                  cx="50%" cy="50%" innerRadius={45} outerRadius={85}
-                  label={({ status, open_qty }) => `${status}: ${fmt(open_qty)}`}
-                  labelLine={false}
-                >
-                  {byStatus.map((_, i) => (
-                    <Cell key={i} fill={COLORS[i % COLORS.length]} />
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={byStore.slice(0, 10)} layout="vertical" margin={{ left: 60 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" horizontal={false} />
+                <XAxis type="number" tick={{ fontSize: 11 }} />
+                <YAxis dataKey="werks" type="category" tick={{ fontSize: 11 }} width={70} />
+                <Tooltip formatter={(v) => fmt(v)} cursor={{ fill: '#f8fafc' }} />
+                <Bar dataKey="open_qty" name="Open hold qty" radius={[0, 4, 4, 0]}
+                     cursor="pointer" onClick={barClick('werks')}>
+                  {byStore.slice(0, 10).map((d, i) => (
+                    <Cell key={i} fill={filters.werks && filters.werks !== String(d.werks)
+                                          ? '#a7f3d0' : '#10b981'} />
                   ))}
-                </Pie>
-                <Tooltip formatter={(v) => fmt(v)} />
-              </PieChart>
+                </Bar>
+              </BarChart>
             </ResponsiveContainer>
           )}
         </Section>
 
-        <Section title="Age Buckets" subtitle="Open holds by days since LISTED_DATE">
-          {byAge.length === 0 ? (
-            <p className="text-sm text-gray-400 py-12 text-center">No data</p>
+        <Section title="Age buckets"
+                 subtitle="Days since LISTED_DATE — click a bar to filter">
+          {byAge.length === 0 || byAge.every(a => !a.open_qty) ? (
+            <p className="text-sm text-gray-400 py-12 text-center">No open holds</p>
           ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={byAge}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis dataKey="bucket" tick={{ fontSize: 10 }} angle={-20} textAnchor="end" height={50} />
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={byAge} margin={{ bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+                <XAxis dataKey="bucket" tick={{ fontSize: 10 }} angle={-20}
+                       textAnchor="end" height={54} interval={0} />
                 <YAxis tick={{ fontSize: 11 }} />
-                <Tooltip />
-                <Bar dataKey="open_qty" fill="#06b6d4" name="Open qty" radius={[4, 4, 0, 0]} />
+                <Tooltip formatter={(v, n) => [fmt(v), n]} cursor={{ fill: '#f8fafc' }} />
+                <Bar dataKey="open_qty" name="Open qty" radius={[4, 4, 0, 0]}
+                     cursor="pointer" onClick={barClick('bucket', 'age_bucket')}>
+                  {byAge.map((d, i) => {
+                    // Older buckets shade warmer; dim the ones filtered out.
+                    const base = ['#06b6d4', '#22d3ee', '#fbbf24', '#fb923c', '#f87171', '#dc2626'][i] || '#06b6d4'
+                    const dim  = filters.age_bucket && filters.age_bucket !== d.bucket
+                    return <Cell key={i} fill={dim ? '#e2e8f0' : base} />
+                  })}
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           )}
         </Section>
       </div>
 
-      {/* Row 2: by-store + by-article */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Section title="Top Stores" subtitle="Stores with the most open hold qty">
-          {byStore.length === 0 ? (
-            <p className="text-sm text-gray-400 py-12 text-center">No data</p>
-          ) : (
-            <ResponsiveContainer width="100%" height={320}>
-              <BarChart data={byStore} layout="vertical" margin={{ left: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis type="number" tick={{ fontSize: 11 }} />
-                <YAxis dataKey="werks" type="category" tick={{ fontSize: 11 }} width={70} />
-                <Tooltip />
-                <Bar dataKey="open_qty" fill="#10b981" name="Open hold qty" radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </Section>
-
-        <Section title="Top Articles" subtitle="Articles with the most open hold qty">
+      {/* Top articles — full width, click a row to filter */}
+      <div className="grid grid-cols-1 gap-4">
+        <Section title="Top articles" subtitle="Articles holding the most qty — click a row to filter">
           {byArticle.length === 0 ? (
             <p className="text-sm text-gray-400 py-12 text-center">No data</p>
           ) : (
@@ -784,7 +858,15 @@ export default function HoldDashboardPage() {
                 </thead>
                 <tbody>
                   {byArticle.map((a, i) => (
-                    <tr key={i} className="border-b border-gray-100 hover:bg-gray-50">
+                    <tr key={i}
+                        onClick={() => drillTo({ gen_art: String(a.gen_art_number) })}
+                        title="Click to filter the detail table by this article"
+                        className={
+                          'border-b border-gray-100 cursor-pointer ' +
+                          (String(filters.gen_art) === String(a.gen_art_number)
+                            ? 'bg-indigo-50 ring-1 ring-indigo-200'
+                            : 'hover:bg-gray-50')
+                        }>
                       <td className="py-1.5 font-mono">{a.gen_art_number}</td>
                       <td className="py-1.5 text-gray-600">{a.maj_cat}</td>
                       <td className="py-1.5 text-right">{fmt(a.stores)}</td>
@@ -832,6 +914,43 @@ export default function HoldDashboardPage() {
           </ResponsiveContainer>
         )}
       </Section>
+
+      {/* Active drill-down chips — every card / bar / slice click lands here,
+          and Export sends exactly this filter set. */}
+      <div ref={detailRef} />
+      {(activeFilterCount > 0 || allocType) && (
+        <div className="flex flex-wrap items-center gap-2 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+          <Filter size={13} className="text-indigo-600" />
+          <span className="text-xs font-medium text-indigo-700">Filtered by:</span>
+          {allocType && (
+            <button onClick={() => { setAllocType(''); setPage(1) }}
+                    className="text-xs px-2 py-0.5 bg-white border border-indigo-300 rounded-full text-indigo-700 hover:bg-indigo-100 flex items-center gap-1">
+              type: {allocType} <X size={10} />
+            </button>
+          )}
+          {[['rdc', 'RDC'], ['werks', 'Store'], ['gen_art', 'Article'], ['age_bucket', 'Age']]
+            .filter(([k]) => filters[k])
+            .map(([k, lbl]) => (
+              <button key={k} onClick={() => drillTo({ [k]: filters[k] }, { scroll: false })}
+                      className="text-xs px-2 py-0.5 bg-white border border-indigo-300 rounded-full text-indigo-700 hover:bg-indigo-100 flex items-center gap-1">
+                {lbl}: {filters[k]} <X size={10} />
+              </button>
+            ))}
+          {!filters.only_open && (
+            <button onClick={() => drillTo({ only_open: true }, { scroll: false })}
+                    className="text-xs px-2 py-0.5 bg-white border border-indigo-300 rounded-full text-indigo-700 hover:bg-indigo-100 flex items-center gap-1">
+              including closed <X size={10} />
+            </button>
+          )}
+          <button onClick={() => { clearFilters(); setAllocType('') }}
+                  className="text-xs text-indigo-600 underline ml-1 hover:text-indigo-800">
+            clear all
+          </button>
+          <span className="ml-auto text-xs text-indigo-700">
+            {fmt(detail.total)} row(s) — Export sends this selection
+          </span>
+        </div>
+      )}
 
       {/* Detail table with filters */}
       <Section

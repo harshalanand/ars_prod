@@ -285,7 +285,7 @@ function HelpModal({ onClose, leadDays = 10, segments = ['APP','GM'] }) {
     ['Last Remark', 'Most recent remark. Click to add/edit (recorded in history only if it changes).'],
     ['R.Chg', 'How many times the remark has changed.'],
     ['Priority', 'Store priority (number). Synced with the store master MANUAL_ST_PRIORITY — editing here updates the master too. Type directly in the cell.'],
-    ['Status', 'Lifecycle: Active (default) / Opened / Hold / Reject-Cancel. Change inline; Opened asks for the actual open date. A new/changed date auto-reactivates a dormant store.'],
+    ['Status', 'Lifecycle: Active (default) / Opened / Hold / Reject-Cancel. Change inline; Opened asks for the actual open date. Each upload is the full schedule — a date given → ACTIVE (reactivates); a blank date → CANCELLED; any Active store NOT in the upload → auto-CANCELLED (opened stores kept).'],
   ]
   const th = { textAlign:'left', padding:'6px 10px', fontSize:11, fontWeight:800, color:C.textSub, position:'sticky', top:0, background:C.headerBg }
   const td = { padding:'6px 10px', fontSize:12.5, color:C.textSub, borderTop:`1px solid ${C.cardBorder}`, verticalAlign:'top' }
@@ -368,6 +368,8 @@ export default function UpcStoreTrackingPage() {
   })
   const [colMenu, setColMenu] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const [compare, setCompare] = useState(null)       // reconcile vs master { missing, extra, ... }
+  const [compareModal, setCompareModal] = useState(null)  // 'missing' | 'extra' | null
   const [hoverCard, setHoverCard] = useState(null)   // { kind:'remark'|'stock', r, x, y } — hover preview
   const showHover = (kind, r, e) => setHoverCard({ kind, r, x: e.clientX, y: e.clientY })
   const [leadDays, setLeadDays] = useState(() => {
@@ -388,9 +390,10 @@ export default function UpcStoreTrackingPage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [l, c] = await Promise.all([upcTrackAPI.list(segments), upcTrackAPI.charts(segments)])
+      const [l, c, cmp] = await Promise.all([upcTrackAPI.list(segments), upcTrackAPI.charts(segments), upcTrackAPI.compare()])
       setRows(l.data?.data?.items || [])
       setChart(c.data?.data || null)
+      setCompare(cmp.data?.data || null)
     } catch (e) { toast.error(errMsg(e, 'Load failed')) }
     finally { setLoading(false) }
   }, [segments])
@@ -751,6 +754,27 @@ export default function UpcStoreTrackingPage() {
               tone={C.amber} sub="proposed date revised" />
       </div>
 
+      {/* Reconcile vs store master (UPC budgeted schedule) */}
+      {compare && (
+        <div style={{ display:'flex', alignItems:'center', gap:14, flexWrap:'wrap', marginBottom:14,
+          background:C.cardBg, border:`1px solid ${C.cardBorder}`, borderRadius:10, padding:'10px 14px' }}>
+          <span style={{ fontSize:12, fontWeight:800, color:C.textSub }}>vs Store Master (UPC schedule):</span>
+          <span style={{ fontSize:12, color:C.textMuted }}>{compare.upc_master_total} budgeted · {compare.tracked_total} tracked</span>
+          <button onClick={()=>compare.missing_count && setCompareModal('missing')}
+            style={{ display:'inline-flex', alignItems:'center', gap:6, fontSize:12, fontWeight:700, padding:'4px 10px', borderRadius:20,
+              cursor:compare.missing_count?'pointer':'default', border:`1px solid ${compare.missing_count?C.amberBd:C.cardBorder}`,
+              background:compare.missing_count?C.amberBg:C.cardBg, color:compare.missing_count?C.amber:C.textMuted }}>
+            <AlertTriangle size={12}/> Missing {compare.missing_count} <span style={{ fontWeight:400 }}>(budgeted, not scheduled)</span>
+          </button>
+          <button onClick={()=>compare.extra_count && setCompareModal('extra')}
+            style={{ display:'inline-flex', alignItems:'center', gap:6, fontSize:12, fontWeight:700, padding:'4px 10px', borderRadius:20,
+              cursor:compare.extra_count?'pointer':'default', border:`1px solid ${compare.extra_count?C.blueBd:C.cardBorder}`,
+              background:compare.extra_count?C.blueBg:C.cardBg, color:compare.extra_count?C.blue:C.textMuted }}>
+            Extra {compare.extra_count} <span style={{ fontWeight:400 }}>(scheduled, not UPC in master)</span>
+          </button>
+        </div>
+      )}
+
       {/* Charts — each: chart⇄table toggle, CSV, zoom, and clickable to filter */}
       <div style={{ display:'flex', gap:12, flexWrap:'wrap', marginBottom:14 }}>
         <ChartCard title="Status distribution" csvName="upc_status"
@@ -920,6 +944,50 @@ export default function UpcStoreTrackingPage() {
       {edit && <EditModal edit={edit} setEdit={setEdit} onSave={save} />}
       {detail && <DetailDrawer detail={detail} onClose={()=>setDetail(null)} />}
       {helpOpen && <HelpModal onClose={()=>setHelpOpen(false)} leadDays={leadDays} segments={segments} />}
+      {compareModal && compare && (
+        <Overlay onClose={()=>setCompareModal(null)}>
+          <div style={{ width:560, maxWidth:'94vw', maxHeight:'85vh', overflow:'auto', background:C.cardBg,
+            borderRadius:12, padding:18, border:`1px solid ${C.cardBorder}` }} onClick={e=>e.stopPropagation()}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+              <div style={{ fontSize:15, fontWeight:800, color:C.text }}>
+                {compareModal==='missing'
+                  ? `Missing — budgeted (UPC) but not scheduled (${compare.missing_count})`
+                  : `Extra — scheduled but not UPC in master (${compare.extra_count})`}
+              </div>
+              <button onClick={()=>setCompareModal(null)} style={{ background:'none', border:'none', cursor:'pointer' }}><X size={18} color={C.textMuted}/></button>
+            </div>
+            <div style={{ fontSize:11, color:C.textMuted, marginBottom:10 }}>
+              {compareModal==='missing'
+                ? 'UPC stores in Master_ALC_INPUT_ST_MASTER that have no row in the tracker yet — upload them to schedule.'
+                : 'Stores in the tracker that are not a current UPC store in the master (not in master, or a different status).'}
+            </div>
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+              <thead><tr style={{ background:C.headerBg, color:C.textSub, textAlign:'left' }}>
+                {compareModal==='missing'
+                  ? <>{['Store','Name','RDC/Hub','Master OP_DT'].map(h=><th key={h} style={{ padding:'6px 9px' }}>{h}</th>)}</>
+                  : <>{['Store','Name','Master status'].map(h=><th key={h} style={{ padding:'6px 9px' }}>{h}</th>)}</>}
+              </tr></thead>
+              <tbody>
+                {(compareModal==='missing' ? compare.missing : compare.extra).map((r,i)=>(
+                  <tr key={i} style={{ borderTop:`1px solid ${C.cardBorder}` }}>
+                    <td style={{ padding:'5px 9px', fontWeight:700, color:C.text }}>{r.st_cd}</td>
+                    {compareModal==='missing' ? <>
+                      <td style={{ padding:'5px 9px', color:C.textSub }}>{r.site_name||'—'}</td>
+                      <td style={{ padding:'5px 9px', color:C.textSub }}>{r.rdc||'—'} / {r.hub||'—'}</td>
+                      <td style={{ padding:'5px 9px', color:C.textSub }}>{fmtD(r.op_dt)}</td>
+                    </> : <>
+                      <td style={{ padding:'5px 9px', color:C.textSub }}>{r.site_name||'—'}</td>
+                      <td style={{ padding:'5px 9px', color:C.textSub }}>{r.master_status}</td>
+                    </>}
+                  </tr>
+                ))}
+                {!(compareModal==='missing' ? compare.missing : compare.extra).length &&
+                  <tr><td colSpan={4} style={{ padding:16, textAlign:'center', color:C.textMuted }}>None — fully reconciled.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </Overlay>
+      )}
       {hoverCard && (() => {
         const w = hoverCard.kind==='chart' ? 420 : hoverCard.kind==='stock' ? 260 : 300
         const h = hoverCard.kind==='chart' ? 330 : 220

@@ -64,6 +64,11 @@ def charts(segments: Optional[str] = None, current_user: User = Depends(get_curr
     return APIResponse(success=True, message="ok", data=svc.charts(_segs(segments)))
 
 
+@router.get("/compare", response_model=APIResponse)
+def compare(current_user: User = Depends(get_current_user)):
+    return APIResponse(success=True, message="ok", data=svc.compare_master())
+
+
 @router.get("/export")
 def export(segments: Optional[str] = None, current_user: User = Depends(get_current_user)):
     data = svc.export_bytes(_segs(segments))
@@ -152,12 +157,25 @@ async def upload(file: UploadFile = File(...), current_user: User = Depends(get_
         content = await file.read()
         res = svc.ingest_upload(content, user=_uname(current_user))
         msg = (f"{res['processed']} store(s): {res['created']} new, "
-               f"{res['changed']} changed, {res['skipped']} skipped"
+               f"{res['changed']} changed"
+               + (f", {res['cancelled']} auto-cancelled ({res.get('absent_cancelled',0)} not in this upload)"
+                  if res.get("cancelled") else "")
+               + f", {res['skipped']} skipped"
                + (f", {res['error_count']} error(s)" if res.get("error_count") else ""))
         return APIResponse(success=(res.get("error_count", 0) == 0), message=msg, data=res)
     except Exception as e:
         logger.exception("upc upload failed")
         raise HTTPException(400, detail=str(e))
+
+
+@router.post("/reset", response_model=APIResponse)
+def reset_all(current_user: User = Depends(get_current_user)):
+    if "SUPER_ADMIN" not in set(getattr(current_user, "role_codes", []) or []):
+        raise HTTPException(403, detail="Reset is restricted to superadmin")
+    res = svc.reset_all()
+    return APIResponse(success=True,
+                       message=f"Cleared {res['total']} row(s) from UPC tracking (stores + all history)",
+                       data=res)
 
 
 @router.post("/compact-history", response_model=APIResponse)

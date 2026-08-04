@@ -61,29 +61,40 @@ def _clean_segments(segments) -> tuple:
     segs = tuple(s for s in (segments or ()) if s in VALID_SEG)
     return segs or DEFAULT_SEG
 
-# ARS_GRID_MJ columns surfaced as the SLOC-wise / stock breakdown, SUM-aggregated
-# per store (over all MAJ_CAT). Left = output key, right = grid column
-# (bracket-quoted in SQL because several start with a digit). These map directly
-# to the manual workbook's SLOC-wise columns.
-SLOC_COLS = {
-    "STK_0001":       "0001",
-    "STK_0002":       "0002",
-    "STK_0004":       "0004",
-    "STK_0006":       "0006",
-    "INT_0099":       "0099",
-    "STK_0017":       "0017",
-    "HUB_INTRA":      "HUB_INTRA",
-    "HUB_PRD_Q":      "HUB_PRD_Q",
-    "ST_STK_V06_QTY": "ST_STK_V06_QTY",
-    "ST_STK_V07_QTY": "ST_STK_V07_QTY",
-    "DH24_PTL_V07_Q": "DH24_PTL_V07_Q",
-    "DH24_PTL_V18_Q": "DH24_PTL_V18_Q",
-    "DH24_PTL_V25_Q": "DH24_PTL_V25_Q",
-    "DW01_PTL_V07_Q": "DW01_PTL_V07_Q",
-    "STO_DH24":       "DH24_STO_QTY_Q",
-    "STO_DW01":       "DW01_STO_QTY_Q",
-    "PND":            "PEND_ALC",
+# The SLOC-wise / stock breakdown is discovered DYNAMICALLY from ARS_GRID_MJ at
+# runtime (see _sloc_cols) rather than hardcoded — the grid schema drifts, and a
+# stale hardcoded column name makes every request 500 with "Invalid column name".
+# A SLOC bucket = any numeric grid column that isn't the store/category grain, an
+# aggregate we already surface under its own name (MBQ / STK_TTL / DISP_Q), or a
+# derived metric. Maintain the exclude set below; new stock columns auto-appear
+# and removed ones auto-disappear, with no code change and no crash.
+_GRID_NON_SLOC = {
+    "WERKS", "MAJ_CAT",                 # grain (identity)
+    "MBQ", "STK_TTL", "DISP_Q",         # surfaced separately as mbq_100/total_stock/disp_q
+    "L-7 DAYS SALE-Q", "LISTING", "ACS_D", "ALC_D", "SAL_PD",
+    "DISP_GR_DGR", "LW_ACT_SL_GR_DGR", "BGT_SL_GR_DGR",
+    "CONT", "OPT_CNT", "STR",           # derived metrics, not stock buckets
 }
+_SLOC_NUMERIC_TYPES = ("numeric", "float", "int", "bigint", "decimal",
+                       "real", "smallint", "money")
+_sloc_cols_cache: Optional[List[str]] = None
+
+
+def _sloc_cols() -> List[str]:
+    """SLOC-wise stock columns that ACTUALLY exist in ARS_GRID_MJ right now,
+    discovered from INFORMATION_SCHEMA (cached for the process). Resilient to grid
+    schema drift: a column added/dropped in the grid appears/disappears here with
+    no code change. Order follows the grid's column order."""
+    global _sloc_cols_cache
+    if _sloc_cols_cache is None:
+        types = ", ".join(f"'{t}'" for t in _SLOC_NUMERIC_TYPES)
+        with data_engine.connect() as c:
+            rows = c.execute(text(
+                f"""SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_NAME = :t AND DATA_TYPE IN ({types})
+                    ORDER BY ORDINAL_POSITION"""), {"t": GRID}).fetchall()
+        _sloc_cols_cache = [r[0] for r in rows if r[0] not in _GRID_NON_SLOC]
+    return _sloc_cols_cache
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -232,9 +243,10 @@ def _record_date_event(conn, st_cd: str, proposed_dt: Optional[date],
     # a later submission whose value differs from the previous latest.
     changed = proposed_dt is not None and prev is not None and proposed_dt != prev
 
-    # Record a history row ONLY for the baseline (first) or a genuine change —
-    # re-sharing the same date does not add a history entry (just bumps counts).
-    if is_first or changed:
+    # Record a history row ONLY when an opening date is actually given AND it's
+    # the baseline (first) or a genuine change. A share with NO date (blank →
+    # cancel signal) or an unchanged re-share does not add a history entry.
+    if proposed_dt is not None and (is_first or changed):
         conn.execute(text(f"""
             INSERT INTO {DHIST} (st_cd, proposed_opening_dt, share_dt, changed,
                                  prev_proposed_dt, source, note, changed_by)
@@ -254,18 +266,21 @@ def _record_date_event(conn, st_cd: str, proposed_dt: Optional[date],
         # latest_share_dt tracks the share date of the CURRENT proposed value, so it
         # only advances on the baseline or a genuine change — an unchanged re-share
         # still counts toward date_given_count but must NOT move the share date.
+        # latest_share_dt tracks the share date of the CURRENT proposed value: it
+        # advances on a genuine change, or on a blank share (:pblank — no date given,
+        # i.e. a cancel signal), but NOT on an unchanged re-share.
         conn.execute(text(f"""
             UPDATE {HEAD} SET
                 first_proposed_dt = COALESCE(first_proposed_dt, :p),
                 latest_proposed_dt = CASE WHEN :chinc=1 AND :p IS NOT NULL THEN :p ELSE latest_proposed_dt END,
                 first_share_dt = COALESCE(first_share_dt, :sh),
-                latest_share_dt = CASE WHEN :chinc=1 AND :sh IS NOT NULL THEN :sh ELSE latest_share_dt END,
+                latest_share_dt = CASE WHEN :sh IS NOT NULL AND (:chinc=1 OR :pblank=1) THEN :sh ELSE latest_share_dt END,
                 date_given_count = date_given_count + CASE WHEN :p IS NOT NULL THEN 1 ELSE 0 END,
                 date_change_count = date_change_count + :chinc,
                 updated_at = GETDATE()
             WHERE st_cd = :s"""),
             {"s": st_cd, "p": proposed_dt, "sh": share_dt,
-             "chinc": 1 if changed else 0})
+             "chinc": 1 if changed else 0, "pblank": 1 if proposed_dt is None else 0})
     return {"changed": changed, "recorded": (is_first or changed) and proposed_dt is not None}
 
 
@@ -396,23 +411,30 @@ def save_store(st_cd: str, proposed_opening_dt: Any = None, share_dt: Any = None
         _apply_layout_outcome(c, st_cd, outcome)
         if outcome.get("status_priority") is not None:
             _apply_priority(c, st_cd, outcome["status_priority"])
-        # Auto-reactivate: a freshly given/changed proposed date revives a dormant
-        # store (CANCELLED / HOLD / unset) back to ACTIVE — unless this same call
-        # explicitly set a status, or the store is already OPENED.
-        if dres["recorded"] and outcome.get("status") is None:
-            cur = (_get_head(c, st_cd) or {}).get("status")
-            if cur not in ("ACTIVE", "OPENED"):
-                reactivated = _record_status_event(c, st_cd, "ACTIVE", user, "auto-date")
+        # Auto status from the share (only when this call didn't set a status):
+        #  • shared WITHOUT an opening date  → auto-CANCELLED (no date given).
+        #  • a freshly given/changed date    → auto-ACTIVE (revive a dormant store,
+        #    e.g. one previously cancelled/held/unset). OPENED is left as-is.
+        auto_status = None
+        if outcome.get("status") is None:
+            if sh is not None and p is None:
+                auto_status = "CANCELLED" if _record_status_event(c, st_cd, "CANCELLED", user, "auto-noshare") else None
+            elif dres["recorded"]:
+                cur = (_get_head(c, st_cd) or {}).get("status")
+                if cur not in ("ACTIVE", "OPENED"):
+                    auto_status = "ACTIVE" if _record_status_event(c, st_cd, "ACTIVE", user, "auto-date") else None
     return {"st_cd": st_cd, "date_changed": dres["changed"],
             "remark_changed": remark_changed, "status_changed": status_changed,
-            "reactivated": reactivated}
+            "auto_status": auto_status}
 
 
 def ingest_upload(file_bytes: bytes, user: Optional[str] = None) -> Dict[str, Any]:
-    """Ingest an uploaded workbook. ALL three columns are mandatory
-    (case/space-insensitive): ST_CD, PROPOSED_OPENING_DATE (/ OP_DATE / BGT_OP_DT),
-    SHARE_DATE (/ DATE_OF_SHARING). Any row missing one is rejected. Remarks are
-    NOT ingested — they are added in the UI after review."""
+    """Ingest an uploaded workbook. Columns (case/space-insensitive): ST_CD,
+    PROPOSED_OPENING_DATE (/ OP_DATE / BGT_OP_DT), SHARE_DATE (/ DATE_OF_SHARING) —
+    all three must exist. Per row: ST_CD + SHARE_DATE are required;
+    PROPOSED_OPENING_DATE may be blank → the store shared with no date is
+    auto-CANCELLED (a date given auto-reactivates it to ACTIVE). Remarks are NOT
+    ingested — they are added in the UI after review."""
     ensure_tables()
     df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     # normalise headers → snake keys
@@ -438,18 +460,21 @@ def ingest_upload(file_bytes: bytes, user: Optional[str] = None) -> Dict[str, An
         raise ValueError("Upload is missing mandatory column(s): " + ", ".join(missing_cols)
                          + ". Download the template.")
 
-    processed = changed = created = skipped = 0
+    processed = changed = created = skipped = cancelled = 0
     errors: List[str] = []
+    seen: set = set()          # every valid store code present in this upload
     for i, r in df.iterrows():
         st_cd = str(r.get(c_st) or "").strip().upper()
         if not st_cd or st_cd in ("NAN", "NONE"):
             skipped += 1
             continue
-        # all three columns are mandatory per row
+        seen.add(st_cd)
+        # ST_CD + SHARE_DATE are mandatory per row. PROPOSED_OPENING_DATE may be
+        # blank — a store shared on a date WITHOUT an opening date is a cancel
+        # signal (auto-set to CANCELLED); a date given (re)activates it.
         p, sh = _to_date(r.get(c_op)), _to_date(r.get(c_sh))
-        row_missing = [n for n, v in (("PROPOSED_OPENING_DATE", p), ("SHARE_DATE", sh)) if v is None]
-        if row_missing:
-            errors.append(f"row {int(i) + 2} ({st_cd}): missing {', '.join(row_missing)}")
+        if sh is None:
+            errors.append(f"row {int(i) + 2} ({st_cd}): missing SHARE_DATE")
             continue
         try:
             existed = get_head_exists(st_cd)
@@ -460,11 +485,38 @@ def ingest_upload(file_bytes: bytes, user: Optional[str] = None) -> Dict[str, An
                 created += 1
             if res["date_changed"]:
                 changed += 1
+            if res.get("auto_status") == "CANCELLED":
+                cancelled += 1
         except Exception as e:
             errors.append(f"{st_cd}: {e}")
+    # Each upload is the full current schedule: active stores absent from it were
+    # not given a date this share → auto-cancel. Guarded on a non-empty upload.
+    absent_cancelled = _cancel_absent(seen, user) if seen else 0
     return {"rows": int(len(df)), "processed": processed, "created": created,
-            "changed": changed, "skipped": skipped,
+            "changed": changed, "cancelled": cancelled + absent_cancelled,
+            "absent_cancelled": absent_cancelled, "skipped": skipped,
             "errors": errors[:50], "error_count": len(errors)}
+
+
+def _cancel_absent(present: set, user: Optional[str]) -> int:
+    """Auto-cancel every currently-ACTIVE tracked store that is NOT in `present`
+    (the set of store codes in the latest upload). Treats each upload as the full
+    current schedule — a store dropped from it was 'not given a date' → CANCELLED.
+    Leaves OPENED / HOLD / already-CANCELLED stores alone. Never runs on an empty
+    upload (guarded by the caller)."""
+    n = 0
+    with data_engine.begin() as c:
+        rows = c.execute(text(
+            f"SELECT st_cd, status, actual_open_dt FROM {HEAD} "
+            f"WHERE (status IS NULL OR status='ACTIVE')")).fetchall()
+        for st_cd, status, ao in rows:
+            if st_cd in present:
+                continue
+            if ao is not None:          # opened stores are terminal, don't cancel
+                continue
+            if _record_status_event(c, st_cd, "CANCELLED", user, "auto-absent"):
+                n += 1
+    return n
 
 
 def get_head_exists(st_cd: str) -> bool:
@@ -478,6 +530,64 @@ def delete_store(st_cd: str) -> None:
     with data_engine.begin() as c:
         for t in (RHIST, DHIST, SHIST, HEAD):
             c.execute(text(f"DELETE FROM {t} WHERE st_cd=:s"), {"s": st_cd})
+
+
+def compare_master() -> Dict[str, Any]:
+    """Reconcile the tracked schedule against the store master's UPC set.
+    • missing = master UPC stores NOT in the tracker (budgeted but not scheduled)
+    • extra   = tracked stores that are NOT a current UPC store in the master
+                (not in master at all, or master status != UPC)."""
+    ensure_tables()
+    with data_engine.connect() as c:
+        missing = c.execute(text(f"""
+            SELECT m.ST_CD AS st_cd, m.ST_NM AS site_name, m.RDC AS rdc, m.HUB AS hub, m.OP_DT AS op_dt
+            FROM {MASTER} m
+            WHERE m.ST_STATUS = 'UPC'
+              AND NOT EXISTS (SELECT 1 FROM {HEAD} h WHERE h.st_cd = m.ST_CD)
+            ORDER BY m.ST_CD""")).mappings().all()
+        extra = c.execute(text(f"""
+            SELECT h.st_cd AS st_cd, m.ST_NM AS site_name, m.ST_STATUS AS master_status
+            FROM {HEAD} h
+            LEFT JOIN {MASTER} m ON m.ST_CD = h.st_cd
+            WHERE m.ST_CD IS NULL OR m.ST_STATUS <> 'UPC'
+            ORDER BY h.st_cd""")).mappings().all()
+        upc_total = c.execute(text(f"SELECT COUNT(*) FROM {MASTER} WHERE ST_STATUS='UPC'")).scalar() or 0
+        tracked_total = c.execute(text(f"SELECT COUNT(*) FROM {HEAD}")).scalar() or 0
+    return {
+        "upc_master_total": upc_total,
+        "tracked_total": tracked_total,
+        "missing": [{"st_cd": r["st_cd"], "site_name": r["site_name"], "rdc": r["rdc"],
+                     "hub": r["hub"], "op_dt": _iso(r["op_dt"])} for r in missing],
+        "extra": [{"st_cd": r["st_cd"], "site_name": r["site_name"],
+                   "master_status": r["master_status"] or "(not in master)"} for r in extra],
+        "missing_count": len(missing), "extra_count": len(extra),
+    }
+
+
+def reset_all() -> Dict[str, Any]:
+    """Wipe ALL module-owned data (head + date/remark/status history) and reset
+    identity seeds to 0 (fresh start). Does NOT touch the external sources (store
+    master, grid, product view) — including the priorities already written to
+    Master_ALC_INPUT_ST_MASTER.MANUAL_ST_PRIORITY. Idempotent."""
+    ensure_tables()
+    tables = [HEAD, DHIST, RHIST, SHIST]
+    removed: Dict[str, int] = {}
+    for t in tables:
+        with data_engine.connect() as c:
+            removed[t] = c.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0
+        try:
+            # TRUNCATE clears rows AND reseeds identity to 0 (true "from 0").
+            with data_engine.begin() as c:
+                c.execute(text(f"TRUNCATE TABLE {t}"))
+        except Exception:
+            # fallback where TRUNCATE isn't permitted: DELETE + reseed identity.
+            with data_engine.begin() as c:
+                c.execute(text(f"DELETE FROM {t}"))
+                try:
+                    c.execute(text(f"DBCC CHECKIDENT ('{t}', RESEED, 0)"))
+                except Exception:
+                    pass
+    return {"cleared": removed, "total": sum(removed.values())}
 
 
 def compact_history() -> Dict[str, Any]:
@@ -556,7 +666,10 @@ def _grid_agg_cte(segments=DEFAULT_SEG) -> str:
     segments (APP/GM by default), via the MASTER_PRODUCT MAJ_CAT→SEG map."""
     segs = _clean_segments(segments)
     inlist = ", ".join(f"'{s}'" for s in segs)   # segs validated → safe to inline
-    sloc = ", ".join(f"SUM(g.[{src}]) AS trend_{key}" for key, src in SLOC_COLS.items())
+    # bracket-quote the source col (many start with a digit / contain odd chars)
+    # and use a positional alias so ANY column name is safe downstream.
+    sloc = ", ".join(f"SUM(g.[{col}]) AS [sloc_{i}]"
+                     for i, col in enumerate(_sloc_cols()))
     return f"""
     WITH seg_cats AS (
         SELECT DISTINCT MAJ_CAT FROM {MPROD} WHERE SEG IN ({inlist})
@@ -614,7 +727,8 @@ def _derive(row: dict) -> dict:
 
 def list_stores(segments=DEFAULT_SEG) -> List[Dict[str, Any]]:
     ensure_tables()
-    sloc_sel = ", ".join(f"g.trend_{key}" for key in SLOC_COLS)
+    sloc_cols = _sloc_cols()
+    sloc_sel = ", ".join(f"g.[sloc_{i}]" for i in range(len(sloc_cols)))
     sql = _grid_agg_cte(segments) + f"""
         SELECT h.*,
                m.ST_NM AS site_name, m.RDC AS rdc, m.HUB AS hub,
@@ -644,7 +758,7 @@ def list_stores(segments=DEFAULT_SEG) -> List[Dict[str, Any]]:
     for r in rows:
         r = dict(r)
         d = _derive(r)
-        sloc = {key: _num(r.get(f"trend_{key}")) for key in SLOC_COLS}
+        sloc = {col: _num(r.get(f"sloc_{i}")) for i, col in enumerate(sloc_cols)}
         out.append({
             "st_cd": r["st_cd"],
             "site_name": r.get("site_name"),
@@ -807,10 +921,11 @@ def template_bytes() -> bytes:
 
     notes = pd.DataFrame([
         ["ST_CD", "Yes", "Store code. Must exist in the store master; identity (name/RDC/hub) is filled automatically."],
-        ["PROPOSED_OPENING_DATE", "Yes", "Currently budgeted opening date. Each upload with a NEW value is recorded as a date change."],
-        ["SHARE_DATE", "Yes", "Date this opening date was shared/given. Drives the 'date given' timeline."],
+        ["PROPOSED_OPENING_DATE", "Optional", "Currently budgeted opening date. New value → recorded as a change & the store is set ACTIVE. LEAVE BLANK to signal no date given this share → the store is auto-set to CANCELLED."],
+        ["SHARE_DATE", "Yes", "Date this row was shared/given. Mandatory on every row."],
         ["", "", ""],
-        ["All columns mandatory", "", "Every row must have ST_CD + PROPOSED_OPENING_DATE + SHARE_DATE. Rows missing any are rejected."],
+        ["Required per row", "", "ST_CD + SHARE_DATE. PROPOSED_OPENING_DATE may be blank (= cancel this store)."],
+        ["Auto status", "", "Each upload = the full current schedule. Date given → ACTIVE (reactivates a cancelled/held store); blank date → CANCELLED; any ACTIVE store NOT in this upload → auto-CANCELLED (opened stores are kept)."],
         ["Date format", "", "YYYY-MM-DD (e.g. 2026-07-22) or DD-MM-YYYY (e.g. 22-07-2026)."],
         ["Header aliases", "", "PROPOSED_OPENING_DATE = OP_DATE / BGT_OP_DT; SHARE_DATE = DATE_OF_SHARING. Case/spaces ignored."],
         ["Remarks", "", "NOT uploaded here — add remarks per store in the UI after review."],

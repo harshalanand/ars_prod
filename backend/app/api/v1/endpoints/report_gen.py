@@ -275,15 +275,15 @@ def run_report_now(report_id: int, current_user: User = Depends(get_current_user
 
 @router.post("/reports/{report_id}/cancel", response_model=APIResponse)
 def cancel_report_run(report_id: int, current_user: User = Depends(get_current_user)):
-    """Stop a running report — interrupts the in-flight query and marks the run
+    """Stop a running report — terminates its worker process and marks the run
     cancelled. No-op if the report isn't currently running."""
-    from app.services.report_engine import cancel_report
-    run_ids = cancel_report(report_id)
-    if run_ids:
-        logger.info(f"[report-gen] cancel requested for report {report_id}, runs {run_ids}")
-        return APIResponse(success=True, message=f"Cancelling run(s) {run_ids}",
-                           data={"run_ids": run_ids})
-    # No in-process run — clear any STALE 'running' rows (orphaned by a restart).
+    # Reports run as separate worker processes; cancel = terminate that process
+    # (which also marks the run 'cancelled'). Falls back to clearing stale rows.
+    if report_scheduler.cancel_running(report_id):
+        logger.info(f"[report-gen] cancel requested for report {report_id} (worker terminated)")
+        return APIResponse(success=True, message="Cancelling run",
+                           data={"report_id": report_id})
+    # No live worker in this process — clear any STALE 'running' rows.
     engine = get_data_engine()
     with engine.begin() as conn:
         res = conn.execute(text(f"""
@@ -520,7 +520,8 @@ def get_events(current_user: User = Depends(get_current_user)):
 
 @router.get("/status", response_model=APIResponse)
 def scheduler_status(current_user: User = Depends(get_current_user)):
-    from app.services.report_engine import active_run_report_ids
+    # Reports run in separate worker PROCESSES now — the live set comes from the
+    # scheduler's process table, not the (per-process) in-memory token registry.
     data = dict(report_scheduler.status)
-    data["running_report_ids"] = active_run_report_ids()
+    data["running_report_ids"] = report_scheduler.active_report_ids()
     return APIResponse(success=True, data=data)

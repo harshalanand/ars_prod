@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     DB_POOL_PRE_PING: bool = True
 
     DB_TEMPDB_CLEANUP_INTERVAL_MINUTES: int = 5
+    # Cleanup cadence: "weekly_sunday_midnight" (default since 2026-08-01 —
+    # one cleanup per week, Sunday 00:00 local) or "interval" (legacy: every
+    # DB_TEMPDB_CLEANUP_INTERVAL_MINUTES). The 5-min interval caused DBCC
+    # SHRINKFILE convoys behind long-running jobs (2026-08-01 gridlock).
+    DB_TEMPDB_CLEANUP_SCHEDULE: str = "weekly_sunday_midnight"
     DB_TEMPDB_ORPHAN_AGE_MINUTES: int = 15   # More room for long MSA runs
     # Aggressive shrink triggers when total tempdb size exceeds this (MB)
     DB_TEMPDB_AGGRESSIVE_THRESHOLD_MB: int = 20480      # 20 GB
@@ -75,7 +80,10 @@ class Settings(BaseSettings):
     # Master switch. When True, the auto_free_space_middleware schedules a
     # post-job cleanup (CHECKPOINT + log shrink + tempdb truncate) after any
     # successful POST/PUT to a path containing one of AUTO_FREE_PATHS.
-    AUTO_FREE_AFTER_JOB: bool = True
+    # Default OFF since 2026-08-01 — tempdb cleanup is now weekly (Sunday
+    # 00:00, see DB_TEMPDB_CLEANUP_SCHEDULE); per-job shrinks piled into a
+    # DBCC convoy behind long-running jobs. Re-enable via env if needed.
+    AUTO_FREE_AFTER_JOB: bool = False
     AUTO_FREE_METHODS: list = ["POST", "PUT"]
     # Substring match against request.url.path. Cheap, no regex overhead,
     # easy to tune from app_settings.json without touching code.

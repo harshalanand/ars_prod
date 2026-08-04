@@ -104,7 +104,19 @@ def _sf_credentials() -> Dict[str, Any]:
 
 
 def _connect():
-    """Open a Snowflake connection. Raises a clear error if unavailable."""
+    """Open a Snowflake connection. Raises a clear error if unavailable.
+
+    Prefers the single app-wide config (Settings → Snowflake via
+    snowflake_config_service) — which supports key-pair auth and is shared with
+    the SAP module — and falls back to the legacy app_settings.snowflake below.
+    """
+    try:
+        from app.services import snowflake_config_service as sfc
+        if sfc.is_enabled():
+            return sfc.connect(require_enabled=True)
+    except Exception as e:
+        logger.warning(f"[snowflake] shared config connect failed, using legacy creds: {e}")
+
     try:
         import snowflake.connector  # noqa
     except ImportError as e:

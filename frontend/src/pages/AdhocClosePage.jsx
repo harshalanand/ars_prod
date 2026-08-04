@@ -26,6 +26,24 @@ const C = {
 
 const EMPTY_ROW = { rdc: '', st_cd: '', article_number: '', reason: '' }
 
+/* FastAPI `detail` is not always a string — the blank-ST_CD guard on
+ * /pend-alc/close-rows returns an OBJECT ({detail, wildcard_rows,
+ * wildcard_count}). Passing that straight to toast.error() made React throw
+ * "Objects are not valid as a React child"; because <Toaster> lives at the
+ * app root (main.jsx), outside every ErrorBoundary, the throw unmounted the
+ * whole app — the page just went blank. Always coerce to a string. */
+function errText(e, fallback) {
+  const d = e?.response?.data?.detail
+  if (typeof d === 'string' && d.trim()) return d
+  if (d && typeof d === 'object') {
+    const inner = typeof d.detail === 'string' ? d.detail : null
+    const n = d.wildcard_count
+    if (inner) return n ? `${inner} (${n} key(s) affected)` : inner
+  }
+  if (typeof e?.message === 'string' && e.message) return e.message
+  return fallback
+}
+
 function parseCsv(text) {
   const lines = text.trim().split('\n')
   if (lines.length < 2) return []
@@ -120,17 +138,33 @@ export default function AdhocClosePage() {
       toast.error('Add at least one row with RDC + ARTICLE_NUMBER')
       return
     }
+    // Blank ST_CD = close EVERY store for that (RDC, ARTICLE). The backend
+    // refuses such rows unless confirm_close_all_stores is set, so ask for
+    // that consent here and pass the flag — without it the request always
+    // 400s and the feature simply cannot be used store-wildcard.
+    const wildcardRows = validRows.filter(r => !r.st_cd?.trim())
     if (!confirm(
       `Adhoc-close ${validRows.length} key(s)?\n\n` +
       `This will set IS_CLOSED=1 on every matching open PEND_ALC row ` +
       `and cancel any STATUS='OPEN' BDC history rows. Revertable from ` +
       `the Operations Log.`
     )) return
+    if (wildcardRows.length && !confirm(
+      `⚠ ${wildcardRows.length} row(s) have a BLANK store code (ST_CD).\n\n` +
+      `Those will close the article across ALL stores for the given RDC, ` +
+      `not just one store:\n` +
+      wildcardRows.slice(0, 10)
+        .map(r => `   • RDC ${r.rdc.trim()} · article ${r.article_number.trim()}`)
+        .join('\n') +
+      (wildcardRows.length > 10 ? `\n   … and ${wildcardRows.length - 10} more` : '') +
+      `\n\nContinue?`
+    )) return
 
     setSubmitting(true); setResult(null)
     try {
       const { data } = await pendAlcAPI.closeRows({
         reason: globalReason.trim() || null,
+        confirm_close_all_stores: wildcardRows.length > 0,
         rows: validRows.map(r => ({
           rdc:            r.rdc.trim(),
           article_number: r.article_number.trim(),
@@ -145,7 +179,7 @@ export default function AdhocClosePage() {
       )
       clearAll()
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'Adhoc close failed')
+      toast.error(errText(e, 'Adhoc close failed'))
     } finally {
       setSubmitting(false)
     }
@@ -159,10 +193,28 @@ export default function AdhocClosePage() {
       : `Submit ${file.name} for adhoc close?`
     if (!confirm(`${msg}\n\nRevertable from the Operations Log.`)) return
 
+    // Same blank-ST_CD consent as the row editor. fileRows is populated by
+    // the CSV preview parser; when it's null (e.g. an .xlsx the browser
+    // can't preview) we can't count wildcards up-front, so opt in and let
+    // the backend's own guard + audit log be the record.
+    const wildcardCount = fileRows
+      ? fileRows.filter(r => !String(r.st_cd ?? '').trim()).length
+      : null
+    if (wildcardCount && !confirm(
+      `⚠ ${wildcardCount} row(s) in ${file.name} have a BLANK store code (ST_CD).\n\n` +
+      `Those close the article across ALL stores for the given RDC, ` +
+      `not just one store.\n\nContinue?`
+    )) return
+    if (wildcardCount === null && !confirm(
+      `Store codes in ${file.name} could not be previewed.\n\n` +
+      `Any row with a blank ST_CD will close the article across ALL stores ` +
+      `for its RDC. Continue?`
+    )) return
+
     setSubmitting(true); setResult(null)
     try {
       const { data } = await pendAlcAPI.closeRowsFile(
-        file, globalReason.trim() || null
+        file, globalReason.trim() || null, wildcardCount !== 0
       )
       setResult(data)
       toast.success(
@@ -172,7 +224,7 @@ export default function AdhocClosePage() {
       setFile(null); setFileRows(null)
       if (fileRef.current) fileRef.current.value = ''
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'File upload failed')
+      toast.error(errText(e, 'File upload failed'))
     } finally {
       setSubmitting(false)
     }

@@ -64,10 +64,26 @@ Two columns, both = count of `(GEN_ART, CLR)` OPTs whose `SUM(FNL_Q) > 50`, per 
 - **`CL_OPT_CNT_>50_PCS`** — from the live `ARS_MSA_TOTAL` table (no `SESSION_ID` column) = **closing** MSA after consumption.
 - Verified DW01/M_JEANS: OP=156, CL=155.
 
+### OPT MBQ per category (2026-08-01)
+Column `MJ_PER_OPT_MBQ` = **per-OPT minimum purchase quantity** from grid:
+```
+MJ_PER_OPT_MBQ = ACS_D + (SAL_PD × ALC_D)
+```
+where **ACS_D** (accessories density = one OPT display qty) and **ALC_D** are MAJ_CAT-constant from the grid row; **SAL_PD** (per-day sales, 2dp) is the grid's daily velocity metric, not the per-OPT SALE (which was not category-constant). On secondary grids, MJ_PER_OPT_MBQ is **dim-level** (one row per category+dimension, not per individual OPT). Used by allocation to size each option's minimum take.
+
+### OPT Status pivot (2026-08-01 — dynamic columns)
+**NEW:** Runtime-built pivot columns from `ARS_LISTING_WORKING_HISTORY` distinct `OPT_STATUS` values (grow/shrink automatically):
+- `CNT_<STATUS>` — count of distinct (GEN_ART, CLR) in that status; grain = (WERKS, MAJ_CAT[, dim])
+- `ALCQ_<STATUS>` — sum of ALLOC_QTY by status
+- Status vocabulary: **NL** (not listed), **RL** (regular live), **WRL** (watch-list live), **TBL** (table live), **L** (new/report-only), **MIX** (mixed post-alloc)
+
+**Gotcha:** OPT_STATUS was added to `ARS_LISTING_WORKING_HISTORY` via `ALTER TABLE` + backfilled 3.29M rows from the latest live session (deduplicated). Future runs auto-carry it via the parked-history column introspection (_reconcile_parked/_history_columns) — no code change. On dim-split grids, an OPT with NULL/unmapped dim (e.g., NULL RNG_SEG) counts at base MAJ_CAT but not in the dim view (e.g., base CNT_MIX=75, sum of dims=74 → 1 OPT with NULL RNG_SEG). Expected, not a bug — **must be explained to users**. Related: [[Listing OPT_TYPE + OPT_STATUS classification]].
+
 ### Grain rules (important)
 - `MSA_OP_Q` / `MSA_CL_Q` / `OP_OPT_CNT_>50_PCS` / `CL_OPT_CNT_>50_PCS` are **RDC+MAJ_CAT totals** (repeated per store/dim — **do NOT SUM** across stores/dim) and are **dimension-split on secondary grids** via `pdim` (article→dim mapping). No FRESH/GRT filter.
 - `ALC_Q` / `HOLD_ALC_Q` / `ALC_FROM_HOLD_Q` / `ART_EXCESS_QTY` (from listing) are **store-level**, **dimension-split** on secondary grids and reconcile to the base-grid MAJ_CAT total.
 - `HOLD_*` are **store-level**. On a **secondary grid** they are **split by the grid dimension** and reconcile to the MAJ_CAT total.
+- `MJ_PER_OPT_MBQ` and `CNT_*/ALCQ_*` (OPT Status) are **dimension-level on secondary grids**, NOT summed across dims — each row is one dim's view.
 
 ### Hold movement
 `opening = closing − added_today + consumed_today`, where

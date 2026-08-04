@@ -68,6 +68,58 @@ BEGIN
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_NAME = @GridTable;
 
+    -- ── OPT_STATUS pivot (dynamic CNT_/ALCQ_ per status) ──────────────────────
+    -- Sourced from ARS_LISTING_WORKING_HISTORY (latest session). Column set is
+    -- built at runtime from the distinct OPT_STATUS values, so it grows/shrinks.
+    DECLARE @sid NVARCHAR(50) = (SELECT MAX(SESSION_ID) FROM ARS_LISTING_HISTORY WITH (NOLOCK));
+    DECLARE @statAgg NVARCHAR(MAX), @statOut NVARCHAR(MAX),
+            @statFrag NVARCHAR(MAX) = N'', @statOutFrag NVARCHAR(MAX) = N'', @statJoin NVARCHAR(MAX) = N'';
+
+    IF COL_LENGTH('ARS_LISTING_WORKING_HISTORY', 'OPT_STATUS') IS NOT NULL
+    BEGIN
+        SELECT
+          @statAgg = STRING_AGG(CAST(
+              'COUNT(DISTINCT CASE WHEN OPT_STATUS=''' + REPLACE(v, '''', '''''')
+            + ''' THEN CAST(GEN_ART_NUMBER AS NVARCHAR(50))+''|''+ISNULL(CLR,'''') END) AS ' + QUOTENAME('CNT_' + v)
+            + ', SUM(CASE WHEN OPT_STATUS=''' + REPLACE(v, '''', '''''')
+            + ''' THEN ISNULL(ALLOC_QTY,0) ELSE 0 END) AS ' + QUOTENAME('ALCQ_' + v)
+            AS NVARCHAR(MAX)), ', '),
+          @statOut = STRING_AGG(CAST(
+              'ISNULL(stat.' + QUOTENAME('CNT_' + v)  + ',0) AS ' + QUOTENAME('CNT_' + v)
+            + ', ISNULL(stat.' + QUOTENAME('ALCQ_' + v) + ',0) AS ' + QUOTENAME('ALCQ_' + v)
+            AS NVARCHAR(MAX)), ', ')
+        FROM (SELECT DISTINCT OPT_STATUS AS v FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK)
+              WHERE SESSION_ID = @sid AND OPT_STATUS IS NOT NULL) s;
+    END
+
+    IF @statAgg IS NOT NULL AND LEN(@statAgg) > 0
+    BEGIN
+        DECLARE @statBody NVARCHAR(MAX) =
+            CASE WHEN @DimCol IS NULL OR @lstDim = 0 THEN
+                N'stat AS (
+    SELECT WERKS, MAJ_CAT, ' + @statAgg + N'
+    FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK)
+    WHERE SESSION_ID = (SELECT SESSION_ID FROM sid) AND (@pMC IS NULL OR MAJ_CAT = @pMC)
+      AND (@pW IS NULL OR WERKS = @pW)
+    GROUP BY WERKS, MAJ_CAT
+)'
+            ELSE
+                N'stat AS (
+    SELECT WERKS, MAJ_CAT, ' + @qd + N' AS DIMV, ' + @statAgg + N'
+    FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK)
+    WHERE SESSION_ID = (SELECT SESSION_ID FROM sid) AND (@pMC IS NULL OR MAJ_CAT = @pMC)
+      AND (@pW IS NULL OR WERKS = @pW)
+    GROUP BY WERKS, MAJ_CAT, ' + @qd + N'
+)' END;
+        SET @statFrag    = N',
+' + @statBody;
+        SET @statOutFrag = N',
+    ' + @statOut;
+        SET @statJoin    = N'
+LEFT JOIN stat ON stat.WERKS = g.WERKS AND stat.MAJ_CAT = g.MAJ_CAT'
+            + CASE WHEN @DimCol IS NOT NULL AND @lstDim = 1 THEN N' AND stat.DIMV = g.' + @qd ELSE N'' END;
+    END
+
     -- ── dimension-aware CTE fragments (base form when @DimCol IS NULL) ─────────
     -- pdim: one dimension value per variant article, from product master.
     DECLARE @pdimCTE NVARCHAR(MAX) = CASE WHEN @DimCol IS NULL THEN N'' ELSE
@@ -87,6 +139,7 @@ pdim AS (
            ISNULL(SUM(FROM_HOLD_QTY),0) AS ALC_FROM_HOLD_Q, SUM(ART_EXCESS) AS ART_EXCESS_QTY
     FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK)
     WHERE SESSION_ID = (SELECT SESSION_ID FROM sid) AND (@pMC IS NULL OR MAJ_CAT = @pMC)
+      AND (@pW IS NULL OR WERKS = @pW)
     GROUP BY WERKS, MAJ_CAT
 )'
       ELSE
@@ -96,6 +149,7 @@ pdim AS (
            ISNULL(SUM(FROM_HOLD_QTY),0) AS ALC_FROM_HOLD_Q, SUM(ART_EXCESS) AS ART_EXCESS_QTY
     FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK)
     WHERE SESSION_ID = (SELECT SESSION_ID FROM sid) AND (@pMC IS NULL OR MAJ_CAT = @pMC)
+      AND (@pW IS NULL OR WERKS = @pW)
     GROUP BY WERKS, MAJ_CAT, ' + @qd + N'
 )' END;
 
@@ -182,6 +236,7 @@ pdim AS (
     SELECT WERKS, MAJ_CAT, SUM(HOLD_QTY) AS HOLD_QTY, SUM(ISNULL(FROM_HOLD_QTY,0)) AS from_hold
     FROM ARS_ALLOC_HISTORY WITH (NOLOCK)
     WHERE SESSION_ID = (SELECT SESSION_ID FROM sid) AND (@pMC IS NULL OR MAJ_CAT = @pMC)
+      AND (@pW IS NULL OR WERKS = @pW)
     GROUP BY WERKS, MAJ_CAT
 )'
       ELSE
@@ -233,7 +288,7 @@ prod AS (
     SELECT MAJ_CAT, MAX(SEG) AS SEG, MAX(DIV) AS DIV, MAX(SUB_DIV) AS SUB_DIV, MAX(SSN) AS SSN
     FROM vw_master_product WITH (NOLOCK)
     GROUP BY MAJ_CAT
-)
+)' + @statFrag + N'
 SELECT
     ISNULL(s.ST_NM, '''')       AS STORE_NAME,
     ISNULL(s.RDC, '''')         AS RDC,
@@ -255,7 +310,8 @@ SELECT
     ISNULL(hold.CLOSE_REM, 0) - ISNULL(hmov.HOLD_QTY, 0) + ISNULL(hmov.from_hold, 0) AS HOLD_OPEN_REM,
     ISNULL(hmov.from_hold, 0)                          AS HOLD_CONSUMED_TODAY,
     ISNULL(hmov.HOLD_QTY, 0)                           AS HOLD_ADDED_TODAY,
-    ISNULL(hold.CLOSE_REM, 0)                          AS HOLD_CLOSE_REM
+    ISNULL(hold.CLOSE_REM, 0)                          AS HOLD_CLOSE_REM,
+    ISNULL(g.ACS_D,0) + ISNULL(g.SAL_PD,0) * ISNULL(g.ALC_D,0) AS MJ_PER_OPT_MBQ' + @statOutFrag + N'
 FROM ' + QUOTENAME(@GridTable) + N' g WITH (NOLOCK)
 LEFT JOIN MASTER_ALC_INPUT_ST_MASTER s WITH (NOLOCK) ON s.ST_CD = g.WERKS
 LEFT JOIN lst         ON lst.WERKS = g.WERKS AND lst.MAJ_CAT = g.MAJ_CAT' + @dLst + N'
@@ -265,7 +321,7 @@ LEFT JOIN opt_gt50_op ON opt_gt50_op.RDC = s.RDC AND opt_gt50_op.MAJ_CAT = g.MAJ
 LEFT JOIN opt_gt50_cl ON opt_gt50_cl.RDC = s.RDC AND opt_gt50_cl.MAJ_CAT = g.MAJ_CAT' + REPLACE(@dDim, N'{a}', N'opt_gt50_cl') + N'
 LEFT JOIN hmov        ON hmov.WERKS = g.WERKS AND hmov.MAJ_CAT = g.MAJ_CAT' + REPLACE(@dDim, N'{a}', N'hmov') + N'
 LEFT JOIN hold        ON hold.WERKS = g.WERKS AND hold.MAJ_CAT = g.MAJ_CAT' + REPLACE(@dDim, N'{a}', N'hold') + N'
-LEFT JOIN prod   p ON p.MAJ_CAT = g.MAJ_CAT' + @where + N'
+LEFT JOIN prod   p ON p.MAJ_CAT = g.MAJ_CAT' + @statJoin + @where + N'
 ORDER BY s.RDC, s.HUB, g.WERKS, g.MAJ_CAT
 OPTION (RECOMPILE);';
 

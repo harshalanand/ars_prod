@@ -59,16 +59,54 @@ class AuthService:
         user.last_login = datetime.now(timezone.utc)
         self.db.commit()
 
+        # ── Session registry (2026-07-31) ──────────────────────────────
+        # Every login gets a server-side session row keyed by a fresh jti
+        # that rides inside both tokens. get_current_user honours a token
+        # only while its session row is active → sessions are revocable.
+        # Business rule SEC_SINGLE_LOGIN (Settings module): ACTIVE = a new
+        # login kills the user's other sessions (single-login); INACTIVE
+        # (default) = unlimited concurrent logins (legacy behavior).
+        import uuid
+        from app.models.rbac import UserSession
+        jti = uuid.uuid4().hex
+        try:
+            single_login = False
+            try:
+                from app.services.business_rules import rule_flag
+                single_login = rule_flag('SEC_SINGLE_LOGIN', False)
+            except Exception:
+                pass  # rules table unreachable → legacy multi-login
+            if single_login:
+                killed = (self.db.query(UserSession)
+                          .filter(UserSession.user_id == user.id,
+                                  UserSession.is_active == True)  # noqa: E712
+                          .update({"is_active": False,
+                                   "revoked_by": "SINGLE_LOGIN",
+                                   "revoked_at": datetime.now(timezone.utc)},
+                                  synchronize_session=False))
+                if killed:
+                    logger.info(f"[auth] single-login: revoked {killed} prior "
+                                f"session(s) of {user.username}")
+            self.db.add(UserSession(user_id=user.id, username=user.username,
+                                    jti=jti, ip_address=ip_address))
+            self.db.commit()
+        except Exception as _serr:
+            # Session bookkeeping must never block a login.
+            logger.warning(f"[auth] session row create failed: {_serr}")
+            try: self.db.rollback()
+            except Exception: pass
+
         # Build token payload
         token_data = {
             "sub": user.username,
             "user_id": user.id,
             "roles": user.role_codes,
             "permissions": list(user.permissions),
+            "jti": jti,
         }
 
         access_token = create_access_token(token_data)
-        refresh_token = create_refresh_token({"sub": user.username, "user_id": user.id})
+        refresh_token = create_refresh_token({"sub": user.username, "user_id": user.id, "jti": jti})
 
         # Audit login
         self.audit.log(
@@ -100,16 +138,46 @@ class AuthService:
         if not user:
             raise ValueError("User not found")
 
+        # Session check: a refresh token carrying a jti is only honoured
+        # while its session row is still active (revoked / single-login
+        # displaced sessions cannot be resurrected via refresh). Legacy
+        # refresh tokens without a jti pass through and get a session.
+        from app.models.rbac import UserSession
+        jti = payload.get("jti")
+        if jti:
+            try:
+                sess = (self.db.query(UserSession)
+                        .filter(UserSession.jti == jti).first())
+                if sess is not None and not sess.is_active:
+                    raise ValueError("Session terminated — please log in again")
+                if sess is not None:
+                    sess.last_seen = datetime.now(timezone.utc)
+                    self.db.commit()
+            except ValueError:
+                raise
+            except Exception as _serr:
+                logger.warning(f"[auth] refresh session check failed: {_serr}")
+        else:
+            import uuid
+            jti = uuid.uuid4().hex
+            try:
+                self.db.add(UserSession(user_id=user.id, username=user.username, jti=jti))
+                self.db.commit()
+            except Exception:
+                try: self.db.rollback()
+                except Exception: pass
+
         token_data = {
             "sub": user.username,
             "user_id": user.id,
             "roles": user.role_codes,
             "permissions": list(user.permissions),
+            "jti": jti,
         }
 
         return TokenResponse(
             access_token=create_access_token(token_data),
-            refresh_token=create_refresh_token({"sub": user.username, "user_id": user.id}),
+            refresh_token=create_refresh_token({"sub": user.username, "user_id": user.id, "jti": jti}),
             expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
             user=self._to_user_response(user),
         )
@@ -386,7 +454,40 @@ def seed_permissions_if_needed(db: Session):
         ("View Store SLOC Validation", "STORE_SLOC_VIEW", "validation", "READ", "store_sloc"),
     ]
 
+    # ── Module-access permissions (2026-07-31) ───────────────────────────
+    # One MOD_* permission per sidebar FATHER MENU. Granting/revoking a
+    # single MOD_* shows/hides that whole module for a role — the coarse
+    # switch that makes user handover easy; the fine-grained permissions
+    # above still gate individual pages/actions inside a module.
+    # AUTO-UPDATE: adding a module = one line here + `permission:` on the
+    # sidebar section; this seed runs on every startup, grants new MOD_*
+    # to ALL existing active roles (visibility-preserving migration) —
+    # superadmin then unticks per role in Settings → Roles.
+    MODULE_PERMISSIONS = [
+        ("Module: ARS Dashboard",      "MOD_ARS_DASHBOARD"),
+        ("Module: Alloc Review",       "MOD_ALC_REVIEW"),
+        ("Module: Data Management",    "MOD_DATA_MGMT"),
+        ("Module: Listing & Alloc",    "MOD_LISTING_ALLOC"),
+        ("Module: GRT ALC",            "MOD_GRT_ALC"),
+        ("Module: Adhoc",              "MOD_ADHOC"),
+        ("Module: Contribution %",     "MOD_CONTRIB"),
+        ("Module: Auto Cont %",        "MOD_AUTO_CONT"),
+        ("Module: ALC_Fixture",        "MOD_ALC_FIXTURE"),
+        ("Module: Trends",             "MOD_TRENDS"),
+        ("Module: Reports",            "MOD_REPORTS"),
+        ("Module: SAP",                "MOD_SAP"),
+        ("Module: FA & CONS",          "MOD_FA_CONS"),
+        ("Module: Pending Allocation", "MOD_PEND_ALC"),
+        ("Module: Data Validation",    "MOD_DATA_VALIDATION"),
+        ("Module: Project Tracker",    "MOD_PROJECT_TRACKER"),
+        ("Module: Training Manual",    "MOD_TRAINING"),
+        ("Module: Settings",           "MOD_SETTINGS"),
+    ]
+    for mname, mcode in MODULE_PERMISSIONS:
+        ALL_PERMISSIONS.append((mname, mcode, "module_access", "READ", "module"))
+
     added = 0
+    new_module_perm_codes = []
     for name, code, module, action, resource in ALL_PERMISSIONS:
         exists = db.query(Permission).filter(Permission.permission_code == code).first()
         if not exists:
@@ -395,6 +496,8 @@ def seed_permissions_if_needed(db: Session):
                 module=module, action=action, resource=resource,
             ))
             added += 1
+            if module == "module_access":
+                new_module_perm_codes.append(code)
 
     if added:
         db.commit()
@@ -411,5 +514,26 @@ def seed_permissions_if_needed(db: Session):
                     db.add(RolePermission(role_id=super_role.id, permission_id=p.id, granted_by="SYSTEM"))
             db.commit()
             logger.info("Assigned new permissions to SUPER_ADMIN")
+
+        # Visibility-preserving migration: a BRAND-NEW MOD_* permission is
+        # granted to ALL active roles once, so no module disappears for
+        # anyone the day the module gate lands. Restricting is then a
+        # deliberate untick per role in Settings → Roles. (Runs only for
+        # perms created in THIS startup — never re-grants after an admin
+        # revokes.)
+        if new_module_perm_codes:
+            roles = db.query(Role).filter(Role.is_active == True).all()  # noqa: E712
+            mod_perms = db.query(Permission).filter(
+                Permission.permission_code.in_(new_module_perm_codes)).all()
+            for role in roles:
+                have = {rp.permission_id for rp in
+                        db.query(RolePermission).filter(RolePermission.role_id == role.id).all()}
+                for p in mod_perms:
+                    if p.id not in have:
+                        db.add(RolePermission(role_id=role.id, permission_id=p.id,
+                                              granted_by="SYSTEM_MODULE_SEED"))
+            db.commit()
+            logger.info(f"Granted {len(new_module_perm_codes)} new MOD_* permissions "
+                        f"to all {len(roles)} active roles (visibility-preserving)")
     else:
         logger.info("All permissions already seeded")

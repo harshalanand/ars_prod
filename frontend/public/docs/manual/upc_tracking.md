@@ -133,10 +133,18 @@ Each store carries a **status**: `ACTIVE` (default — still being tracked),
 `OPENED`, `HOLD`, or `CANCELLED` (Reject/Cancel). It can be changed **inline
 from the table** (the Status column is a dropdown — no need to open Edit) or from
 the Edit form. Choosing **OPENED** prompts for the **actual open date** (defaults
-to today) so it is always captured. **Auto-reactivation**: when a *new/changed*
-proposed date arrives for a dormant store (CANCELLED / HOLD / unset), it flips
-back to **ACTIVE** automatically (recorded in status history as `auto-date`) —
-re-sharing the same date does not. Every change is **recorded as an event** in
+to today) so it is always captured. **Auto status from a share** — each upload is treated as the **full current
+schedule** (when no status is set explicitly):
+- a **new/changed** proposed date → **ACTIVE** (`auto-date`, reactivates a
+  dormant store); re-sharing the same date does nothing;
+- a store **shared with a blank opening date** → **CANCELLED** (`auto-noshare`);
+- any currently-**ACTIVE** store **NOT present in the upload** → **CANCELLED**
+  (`auto-absent`) — it wasn't given a date this share. **OPENED** stores are kept.
+
+So upload the complete schedule each time — dropped stores auto-cancel. Rows need
+only `ST_CD` + `SHARE_DATE`. The **reconcile-vs-master** card (below the tiles)
+shows **Missing** (UPC stores in the master not scheduled) and **Extra** (tracked
+stores that aren't a current UPC store in the master). Every change is **recorded as an event** in
 `ARS_UPC_STORE_TRACK_STATUS_HIST` (from-status → to-status, who, when) and shown
 in the store's detail drawer under *Status history*. Status affects the delay
 logic: only **ACTIVE** stores past their latest budgeted date are flagged

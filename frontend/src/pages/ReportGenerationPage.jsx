@@ -36,7 +36,7 @@ const EMPTY_FORM = {
 
 const statusColor = (s) => ({
   completed: C.green, failed: C.red, running: C.primary,
-  skipped: C.amber, cancelled: C.amber, pending: C.textMuted,
+  partial: C.amber, skipped: C.amber, cancelled: C.amber, pending: C.textMuted,
 }[s] || C.textMuted)
 
 const statusIcon = (s, size = 12) => {
@@ -44,6 +44,7 @@ const statusIcon = (s, size = 12) => {
   if (s === 'running') return <Loader2 size={size} style={st} className="spin" />
   if (s === 'completed') return <CheckCircle size={size} style={st} />
   if (s === 'failed') return <AlertTriangle size={size} style={st} />
+  if (s === 'partial') return <AlertTriangle size={size} style={st} />
   if (s === 'cancelled') return <Square size={size} style={st} />
   return <Clock size={size} style={st} />
 }
@@ -1171,7 +1172,7 @@ const statusPill = (s) => ({
   color: statusColor(s),
   background: s === 'completed' ? C.greenBg : s === 'failed' ? C.redBg
     : s === 'running' ? C.primaryLight
-    : (s === 'skipped' || s === 'cancelled') ? C.amberBg : C.grayBg,
+    : (s === 'partial' || s === 'skipped' || s === 'cancelled') ? C.amberBg : C.grayBg,
 })
 
 const DeliverChip = ({ active, icon, label, onClick }) => (

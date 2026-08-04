@@ -71,6 +71,14 @@ PROCESS_POOL_MIN_MAJCATS = 3
 
 OPT_TYPE_ORDER = ["RL", "TBC", "TBL"]
 POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
+
+# Post-pass PAK_SZ rounding (in-memory `_apply_pak_sz_rounding_df` + SQL
+# `_stage_d_apply_pak_sz_rounding`). RETIRED 2026-08-01: both rounded SHIP up
+# to a whole pak WITHOUT checking the pool, which shipped stock that did not
+# exist. Pack conversion now happens once, in-band, inside the per-OPT engine
+# where the live pool is known (50% rule + MIN against pool). Flip to True
+# only to restore the legacy sweeps for a side-by-side comparison.
+ENABLE_POST_PASS_PAK_ROUNDING = False
 OPT_KEYS  = ["WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
 
 # Per-OPT is the ONLY band engine (2026-07-10 removal — see
@@ -146,6 +154,11 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     skip_hold_upc      = bool(_extras[8])  if len(_extras) > 8  else False
     apply_hold_seg_app = bool(_extras[9])  if len(_extras) > 9  else True
     apply_hold_seg_gm  = bool(_extras[10]) if len(_extras) > 10 else True
+    # _extras[11..13] (27th–29th elements) — post-TBL hold release + retry
+    # (Option B, 2026-07-31). Missing → defaults (0.6 / 18 / enabled).
+    stock_threshold_pct    = float(_extras[11]) if len(_extras) > 11 else 0.6
+    default_acs_d          = float(_extras[12]) if len(_extras) > 12 else 18.0
+    tbl_hold_release_retry = bool(_extras[13])  if len(_extras) > 13 else True
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
@@ -226,6 +239,9 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
             sec_cap_grid_specs=sec_cap_grid_specs,
             rl_dispatch_mode=rl_dispatch_mode,
             tbc_dispatch_mode=tbc_dispatch_mode,
+            stock_threshold_pct=stock_threshold_pct,
+            default_acs_d=default_acs_d,
+            tbl_hold_release_retry=tbl_hold_release_retry,
             matrix_enabled=matrix_enabled,
             matrix_bands=matrix_bands,
             alloc_type=alloc_type,
@@ -443,6 +459,11 @@ def _stage_d_apply_pak_sz_rounding(conn, alloc_table: str) -> None:
     row is gated to 0 and marked SKIPPED. POOL_CONSUMED is adjusted by the
     same delta so the FNL_Q_REM recompute downstream refunds (or charges)
     the pool correctly."""
+    # RETIRED 2026-08-01 — same reason as _apply_pak_sz_rounding_df: rounds
+    # SHIP up to a whole pak with no reference to FNL_Q / remaining pool. The
+    # per-OPT engine now owns pack conversion (50% rule + MIN against pool).
+    if not ENABLE_POST_PASS_PAK_ROUNDING:
+        return
     try:
         run_sql(conn, f"ALTER TABLE [{alloc_table}] ADD [ALLOC_REMARKS] NVARCHAR(MAX) NULL")
     except Exception:
@@ -561,6 +582,16 @@ def run_listing_and_allocation_pandas(
     skip_hold_upc: bool = False,
     apply_hold_seg_app: bool = True,
     apply_hold_seg_gm: bool = True,
+    # ── Post-TBL hold release + retry (Option B, 2026-07-31) ──
+    # After the TBL waterfall completes in a MAJ_CAT, options that shipped
+    # but did NOT reach display cover (STK_TTL + Σ SHIP < stock_threshold_pct
+    # × ACS_D) release their warehouse HOLD_QTY back into the live pool, and
+    # ONE extra TBL pass runs so still-hungry options (e.g. POOL_EMPTY) can
+    # consume the freed pieces in the SAME run. All gates/caps re-apply on
+    # the retry. Part 8.55 (post-run release) stays as the safety net.
+    stock_threshold_pct: float = 0.6,
+    default_acs_d: float = 18.0,
+    tbl_hold_release_retry: bool = True,
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -846,6 +877,13 @@ def run_listing_and_allocation_pandas(
             bool(skip_hold_upc),
             bool(apply_hold_seg_app),
             bool(apply_hold_seg_gm),
+            # 27th–29th elements — post-TBL hold release + retry (Option B).
+            # Cover threshold inputs mirror Part 3.6/8.5 classification; the
+            # flag gates the whole release+retry block. Missing → defaults
+            # (0.6 / 18 / enabled) in the worker's unpack.
+            float(stock_threshold_pct),
+            float(default_acs_d),
+            bool(tbl_hold_release_retry),
         )
         for mc in alloc_groups
     ]
@@ -1527,6 +1565,10 @@ def _select_working_cols(conn, working_table, grids) -> List[str]:
         'WERKS', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR',
         'OPT_TYPE', 'OPT_PRIORITY_RANK', 'LISTED_FLAG',
         'ALLOC_STATUS', 'ALLOC_REMARKS', 'ACS_D',
+        # Option-level store stock — needed by the post-TBL hold-release
+        # cover check (STK_TTL + Σ SHIP < thr × ACS_D). Note the suffix scan
+        # below only catches '<prefix>_STK_TTL', not the plain column.
+        'STK_TTL',
         'MSA_FNL_Q_REM', 'PRI_CT_REM',
         # MAJ_CAT-level store aggregates — used by the MBQ cap in _run_band
         'MJ_MBQ', 'MJ_STK_TTL', 'MJ_REQ', 'MJ_REQ_REM',
@@ -1672,6 +1714,10 @@ def _run_majcat_waterfall(
     skip_hold_upc: bool = False,
     apply_hold_seg_app: bool = True,
     apply_hold_seg_gm: bool = True,
+    # Post-TBL hold release + retry (Option B, 2026-07-31).
+    stock_threshold_pct: float = 0.6,
+    default_acs_d: float = 18.0,
+    tbl_hold_release_retry: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run RL → TBC → TBL waterfall in pandas for one MAJ_CAT slice.
@@ -1877,6 +1923,135 @@ def _run_majcat_waterfall(
                 f"[C-pd] {ot} round={r}/{max_round} — "
                 f"ship={int(alloc_df.loc[ot_mask,'SHIP_QTY'].sum())} "
                 f"hold={int(alloc_df.loc[ot_mask,'HOLD_QTY'].sum())}"
+            )
+
+    # ── Post-TBL hold release + ONE retry pass (Option B, 2026-07-31) ──
+    # A TBL option that shipped but did NOT reach display cover
+    # (STK_TTL + Σ SHIP < stock_threshold_pct × ACS_D — the same test
+    # Part 8.5 uses to stamp OPT_STATUS='MIX') will have its warehouse
+    # hold released by Part 8.55 after the run anyway; doing it HERE, while
+    # pool_dict is still live, lets ONE extra TBL pass hand the freed
+    # pieces to still-hungry options (POOL_EMPTY sizes) in the SAME run.
+    #
+    # Safety properties:
+    #   - all gates re-apply on the retry (R07, MJ_REQ gate, MBQ caps,
+    #     sec-cap, dispatch modes) — the band is simply called once more;
+    #   - a released option cannot re-take its own pieces as hold:
+    #     POOL_CONSUMED is NOT decremented, so its need_pool stays spent;
+    #   - its covered sizes have need_ship = 0, so no re-ship either;
+    #   - ONE pass only — holds created BY the retry are not re-examined
+    #     here (Part 8.55 remains the post-run safety net).
+    if (
+        tbl_hold_release_retry
+        and 'TBL' in active_ot
+        and working_df is not None and not working_df.empty
+        and 'STK_TTL' in working_df.columns
+        and 'ACS_D' in working_df.columns
+    ):
+        try:
+            _thr = float(stock_threshold_pct or 0.6)
+            _dacs = float(default_acs_d or 18.0)
+            tbl_mask = (alloc_df['OPT_TYPE'] == 'TBL')
+            held = tbl_mask & (
+                pd.to_numeric(alloc_df['HOLD_QTY'], errors='coerce')
+                  .fillna(0.0) > 0.0
+            )
+            if held.any():
+                def _okey(df):
+                    return list(zip(
+                        df['WERKS'].astype(str),
+                        df['GEN_ART_NUMBER'].astype(str),
+                        df['CLR'].fillna('').astype(str),
+                    ))
+                # Per-option ship total (post-waterfall) from the alloc rows.
+                _ship = (
+                    alloc_df.loc[tbl_mask]
+                    .assign(_k=lambda d: _okey(d))
+                    .groupby('_k', observed=True)['SHIP_QTY'].sum()
+                )
+                # Option-level stock + cover need from the working slice.
+                _w = working_df.drop_duplicates(
+                    subset=['WERKS', 'GEN_ART_NUMBER', 'CLR']
+                )
+                _wk = _okey(_w)
+                _stk = dict(zip(_wk, pd.to_numeric(
+                    _w['STK_TTL'], errors='coerce').fillna(0.0)))
+                _acs = pd.to_numeric(_w['ACS_D'], errors='coerce').fillna(0.0)
+                _g = dict(zip(_wk, np.where(_acs > 0, _acs, _dacs) * _thr))
+                uncovered = {
+                    k for k, s in _ship.items()
+                    if (_stk.get(k, 0.0) + float(s)) < _g.get(k, _thr * _dacs)
+                }
+                rel_keys = pd.Series(_okey(alloc_df), index=alloc_df.index)
+                rel_mask = held & rel_keys.isin(uncovered)
+                released_pcs = float(
+                    pd.to_numeric(
+                        alloc_df.loc[rel_mask, 'HOLD_QTY'], errors='coerce'
+                    ).fillna(0.0).sum()
+                )
+                if released_pcs > 0:
+                    # 1) credit the freed pieces back into the LIVE pool
+                    for pk, qty in (
+                        alloc_df.loc[rel_mask]
+                        .groupby(POOL_KEYS, sort=False, observed=True)['HOLD_QTY']
+                        .sum().items()
+                    ):
+                        pool_dict[pk] = float(pool_dict.get(pk, 0.0)) + float(qty)
+                    # 2) audit stamp + zero the hold on the released rows
+                    _rq = pd.to_numeric(
+                        alloc_df.loc[rel_mask, 'HOLD_QTY'], errors='coerce'
+                    ).fillna(0.0).astype(int).astype(str)
+                    alloc_df.loc[rel_mask, 'ALLOC_REMARKS'] = (
+                        alloc_df.loc[rel_mask, 'ALLOC_REMARKS'].fillna('')
+                        + ';HOLD_RELEASED_NOT_COVERED(' + _rq + ')'
+                    )
+                    alloc_df.loc[rel_mask, 'HOLD_QTY'] = 0.0
+                    alloc_df.loc[rel_mask, 'ROUND_HOLD'] = 0.0
+                    # 3) ONE retry pass over still-hungry TBL options,
+                    #    highest priority first, every gate live.
+                    alloc_df.loc[tbl_mask, 'ROUND_SHIP'] = 0.0
+                    alloc_df.loc[tbl_mask, 'ROUND_HOLD'] = 0.0
+                    _rebuild_mj_req_rem_dict()
+                    mbq_budget = (
+                        _live_mbq_budget(working_df, eff_tbl_cap)
+                        if eff_tbl_cap > 0 and has_working else {}
+                    )
+                    _pre_ship = float(alloc_df.loc[tbl_mask, 'SHIP_QTY'].sum())
+                    from app.services.rule_engine_per_opt import _run_band_per_opt
+                    _run_band_per_opt(alloc_df, pool_dict, 'TBL', 1,
+                                      mbq_budget=mbq_budget,
+                                      hold_dict=hold_dict,
+                                      size_threshold=size_threshold,
+                                      min_size_count=min_size_count,
+                                      mj_req_rem_dict=mj_req_rem_dict,
+                                      tbl_mj_req_cap_pct=tbl_mj_req_cap_pct,
+                                      sec_cap_state=sec_cap_state,
+                                      rl_dispatch_mode=rl_dispatch_mode,
+                                      tbc_dispatch_mode=tbc_dispatch_mode,
+                                      alloc_type=alloc_type,
+                                      skip_hold_upc=skip_hold_upc,
+                                      apply_hold_seg_app=apply_hold_seg_app,
+                                      apply_hold_seg_gm=apply_hold_seg_gm)
+                    if revalidate_enabled:
+                        _revalidate_after_band(
+                            alloc_df, working_df, grids, 'TBL', 1,
+                            pri_ct_check_rl=pri_ct_check_rl,
+                            pri_ct_check_tbc=pri_ct_check_tbc,
+                        )
+                    _retry_ship = (
+                        float(alloc_df.loc[tbl_mask, 'SHIP_QTY'].sum())
+                        - _pre_ship
+                    )
+                    logger.info(
+                        f"[C-pd] TBL hold-release retry — "
+                        f"released {released_pcs:.0f} pcs from "
+                        f"{len(uncovered)} uncovered OPTs back to pool; "
+                        f"retry re-shipped {_retry_ship:.0f} pcs"
+                    )
+        except Exception as _hrerr:
+            logger.warning(
+                f"[C-pd] TBL hold-release retry failed (non-fatal, "
+                f"Part 8.55 will release post-run): {_hrerr}"
             )
 
     return alloc_df, working_df
@@ -2542,6 +2717,13 @@ def _apply_pak_sz_rounding_df(alloc_df: pd.DataFrame) -> pd.DataFrame:
         ALLOC_REMARKS is rewritten to match the post-PAK SHIP (or
         dropped entirely when the row is gated to 0), then a
         PAK_SZ_GATE/PAK_SZ_ROUND audit marker is appended."""
+    # RETIRED 2026-08-01 — see ENABLE_POST_PASS_PAK_ROUNDING. The per-OPT
+    # engine now does the 50% pack conversion in-band and MINs it against the
+    # live pool (rule_engine_per_opt 5e/5g), so this blind sweep can only do
+    # harm: it re-rounds already-final rows with no knowledge of the pool and
+    # shipped phantom stock (pool 3 → SHIP 6 on DW01/1241092244001).
+    if not ENABLE_POST_PASS_PAK_ROUNDING:
+        return alloc_df
     if 'PAK_SZ' not in alloc_df.columns:
         return alloc_df
     if 'SHIP_QTY' not in alloc_df.columns:
