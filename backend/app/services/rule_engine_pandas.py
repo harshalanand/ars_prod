@@ -544,6 +544,9 @@ def run_listing_and_allocation_pandas(
     size_threshold: float = 0.6,
     min_size_count: int = 3,
     tbl_trivial_factor: float = 0.5,
+    # FS-10 / BR-16 — R05 tests the full I_ROD entitlement (OPT_REQ_ROD)
+    # instead of one round (OPT_REQ_WH). Must match the listing Part 6.6 gate.
+    use_irod_eligibility: bool = False,
     pri_ct_check_rl:  bool = False,
     pri_ct_check_tbc: bool = False,
     rl_mbq_cap_pct:  float = 0.0,
@@ -640,6 +643,7 @@ def run_listing_and_allocation_pandas(
                 rl_mbq_cap_pct=rl_mbq_cap_pct,
                 tbc_mbq_cap_pct=tbc_mbq_cap_pct,
                 tbl_mbq_cap_pct=tbl_mbq_cap_pct,
+                use_irod_eligibility=use_irod_eligibility,
             )
             rne._stage_a_assign_tier(conn, working_table)
             rne._stage_a_assign_rank(conn, working_table)
@@ -1158,9 +1162,20 @@ def run_listing_and_allocation_pandas(
                              - ISNULL(SZ_STK,0) <= 0
                          THEN 'ALREADY_STOCKED'
                     -- Split NO_POOL_OR_DEMAND so users can tell demand-side
-                    -- (SZ_REQ<=0 → no demand) from supply-side (MSA pool empty).
+                    -- (no requirement) from supply-side (MSA pool empty).
+                    -- FS-10: the demand test uses the I_ROD target, NOT the
+                    -- single-round SZ_REQ. With I_ROD-aware admission an option
+                    -- can legitimately have SZ_REQ=0 in round 1 and real demand
+                    -- in round 2; testing SZ_REQ would label a pool-starved row
+                    -- 'NO_REQ' and send reviewers after demand instead of
+                    -- supply. Demand-side rows are already caught by the
+                    -- ALREADY_STOCKED arm above, so anything reaching here with
+                    -- SHIP=0 is a supply problem → NO_POOL_MSA.
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                         AND ISNULL(SZ_REQ, 0) <= 0 THEN 'NO_REQ'
+                         AND CASE WHEN OPT_TYPE='TBL'
+                                  THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                                  ELSE ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0) END
+                             - ISNULL(SZ_STK,0) <= 0 THEN 'NO_REQ'
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_MSA'
                     ELSE SKIP_REASON END
             OPTION (MAXDOP 1)
@@ -2018,7 +2033,14 @@ def _run_majcat_waterfall(
                     )
                     _pre_ship = float(alloc_df.loc[tbl_mask, 'SHIP_QTY'].sum())
                     from app.services.rule_engine_per_opt import _run_band_per_opt
+                    # FS-11: this is NOT round 1 — it is a single extra pass
+                    # after the real rounds finished. It re-enters the band
+                    # with r=1 only to reuse the round-1 need formula, so it
+                    # carries its own wave label; the band's MAX() rule stops
+                    # it lowering a genuine round-2 stamp, and its no-op visits
+                    # no longer restamp anything at all.
                     _run_band_per_opt(alloc_df, pool_dict, 'TBL', 1,
+                                      wave_label='TBL_RETRY',
                                       mbq_budget=mbq_budget,
                                       hold_dict=hold_dict,
                                       size_threshold=size_threshold,

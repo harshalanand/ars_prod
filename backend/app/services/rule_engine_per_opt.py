@@ -767,6 +767,12 @@ def _run_band_per_opt(
     skip_hold_upc: bool = False,
     apply_hold_seg_app: bool = True,
     apply_hold_seg_gm: bool = True,
+    # ── FS-11: wave label override ──
+    # None → the ordinary "{ot}_R{r}" stamp. The post-TBL hold-release retry
+    # (rule_engine_pandas) is NOT an ordinary round — it re-enters this band
+    # with r=1 after the real rounds have finished, so it passes 'TBL_RETRY'
+    # to keep its shipments distinguishable from genuine round-1 ones.
+    wave_label: Optional[str] = None,
 ) -> None:
     """
     Per-OPT replacement for rule_engine_pandas._run_band.
@@ -1459,8 +1465,34 @@ def _run_band_per_opt(
         alloc_df.loc[opt_idx, 'ROUND_HOLD'] = round_hold
         alloc_df.loc[opt_idx, 'SHIP_QTY'] = prev_ship + round_ship
         alloc_df.loc[opt_idx, 'HOLD_QTY'] = prev_hold + round_hold
-        alloc_df.loc[opt_idx, 'ALLOC_WAVE'] = f"{ot}_R{r}"
-        alloc_df.loc[opt_idx, 'ALLOC_ROUND'] = float(r)
+
+        # ── FS-11: wave / round stamp ───────────────────────────────────
+        # These two columns are LABELS (overwritten), unlike SHIP_QTY and
+        # POOL_CONSUMED which accumulate. Two rules keep them truthful when a
+        # pass revisits an OPT it gives nothing to — which the post-TBL
+        # hold-release retry does for every TBL OPT in the MAJ_CAT, re-entering
+        # this band with r=1 AFTER the real rounds finished:
+        #   1. stamp only rows that actually moved this pass — a no-op visit
+        #      must not claim credit;
+        #   2. never lower ALLOC_ROUND — take MAX(existing, r), so a retry at
+        #      r=1 can't drag a genuine round-2 stamp back to 1.
+        # Pre-fix symptom (session 20260812_131757_589, HP04/1110116457): sizes
+        # shipped 4+4 across rounds 1 and 2, SHIP_QTY=8 correct, but ALLOC_ROUND
+        # read 1 / ALLOC_WAVE read TBL_R1 because the retry restamped them.
+        # 37 of 332 two-round TBL rows were affected; RL/TBC (no retry) were
+        # always correct.
+        _stamp_moved = (round_ship + round_hold + from_hold) > 0
+        if _stamp_moved.any():
+            _stamp_idx = opt_idx[_stamp_moved]
+            alloc_df.loc[_stamp_idx, 'ALLOC_WAVE'] = (
+                wave_label if wave_label else f"{ot}_R{r}"
+            )
+            _prev_round = pd.to_numeric(
+                alloc_df.loc[_stamp_idx, 'ALLOC_ROUND'], errors='coerce'
+            ).fillna(0.0).to_numpy()
+            alloc_df.loc[_stamp_idx, 'ALLOC_ROUND'] = np.maximum(
+                _prev_round, float(r)
+            )
         if ot in ('RL', 'TBC') and from_hold.any():
             prev_fh = alloc_df.loc[opt_idx, 'FROM_HOLD_QTY'].fillna(0.0).to_numpy()
             alloc_df.loc[opt_idx, 'FROM_HOLD_QTY'] = prev_fh + from_hold

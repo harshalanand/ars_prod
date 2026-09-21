@@ -39,6 +39,13 @@ RULE_R08_MJ_REQ_BOOSTED   = False  # DEPRECATED: merged into unified R09 below (
 RULE_R09_TBL_TRIVIAL      = True   # Unified headroom check for ALL OPT_TYPEs
                                     # ((cap × MJ_MBQ) − MJ_STK_TTL − ALLOC_QTY) < 0.5 × ACS_D → SKIP
 
+# FS-10 / BR-16 — source column for R05. False = legacy single-round test on
+# OPT_REQ_WH. True = full I_ROD entitlement (OPT_REQ_ROD), so an option stocked
+# for one round but short of its I_ROD rounds still enters the waterfall. This
+# is the module-level kill switch; the per-run override arrives as the
+# use_irod_eligibility argument and must match the listing Part 6.6 gate.
+RULE_R05_USE_IROD         = False
+
 ENABLE_FOCUS_TIERING      = True
 ENABLE_STORE_BROKEN       = True   # MJ_REQ_REM < factor × ACS_D → skip store in opt_type
 ENABLE_GRID_OVERFLOW      = False
@@ -68,6 +75,9 @@ def run_listing_and_allocation(
     size_threshold: float = 0.6,
     min_size_count: int = 3,
     tbl_trivial_factor: float = 0.5,
+    # FS-10 / BR-16 — R05 tests the full I_ROD entitlement (OPT_REQ_ROD) instead
+    # of a single round (OPT_REQ_WH). Must match the listing Part 6.6 gate.
+    use_irod_eligibility: bool = False,
     pri_ct_check_rl: bool = False,   # apply PRI_CT%>=100 gate to RL? Default False = MBQ-cap mode
     pri_ct_check_tbc: bool = False,  # apply PRI_CT%>=100 gate to TBC? Default False = MBQ-cap mode
     rl_mbq_cap_pct: float = 0.0,     # when pri_ct_check_rl=False, cap RL at X% of MJ_MBQ
@@ -150,7 +160,8 @@ def run_listing_and_allocation(
                          pri_ct_check_tbc=pri_ct_check_tbc,
                          rl_mbq_cap_pct=rl_mbq_cap_pct,
                          tbc_mbq_cap_pct=tbc_mbq_cap_pct,
-                         tbl_mbq_cap_pct=tbl_mbq_cap_pct)
+                         tbl_mbq_cap_pct=tbl_mbq_cap_pct,
+                         use_irod_eligibility=use_irod_eligibility)
     _stage_a_assign_tier(conn, working_table)
     _stage_a_assign_rank(conn, working_table)
     listed_count = _stage_a_materialize_listed(conn, working_table, listed_table)
@@ -308,7 +319,8 @@ def _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
                           pri_ct_check_tbc: bool = False,
                           rl_mbq_cap_pct: float = 0.0,
                           tbc_mbq_cap_pct: float = 0.0,
-                          tbl_mbq_cap_pct: float = 0.0):
+                          tbl_mbq_cap_pct: float = 0.0,
+                          use_irod_eligibility: bool = False):
     """
     Chain every rule into a reason string. LISTED_FLAG=1 iff the chain is empty.
     Rules are guarded by feature flags so the user can turn any off.
@@ -339,7 +351,28 @@ def _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
             "      THEN 'R04_MSA_POS;' ELSE '' END"
         )
     if RULE_R05_REQ_POS:
-        pieces.append("CASE WHEN ISNULL(TRY_CAST([OPT_REQ_WH] AS FLOAT),0) < 1 THEN 'R05_REQ_POS;' ELSE '' END")
+        # FS-10 — requirement column. OPT_REQ_ROD carries the full I_ROD
+        # entitlement (TBL: MBQ_WH + (I_ROD-1)*MBQ − STK; else I_ROD*MBQ − STK),
+        # matching the engine's own per-round target at r = I_ROD. Falls back to
+        # the single-round OPT_REQ_WH when the switch is off or the column is
+        # missing (replays against pre-FS-10 working tables). MUST agree with
+        # the Part 6.6 gate in listing.py — if one admits and the other rejects,
+        # Part 7 silently drops the row on ELIG_FLAG.
+        _req_col = "OPT_REQ_WH"
+        if RULE_R05_USE_IROD or use_irod_eligibility:
+            if "OPT_REQ_ROD" in {c.upper() for c in _cols(conn, working_table)}:
+                _req_col = "OPT_REQ_ROD"
+            else:
+                logger.warning(
+                    "[A] R05: use_irod_eligibility requested but "
+                    f"{working_table}.OPT_REQ_ROD is missing — falling back to "
+                    "OPT_REQ_WH (single round)"
+                )
+        logger.info(f"[A] R05 requirement column = {_req_col}")
+        pieces.append(
+            f"CASE WHEN ISNULL(TRY_CAST([{_req_col}] AS FLOAT),0) < 1 "
+            f"THEN 'R05_REQ_POS;' ELSE '' END"
+        )
     if RULE_R06_PRI_100:
         # Build the list of opt_types that enforce the PRI_CT gate.
         enforced = ["'TBL'"]  # TBL always enforces
@@ -2728,26 +2761,29 @@ def _stage_c_waterfall(conn, alloc_table, working_table=None, grids=None,
                      THEN 'ALREADY_STOCKED'
                 -- Split NO_POOL_OR_DEMAND into the two distinct causes so users
                 -- can tell why the row got nothing: did the store not need stock
-                -- (SZ_REQ<=0 → NO_REQ) or was the MSA pool empty at this size
-                -- (had demand, nothing left to draw → NO_POOL_MSA).
+                -- (NO_REQ) or was the MSA pool empty at this size (had demand,
+                -- nothing left to draw → NO_POOL_MSA).
+                -- FS-10: the demand test is the I_ROD target, NOT the
+                -- single-round SZ_REQ. Under I_ROD-aware admission a row can
+                -- legitimately show SZ_REQ=0 in round 1 and real demand in
+                -- round 2; testing SZ_REQ would label a pool-starved row
+                -- 'NO_REQ' and point reviewers at demand instead of supply.
+                -- Genuinely demand-less rows are already caught by
+                -- ALREADY_STOCKED above, so this arm is unreachable by
+                -- construction and anything left with SHIP=0 is NO_POOL_MSA.
                 WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                     AND ISNULL(SZ_REQ, 0) <= 0 THEN 'NO_REQ'
-                WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_MSA'
-                ELSE SKIP_REASON END,
-            ALLOC_REMARKS = CASE
-                WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                     AND ISNULL(SZ_REQ, 0) <= 0
                      AND CASE WHEN OPT_TYPE='TBL'
                               THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
                               ELSE ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0) END
-                          - ISNULL(SZ_STK,0) > 0
-                     THEN ISNULL(ALLOC_REMARKS,'')
-                          + ' NO_REQ(SZ_REQ=' + CAST(ISNULL(SZ_REQ,0) AS NVARCHAR(20))
-                          + ', SZ_STK=' + CAST(ISNULL(SZ_STK,0) AS NVARCHAR(20))
-                          + ', SZ_MBQ=' + CAST(ISNULL(SZ_MBQ,0) AS NVARCHAR(20))
-                          + ', OPT_MBQ=' + CAST(ISNULL(OPT_MBQ,0) AS NVARCHAR(20)) + ');'
+                          - ISNULL(SZ_STK,0) <= 0 THEN 'NO_REQ'
+                WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_MSA'
+                ELSE SKIP_REASON END,
+            ALLOC_REMARKS = CASE
+                -- FS-10: demand is established by the I_ROD target above, so a
+                -- zeroed row with target > 0 is always a supply story. The old
+                -- SZ_REQ<=0 arm that emitted 'NO_REQ(...)' here is removed — it
+                -- fired on exactly the rows the I_ROD gate now admits.
                 WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                     AND ISNULL(SZ_REQ, 0) > 0
                      AND CASE WHEN OPT_TYPE='TBL'
                               THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
                               ELSE ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0) END

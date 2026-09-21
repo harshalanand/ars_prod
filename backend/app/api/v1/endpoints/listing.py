@@ -57,6 +57,10 @@ _FINAL_KEEP_COLS = {
     # suppression predicate
     "ST_STATUS", "SEG",
     "PER_OPT_SALE", "OPT_MBQ", "OPT_REQ", "OPT_MBQ_WH", "OPT_REQ_WH", "EXCESS_STK",
+    # FS-10: I_ROD-aware requirement. Listed explicitly — the _REQ suffix
+    # pattern below does NOT match a name ending in _ROD, and without it the
+    # column never reaches the working table and both gates read NULL.
+    "OPT_REQ_ROD",
     "ST_RANK", "MAX_DAILY_SALE",
     "FINAL_OPT_TYPE", "ALLOC_BATCH_ID", "ALLOC_TYPE",
     "OPT_TYPE_REASON", "FOCUS_FLAG", "CLR_CAP_MODE", "STR_BOOST_PCT",
@@ -106,6 +110,14 @@ class GenerateRequest(BaseModel):
     # only drives OPT_TYPE classification). Defaults 0.6 to preserve prior behavior
     # — until this was split, R07 silently reused stock_threshold_pct.
     size_threshold: float = 0.6
+    # FS-10 / BR-16 — I_ROD-aware demand gate. False (default) = legacy
+    # single-round test: an option is eligible only when OPT_MBQ_WH − STK_TTL
+    # >= 1. True = test the full I_ROD entitlement (OPT_REQ_ROD), so an option
+    # stocked for one round but short of its I_ROD rounds still enters the
+    # waterfall and receives the later rounds. Drives BOTH gates (listing
+    # Part 6.6 NO_DEMAND and engine Stage A R05_REQ_POS) — they must never
+    # disagree, or Part 7 silently drops rows on ELIG_FLAG.
+    use_irod_eligibility: bool = False
     # PRI_CT% >= 100 gate (R06 + revalidation SKIP_PRI_BROKEN). TBL always enforces.
     # When False, the opt_type is allowed in even if primary grid coverage is < 100%
     # (and the boosted MBQ-cap path is activated instead). Default False — matches
@@ -2348,6 +2360,41 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     THEN ROUND(ISNULL([OPT_MBQ_WH], 0) - ISNULL([STK_TTL], 0), 0)
                     ELSE 0 END
             """)
+
+            # ── FS-10 / BR-16: OPT_REQ_ROD — I_ROD-aware requirement ────
+            # OPT_REQ / OPT_REQ_WH are single-round figures. I_ROD says how
+            # many rounds the store is entitled to, and the engine's per-round
+            # need already honours it at size grain
+            # (rule_engine_per_opt.py:835-841). This column is the OPT-level
+            # mirror of that same target at r = I_ROD, so the eligibility gate
+            # admits exactly the options the waterfall can still ship to.
+            #
+            #   TBL   → OPT_MBQ_WH + (I_ROD − 1) × OPT_MBQ − STK_TTL
+            #   other → I_ROD × OPT_MBQ − STK_TTL
+            #
+            # TBL counts the hold-days buffer ONCE (mirrors per_opt:837) —
+            # I_ROD × OPT_MBQ_WH would multiply hold_days by the round count
+            # and inflate every TBL option. NULLIF(I_ROD,0) treats a missing/
+            # zero I_ROD as one round instead of a negative entitlement.
+            # Safe here: OPT_MBQ/OPT_MBQ_WH are set just above, OPT_TYPE in
+            # Part 3.6 and I_ROD in Part 3.5a.
+            try:
+                _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [OPT_REQ_ROD] FLOAT NULL")
+            except Exception:
+                pass
+            _rod_target = (
+                "CASE WHEN ISNULL([OPT_TYPE], '') = 'TBL' "
+                "     THEN ISNULL([OPT_MBQ_WH], 0) "
+                "          + (ISNULL(NULLIF([I_ROD], 0), 1) - 1) * ISNULL([OPT_MBQ], 0) "
+                "     ELSE ISNULL(NULLIF([I_ROD], 0), 1) * ISNULL([OPT_MBQ], 0) "
+                "END - ISNULL([STK_TTL], 0)"
+            )
+            _run(conn, f"""
+                UPDATE [{LISTING_TABLE}]
+                SET [OPT_REQ_ROD] = CASE
+                    WHEN ({_rod_target}) > 0 THEN ROUND(({_rod_target}), 0)
+                    ELSE 0 END
+            """)
             # MAX_DAILY_SALE — same eff_age branching as the OPT_MBQ rate:
             #   eff_age < threshold → MAX(PER_OPT_SALE, L-7/7, AUTO_GEN_ART_SALE)
             #   else                → MAX(L-7/7, AUTO_GEN_ART_SALE)
@@ -2370,7 +2417,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 SET [MAX_DAILY_SALE] = ROUND({mds_expr}, 3)
             """)
 
-            logger.info(f"Part 4c: OPT_MBQ(ACS_D+ALC_D) + OPT_REQ + OPT_MBQ_WH(hold={hold}d) + OPT_REQ_WH + MAX_DAILY_SALE")
+            logger.info(f"Part 4c: OPT_MBQ(ACS_D+ALC_D) + OPT_REQ + OPT_MBQ_WH(hold={hold}d) "
+                        f"+ OPT_REQ_WH + OPT_REQ_ROD(I_ROD-aware) + MAX_DAILY_SALE")
 
         t0 = _time_step("Part 4c (OPT_MBQ + OPT_REQ + OPT_MBQ_WH + MAX_DAILY_SALE)", t0)
 
@@ -2769,6 +2817,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             _has_msa     = "MSA_FNL_Q"    in elig_cols_upper
             _has_hold    = "RL_HOLD_QTY"  in elig_cols_upper
             _has_req     = "OPT_REQ_WH"   in elig_cols_upper
+            _has_req_rod = "OPT_REQ_ROD"  in elig_cols_upper
             _has_disp    = "MJ_DISP_Q"    in elig_cols_upper
             _has_opttype = "OPT_TYPE"     in elig_cols_upper
             _has_var     = "VAR_COUNT" in elig_cols_upper and "VAR_FNL_COUNT" in elig_cols_upper
@@ -2781,7 +2830,19 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 gate_stock = "ISNULL([MSA_FNL_Q], 0) > 0"
             else:
                 gate_stock = "1=1"
-            gate_demand  = "ISNULL([OPT_REQ_WH], 0) >= 1" if _has_req else "1=1"
+            # FS-10 — demand gate source column. With use_irod_eligibility the
+            # gate tests the full I_ROD entitlement (OPT_REQ_ROD) instead of a
+            # single round (OPT_REQ_WH). Falls back to OPT_REQ_WH whenever the
+            # column is absent, so replays against older listing tables keep
+            # working. MUST stay in lock-step with R05 in rule_engine_new —
+            # a disagreement makes Part 7 drop rows on ELIG_FLAG.
+            _use_rod = bool(getattr(req, "use_irod_eligibility", False)) and _has_req_rod
+            if _use_rod:
+                gate_demand = "ISNULL([OPT_REQ_ROD], 0) >= 1"
+            elif _has_req:
+                gate_demand = "ISNULL([OPT_REQ_WH], 0) >= 1"
+            else:
+                gate_demand = "1=1"
             gate_display = "ISNULL(TRY_CAST([MJ_DISP_Q] AS FLOAT), 0) > 0" if _has_disp else "1=1"
 
             _t = float(req.stock_threshold_pct or 0.6)
@@ -2823,7 +2884,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 f"SELECT [ELIG_REASON], COUNT(*) FROM [{LISTING_TABLE}] GROUP BY [ELIG_REASON]"
             )).fetchall()
             logger.info(
-                f"Part 6.6 eligibility breakdown: "
+                f"Part 6.6 eligibility breakdown "
+                f"[demand gate = {'OPT_REQ_ROD (I_ROD-aware)' if _use_rod else 'OPT_REQ_WH (1 round)'}]: "
                 f"{ {r[0]: r[1] for r in _diag_rows} }"
             )
     except Exception as e:
@@ -3247,6 +3309,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             batch_id=preset_batch_id,
             size_threshold=req.size_threshold,
             min_size_count=req.min_size_count,
+            # FS-10 — must match the Part 6.6 gate above, or Part 7 drops rows.
+            use_irod_eligibility=req.use_irod_eligibility,
             pri_ct_check_rl=req.pri_ct_check_rl,
             pri_ct_check_tbc=req.pri_ct_check_tbc,
             rl_mbq_cap_pct=req.rl_mbq_cap_pct,
@@ -4618,10 +4682,14 @@ def create_final_table(
       - Columns: only identity + calculated outputs (no SLOC stock, no Part 4 grid-prefix)
 
     Optional body params:
-      min_opt_req_wh: float (default 1) — minimum OPT_REQ_WH to include
+      min_opt_req_wh: float (default 1) — minimum requirement to include
       min_msa_fnl_q: float (default 0) — minimum MSA_FNL_Q (> this value)
       extra_keep_cols: list[str] — additional columns to keep beyond defaults
       extra_filters: dict — {column: {op: 'gte'|'gt'|'lte'|'lt'|'eq', value: N}}
+      use_irod_eligibility: bool — FS-10. When true the requirement filter reads
+        OPT_REQ_ROD (full I_ROD entitlement) instead of OPT_REQ_WH (one round),
+        matching the generate-time gate. Defaults to the saved run setting so a
+        manual /create-final does not silently re-drop rows the run admitted.
     """
     import time as _t
     start = _t.time()
@@ -4657,9 +4725,19 @@ def create_final_table(
             where_parts.append(f"ISNULL([MSA_FNL_Q], 0) > :min_fnl")
             params["min_fnl"] = min_fnl_q
 
-        # OPT_REQ_WH >= min_req_wh
-        if "OPT_REQ_WH" in all_upper:
-            where_parts.append(f"ISNULL([OPT_REQ_WH], 0) >= :min_req")
+        # Requirement filter — FS-10. Mirrors the generate-time demand gate:
+        # OPT_REQ_ROD (full I_ROD entitlement) when the run used it, else the
+        # legacy single-round OPT_REQ_WH. Without this the endpoint would
+        # re-drop exactly the rows the I_ROD gate admitted.
+        if "use_irod_eligibility" in body:
+            _cf_use_rod = bool(body.get("use_irod_eligibility"))
+        else:
+            _cf_use_rod = str(
+                _load_listing_settings(conn).get("use_irod_eligibility", "false")
+            ).lower() == "true"
+        _req_col = "OPT_REQ_ROD" if (_cf_use_rod and "OPT_REQ_ROD" in all_upper) else "OPT_REQ_WH"
+        if _req_col in all_upper:
+            where_parts.append(f"ISNULL([{_req_col}], 0) >= :min_req")
             params["min_req"] = min_req_wh
 
         # Extra user-supplied filters
@@ -4693,7 +4771,7 @@ def create_final_table(
 
     return {
         "success": True,
-        "message": f"Final: {row_count:,} rows from {src_count:,} listing (MSA_FNL_Q>{min_fnl_q}, OPT_REQ_WH>={min_req_wh}) in {duration}s",
+        "message": f"Final: {row_count:,} rows from {src_count:,} listing (MSA_FNL_Q>{min_fnl_q}, {_req_col}>={min_req_wh}) in {duration}s",
         "data": {
             "table": FINAL_TABLE,
             "rows": row_count,
@@ -5543,7 +5621,7 @@ def opt_summary(
             "RDC", "GEN_ART_DESC", "OPT_TYPE", "OPT_STATUS", "FINAL_OPT_TYPE",
             "IS_NEW", "I_ROD", "ACS_D", "ALC_D", "MAX_DAILY_SALE",
             "STK_TTL", "EXCESS_STK", "MSA_FNL_Q", "MSA_FNL_Q_REM",
-            "OPT_MBQ", "OPT_REQ", "OPT_REQ_WH",
+            "OPT_MBQ", "OPT_REQ", "OPT_REQ_WH", "OPT_REQ_ROD",
             "MJ_REQ", "MJ_MBQ", "MJ_STK_TTL", "MJ_REQ_REM",
             "PRI_CT%", "PRI_CT_REM", "SEC_CT%",
             "ALLOC_QTY", "HOLD_QTY", "ALLOC_STATUS", "ALLOC_REMARKS",
@@ -5745,7 +5823,7 @@ def sloc_breakdown(
             "CLR_MIN", "CLR_MAX", "FOCUS_W_CAP", "FOCUS_WO_CAP",
             "RL_HOLD_QTY", "MSA_FNL_Q", "VAR_COUNT", "VAR_FNL_COUNT",
             "PER_OPT_SALE", "OPT_MBQ", "OPT_REQ",
-            "OPT_MBQ_WH", "OPT_REQ_WH", "EXCESS_STK",
+            "OPT_MBQ_WH", "OPT_REQ_WH", "OPT_REQ_ROD", "EXCESS_STK",
             "ST_RANK", "MAX_DAILY_SALE",
             "FINAL_OPT_TYPE", "ALLOC_BATCH_ID", "ALLOC_TYPE",
             "OPT_TYPE_REASON", "FOCUS_FLAG", "CLR_CAP_MODE", "STR_BOOST_PCT",

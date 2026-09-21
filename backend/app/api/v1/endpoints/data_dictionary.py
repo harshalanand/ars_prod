@@ -172,6 +172,8 @@ SEED = [
      "ARS_LISTING", "Sales velocity (pieces/day) that feeds the OPT_MBQ demand — this is the true sales-rate term, NOT ACS_D. Picked from the rate ladder: PER_OPT_SALE → last-7-day → AUTO.", "Listing"),
     ("OPT_MBQ_WH / OPT_REQ_WH", "Option MBQ / REQ with warehouse hold", "TBL variant that adds hold_days lookback so the first dispatch parks a warehouse buffer. For RL/TBC the WH value equals the base.",
      "ARS_LISTING", "OPT_MBQ_WH = ROUND(ACS_D + rate×(ALC_D + hold_days_if_TBL), 0); OPT_REQ_WH = MAX(0, OPT_MBQ_WH − STK_TTL)", "Listing"),
+    ("OPT_REQ_ROD", "Option REQ across I_ROD rounds", "FS-10 requirement over the FULL I_ROD entitlement, not one round. Drives the demand gate (ELIG_REASON NO_DEMAND / Stage A R05_REQ_POS) when Use I_ROD eligibility is on. OPT_REQ / OPT_REQ_WH stay single-round.",
+     "ARS_LISTING", "OPT_REQ_ROD = MAX(0, ROUND(CASE WHEN OPT_TYPE='TBL' THEN OPT_MBQ_WH + (I_ROD−1)×OPT_MBQ ELSE I_ROD×OPT_MBQ END − STK_TTL, 0)); I_ROD of 0/NULL counts as 1 round; TBL counts the hold buffer once", "Listing"),
     ("ART_EXCESS", "Article Excess", "Stock above the excess ceiling — surfaced for pull / cross-RDC. 0 for MIX options.",
      "ARS_LISTING", "ART_EXCESS = MAX(0, STK_TTL − excess_multiplier × OPT_MBQ)", "Listing"),
     ("ST_RANK / W_SCORE", "Store Rank / Weighted Score", "Per-MAJ_CAT store priority. W_SCORE blends the REQ and FILL ranks; ST_RANK orders stores by it (manual pins override). Also the cross-MAJ_CAT allocation tiebreaker.",

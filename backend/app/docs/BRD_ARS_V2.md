@@ -375,7 +375,7 @@ All rules are OR'd as exclusion criteria — an option is listed only if **every
 | **R02 — OPT_TYPE Filter** | Exclude MIX (clearance/incomplete) options. | Option | ON | `R02_NOT_MIX` |
 | **R03 — NL Filter** | *Deprecated.* NL filtering moved upstream to OPT_TYPE tagging. | Option | OFF | n/a |
 | **R04 — MSA Availability** | Ship only if MSA has sourced inventory OR prior-run hold exists. | Option | ON | `R04_MSA_POS` |
-| **R05 — Positive Requirement** | Enforce minimum demand (`OPT_REQ_WH ≥ 1`). | Option | ON | `R05_REQ_POS` |
+| **R05 — Positive Requirement** | Enforce minimum demand. Default tests one round (`OPT_REQ_WH ≥ 1`). With **Use I_ROD eligibility** (BR-16/FS-10) it tests the full `I_ROD` entitlement (`OPT_REQ_ROD ≥ 1`), so an option stocked for one round but short of its `I_ROD` rounds still enters the waterfall. | Option | ON | `R05_REQ_POS` |
 | **R06 — Primary Inventory Ceiling** | Gate by primary-supplier ratio (`PRI_CT% ≥ 100`). TBL always enforced; RL/TBC enforcement is config-driven (else they use MBQ-cap instead). | Option | ON (TBL); config (RL/TBC) | `R06_PRI_100` |
 | **R07 — Size Coverage (TBL)** | Skip TBL when size coverage is sparse (`VAR_FNL_COUNT / VAR_COUNT < size_threshold` AND `VAR_FNL_COUNT < min_size_count`). | Option | ON | `R07_VAR_RATIO_TBL` |
 | **R09 — Headroom (TBL only)** | Prevent **TBL** allocation when (store × MAJ_CAT) headroom is trivial: `headroom = tbl_cap × MJ_MBQ − MJ_STK_TTL − ALLOC_QTY_RUNNING`; skip if `< 0.5 × ACS_D`. ACS_D NULL/0 falls back to `default_acs_d` (UI default = 18). RL/TBC are NOT gated by R09 — they rely on MBQ-cap + MJ_REQ-cap post-waterfall. Re-evaluated after each OPT_TYPE waterfall pass when TBL is still upcoming. | (WERKS, MAJ_CAT) | ON | `MJ_REQ < .5 OF ACS_D` |
