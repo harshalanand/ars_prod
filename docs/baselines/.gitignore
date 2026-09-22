@@ -1,0 +1,7 @@
+# Baseline CSVs are large (100s of MB) - keep them local.
+*.csv
+*.csv.gz
+
+# The manifest carries row counts, SHA-256 and per-column numeric sums.
+# That is what V5 compares first, and it IS committed.
+!manifest.json

@@ -1,0 +1,80 @@
+{
+  "session_id": "20260919_125317_275",
+  "label": "own",
+  "captured_at": "2026-09-21T15:29:43",
+  "purpose": "Step 0 regression baseline for V5 (Own/Cross unchanged) \u2014 spec 2026-09-21-central-rdc-pool-allocation-brd-fsd-v1.5.md",
+  "files": [
+    {
+      "table": "ARS_ALLOC_PARKED",
+      "rows": 0,
+      "file": "ARS_ALLOC_PARKED.csv.gz",
+      "sha256": "24ce0e31438dd6b6988d29a0ef1ee775f89a97e18a0052af552f6ad865b21f91",
+      "column_sums": {}
+    },
+    {
+      "table": "ARS_ALLOC_HISTORY",
+      "rows": 1139285,
+      "file": "ARS_ALLOC_HISTORY.csv.gz",
+      "sha256": "bcd67ac01628a8ba0f86784dc39e4cfdcb977c9e9557ab474e9292563f570034",
+      "column_sums": {
+        "ALLOC_FLAG": 1139285.0,
+        "ALLOC_QTY": 496871.0,
+        "ALLOC_ROUND": 131468.0,
+        "ALLOC_SEQ": 6056587518.0,
+        "CONT": 245853.01,
+        "FNL_Q": 130243656.0,
+        "FNL_Q_REM": 111094226.0,
+        "FROM_HOLD_QTY": 908.0,
+        "GEN_ART_NUMBER": 1278237282033812.0,
+        "HOLD_QTY": 0.0,
+        "I_ROD": 1236893.0,
+        "MAX_DAILY_SALE": 313168.224,
+        "MRP": 620413509.0,
+        "M_VND_CD": 229801546857.0,
+        "OPT_MBQ": 20691599.0,
+        "OPT_MBQ_WH": 20691599.0,
+        "OPT_PRIORITY_RANK": 26557999.0,
+        "OPT_PRIORITY_TIER": 3417855.0,
+        "OPT_REQ": 19604989.0,
+        "OPT_REQ_WH": 19604989.0,
+        "PAK_SZ": 1418917.0,
+        "POOL_CONSUMED": 495963.0,
+        "PRI_CT%": 113928500.0,
+        "ROUND_HOLD": 0.0,
+        "ROUND_SHIP": 0.0,
+        "SEC_CT%": 39754788.5,
+        "SHIP_QTY": 496871.0,
+        "ST_RANK": 98451999.0,
+        "SZ_MBQ": 4477636.0,
+        "SZ_MBQ_WH": 4477636.0,
+        "SZ_REQ": 4234400.0,
+        "SZ_REQ_WH": 4234400.0,
+        "SZ_STK": 274881.0
+      }
+    },
+    {
+      "table": "ARS_PEND_ALC",
+      "rows": 124427,
+      "file": "ARS_PEND_ALC.csv.gz",
+      "sha256": "17806d293c71bdb6d5b3f3c6fbb63e6a7abf9f855cb4386269b77c0b064327d5",
+      "column_sums": {
+        "ALLOC_QTY": 496871.0,
+        "BDC_QTY": 0.0,
+        "DO_QTY": 0.0,
+        "PEND_QTY": 496871.0
+      }
+    },
+    {
+      "table": "ARS_NL_TBL_HOLD_TRACKING",
+      "rows": 234285,
+      "file": "ARS_NL_TBL_HOLD_TRACKING.csv.gz",
+      "sha256": "2ea678d67c13cf544de5dfb3bb215ddcb97f5230f41e27d918da548d10f84997",
+      "column_sums": {
+        "GEN_ART_NUMBER": 262658193731805.0,
+        "HOLD_QTY_INITIAL": 363826.0,
+        "HOLD_REM": 346258.0,
+        "VAR_ART": 2.6265819373360938e+17
+      }
+    }
+  ]
+}

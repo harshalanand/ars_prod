@@ -181,6 +181,17 @@ SEED = [
     # ── Allocation columns ──
     ("ALLOC_TYPE", "Allocation Pool Type", "FRESH or GRT — which warehouse SLOC pool the run allocated from. Stamped on every alloc output row; pend/hold deductions are typed to the pool.",
      "ARS_ALLOC_WORKING, ARS_PEND_ALC, ARS_SLOC_SETTINGS", "Chosen at run start: FRESH or GRT — which warehouse SLOC pool to ship from. Stamped on every output row; pending and hold deductions are kept separate per pool. Not a calculation.", "Allocation"),
+    # ── Central RDC Pool (spec v1.5) ────────────────────────────────────────
+    # Active only under RDC Scope = All RDCs with business rule
+    # ALC_RDC_CENTRAL_POOL ON. Every Own / Cross run leaves these NULL.
+    ("SRC_RDC", "Source RDC (sourcing warehouse)", "The warehouse that PHYSICALLY ships a line, which under central pooling need not be the store's own. 'MULTI' on ARS_ALLOC_WORKING means the line was split — read ARS_ALLOC_RDC_SPLIT for the per-warehouse breakdown. NULL on every Own/Cross row; readers use ISNULL(SRC_RDC, RDC) so a NULL falls back to today's value.",
+     "ARS_ALLOC_RDC_SPLIT, ARS_ALLOC_WORKING, ARS_PEND_ALC, ARS_NL_TBL_HOLD_TRACKING", "Decided by the Part 8.37 split pass: try the store's own warehouse first, then the fallback order, against one shared running balance. Never more than ALC_RDC_MAX_SPLIT warehouses per shipment line; a hold is always sourced from exactly one. Not a formula — the outcome of the sourcing walk.", "Allocation"),
+    ("SRC_SPLIT_CNT", "Source Split Count", "How many warehouses supply one allocation line. 1 = single source; 2+ = the line was split and the store receives that many dispatch documents.",
+     "ARS_ALLOC_WORKING", "Count of ARS_ALLOC_RDC_SPLIT rows for the line. NULL on Own/Cross runs.", "Allocation"),
+    ("PREF_TIER", "Sourcing Preference Tier", "Which rule decided the warehouse order for a line: 1 = the store's own RDC first, 2 = the global fallback order (store tag blank/'ALL'/unknown), 3 = largest-available-first (no order configured). Audit only — it never changes a quantity.",
+     "ARS_ALLOC_RDC_SPLIT", "Set per line by the split pass preference chain; the first tier that yields an order wins.", "Allocation"),
+    ("IS_CROSS", "Cross-Ship Flag", "1 when a line is sourced from a warehouse OTHER than the store's own tag. Drives the freight-exposure report.",
+     "ARS_ALLOC_RDC_SPLIT", "SRC_RDC <> STORE_RDC.", "Allocation"),
     ("OPT_PRIORITY_RANK", "Option Priority Rank", "Waterfall order within a store × MAJ_CAT (RL→TBC→TBL, then rank). Lower ships first.",
      "ARS_LISTING_WORKING, ARS_ALLOC_WORKING", "The order options ship inside a store × MAJ_CAT: first by type (RL, then TBC, then TBL), then by rank. The lower the number, the earlier it ships.", "Allocation"),
     ("MJ_REQ_REM", "MAJ_CAT Requirement Remaining", "Live remaining MJ_REQ during the per-OPT walk; each shipping OPT consumes it. Gates TBL admission and bounded overshoot.",

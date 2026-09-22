@@ -775,7 +775,10 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
                      pri_ct_check_rl: bool = True,
                      pri_ct_check_tbc: bool = True,
                      opt_types: Optional[List[str]] = None,
-                     alloc_type: Optional[str] = None) -> int:
+                     alloc_type: Optional[str] = None,
+                     central_pool: bool = False) -> int:
+    """central_pool: FS-RDC-03, spec v1.5 §B5. False (the default) is today's
+    per-RDC behaviour and is what every Own and Cross run passes."""
     # Build the OPT_TYPE list that must enforce PRI_CT%=100 — mirrors R06.
     enforced = ["'TBL'"]
     if pri_ct_check_rl:  enforced.append("'RL'")
@@ -826,6 +829,58 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
         alloc_type_sel = f",\n            CAST('{at}' AS NVARCHAR(10)) AS ALLOC_TYPE"
         sql_params = {"at_pool": at}
 
+    # ── FS-RDC-03 — the clubbed pool source (spec v1.5 §B5) ───────────────
+    #
+    # Per-RDC (today) the join is `L.RDC = V.RDC`, so each alloc row carries
+    # its own warehouse's FNL_Q. Two things go wrong if that predicate is
+    # simply deleted:
+    #
+    #   1. ROW MULTIPLICATION. The MSA var table holds one row per warehouse,
+    #      so an unqualified join emits one alloc row per (store, size, RDC).
+    #      ARS_ALLOC_WORKING's one-row-per-store-size grain — relied on by
+    #      parking, Approve and every report — would break immediately.
+    #   2. It is also what fixes defect D-2: a store whose RDC tag is blank or
+    #      'ALL' matches no V.RDC today and silently drops out of allocation
+    #      entirely, with no error.
+    #
+    # So clubbing replaces the table with a sub-query already aggregated to
+    # option-size grain: SUM(FNL_Q) across warehouses, one row per size.
+    # MRP / PAK_SZ / ARTICLE_DESC are article attributes and identical across
+    # warehouses; MAX() picks the single value deterministically.
+    #
+    # The typed (Fresh/GRT) filter moves INSIDE the sub-query, so `type_join`
+    # is cleared — V no longer has an ALLOC_TYPE column to test.
+    # NOLOCK stays on the base table in both shapes — a table hint cannot be
+    # attached to a derived table, so the clubbed variant carries it inside.
+    msa_src = f"[{msa_var_table}] V WITH (NOLOCK)"
+    if central_pool:
+        _inner_type = (" WHERE ISNULL([ALLOC_TYPE],'FRESH') = :at_pool"
+                       if alloc_type is not None else "")
+        msa_src = f"""(
+            SELECT LTRIM(RTRIM(CAST([MAJ_CAT] AS NVARCHAR(200))))            AS [MAJ_CAT],
+                   TRY_CAST(TRY_CAST([GEN_ART_NUMBER] AS FLOAT) AS BIGINT)   AS [GEN_ART_NUMBER],
+                   LTRIM(RTRIM(CAST([CLR] AS NVARCHAR(200))))                AS [CLR],
+                   [ARTICLE_NUMBER],
+                   [SZ],
+                   MAX([ARTICLE_DESC])                                       AS [ARTICLE_DESC],
+                   MAX([MRP])                                                AS [MRP],
+                   MAX([PAK_SZ])                                             AS [PAK_SZ],
+                   SUM(TRY_CAST([FNL_Q] AS FLOAT))                           AS [FNL_Q]
+            FROM [{msa_var_table}] WITH (NOLOCK){_inner_type}
+            GROUP BY LTRIM(RTRIM(CAST([MAJ_CAT] AS NVARCHAR(200)))),
+                     TRY_CAST(TRY_CAST([GEN_ART_NUMBER] AS FLOAT) AS BIGINT),
+                     LTRIM(RTRIM(CAST([CLR] AS NVARCHAR(200)))),
+                     [ARTICLE_NUMBER], [SZ]
+        ) V"""
+        type_join = ""          # already applied inside the sub-query
+        logger.info("[B] FS-RDC-03: clubbed pool — MSA summed across all RDCs")
+
+    # The store-RDC predicate. Dropped only when clubbing; otherwise the exact
+    # text used today, so Own and Cross emit byte-identical SQL.
+    rdc_join = "" if central_pool else """
+            AND LTRIM(RTRIM(CAST(L.RDC AS NVARCHAR(50))))
+               = LTRIM(RTRIM(CAST(V.[RDC] AS NVARCHAR(50))))"""
+
     _run(conn, f"IF OBJECT_ID('{alloc_table}','U') IS NOT NULL DROP TABLE [{alloc_table}]")
     _run(conn, f"""
         SELECT
@@ -857,21 +912,29 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
             CAST(0 AS FLOAT) AS ROUND_SHIP,
             CAST(0 AS FLOAT) AS ROUND_HOLD,
             CAST(NULL AS NVARCHAR(20))  AS ALLOC_WAVE,
+            -- Central RDC Pool (spec v1.5 §B7.4 / correction M3).
+            -- These MUST be declared here, not added by ALTER TABLE: this
+            -- SELECT..INTO drops and recreates the alloc table on every run,
+            -- so an ALTER would be silently wiped by the next Generate.
+            -- Both stay NULL unless the Part 8.37 split pass runs, which only
+            -- happens under `All RDCs` with ALC_RDC_CENTRAL_POOL active
+            -- (BR-RDC-11 mode separation, invariant I-11 / check V14).
+            -- SRC_RDC = sourcing warehouse, or 'MULTI' when the line is split.
+            CAST(NULL AS NVARCHAR(20))  AS SRC_RDC,
+            CAST(NULL AS INT)           AS SRC_SPLIT_CNT,
             CAST(0 AS INT)              AS ALLOC_ROUND,
             CAST('PENDING' AS NVARCHAR(50)) AS ALLOC_STATUS,
             CAST(NULL AS NVARCHAR(500)) AS SKIP_REASON,
             CAST(NULL AS INT)           AS ALLOC_SEQ{alloc_type_sel}
         INTO [{alloc_table}]
         FROM [{listed_table}] L
-        INNER JOIN [{msa_var_table}] V WITH (NOLOCK)
+        INNER JOIN {msa_src}
             ON  LTRIM(RTRIM(CAST(L.MAJ_CAT AS NVARCHAR(200))))
                = LTRIM(RTRIM(CAST(V.[MAJ_CAT] AS NVARCHAR(200))))
             AND TRY_CAST(L.GEN_ART_NUMBER AS BIGINT)
                = TRY_CAST(TRY_CAST(V.[GEN_ART_NUMBER] AS FLOAT) AS BIGINT)
             AND LTRIM(RTRIM(CAST(L.CLR AS NVARCHAR(200))))
-               = LTRIM(RTRIM(CAST(V.[CLR] AS NVARCHAR(200))))
-            AND LTRIM(RTRIM(CAST(L.RDC AS NVARCHAR(50))))
-               = LTRIM(RTRIM(CAST(V.[RDC] AS NVARCHAR(50)))){type_join}
+               = LTRIM(RTRIM(CAST(V.[CLR] AS NVARCHAR(200)))){rdc_join}{type_join}
         WHERE {fnl_expr} > 0
           -- PRI_CT%=100 gate mirrors R06: TBL always enforces; RL/TBC only when
           -- their pri_ct_check flag is True.  Rows whose OPT_TYPE is not in the

@@ -132,7 +132,9 @@ api_router.include_router(report_gen_router)
 
 # Listing
 from app.api.v1.endpoints.listing import router as listing_router
+from app.api.v1.endpoints.rdc_split_report import router as rdc_split_router
 api_router.include_router(listing_router)
+api_router.include_router(rdc_split_router)
 
 # Maintenance (superadmin only)
 api_router.include_router(maintenance_router)

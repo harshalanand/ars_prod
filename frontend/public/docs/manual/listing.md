@@ -149,6 +149,73 @@ if growth_pct != 100:  <prefix>_MBQ ← _MBQ_REV ; <prefix>_REQ ← _REQ_REV   (
 2. **Validate primary-grid coverage before allocating (PRI_CT% gate).** `ALLOC_FLAG=1` requires `PRI_CT% >= 100`. TBL always enforces. RL/TBC enforce only when `pri_ct_check_rl` / `pri_ct_check_tbc` are true; when false, the option is admitted and the boosted MBQ-cap fallback path activates instead. (E2 in the allocator.)
 3. **Validate MSA + demand + pool per OPT before shipping (allocator E1–E7).** Before each OPT: E1 `LISTING=1`, E2 `ALLOC_FLAG=1`, E3 `OPT_TYPE≠MIX`, E4 `MSA_FNL_Q>0`, E5 `OPT_REQ_WH>=1`, E6 pool `FNL_Q_REM>0`, E7 size availability ≥ threshold. Post-alloc: deduct `MSA_FNL_Q`, recalc `OPT_REQ_WH`, break the store when size coverage drops below threshold.
 
+### RDC Scope — per-warehouse pools vs the central pool
+
+Three RDC Scope modes. Only `All RDCs` behaves differently, and only when the
+business rule **`ALC_RDC_CENTRAL_POOL`** is ACTIVE (BR-RDC-13). With it inactive
+— the default — all three modes behave exactly as they always have.
+
+| Mode | Stock pool | Stores in the run | Post-alloc split |
+|---|---|---|---|
+| `Own` | per-RDC | stores of the selected RDC(s) | n/a |
+| `Cross` | per-RDC | stores of `cross_to` | n/a |
+| `All RDCs` + switch OFF | per-RDC | all stores | none |
+| **`All RDCs` + switch ON** | **clubbed across RDCs** | all stores | **Part 8.37 split pass** |
+
+**Why.** Options are rarely stocked at both warehouses. Measured 2026-09-21:
+**11,303 of 12,647 stocked options (89 %) sit at exactly one warehouse**, so
+they are invisible to roughly half the chain, and **403,732 store-option
+listing rows have zero stock at the store's own warehouse while the other holds
+some**.
+
+**Two strictly separated steps.** Clubbing decides *how much* each store gets,
+against the summed stock of all warehouses, using **completely unchanged
+allocation rules** — every gate, cap, round, pack-size rounding and store
+ranking applies as before. The split pass then decides *which warehouse ships*
+each allocated line, within that warehouse's real stock. It never re-derives a
+quantity.
+
+**`RDC` vs `SRC_RDC` — two columns, never one with two meanings (BR-RDC-11).**
+`RDC` always means the **store's** warehouse. `SRC_RDC` means the warehouse that
+**physically ships**. An `Own`/`Cross` run writes no `SRC_RDC` and no split
+rows at all, so every downstream reader's `ISNULL(SRC_RDC, RDC)` resolves to
+`RDC` and behaves exactly as it does today — no branch, no migration, no dual
+meaning.
+
+**Part 8.37 — the split pass.** Runs once, single-threaded, after every MAJ_CAT
+worker finishes and **before** parking, so the parked and history snapshots
+inherit `SRC_RDC` through the existing column reconcile. It walks lines in
+waterfall order (`ST_RANK`, then `ALLOC_SEQ`) against **one shared balance
+ledger** that SHIP and HOLD both consume — two independent passes would each
+see the full balance and together over-book a warehouse.
+
+Sourcing order per store (`PREF_TIER`): **1** own warehouse first then the
+fallback order · **2** the fallback order alone, when the tag is blank/`ALL`/
+unknown · **3** largest-available-first, when no order is configured. The
+fallback order is `ALC_RDC_PRIORITY`, stored `>`-separated (`DW01>DH24`) because
+the rules registry validates a choice by splitting on commas. **It is a
+preference, never a filter** — a live warehouse missing from it is appended
+alphabetically and can never be silently excluded.
+
+**A HOLD is never split (BR-RDC-12).** `ARS_NL_TBL_HOLD_TRACKING` is keyed on
+`(WERKS, VAR_ART, SZ, ALLOC_TYPE)`, so two source rows for one hold would
+collide on the primary key. A hold no single warehouse can cover is taken from
+the largest available and **reduced**, stamped `RDC_HOLD_SHORT`. Cross-warehouse
+holds remain fully allowed — only splitting one is not.
+
+**No silent truncation (BR-RDC-10).** Three things can reduce a line: strict
+single-sourcing, a binding `ALC_RDC_MAX_SPLIT`, and a short hold. Each stamps
+`ALLOC_REMARKS`, refreshes the option rollup so Part 8.5 `OPT_STATUS` judges the
+real shipped quantity, and is counted in the run log and cockpit. **With two
+warehouses and the default policy no shipment quantity can ever change — the
+pass is pure tagging.** A non-zero *reduced lines* figure on a 2-RDC run means
+something is wrong.
+
+**Downstream.** `SRC_RDC` flows into `ARS_PEND_ALC` and the hold ledger at
+Approve, so MSA deducts from the warehouse that actually shipped and the BDC
+picking file names the right one. Without that the allocation would be right
+and the shipment wrong.
+
 ### Allocation hand-off (planner + developer view)
 
 The rule engine consumes `ARS_LISTING_WORKING` and writes `ARS_ALLOC_WORKING`. `allocation_mode='per_opt'` is the **production default** (Jul 2026): it sets `ARS_PER_OPT_MODE=1` + `ARS_EXEC_ORDER` and dispatches through the pandas engine, which swaps in `rule_engine_per_opt._run_band_per_opt`. `sequential` is the single-thread SQL reference path. Deep engine internals are owned by **`rule_ars`** (`rule_engine_*.py`).
@@ -203,9 +270,15 @@ The screen tunables are `GenerateRequest` fields; they flow straight into the en
 | `ALLOC_FLAG` | Allocation-eligible | `PRI_CT% >= 100` |
 | `<prefix>_MBQ_ORIG/_REV` | Pre/post-growth grid budget | growth lift, Part 7 |
 | `FAB` `MACRO_MVGR` `MICRO_MVGR` `M_VND_CD` `RNG_SEG` | Sec-cap grid keys | `_FINAL_KEEP_COLS` — must propagate |
+| `RDC` | The **store's** warehouse — unchanged in every mode | `Master_ALC_INPUT_ST_MASTER`, Part 1 |
+| `SRC_RDC` | The warehouse that **physically ships**; `'MULTI'` when split. NULL on Own/Cross | Part 8.37 split pass |
+| `SRC_SPLIT_CNT` | Warehouses supplying one line (1 = single source) | Part 8.37 |
+| `PREF_TIER` | Which rule chose the warehouse order: `1` own · `2` fallback · `3` largest-available | `ARS_ALLOC_RDC_SPLIT` |
+| `IS_CROSS` | Line sourced from a warehouse other than the store's tag | `SRC_RDC <> STORE_RDC` |
 
 ## Recorded rules
 <!-- dated appendable bullets -->
+- 2026-09-22 — **Central RDC pool: club all warehouses, allocate, then tag who ships (`ALC_RDC_CENTRAL_POOL`, seeded INACTIVE).** `All RDCs` changes meaning from *run both warehouses side by side* to *club, allocate, split* — but **only** when the switch is ON; with it OFF (the default, and the state at time of writing) all three RDC Scope modes behave exactly as before. Evidence for the change, measured on the live master 2026-09-21: **11,303 of 12,647 stocked options (89 %) exist at exactly one warehouse**, and **403,732 of 3,382,403 listing rows (11.9 %) have zero stock at the store's own warehouse while the other holds some**. Note `All RDCs` had **never been run in production** — 0 of 293 sessions — so defect D-1 (the Part 3.55 join picking one warehouse's `MSA_FNL_Q` arbitrarily) was latent, not observed. **Six code sites, all gated on `rdc_mode=='all' AND rule active`, resolved ONCE at run start and threaded down as an argument** (the rules cache has a 30 s TTL, so per-site reads could produce a half-clubbed run): Part 3.55 clubs `MSA_FNL_Q`/`VAR_COUNT`/`VAR_FNL_COUNT` — all **three** SQL fragments (SELECT, GROUP BY, JOIN) move together, since dropping only the join leaves the per-warehouse fan-out and D-1 intact, and `VAR_COUNT` needs a **two-level** aggregate or a size held at both warehouses is counted twice (would have inflated 34.3 % of options and let the R07 size gate pass on a fiction); `_stage_b_explode` joins a pre-aggregated MSA sub-query instead of dropping the `L.RDC = V.RDC` predicate, which would otherwise multiply alloc rows per warehouse and break the one-row-per-store-size grain (this is also what fixes **D-2**, a blank/`'ALL'` tag matching no pool key and silently receiving zero); the pandas pool key gains a derived `POOL_RDC` (`'*'` when clubbing) — leaving `RDC` in the key would give two stores of different warehouses two pool groups each holding the **full** clubbed quantity, i.e. the same stock twice; **new Part 8.37** split pass; Part 8.55 hold release cascades to the split rows; and `ARS_ALLOC_WORKING` gains `SRC_RDC`/`SRC_SPLIT_CNT` **inside the `SELECT..INTO`**, not by `ALTER` — that table is dropped and rebuilt every run, so an ALTER would be wiped. **`RDC` is never redefined** (BR-RDC-11): it stays the store's warehouse, `SRC_RDC` is the sourcing one, an Own/Cross run writes neither, and every consumer reads `ISNULL(SRC_RDC, RDC)` — so no backfill of the 17.9 M `ARS_PEND_ALC` / 2.75 M hold / 6.56 M snapshot rows was needed. **A hold is never split (BR-RDC-12)** — the hold tracker's PK `(WERKS, VAR_ART, SZ, ALLOC_TYPE)` cannot hold two source rows; a short hold takes the largest single warehouse and is reduced with `RDC_HOLD_SHORT`. Downstream (the half that decides whether the right warehouse actually ships): Approve reads **`ARS_ALLOC_RDC_SPLIT`**, not `ARS_ALLOC_HISTORY`, because a split line's `SRC_RDC` there is the literal `'MULTI'`; the `ARS_PEND_ALC` idempotency guard and `GROUP BY` gained `SRC_RDC` or a split line's second row was **silently dropped**; and the per-source quantity comes from the split row, since the join multiplies the history row once per warehouse (caught in test: 6 allocated pieces became 12 of pending). `msa_service`'s two hold loaders ignored the hold row's warehouse entirely and read the store master — adding the column alone would have changed nothing for MSA. New table `ARS_ALLOC_RDC_SPLIT` (one row per line × source warehouse) with delete-on-reject, delete-on-revert and TTL purge. Cockpit gains an **RDC Sourcing** panel (policy radios, max-split, fallback order) shown only when clubbing is live, an untagged-store banner in **all three** modes (Own/Cross drop those stores silently today — defect D-2's front-end half), a post-run **RDC SPLIT** block, and five report endpoints. Alloc Review's `RDC` pivot column renamed **`Store RDC`** — after clubbing it and the picklist answer different questions. `ALC_MULTI_PARKED` is refused while clubbing is active: two parked runs would draw the same clubbed stock, an isolation `Own` had only by accident. 34 unit tests (`backend/tests/test_rdc_split_pass.py`) plus live-data checks: stock conserved exactly (6,409,069 → 6,409,069, no fan-out), 271,869 tagged + 225,002 reduced = 496,871 allocated, zero negative balances, 1.1 s per 10k lines, and all 234,285 open hold rows resolving identically to today. Spec: `docs/superpowers/specs/2026-09-21-central-rdc-pool-allocation-brd-fsd-v1.5.md`. Owned by `ars_flow` / `rule_ars`.
 - 2026-07-09 — Manual dossier created from source. OPT_TYPE CASE at `listing.py:1644`; OPT_MBQ/REQ at `2122`; store ranking at `2475`; ELIG_FLAG at `2587`; growth lift at `2748`; GH_/H_/PRI_CT% at `2864`; engine dispatch at `3031`. Allocator eligibility E1–E7 at `listing_allocator.py:16`.
 - 2026-07-14 — **Manual store priority override** added to Part 6 store ranking (`listing.py`). `MANUAL_ST_PRIORITY` (int) on `Master_ALC_INPUT_ST_MASTER` pins `ST_RANK = P` per MAJ_CAT; non-manual stores keep score order and skip used slots (tally/`FreeSlots` CTE bounded by per-MAJ_CAT row count). Duplicate `P` in a MAJ_CAT → best `W_SCORE` holds the slot, other shifts + logged warning; non-positive → treated as auto. `ARS_STORE_RANKING` gains `MANUAL_PRI` + `MANUAL` bit. Column self-heals on run; migration `021_add_manual_st_priority.sql` adds it upfront so it's editable in the store-master table view before the first run.
 - 2026-07-14 — `ARS_STORE_RANKING` gains **`AUTO_ST_RANK`** (score-only `ROW_NUMBER` over W_SCORE DESC, WERKS ASC per MAJ_CAT — ignores pins) and **`RANK_DELTA = AUTO_ST_RANK − ST_RANK`** so ops can review how far each pin moved a store. Display/audit only — engine still reads `ST_RANK`.

@@ -755,6 +755,11 @@ export default function ListingPage() {
   // Generate settings
   const [rdcMode, setRdcMode] = useState('all')
   const [crossFrom, setCrossFrom] = useState([])
+  // Central RDC Pool (spec v1.5 FS-RDC-06). Read only when rdcMode==='all'
+  // AND the ALC_RDC_CENTRAL_POOL switch is active; Own/Cross ignore both.
+  const [rdcSplitPolicy, setRdcSplitPolicy] = useState('SINGLE_PREFERRED')
+  const [rdcMaxSplit, setRdcMaxSplit] = useState(2)
+  const [rdcSplitSummary, setRdcSplitSummary] = useState(null)
   const [selectedStores, setSelectedStores] = useState([])
   const [selectedMajCats, setSelectedMajCats] = useState([])
   const [selectedSsn, setSelectedSsn] = useState([])
@@ -1077,6 +1082,13 @@ export default function ListingPage() {
     try {
       const { data } = await listingAPI.config({ quiet })
       setConfig(data.data)
+      // Seed the sourcing controls from the business rules so the cockpit
+      // shows the values a run would actually use.
+      const rp = data.data?.rdc_pool
+      if (rp) {
+        if (rp.split_policy) setRdcSplitPolicy(rp.split_policy)
+        if (rp.max_split) setRdcMaxSplit(Number(rp.max_split) || 2)
+      }
       // Restore saved settings from DB
       const s = data.data?.settings
       if (s) {
@@ -1132,6 +1144,16 @@ export default function ListingPage() {
     try {
       const { data } = await listingAPI.summary({ quiet })
       setSummary(data.data)
+      // Central RDC Pool post-run block (FS-RDC-06 §B8.4). Keyed on the
+      // session, and empty for an Own/Cross run — BR-RDC-11 means those
+      // produce no split rows, so the block simply does not render.
+      const sid = data.data?.session_id || data.data?.last_session_id
+      if (sid) {
+        try {
+          const { data: sp } = await listingAPI.rdcSplitSummary(sid, { quiet })
+          setRdcSplitSummary(sp?.data?.central_pool ? sp.data : null)
+        } catch { setRdcSplitSummary(null) }
+      }
     } catch {}
   }, [])
 
@@ -1274,6 +1296,17 @@ export default function ListingPage() {
   const storeRdcMap = config?.store_rdc_map || {}
   const autoRdcs = [...new Set((selectedStores || []).map(s => storeRdcMap[s]).filter(Boolean))]
   const otherRdcs = (config?.rdcs || []).filter(r => !autoRdcs.includes(r))
+
+  // Central RDC Pool state, straight from /listing/config.
+  // centralPoolOn is what decides whether `All RDCs` clubs or behaves as
+  // today — the panel must never imply the feature is live when it is not.
+  const rdcPool = config?.rdc_pool || {}
+  const centralPoolOn = !!rdcPool.central_pool_active
+  const untaggedStores = Number(rdcPool.untagged_store_count || 0)
+  // Untagged stores are dropped by autoRdcs' .filter(Boolean), so an Own run
+  // silently excludes them today. Surfacing the count is defect D-2's
+  // front-end half — a warning only, it never blocks or alters a run.
+  const untaggedSelected = (selectedStores || []).filter(x => !storeRdcMap[x]).length
 
   // Store search metadata: per-store "RDC HUB" tokens (searchable + shown as
   // row suffix) and RDC/HUB groups for one-click bulk selection.
@@ -1491,6 +1524,10 @@ export default function ListingPage() {
       } else if (rdcMode === 'cross') {
         payload.cross_from = crossFrom
         payload.cross_to = autoRdcs
+      } else if (rdcMode === 'all') {
+        // Ignored by the backend unless ALC_RDC_CENTRAL_POOL is active.
+        payload.rdc_split_policy = rdcSplitPolicy
+        payload.rdc_max_split = rdcMaxSplit
       }
       // Reset previous batch state so the progress panel doesn't show stale data.
       setAllocBatchId(null); setAllocProgress(null); setAllocFailed([])
@@ -2821,7 +2858,95 @@ export default function ListingPage() {
                     })}
                   </div>
                 )}
+
+                {/* Untagged-store banner — shown in ALL THREE modes (FS-RDC-06).
+                    Own/Cross drop these stores silently today because autoRdcs
+                    filters out a blank RDC; that is defect D-2's front-end half.
+                    Warning only: it never blocks a run or changes the payload. */}
+                {untaggedSelected > 0 && (
+                  <div style={{ fontSize: 8.5, color: C.amber, lineHeight: 1.35 }}>
+                    ⚠ {untaggedSelected} of {selectedStores.length} selected stores have no RDC tag —{' '}
+                    {rdcMode === 'all' && centralPoolOn
+                      ? 'sourcing will use the fallback order'
+                      : 'these stores are excluded from this run'}
+                  </div>
+                )}
+
+                {/* Pool composition, so `All RDCs` is visibly different from
+                    `Own` BEFORE Generate rather than only in the logs. */}
+                {rdcMode === 'all' && (
+                  <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.35 }}>
+                    {centralPoolOn ? (
+                      <>Pool: <b>{(config?.rdcs || []).join(' + ') || '—'} → one pool</b></>
+                    ) : (
+                      <>Separate pool per RDC · <b>central pool OFF</b> — behaves as today</>
+                    )}
+                    {untaggedStores > 0 && <> · {untaggedStores} untagged in master</>}
+                  </div>
+                )}
               </ParamGroup>
+
+              {/* ── RDC Sourcing — progressive disclosure (FS-RDC-06 §B8.2) ──
+                  Rendered ONLY for `All RDCs` with central pooling active,
+                  because that is the only combination whose sourcing is
+                  configurable. Own and Cross never see it. */}
+              {rdcMode === 'all' && centralPoolOn && (
+                <ParamGroup title="RDC Sourcing" color={C.amber}>
+                  <div style={{ fontSize: 9, color: C.textSub, marginBottom: 2 }}>
+                    When one warehouse cannot cover a line:
+                  </div>
+                  {[
+                    ['SPLIT_ALWAYS',     'Split whenever short', 'Take what each warehouse has, in preference order'],
+                    ['SINGLE_PREFERRED', 'Single source preferred', 'Prefer one warehouse for the whole line; split only as a last resort'],
+                    ['SINGLE_STRICT',    'Strict single source', 'Never split — may REDUCE a line no single warehouse can cover'],
+                  ].map(([v, label, hint]) => (
+                    <label key={v} title={hint}
+                           style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
+                                    cursor: 'pointer',
+                                    color: rdcSplitPolicy === v ? C.amber : C.textSub,
+                                    fontWeight: rdcSplitPolicy === v ? 700 : 500 }}>
+                      <input type="radio" name="rdc_split_policy"
+                             checked={rdcSplitPolicy === v}
+                             onChange={() => setRdcSplitPolicy(v)} />
+                      {label}{v === 'SINGLE_STRICT' && ' ⚠'}
+                    </label>
+                  ))}
+                  {rdcSplitPolicy === 'SINGLE_STRICT' && (
+                    <div style={{ fontSize: 8.5, color: '#dc2626', lineHeight: 1.3 }}>
+                      May reduce an allocated line when no single warehouse can cover it.
+                    </div>
+                  )}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto',
+                                alignItems: 'center', gap: 4, marginTop: 2 }}>
+                    <span style={{ fontSize: 10, color: C.textSub }}>Max warehouses / line</span>
+                    <select value={rdcMaxSplit}
+                            onChange={e => setRdcMaxSplit(Number(e.target.value))}
+                            style={{ height: 22, fontSize: 10 }}>
+                      {[1, 2, 3, 4].map(n => (
+                        <option key={n} value={n}>
+                          {n}{n === 1 ? ' (= strict)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.35 }}>
+                    Fallback order: <b>{rdcPool.priority || 'largest available first'}</b>
+                    {' '}· edit in Settings → Business Rules
+                  </div>
+                  {/* BR-RDC-12 is not a choice — the hold tracker is keyed on
+                      (WERKS, VAR_ART, SZ, ALLOC_TYPE), so two source rows for
+                      one hold would collide on the primary key. */}
+                  <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.35 }}>
+                    Holds are always sourced from a single warehouse.
+                  </div>
+                  {(config?.rdcs || []).length <= 2 && rdcMaxSplit >= 2 && (
+                    <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.3 }}>
+                      ⓘ Only {(config?.rdcs || []).length} warehouses live — a cap of{' '}
+                      {rdcMaxSplit} cannot bind.
+                    </div>
+                  )}
+                </ParamGroup>
+              )}
 
               <ParamGroup title="Run Pool (Fresh / GRT)" color="#7c3aed">
                 <div style={{ display: 'grid', gridTemplateColumns: '78px 1fr', alignItems: 'center', gap: 4 }}
@@ -3575,6 +3700,102 @@ export default function ListingPage() {
           </div>
         )
       })()}
+
+      {/* ═══ RDC SPLIT — post-run block (FS-RDC-06 §B8.4) ═══
+          Only rendered for a central-pool run; BR-RDC-11 guarantees an
+          Own/Cross session produces no split rows, so rdcSplitSummary stays
+          null and this disappears entirely.
+
+          These are the figures that tell ops whether clubbing worked. Note
+          BOTH warehouse views are shown: "pick by source" is what each
+          warehouse physically picks, while the existing MAJ_CAT × RDC modal
+          groups on the STORE's warehouse. After clubbing those are different
+          questions, and conflating them is how a reviewer ends up approving
+          one number while the warehouse receives another. */}
+      {rdcSplitSummary && (
+        <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`,
+                      borderRadius: 8, padding: 12, marginTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: C.amber }}>RDC SPLIT</span>
+            <span style={{ fontSize: 9, color: C.textMuted }}>
+              which warehouse physically ships each line
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
+            {(rdcSplitSummary.by_rdc || []).map(r => (
+              <div key={r.src_rdc} style={{ minWidth: 120 }}>
+                <div style={{ fontSize: 9, color: C.textMuted }}>PICK FROM {r.src_rdc}</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: C.primary }}>
+                  {Number(r.ship_qty || 0).toLocaleString()}
+                </div>
+                {Number(r.hold_qty || 0) > 0 && (
+                  <div style={{ fontSize: 8.5, color: C.textMuted }}>
+                    + {Number(r.hold_qty).toLocaleString()} held
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+                        gap: 8, fontSize: 10 }}>
+            <div>
+              <span style={{ color: C.textMuted }}>Cross-shipped </span>
+              <b>{Number(rdcSplitSummary.cross_ship_qty || 0).toLocaleString()} pcs</b>
+              <span style={{ color: C.textMuted }}>
+                {' '}({rdcSplitSummary.cross_ship_pct}%) to {rdcSplitSummary.cross_stores} stores
+              </span>
+            </div>
+            <div>
+              <span style={{ color: C.textMuted }}>Split lines </span>
+              <b>{Number(rdcSplitSummary.split_lines || 0).toLocaleString()}</b>
+              <span style={{ color: C.textMuted }}>
+                {' '}of {Number(rdcSplitSummary.alloc_lines || 0).toLocaleString()}
+              </span>
+            </div>
+            {/* With two warehouses and the default policy this MUST be 0 for
+                shipments — a non-zero value means quantity was taken away. */}
+            <div>
+              <span style={{ color: C.textMuted }}>Reduced lines </span>
+              <b style={{ color: rdcSplitSummary.reduced_lines > 0 ? '#dc2626' : C.textSub }}>
+                {Number(rdcSplitSummary.reduced_lines || 0).toLocaleString()}
+              </b>
+              {rdcSplitSummary.reduced_lines > 0 && (
+                <span style={{ fontSize: 8.5, color: '#dc2626' }}>
+                  {' '}({(rdcSplitSummary.reduced_detail || [])
+                          .map(d => `${d.reason} ${d.lines_}`).join(', ')})
+                </span>
+              )}
+            </div>
+            <div>
+              <span style={{ color: C.textMuted }}>Sourced by fallback </span>
+              <b>
+                {(rdcSplitSummary.by_pref_tier || [])
+                  .filter(t => t.pref_tier !== '1')
+                  .reduce((a, t) => a + Number(t.ship_qty || 0), 0)
+                  .toLocaleString()} pcs
+              </b>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            {['picklist', 'dispatch', 'cross-ship', 'residual'].map(kind => (
+              <button key={kind}
+                onClick={() => window.open(
+                  `/api/v1/listing/rdc-split/${kind}/${rdcSplitSummary.session_id}`,
+                  '_blank')}
+                style={{ ..._btn(false), height: 24, fontSize: 9, padding: '0 10px' }}>
+                {kind === 'picklist' ? 'Export picklist'
+                  : kind === 'dispatch' ? 'Store dispatch'
+                  : kind === 'cross-ship' ? 'Cross-ship exposure'
+                  : 'Residual by RDC'}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* ═══ MAJ_CAT modal — one row per MAJ_CAT, RDC-wise columns ═══ */}
       {majCatModalOpen && (() => {

@@ -100,6 +100,7 @@ _AFFECTED_TABLES: List[str] = [
     "ARS_LISTING_WORKING",
     "ARS_LISTED_OPT",
     "ARS_ALLOC_WORKING",
+    "ARS_ALLOC_RDC_SPLIT",
     "ARS_MSA_TOTAL",
     "ARS_MSA_GEN_ART",
     "ARS_MSA_VAR_ART",
@@ -565,6 +566,14 @@ def revert_approved_to_parked(conn, session_id: str) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for tgt in _SNAPSHOT_TARGETS:
         out[tgt["label"]] = _demote_one_within_conn(conn, tgt, session_id)
+    # Central RDC Pool (spec v1.5 §B7.2). Un-approving a run must also retract
+    # its picking record — otherwise the warehouse keeps an instruction for an
+    # allocation that is back in review.
+    try:
+        from app.services.rdc_split_service import delete_session as _rdc_del
+        out["rdc_split"] = _rdc_del(conn, session_id)
+    except Exception as _e:
+        logger.warning(f"[parked_history:revert] rdc split cleanup: {_e}")
     return out
 
 
@@ -964,6 +973,16 @@ def reject_parked(session_id: str, user: str,
                     f"in chunks of {BATCH}"
                 )
 
+            # 1b. Central RDC Pool (spec v1.5 §B7.2): a rejected run must
+            # leave NO picking record behind. Split rows are session-keyed and
+            # durable, so without this they survive the reject and still look
+            # like live warehouse instructions.
+            try:
+                from app.services.rdc_split_service import delete_session as _rdc_del
+                rejected_by_table["rdc_split"] = _rdc_del(conn, session_id)
+            except Exception as _e:
+                logger.warning(f"[parked_history:reject] rdc split cleanup: {_e}")
+
             # 2. Revert ARS_NL_TBL_HOLD_TRACKING to its pre-run snapshot.
             _ensure_hold_snapshot_tables(conn)
             hold_revert = _revert_hold_tracking(conn, session_id)
@@ -1283,6 +1302,26 @@ def purge_old_history() -> Dict[str, Any]:
                 d = int(res.rowcount or 0)
                 by_table[tgt["label"]] = d
                 total += d
+
+            # Central RDC Pool (spec v1.5 §B7.2). The split table is durable
+            # and session-keyed with no APPROVED_AT of its own, so it ages on
+            # CREATED_AT under the same retention window. Without this it
+            # would grow without bound — ~70k rows per run.
+            try:
+                if conn.execute(text(
+                    "SELECT CASE WHEN OBJECT_ID('dbo.ARS_ALLOC_RDC_SPLIT','U') "
+                    "IS NULL THEN 0 ELSE 1 END"
+                )).scalar():
+                    res = conn.execute(text("""
+                        DELETE FROM dbo.ARS_ALLOC_RDC_SPLIT
+                         WHERE CREATED_AT < DATEADD(day, -:n, GETDATE())
+                    """), {"n": retention})
+                    d = int(res.rowcount or 0)
+                    by_table["rdc_split"] = d
+                    total += d
+            except Exception as _e:
+                logger.warning(f"[parked_history] rdc split purge: {_e}")
+
             conn.commit()
         logger.info(
             f"[parked_history] history purge: retention={retention}d "
@@ -1413,6 +1452,17 @@ def _ensure_hold_snapshot_tables(conn) -> None:
               AND name = 'RDC'
         )
         ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}] ADD [RDC] NVARCHAR(20) NULL
+    """))
+    # Central RDC Pool (spec v1.5 §B7.3). RDC stays the STORE's warehouse;
+    # SRC_RDC is the warehouse physically reserving the hold under `All RDCs`.
+    # NULL on every legacy and Own/Cross row — readers use ISNULL(SRC_RDC, RDC).
+    conn.execute(text(f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.columns
+            WHERE object_id = OBJECT_ID('{_HOLD_SNAPSHOT_TABLE}')
+              AND name = 'SRC_RDC'
+        )
+        ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}] ADD [SRC_RDC] NVARCHAR(20) NULL
     """))
     # Idempotent ALTER for older deployments without the typed-pool column
     # (Fresh/GRT approve chain, Jul 2026). '' = legacy/untyped row.
@@ -1612,12 +1662,44 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
         """))
         result["step_a_rows"] = int(r_a1.rowcount or 0) + int(r_a2.rowcount or 0)
 
-        # STEP B — TBL created new warehouse hold (with RDC populated from
-        # store master so MSA hold sync can join directly later).
-        r_b = conn.execute(text("""
+        # Central RDC Pool (M6): carry the sourcing warehouse into the hold
+        # ledger, but only where both the column and the split table exist —
+        # a pre-migration database must keep working unchanged.
+        _hold_has_src = bool(conn.execute(text(
+            "SELECT CASE WHEN COL_LENGTH('ARS_NL_TBL_HOLD_TRACKING','SRC_RDC') "
+            "IS NULL THEN 0 ELSE 1 END"
+        )).scalar()) and bool(conn.execute(text(
+            "SELECT CASE WHEN OBJECT_ID('dbo.ARS_ALLOC_RDC_SPLIT','U') "
+            "IS NULL THEN 0 ELSE 1 END"
+        )).scalar())
+        # Only split rows that actually carry a hold identify the reserving
+        # warehouse. BR-RDC-12 means there is at most one per store-size.
+        _hold_src_join = ("""
+                LEFT JOIN [ARS_ALLOC_RDC_SPLIT] SPL
+                    ON  SPL.[SESSION_ID] = A.[SESSION_ID]
+                    AND SPL.[WERKS]      = A.[WERKS]
+                    AND SPL.[VAR_ART]    = TRY_CAST(A.[VAR_ART] AS BIGINT)
+                    AND SPL.[SZ]         = A.[SZ]
+                    AND ISNULL(SPL.[HOLD_QTY],0) > 0""" if _hold_has_src else "")
+
+        # STEP B — TBL created new warehouse hold. RDC stays the STORE's
+        # warehouse, from the store master, exactly as before.
+        #
+        # SRC_RDC is new (correction M6, spec v1.5 §B7.3 ii): the warehouse
+        # PHYSICALLY reserving the hold. It cannot be read from
+        # ARS_ALLOC_HISTORY — a split line's SRC_RDC there is the literal
+        # 'MULTI' — so it comes from ARS_ALLOC_RDC_SPLIT. BR-RDC-12 guarantees
+        # a hold is never split, so MAX() over the split rows that carry a
+        # hold yields exactly one warehouse per (WERKS, VAR_ART, SZ) and the
+        # hold table's primary key still holds.
+        #
+        # Own/Cross sessions have no split rows, so SRC_RDC lands NULL and
+        # every downstream reader falls back to RDC as it does today.
+        r_b = conn.execute(text(f"""
             MERGE [ARS_NL_TBL_HOLD_TRACKING] AS T
             USING (
                 SELECT A.[WERKS], MAX(SM.[RDC]) AS RDC,
+                       {"MAX(SPL.[SRC_RDC]) AS SRC_RDC," if _hold_has_src else ""}
                        A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
                        TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
                        A.[SZ],
@@ -1626,6 +1708,7 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                 FROM [ARS_ALLOC_HISTORY] A
                 LEFT JOIN [Master_ALC_INPUT_ST_MASTER] SM
                     ON SM.[ST_CD] = A.[WERKS]
+                {_hold_src_join}
                 WHERE A.[SESSION_ID] = :sid
                   AND A.[OPT_TYPE] = 'TBL'
                   AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
@@ -1639,6 +1722,7 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
             WHEN MATCHED THEN
                 UPDATE SET
                     T.[RDC] = ISNULL(T.[RDC], R.[RDC]),
+                    {"T.[SRC_RDC] = ISNULL(R.[SRC_RDC], T.[SRC_RDC])," if _hold_has_src else ""}
                     T.[HOLD_QTY_INITIAL] = CASE
                         WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
                         ELSE T.[HOLD_QTY_INITIAL] + R.hold_qty
@@ -1652,13 +1736,15 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                     T.[LAST_UPDATED]     = GETDATE()
             WHEN NOT MATCHED THEN
                 INSERT (
-                    [WERKS], [RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
+                    [WERKS], [RDC], {"[SRC_RDC]," if _hold_has_src else ""}
+                    [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
                     [VAR_ART], [SZ], [OPT_STATUS],
                     [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM],
                     [LAST_UPDATED], [IS_CLOSED], [ALLOC_TYPE]
                 )
                 VALUES (
-                    R.[WERKS], R.[RDC], R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
+                    R.[WERKS], R.[RDC], {"R.[SRC_RDC]," if _hold_has_src else ""}
+                    R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
                     R.[VAR_ART], R.[SZ], 'TBL',
                     GETDATE(), R.hold_qty, R.hold_qty,
                     GETDATE(), 0, ISNULL(R.[ALLOC_TYPE], '')

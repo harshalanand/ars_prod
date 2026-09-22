@@ -257,6 +257,36 @@ Also: `TBL_LISTED_DATE = GETDATE()` when `OPT_TYPE='TBL'` AND `ALLOC_QTY > 0`.
 
 ---
 
+### 5.11 RDC Scope — central pool (switch-gated, INACTIVE by default)
+
+Governed by business rule **`ALC_RDC_CENTRAL_POOL`**. Inactive (the default) =
+today's behaviour in all three modes. Active + `rdc_mode='all'` = club, allocate,
+split. `Own` and `Cross` can never satisfy the mode test.
+
+| ID | Rule |
+|---|---|
+| BR-RDC-01 | Under `All RDCs`, allocatable stock for an option-size is the SUM across all RDCs. |
+| BR-RDC-02 | Clubbing changes only WHICH POOL a row draws from, never a store's entitlement. Every gate, cap, round, pack rounding and ranking rule applies unchanged. |
+| BR-RDC-03 | Every shipped and held piece is tagged to exactly one source RDC. `Σ split = Σ alloc`. |
+| BR-RDC-04 | No RDC may be tagged beyond its own physical stock for that option-size. |
+| BR-RDC-05 | Sourcing preference = the store's own RDC first, then `ALC_RDC_PRIORITY`. |
+| BR-RDC-06 | SHIP and HOLD consume ONE shared balance ledger; neither may reserve stock the other committed. |
+| BR-RDC-07 | `Own` / `Cross` output must be identical to pre-change, verified row-for-row across 4 tables. |
+| BR-RDC-08 | A store with a missing/invalid RDC tag still receives its full allocation; only its sourcing preference falls back. |
+| BR-RDC-09 | One SHIPMENT line may be sourced from at most `ALC_RDC_MAX_SPLIT` RDCs (default 2). |
+| BR-RDC-10 | No silent truncation. Any reduced line is stamped in `ALLOC_REMARKS`, rolled up to the option, and counted in the run log and cockpit. |
+| BR-RDC-11 | `RDC` and `SRC_RDC` never mix. Own/Cross use `RDC` and write no `SRC_RDC` and no split rows; `All RDCs` uses `SRC_RDC`. Readers use `ISNULL(SRC_RDC, RDC)`. |
+| BR-RDC-12 | **A HOLD is never split.** The hold tracker's PK `(WERKS, VAR_ART, SZ, ALLOC_TYPE)` cannot express two sources. A short hold takes the largest single RDC and is reduced with `RDC_HOLD_SHORT`. Cross-RDC holds remain allowed. |
+| BR-RDC-13 | Central pooling requires `rdc_mode='all'` **AND** `ALC_RDC_CENTRAL_POOL` active. The flag is resolved ONCE at run start (the rules cache has a 30 s TTL) and passed down as an argument. |
+
+Code sites, all mode-gated: `listing.py` Part 3.55 (three SQL fragments move
+together), new Part 8.37 split pass, Part 8.55 cascade, `rule_engine_new.
+_stage_b_explode` (pre-aggregated MSA sub-query), `rule_engine_pandas.POOL_KEYS`
+(derived `POOL_RDC`), and the downstream ledgers `pend_alc_service`,
+`msa_service`, `alloc_pool`, `parked_history`.
+
+Spec: `docs/superpowers/specs/2026-09-21-central-rdc-pool-allocation-brd-fsd-v1.5.md`
+
 ## 6. Allocation rules (per-OPT engine)
 
 **Source:** [backend/app/services/rule_engine_per_opt.py](../backend/app/services/rule_engine_per_opt.py), [backend/app/services/rule_engine_new.py](../backend/app/services/rule_engine_new.py), [backend/app/services/rule_engine_pandas.py](../backend/app/services/rule_engine_pandas.py)

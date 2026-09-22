@@ -81,6 +81,11 @@ class GenerateRequest(BaseModel):
     rdc_values: List[str] = []         # Own RDC: selected RDC(s)
     cross_from: List[str] = []         # Cross RDC: take options FROM these RDCs
     cross_to: List[str] = []           # Cross RDC: send TO stores of these RDCs
+    # ── Central RDC Pool (spec v1.5) — read ONLY when rdc_mode == 'all' AND
+    # business rule ALC_RDC_CENTRAL_POOL is active (BR-RDC-13). Ignored
+    # entirely by Own and Cross runs, which never reach the split pass.
+    rdc_split_policy: str = "SINGLE_PREFERRED"   # SPLIT_ALWAYS | SINGLE_PREFERRED | SINGLE_STRICT
+    rdc_max_split: int = 2                       # max source RDCs per SHIP line (BR-RDC-09)
     store_codes: List[str] = []        # selected stores (empty = all active)
     maj_cat_values: List[str] = []     # selected MAJ_CATs (empty = all)
     run_mode: str = "listing"          # "listing" | "full" (full = MSA+Grid+Listing)
@@ -165,6 +170,35 @@ class GenerateRequest(BaseModel):
         # direct-API caller, or legacy UI — to COMPLETE so SCALED can never
         # take effect regardless of what the client sends.
         return "COMPLETE"
+
+    @field_validator("rdc_split_policy")
+    @classmethod
+    def _valid_split_policy(cls, v):
+        """Reject an unknown sourcing policy rather than silently defaulting.
+        A typo here would otherwise pick a different warehouse for real stock."""
+        allowed = {"SPLIT_ALWAYS", "SINGLE_PREFERRED", "SINGLE_STRICT"}
+        s = str(v or "").strip().upper()
+        if s not in allowed:
+            raise ValueError(
+                f"rdc_split_policy must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return s
+
+    @field_validator("rdc_max_split")
+    @classmethod
+    def _valid_max_split(cls, v):
+        """BR-RDC-09. 1 is equivalent to SINGLE_STRICT; the upper bound is a
+        sanity fence, not a live-warehouse count (that clamp is UI-side).
+
+        0 is REJECTED rather than coerced: `int(v or 2)` would silently turn
+        it into 2, and a caller asking for zero source warehouses deserves an
+        error rather than a guess. (A missing field takes the default before
+        this runs; an explicit null fails the `int` type first.)"""
+        n = int(v)
+        if not 1 <= n <= 6:
+            raise ValueError(f"rdc_max_split must be between 1 and 6, got {v!r}")
+        return n
+
     # MJ_MBQ growth headroom (Allocation Gate).  100 = strict (waterfall stops
     # at the MAJ_CAT target, current default).  >100 scales MJ_MBQ to a
     # SIBLING column MJ_MBQ_REV — the original MJ_MBQ is preserved untouched —
@@ -435,6 +469,26 @@ def get_config(current_user: User = Depends(get_current_user)):
         except Exception:
             result["ssns"] = []
 
+        # ── Central RDC Pool — what the cockpit needs to render honestly ──
+        # The UI must be able to say, BEFORE Generate, whether `All RDCs`
+        # will club or behave as today. Without this the screen would show a
+        # sourcing panel for a feature that is switched off (§B8.3).
+        try:
+            _untagged = conn.execute(text(
+                "SELECT COUNT(DISTINCT [ST_CD]) FROM [Master_ALC_INPUT_ST_MASTER] "
+                "WHERE [RDC] IS NULL OR LTRIM(RTRIM([RDC])) IN ('', 'ALL')"
+            )).scalar() or 0
+        except Exception:
+            _untagged = 0
+        result["rdc_pool"] = {
+            "central_pool_active": bool(rule_flag('ALC_RDC_CENTRAL_POOL', False)),
+            "split_policy": rule_value('ALC_RDC_SPLIT_POLICY', 'SINGLE_PREFERRED'),
+            "priority": rule_value('ALC_RDC_PRIORITY', None),
+            "max_split": int(float(rule_value('ALC_RDC_MAX_SPLIT', 2) or 2)),
+            "hold_split_allowed": bool(rule_flag('ALC_RDC_HOLD_SPLIT', False)),
+            "untagged_store_count": int(_untagged),
+        }
+
     return {"success": True, "data": result}
 
 
@@ -623,6 +677,19 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     # the legacy AppSettings value only serves as the fallback default if
     # the rules table is unreachable / the row is missing.
     _allow_mp = rule_flag('ALC_MULTI_PARKED', _legacy_mp)
+    # ── R10 — central pooling removes the isolation multi-parking relied on ─
+    # Stock is only reserved at Approve. Under `Own` two simultaneous parked
+    # runs draw from DIFFERENT warehouse pools, so they cannot promise the
+    # same pieces — the isolation is accidental but real. Clubbing destroys
+    # it: both runs see one pool and both can allocate the same stock.
+    # Refuse the combination rather than allow a silent over-allocation.
+    if _allow_mp and rule_flag('ALC_RDC_CENTRAL_POOL', False):
+        _allow_mp = False
+        req.allow_multi_parked = False
+        logger.warning(
+            "[generate] ALC_MULTI_PARKED suppressed — central RDC pooling is "
+            "active and two parked runs would draw the same clubbed stock (R10)"
+        )
     # Reflect the persisted value back onto the request so downstream
     # consumers (audit log, persisted-settings rewrite at line ~585) see
     # the authoritative value.
@@ -802,6 +869,33 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     start = time.time()
     de = get_data_engine()
 
+    # ── Central RDC Pool — resolved ONCE, here, and never re-read ──────────
+    # Spec v1.5 §B1.4 / correction M9. rule_flag() caches with a 30-second
+    # TTL, and a full Generate spans many refreshes. If Part 3.55 and Part
+    # 8.37 each asked independently, an admin toggling the switch mid-run
+    # would produce a half-clubbed, half-split run — the worst possible
+    # state. One resolution, passed down as an argument, makes that
+    # impossible.
+    #
+    # BR-RDC-13: BOTH conditions required. Own and Cross can never satisfy
+    # the first, so they cannot enter any of the new code paths even if the
+    # rule is switched on by accident.
+    _CENTRAL_POOL = (
+        str(req.rdc_mode).strip().lower() == "all"
+        and rule_flag("ALC_RDC_CENTRAL_POOL", False)
+    )
+    if _CENTRAL_POOL:
+        logger.info(
+            f"[rdc] CENTRAL POOL ACTIVE — stock clubbed across all RDCs; "
+            f"split policy={req.rdc_split_policy}, max_split={req.rdc_max_split}"
+        )
+    else:
+        logger.info(
+            f"[rdc] central pool OFF (rdc_mode={req.rdc_mode}, "
+            f"rule={'on' if rule_flag('ALC_RDC_CENTRAL_POOL', False) else 'off'}) "
+            f"— per-RDC pools, today's behaviour"
+        )
+
     # Snapshot which tracked tables existed before the run started, so the
     # post-run sweep can label each one CREATED vs. RECREATED/TRUNCATED.
     pre_existence = parked_history.capture_pre_existence()
@@ -960,6 +1054,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             ("LISTING",    "size_threshold",        str(req.size_threshold)),
             ("LISTING",    "mix_mode",              str(req.mix_mode)),
             ("LISTING",    "rdc_mode",              str(req.rdc_mode)),
+            # Central RDC Pool (spec v1.5 §B1.4). Stamped so every run records
+            # WHICH engine produced it — a run's output can never be
+            # misattributed later, and the parallel-run comparison in Step 6
+            # can filter on it.
+            ("LISTING",    "central_pool_active",   str(_CENTRAL_POOL).lower()),
+            ("LISTING",    "rdc_split_policy",
+             str(req.rdc_split_policy) if _CENTRAL_POOL else "n/a"),
+            ("LISTING",    "rdc_max_split",
+             str(req.rdc_max_split) if _CENTRAL_POOL else "n/a"),
             ("LISTING",    "run_mode",              str(req.run_mode)),
             ("LISTING",    "ssn_values",            json.dumps(req.ssn_values)),
             # Run dates (information-only, 2026-07-18)
@@ -1629,9 +1732,28 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             _pre_msa_cols = _get_columns(conn, req.msa_table)
             if "FNL_Q" in _pre_msa_cols:
                 _has_msa_rdc = msa_rdc_col in _pre_msa_cols
-                _rdc_select = f", LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50)))) AS MSA_RDC" if _has_msa_rdc else ""
-                _rdc_group  = f", LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50))))" if _has_msa_rdc else ""
-                _rdc_join   = "AND L.[RDC] = M.[MSA_RDC]" if _has_msa_rdc and req.rdc_mode == "own" else ""
+                # FS-RDC-01 / correction M2 — all THREE fragments move together.
+                #
+                # Today's defect D-1: the sub-query groups per RDC but the join
+                # back only adds the RDC predicate in 'own' mode. In 'all' mode
+                # an option held at both warehouses therefore produces two
+                # candidate rows and SQL Server's UPDATE..FROM picks ONE
+                # ARBITRARILY — neither summed nor own-preferred.
+                #
+                # Dropping only the join does NOT fix it: the GROUP BY still
+                # emits a row per RDC, so the fan-out (and the arbitrary pick)
+                # survives. Clubbing means removing the RDC dimension from the
+                # SELECT, the GROUP BY and the JOIN in one move, which turns
+                # SUM(FNL_Q) into the true cross-warehouse total.
+                #
+                # The false branch reproduces today's strings byte-for-byte,
+                # including the inner == "own" test, so Cross is untouched.
+                _rdc_select = "" if _CENTRAL_POOL else (
+                    f", LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50)))) AS MSA_RDC" if _has_msa_rdc else "")
+                _rdc_group  = "" if _CENTRAL_POOL else (
+                    f", LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50))))" if _has_msa_rdc else "")
+                _rdc_join   = "" if _CENTRAL_POOL else (
+                    "AND L.[RDC] = M.[MSA_RDC]" if _has_msa_rdc and req.rdc_mode == "own" else "")
                 try:
                     _run(conn, f"""
                         UPDATE L SET L.[MSA_FNL_Q] = TRY_CAST(M.[FNL_Q] AS FLOAT)
@@ -1665,9 +1787,17 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 has_fnl = "FNL_Q" in var_cols
                 has_var_rdc = "RDC" in var_cols
                 has_var_art = "ARTICLE_NUMBER" in var_cols
-                vrdc_select = f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50)))) AS MSA_RDC" if has_var_rdc else ""
-                vrdc_group = f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50))))" if has_var_rdc else ""
-                vrdc_join = "AND L.[RDC] = V.[MSA_RDC]" if has_var_rdc and req.rdc_mode == "own" else ""
+                # FS-RDC-01 / M2 — same three-fragment rule as MSA_FNL_Q above.
+                # VAR_FNL_COUNT must be counted on the CLUBBED figure: a size
+                # held at both warehouses is still one size, and this value
+                # drives the R07 TBL size-coverage gate. Summing per-RDC counts
+                # would double it and wrongly pass the gate.
+                vrdc_select = "" if _CENTRAL_POOL else (
+                    f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50)))) AS MSA_RDC" if has_var_rdc else "")
+                vrdc_group = "" if _CENTRAL_POOL else (
+                    f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50))))" if has_var_rdc else "")
+                vrdc_join = "" if _CENTRAL_POOL else (
+                    "AND L.[RDC] = V.[MSA_RDC]" if has_var_rdc and req.rdc_mode == "own" else "")
                 var_rdc_where = msa_rdc_filter.replace(f"[{msa_rdc_col}]", "[RDC]") if has_var_rdc else ""
                 # Row-per-type MSA: VAR_FNL_COUNT counts sizes whose baked typed
                 # FNL_Q is positive, filtered to the run's ALLOC_TYPE rows.
@@ -1681,17 +1811,63 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                                 "THEN 1 ELSE 0 END) AS fnl_cnt")
                 else:
                     fnl_expr = ", 0 AS fnl_cnt"
-                try:
-                    _run(conn, f"""
-                        UPDATE L SET L.[VAR_COUNT] = V.var_cnt, L.[VAR_FNL_COUNT] = V.fnl_cnt
-                        FROM [{LISTING_TABLE}] L
-                        INNER JOIN (
+
+                # FS-RDC-01 / M2 — the clubbed variant needs a DIFFERENT SHAPE,
+                # not just RDC dropped from the GROUP BY.
+                #
+                # Per-RDC (today) the inner query has one row per size, so
+                # COUNT(*) is the size count. Remove RDC from the grouping and
+                # COUNT(*) suddenly counts ROWS ACROSS BOTH WAREHOUSES — a size
+                # stocked at each is counted twice, VAR_COUNT doubles and the
+                # R07 TBL size-coverage gate passes on a fiction.
+                #
+                # So clubbing aggregates twice: first sum FNL_Q per size across
+                # warehouses, then count those sizes. VAR_FNL_COUNT is then the
+                # number of sizes whose CLUBBED quantity is positive, which is
+                # exactly what the gate is supposed to ask.
+                _sz_key = ("SZ" if "SZ" in var_cols
+                           else ("ARTICLE_NUMBER" if has_var_art else None))
+                _club_var = _CENTRAL_POOL and _sz_key is not None
+                if _CENTRAL_POOL and not _club_var:
+                    logger.warning(
+                        "Part 3.55: ARS_MSA_MSA_VAR_ART has neither SZ nor "
+                        "ARTICLE_NUMBER — cannot club VAR_COUNT safely; "
+                        "falling back to the per-RDC shape."
+                    )
+                    vrdc_select = (f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50)))) AS MSA_RDC"
+                                   if has_var_rdc else "")
+                    vrdc_group = (f", LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50))))"
+                                  if has_var_rdc else "")
+
+                if _club_var:
+                    _sz_expr = f"LTRIM(RTRIM(CAST([{_sz_key}] AS NVARCHAR(100))))"
+                    _inner_fnl = ("SUM(TRY_CAST([FNL_Q] AS FLOAT))" if has_fnl else "0")
+                    var_inner = f"""
+                            SELECT Z.[MAJ_CAT], Z.[GEN_ART_NUMBER], Z.[CLR],
+                                   COUNT(*) AS var_cnt,
+                                   SUM(CASE WHEN Z.SZ_FNL > 0 THEN 1 ELSE 0 END) AS fnl_cnt
+                            FROM (
+                                SELECT {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')},
+                                       {_sz_expr} AS SZ_K,
+                                       {_inner_fnl} AS SZ_FNL
+                                FROM [ARS_MSA_VAR_ART]
+                                WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{var_rdc_where}{_var_type_where}
+                                GROUP BY {_msa_expr('MAJ_CAT')}, {_msa_expr('GEN_ART_NUMBER')}, {_msa_expr('CLR')}, {_sz_expr}
+                            ) Z
+                            GROUP BY Z.[MAJ_CAT], Z.[GEN_ART_NUMBER], Z.[CLR]"""
+                else:
+                    var_inner = f"""
                             SELECT {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')}
                                    {vrdc_select},
                                    COUNT(*) AS var_cnt{fnl_expr}
                             FROM [ARS_MSA_VAR_ART]
                             WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{var_rdc_where}{_var_type_where}
-                            GROUP BY {_msa_expr('MAJ_CAT')}, {_msa_expr('GEN_ART_NUMBER')}, {_msa_expr('CLR')}{vrdc_group}
+                            GROUP BY {_msa_expr('MAJ_CAT')}, {_msa_expr('GEN_ART_NUMBER')}, {_msa_expr('CLR')}{vrdc_group}"""
+                try:
+                    _run(conn, f"""
+                        UPDATE L SET L.[VAR_COUNT] = V.var_cnt, L.[VAR_FNL_COUNT] = V.fnl_cnt
+                        FROM [{LISTING_TABLE}] L
+                        INNER JOIN ({var_inner}
                         ) V ON L.[MAJ_CAT] = V.[MAJ_CAT]
                             AND L.[GEN_ART_NUMBER] = V.[GEN_ART_NUMBER]
                             AND L.[CLR] = V.[CLR] {vrdc_join}
@@ -3338,6 +3514,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             stock_threshold_pct=req.stock_threshold_pct,
             default_acs_d=float(req.default_acs_d or 18.0),
             tbl_hold_release_retry=rule_flag('ALC_TBL_HOLD_RETRY', True),
+            # Central RDC Pool — resolved once at run start (§B1.4 / M9).
+            # False for every Own and Cross run, and for an All RDCs run
+            # while ALC_RDC_CENTRAL_POOL is inactive.
+            central_pool=_CENTRAL_POOL,
         )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")
@@ -3421,6 +3601,43 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     except Exception as e:
         logger.warning(f"Part 8.36: run-date stamp failed: {e}")
     t0 = _time_step("Part 8.36 (run-date stamp)", t0)
+
+    # ── Part 8.37 — RDC split pass (FS-RDC-04, spec v1.5 §B6) ─────────────
+    # Allocation has just finished against ONE clubbed pool; nothing yet says
+    # WHICH warehouse ships each line. This pass decides that, walking the
+    # lines in waterfall order against a single shared balance ledger.
+    #
+    # Placement is deliberate: AFTER the run-date stamp and BEFORE Part 8.4
+    # parking, so ARS_ALLOC_PARKED -> ARS_ALLOC_HISTORY inherit SRC_RDC
+    # through the existing column reconcile with no change to parked_history.
+    #
+    # BR-RDC-11 mode separation: this does not execute at all unless the run
+    # is `All RDCs` AND ALC_RDC_CENTRAL_POOL is active. An Own or Cross run
+    # leaves SRC_RDC NULL and writes zero split rows (invariant I-11 / V14).
+    rdc_split_summary = None
+    if _CENTRAL_POOL:
+        try:
+            from app.services import rdc_split_service as _rdc
+            with de.begin() as _sc:
+                rdc_split_summary = _rdc.run_split_pass(
+                    _sc,
+                    session_id=session_id,
+                    alloc_table=ALLOC_TABLE,
+                    listing_table=FINAL_TABLE,
+                    msa_var_table="ARS_MSA_VAR_ART",
+                    alloc_type=req.alloc_type,
+                    policy=req.rdc_split_policy,
+                    max_split=req.rdc_max_split,
+                    priority_raw=rule_value('ALC_RDC_PRIORITY', None),
+                )
+            summary["rdc_split"] = rdc_split_summary
+        except Exception as e:
+            # A partial tagging is worse than none: the picking requirement
+            # would under-state and stock would look free that is already
+            # committed. Fail the run loudly instead.
+            logger.error(f"Part 8.37: RDC split pass FAILED — {e}")
+            raise
+        t0 = _time_step("Part 8.37 (RDC split pass)", t0)
 
     # ── Part 8.4 — Park ARS_ALLOC_WORKING + ARS_LISTING_WORKING for review ──
     # Snapshot the freshly-built allocation AND the working listing into
@@ -3611,6 +3828,20 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                           AND ISNULL(A.[HOLD_QTY], 0) > 0
                           {_hfilter}
                     """), ({"sid": session_id} if _hfilter else {}))
+                # 4. the RDC split rows (§B6.6). A fourth copy of the hold
+                # lives in the picking requirement; without this it would keep
+                # reserving stock this step has just returned to the pool.
+                # Only an `All RDCs` run has split rows at all.
+                if _CENTRAL_POOL:
+                    try:
+                        from app.services import rdc_split_service as _rdc855
+                        _rdc855.release_holds_for_mix_options(
+                            ac, session_id, FINAL_TABLE
+                        )
+                    except Exception as _se:
+                        logger.warning(
+                            f"Part 8.55: split-row hold cascade failed: {_se}"
+                        )
                 rel = ac.execute(text(
                     f"SELECT COUNT(*), ISNULL(SUM([HOLD_RELEASED_QTY]),0) "
                     f"FROM [{FINAL_TABLE}] WHERE ISNULL([HOLD_RELEASED_QTY],0) > 0 "
@@ -3680,6 +3911,24 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
+            # Central RDC Pool (spec v1.5 §B7.3). RDC keeps its meaning — the
+            # STORE's warehouse, backfilled from the store master below. SRC_RDC
+            # is the warehouse PHYSICALLY reserving the hold, written only by an
+            # `All RDCs` run. NULL on every legacy and Own/Cross row, so
+            # ISNULL(SRC_RDC, RDC) reproduces today's value exactly and the
+            # 2.75 M existing rows need no backfill.
+            try:
+                _run(ac, """
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
+                          AND name = 'SRC_RDC'
+                    )
+                    ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING] ADD [SRC_RDC] NVARCHAR(20) NULL
+                """)
+            except Exception:
+                pass
+
             # Add ALLOC_TYPE if the table predates the Fresh/GRT change
             # (FS-DB-03 / FS-10 item 1 — mirrors the RDC guard above).
             # NOT NULL DEFAULT '' backfills legacy rows with '' = "matches
@@ -3702,8 +3951,23 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
             # Backfill RDC on any rows still NULL by joining the store master.
             # Idempotent — only touches rows where RDC IS NULL.
+            #
+            # Central RDC Pool (spec v1.5 §B7.3 i): the guard below must never
+            # reach a centrally-sourced row. That row already records the
+            # warehouse that PHYSICALLY reserved the hold; stamping the store's
+            # warehouse over it would make MSA debit the wrong pool. The
+            # predicate is composed in Python because SQL Server resolves
+            # column names at compile time — referencing a SRC_RDC that does
+            # not exist would fail the whole batch, not just skip the clause.
             try:
-                _run(ac, """
+                _src_guard = ""
+                if ac.execute(text(
+                    "SELECT CASE WHEN COL_LENGTH("
+                    "'ARS_NL_TBL_HOLD_TRACKING','SRC_RDC') IS NULL "
+                    "THEN 0 ELSE 1 END"
+                )).scalar():
+                    _src_guard = "AND T.[SRC_RDC] IS NULL"
+                _run(ac, f"""
                     IF EXISTS (SELECT 1 FROM sys.columns
                                WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
                                  AND name = 'RDC')
@@ -3713,7 +3977,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         FROM [ARS_NL_TBL_HOLD_TRACKING] T
                         INNER JOIN [Master_ALC_INPUT_ST_MASTER] S
                             ON S.[ST_CD] = T.[WERKS]
-                        WHERE T.[RDC] IS NULL OR T.[RDC] = ''
+                        WHERE (T.[RDC] IS NULL OR T.[RDC] = '')
+                          {_src_guard}
                     END
                 """)
             except Exception:
@@ -5232,6 +5497,41 @@ def _compute_listing_summary(conn):
             summary["by_maj_cat_rdc"] = []
     else:
         summary["by_maj_cat_rdc"] = []
+
+    # FS-RDC-07 (§B9) — by_maj_cat_rdc above is grouped on the STORE's RDC and
+    # therefore answers "demand by store's warehouse". After clubbing that is
+    # no longer the same question as "what does each warehouse pick", so the
+    # pick view is ADDED rather than substituted: replacing it would silently
+    # change a number ops reads every day.
+    #
+    # This function summarises the CURRENT working tables, which belong to the
+    # latest run, so the matching split rows are the latest SESSION_ID. Session
+    # ids are timestamp-prefixed (YYYYMMDD_HHMMSS_mmm), so MAX() is the newest.
+    # An Own/Cross run writes no split rows, so this stays empty for them.
+    summary["by_maj_cat_src_rdc"] = []
+    try:
+        if _table_exists(conn, "ARS_ALLOC_RDC_SPLIT"):
+            _sp_rows = conn.execute(text("""
+                SELECT [MAJ_CAT], [SRC_RDC],
+                       SUM(ISNULL([SHIP_QTY],0)) AS pick_qty,
+                       SUM(ISNULL([HOLD_QTY],0)) AS hold_qty,
+                       SUM(CASE WHEN [IS_CROSS] = 1
+                                THEN ISNULL([SHIP_QTY],0) ELSE 0 END) AS cross_qty
+                FROM   [ARS_ALLOC_RDC_SPLIT]
+                WHERE  [SESSION_ID] = (
+                    SELECT MAX([SESSION_ID]) FROM [ARS_ALLOC_RDC_SPLIT]
+                )
+                GROUP  BY [MAJ_CAT], [SRC_RDC]
+                ORDER  BY [MAJ_CAT], [SRC_RDC]
+            """)).fetchall()
+            summary["by_maj_cat_src_rdc"] = [
+                {"maj_cat": r[0], "src_rdc": r[1],
+                 "pick_qty": int(r[2] or 0), "hold_qty": int(r[3] or 0),
+                 "cross_qty": int(r[4] or 0)}
+                for r in _sp_rows if r[0] and r[1]
+            ]
+    except Exception as _e:
+        logger.warning(f"summary: by_maj_cat_src_rdc failed: {_e}")
 
     # GEN_ART_NUMBER is BIGINT — must CAST for string concatenation
     opt_key = "ISNULL([MAJ_CAT],'') + '|' + ISNULL(CAST([GEN_ART_NUMBER] AS NVARCHAR(50)),'') + '|' + ISNULL([CLR],'')"

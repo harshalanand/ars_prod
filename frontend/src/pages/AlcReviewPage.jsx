@@ -251,7 +251,12 @@ function SessionDrillView({ sid }) {
       render: (r) => r.st_nm || '—' },
     { k: 'hub',        l: 'HUB',
       render: (r) => r.hub || '—' },
-    { k: 'rdc',        l: 'RDC',       cls: 'font-mono text-[11px] text-indigo-600' },
+    // O7 (spec v1.5 §B8.6): this is the STORE's warehouse. Under central
+    // pooling the warehouse that actually PICKS can differ, so the bare label
+    // 'RDC' would have a reviewer approving one number while the picklist
+    // shows another. Renamed rather than replaced — the store view is still
+    // the right one for demand.
+    { k: 'rdc',        l: 'Store RDC', cls: 'font-mono text-[11px] text-indigo-600' },
     { k: 'mbq',        l: 'MBQ',         align: 'right', fmt: true },
     { k: 'store_stk',  l: 'STORE_STK',   align: 'right', fmt: true },
     { k: 'excess_stk', l: 'EXCESS_STK',  align: 'right', fmt: true },
@@ -321,7 +326,7 @@ function SessionDrillView({ sid }) {
       render: (r) => r.alloc_seq == null ? '—' : r.alloc_seq },
     { k: 'alloc_wave', l: 'WAVE',       cls: 'font-mono text-[11px]',
       render: (r) => r.alloc_wave || '—' },
-    { k: 'rdc',        l: 'RDC',        cls: 'font-mono text-[11px] text-indigo-600' },
+    { k: 'rdc',        l: 'Store RDC',  cls: 'font-mono text-[11px] text-indigo-600' },  // O7 — see note above
     { k: 'i_rod_planned', l: 'I_ROD PLAN',  align: 'right', fmt: true,
       cls: 'text-[11px] text-gray-700' },
     { k: 'i_rod_used',    l: 'I_ROD USED',  align: 'right', fmt: true,

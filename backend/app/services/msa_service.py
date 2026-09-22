@@ -39,6 +39,45 @@ def _df_to_native_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
+def _hold_src_expr(db, hold_table: str, rdc_col: str) -> str:
+    """SQL expression for the warehouse a hold is PHYSICALLY reserved at.
+
+    Central RDC Pool, correction M7 (spec v1.5 §B7.3 iv). MSA deducts open
+    holds from FNL_Q per warehouse. Under central pooling a hold can be
+    reserved at a warehouse other than the store's own, so resolving it from
+    the store master — which is what both loaders used to do — debits the
+    wrong pool twice over: the store's warehouse loses stock that was never
+    reserved there, and the sourcing warehouse keeps counting committed
+    pieces as free.
+
+    Resolution order, first non-blank wins:
+        1. H.SRC_RDC  — written at Approve by an `All RDCs` run
+        2. S.<rdc>    — the store master, exactly as today
+
+    Every legacy and Own/Cross row has SRC_RDC NULL, so this reduces to
+    today's expression on every existing row — which is what check V13
+    asserts. The column guard keeps pre-migration databases working.
+
+    DELIBERATELY NOT INCLUDED: H.RDC. `alloc_pool._typed_hold_sql` prefers
+    the hold row's own RDC over the store master, and these two loaders
+    therefore disagree for any store re-tagged after its hold was created —
+    measured 2026-09-22 at 234,285 of 234,285 open hold rows (346,258 pcs,
+    412 stores). That is a real pre-existing defect, but it is NOT this
+    change's to fix: adding H.RDC here would move the MSA deduction for
+    every one of those rows and V13 could no longer prove that central
+    pooling left the existing behaviour alone. Tracked separately.
+    """
+    try:
+        has_src = bool(db.execute(text(
+            "SELECT CASE WHEN COL_LENGTH(:t,'SRC_RDC') IS NULL THEN 0 ELSE 1 END"
+        ), {"t": hold_table}).scalar())
+    except Exception:
+        has_src = False
+    if not has_src:
+        return f"S.[{rdc_col}]"
+    return f"COALESCE(NULLIF(H.[SRC_RDC],''), S.[{rdc_col}])"
+
+
 class MSAService:
     """Service for MSA stock calculation operations"""
 
@@ -117,9 +156,19 @@ class MSAService:
                 )
                 return pd.DataFrame(columns=["RDC", "ARTICLE_NUMBER", "HOLD_QTY"])
 
+            # Central RDC Pool — correction M7 (spec v1.5 Part B7.3 iv).
+            # A hold is physically reserved at the SOURCING warehouse, which
+            # under central pooling need not be the store's own. Resolve in
+            # that order: the hold row's SRC_RDC, then its legacy RDC, then
+            # the store master. Legacy rows have both NULL and fall through to
+            # exactly today's behaviour, so no backfill is needed.
+            # NOTE alloc_pool.py already reads COALESCE(H.RDC, SM.RDC); these
+            # two loaders did NOT, which is why adding the column alone would
+            # have changed nothing for MSA.
+            _hold_rdc = _hold_src_expr(self.db, self.hold_table, rdc_col)
             sql = f"""
                 SELECT
-                    S.[{rdc_col}]   AS RDC,
+                    {_hold_rdc}     AS RDC,
                     H.[VAR_ART]     AS ARTICLE_NUMBER,
                     SUM(ISNULL(H.[HOLD_REM], 0)) AS HOLD_QTY
                 FROM [{self.hold_table}] H
@@ -127,7 +176,7 @@ class MSAService:
                     ON S.[ST_CD] = H.[WERKS]
                 WHERE ISNULL(H.[IS_CLOSED], 0) = 0
                   AND ISNULL(H.[HOLD_REM], 0) > 0
-                GROUP BY S.[{rdc_col}], H.[VAR_ART]
+                GROUP BY {_hold_rdc}, H.[VAR_ART]
             """
             holds_result = self.db.execute(text(sql))
             holds_rows = holds_result.fetchall()
@@ -240,11 +289,13 @@ class MSAService:
                     "THEN 'GRT' ELSE 'FRESH' END")
             where = ("ISNULL(H.[IS_CLOSED],0) = 0 "
                      "AND ISNULL(TRY_CAST(H.[HOLD_REM] AS FLOAT),0) > 0")
+            # M7 — same sourcing-warehouse resolution as _load_open_holds.
+            _hold_rdc = _hold_src_expr(self.db, self.hold_table, rdc_col)
             if grain == "var":
-                keys = (f"S.[{rdc_col}], "
+                keys = (f"{_hold_rdc}, "
                         "LTRIM(RTRIM(CAST(H.[VAR_ART] AS NVARCHAR(30))))")
             else:
-                keys = (f"S.[{rdc_col}], "
+                keys = (f"{_hold_rdc}, "
                         "LTRIM(RTRIM(CAST(H.[GEN_ART_NUMBER] AS NVARCHAR(50)))), "
                         "LTRIM(RTRIM(CAST(ISNULL(H.[CLR],'') AS NVARCHAR(200))))")
             sql = (f"SELECT {keys}, {fold} AS ALLOC_TYPE, "

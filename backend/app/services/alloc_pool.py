@@ -189,7 +189,13 @@ def hold_agg_sql(grain: str, st_master_table: str = DEFAULT_ST_MASTER) -> str:
     grain 'gen' → (RDC_KEY, GEN_KEY, CLR_KEY, HOLD_T)
     Bind param: :pool_alloc_type
     """
-    rdc = "COALESCE(NULLIF(H.[RDC], ''), SM.[RDC])"
+    # Central RDC Pool — correction M7 (spec v1.5 §B7.3 iv). This expression
+    # was already the right SHAPE: it prefers the hold row's own warehouse and
+    # falls back to the store master. SRC_RDC simply goes in FRONT, because
+    # under central pooling the piece is physically reserved at the SOURCING
+    # warehouse, which need not be the store's own. Every legacy and Own/Cross
+    # row has SRC_RDC NULL, so the result is unchanged for them.
+    rdc = "COALESCE(NULLIF(H.[SRC_RDC], ''), NULLIF(H.[RDC], ''), SM.[RDC])"
     where = ("ISNULL(H.[IS_CLOSED], 0) = 0 AND ISNULL(H.[HOLD_REM], 0) > 0 "
              f"AND {_typed_match('H')}")
     if grain == "var":

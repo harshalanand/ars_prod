@@ -436,6 +436,14 @@ export const listingAPI = {
   generate:     (data, opts) => api.post('/listing/generate', data, { timeout: 600000, ...opts }),
   preview:      (params) => api.get('/listing/preview', { params }),
   summary:      (opts={}) => api.get('/listing/summary', _pollOrForeground(opts)),
+  // Central RDC Pool (spec v1.5 §B9). All five return
+  // { central_pool: false } for an Own/Cross session rather than erroring,
+  // so callers can render conditionally without special-casing.
+  rdcSplitSummary:   (sid, opts={}) => api.get(`/listing/rdc-split/summary/${sid}`,   _pollOrForeground(opts)),
+  rdcSplitPicklist:  (sid, params)  => api.get(`/listing/rdc-split/picklist/${sid}`,  { params }),
+  rdcSplitDispatch:  (sid)          => api.get(`/listing/rdc-split/dispatch/${sid}`),
+  rdcSplitCrossShip: (sid)          => api.get(`/listing/rdc-split/cross-ship/${sid}`),
+  rdcSplitResidual:  (sid, params)  => api.get(`/listing/rdc-split/residual/${sid}`,  { params }),
   export:       (params) => api.get('/listing/export', { params, responseType: 'blob', timeout: 600000 }),
   createFinal:  (data)   => api.post('/listing/create-final', data || {}),
   storeRanking: (params) => api.get('/listing/store-ranking', { params }),

@@ -2154,6 +2154,12 @@ def list_schedule_audit(
 _ENSURE_COLS = [
     ("SESSION_ID",     "NVARCHAR(50)   NOT NULL DEFAULT ''"),
     ("RDC",            "NVARCHAR(20)   NOT NULL DEFAULT ''"),
+    # Central RDC Pool (spec v1.5 §B7.3). RDC keeps its meaning — the STORE's
+    # warehouse. SRC_RDC is the warehouse that physically ships, written only by
+    # an `All RDCs` run; NULL on every Own/Cross row, legacy or new. Consumers
+    # read ISNULL(SRC_RDC, RDC), so a NULL falls back to today's exact value and
+    # no backfill of the 17.9 M existing rows is needed.
+    ("SRC_RDC",        "NVARCHAR(20)   NULL"),
     ("ST_CD",          "NVARCHAR(20)   NULL"),
     ("ARTICLE_NUMBER", "NVARCHAR(30)   NOT NULL DEFAULT ''"),
     ("MAJ_CAT",        "NVARCHAR(50)   NULL"),
@@ -2314,26 +2320,98 @@ def write_pend_alc(conn, session_id: str) -> int:
         logger.warning("[pend_alc] write_pend_alc: store master RDC col not found — "
                        "WERKS stored as RDC (MSA deduction may be inaccurate)")
 
+    # ── Central RDC Pool — corrections M5 and M6 (spec v1.5 §B7.3) ────────
+    #
+    # RDC above keeps its meaning: the STORE's warehouse. It is wrong as a
+    # *sourcing* answer the moment a line is served from the other warehouse,
+    # and ARS_PEND_ALC.RDC is what MSA deducts from and what the BDC picking
+    # file keys on. So a second column carries the truth.
+    #
+    # M6 — the source CANNOT come from ARS_ALLOC_HISTORY. A split line's
+    # SRC_RDC there is the literal 'MULTI', which is not a warehouse: history
+    # cannot say the line was DH24 2 + DW01 4. Only ARS_ALLOC_RDC_SPLIT knows,
+    # so we aggregate it to (WERKS, VAR_ART, SRC_RDC) — pend is at article
+    # grain, so sizes roll up.
+    #
+    # M5 — a split line then yields TWO candidate rows that share WERKS,
+    # ARTICLE_NUMBER, ALLOC_MODE *and* RDC (the store's warehouse is the same
+    # for both). SRC_RDC must therefore join the GROUP BY and the NOT EXISTS
+    # guard, or the second row is silently dropped and those pieces are never
+    # reserved.
+    #
+    # Own / Cross: the split table holds no rows for the session, the LEFT
+    # JOIN yields NULL, SRC_RDC is written NULL, and every expression below
+    # reduces to exactly what it produced before this change.
+    _has_split = bool(conn.execute(text(
+        "SELECT CASE WHEN OBJECT_ID('dbo.ARS_ALLOC_RDC_SPLIT','U') "
+        "IS NULL THEN 0 ELSE 1 END"
+    )).scalar())
+    _has_src_col = bool(conn.execute(text(
+        f"SELECT CASE WHEN COL_LENGTH('{PEND_ALC_TABLE}','SRC_RDC') "
+        f"IS NULL THEN 0 ELSE 1 END"
+    )).scalar())
+
+    if _has_split and _has_src_col:
+        src_expr = "SPL.[SRC_RDC]"
+        src_join = """
+                LEFT JOIN (
+                    SELECT [SESSION_ID], [WERKS], [VAR_ART], [SRC_RDC],
+                           SUM(ISNULL([SHIP_QTY],0)) AS SRC_QTY
+                    FROM   [ARS_ALLOC_RDC_SPLIT]
+                    GROUP  BY [SESSION_ID], [WERKS], [VAR_ART], [SRC_RDC]
+                ) SPL
+                    ON  SPL.[SESSION_ID] = H.[SESSION_ID]
+                    AND SPL.[WERKS]      = H.[WERKS]
+                    AND SPL.[VAR_ART]    = H.[VAR_ART]"""
+        src_sel = ", SRC_RDC"
+        src_val = ", src.SRC_RDC"
+        qty_expr = ("ISNULL(MAX(SPL.SRC_QTY), "
+                    "SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0)))")
+        # SRC_RDC must join the GROUP BY (M5) — but only when it is a real
+        # column reference. `GROUP BY CAST(NULL AS ...)` is not valid T-SQL.
+        src_group = f", {src_expr}"
+        # M5: without SRC_RDC in the guard, a split line's second source row
+        # is silently dropped — both rows share SESSION_ID, RDC (the store's
+        # warehouse), ST_CD, ARTICLE_NUMBER and ALLOC_MODE. '~' stands in for
+        # NULL so an Own/Cross row (SRC_RDC NULL) still matches itself.
+        src_guard = ("\n                  AND ISNULL(P.SRC_RDC,'~')"
+                     " = ISNULL(src.SRC_RDC,'~')")
+    else:
+        src_expr = "CAST(NULL AS NVARCHAR(20))"
+        src_join = ""
+        src_sel = ""
+        src_val = ""
+        src_group = ""
+        src_guard = ""
+        qty_expr = "SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0))"
+        if not _has_src_col:
+            logger.warning(
+                f"[pend_alc] {PEND_ALC_TABLE} has no SRC_RDC column — a "
+                f"central-pool run would book its pendings against the "
+                f"store's RDC. Apply the Step 1 migration."
+            )
+
     if has_lwh:
         sql = f"""
             INSERT INTO {PEND_ALC_TABLE}
                 (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
+                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE{src_sel})
             SELECT :sid, src.RDC, src.ST_CD, src.VAR_ART, src.MAJ_CAT,
                    src.GEN_ART_NUMBER, src.CLR, src.ALLOC_QTY, src.ALLOC_MODE, 'AUTO',
-                   src.ALLOC_TYPE
+                   src.ALLOC_TYPE{src_val}
             FROM (
                 SELECT {rdc_expr}                         AS RDC,
+                       {src_expr}                         AS SRC_RDC,
                        H.[WERKS]                          AS ST_CD,
                        H.[VAR_ART],
                        H.[MAJ_CAT]                        AS MAJ_CAT,
                        H.[GEN_ART_NUMBER],
                        MAX(H.[CLR])                       AS CLR,
-                       SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0)) AS ALLOC_QTY,
+                       {qty_expr}                         AS ALLOC_QTY,
                        ISNULL(MAX(W.[OPT_TYPE]), 'AUTO')  AS ALLOC_MODE,
                        MAX(H.[ALLOC_TYPE])                AS ALLOC_TYPE
                 FROM [ARS_ALLOC_HISTORY] H
-                {st_join}
+                {st_join}{src_join}
                 LEFT JOIN [ARS_LISTING_WORKING_HISTORY] W
                     ON  W.[SESSION_ID]                = H.[SESSION_ID]
                     AND W.[WERKS]                     = H.[WERKS]
@@ -2342,42 +2420,44 @@ def write_pend_alc(conn, session_id: str) -> int:
                     AND ISNULL(W.[CLR],'')             = ISNULL(H.[CLR],'')
                 WHERE H.[SESSION_ID] = :sid
                   AND ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0) > 0
-                GROUP BY {rdc_expr}, H.[WERKS], H.[VAR_ART], H.[MAJ_CAT],
+                GROUP BY {rdc_expr}{src_group}, H.[WERKS], H.[VAR_ART], H.[MAJ_CAT],
                          H.[GEN_ART_NUMBER], ISNULL(W.[OPT_TYPE], 'AUTO')
             ) src
             WHERE NOT EXISTS (
                 SELECT 1 FROM {PEND_ALC_TABLE} P
                 WHERE P.SESSION_ID     = :sid
-                  AND P.RDC            = src.RDC
+                  AND P.RDC            = src.RDC{src_guard}
                   AND ISNULL(P.ST_CD,'') = ISNULL(src.ST_CD,'')
                   AND P.ARTICLE_NUMBER = src.VAR_ART
                   AND P.ALLOC_MODE     = src.ALLOC_MODE
             )
         """
     else:
-        # Fallback: no working history — one row per (RDC, ST_CD, ARTICLE)
+        # Fallback: no working history — one row per (RDC, SRC_RDC, ST_CD, ARTICLE)
         sql = f"""
             INSERT INTO {PEND_ALC_TABLE}
                 (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
+                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE{src_sel})
             SELECT :sid,
                    {rdc_expr}, H.[WERKS], H.[VAR_ART],
                    MAX(H.[MAJ_CAT]), MAX(H.[GEN_ART_NUMBER]), MAX(H.[CLR]),
-                   SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0)),
-                   'AUTO', 'AUTO', MAX(H.[ALLOC_TYPE])
+                   {qty_expr},
+                   'AUTO', 'AUTO', MAX(H.[ALLOC_TYPE]){f", {src_expr}" if src_sel else ""}
             FROM [ARS_ALLOC_HISTORY] H
-            {st_join}
+            {st_join}{src_join}
             WHERE H.[SESSION_ID] = :sid
               AND ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0) > 0
               AND NOT EXISTS (
                   SELECT 1 FROM {PEND_ALC_TABLE} P
                   WHERE P.SESSION_ID       = :sid
-                    AND P.RDC              = {rdc_expr}
+                    AND P.RDC              = {rdc_expr}{
+                      chr(10) + "                    AND ISNULL(P.SRC_RDC,'~') = ISNULL(" + src_expr + ",'~')"
+                      if src_sel else ""}
                     AND ISNULL(P.ST_CD,'') = ISNULL(H.[WERKS],'')
                     AND P.ARTICLE_NUMBER   = H.[VAR_ART]
                     AND P.ALLOC_MODE       = 'AUTO'
               )
-            GROUP BY {rdc_expr}, H.[WERKS], H.[VAR_ART]
+            GROUP BY {rdc_expr}{src_group}, H.[WERKS], H.[VAR_ART]
         """
 
     res = conn.execute(text(sql), {"sid": session_id})

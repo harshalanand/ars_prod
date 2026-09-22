@@ -70,7 +70,38 @@ MAX_WORKERS = 8   # was 16; capped lower for the same GIL-saturation reason
 PROCESS_POOL_MIN_MAJCATS = 3
 
 OPT_TYPE_ORDER = ["RL", "TBC", "TBL"]
-POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
+# FS-RDC-03 (spec v1.5 §B5). The first element is POOL_RDC, a DERIVED column,
+# not the store's RDC:
+#
+#   per-RDC run (Own / Cross / switch off) : POOL_RDC = RDC   → today's 6-key pool
+#   clubbed run (All RDCs + switch on)     : POOL_RDC = '*'   → one pool per option-size
+#
+# Why a derived column rather than a shorter key list. Under clubbing every
+# alloc row already carries the SUMMED FNL_Q from _stage_b_explode. If RDC
+# stayed in the key, two stores of different warehouses would land in two
+# separate pool groups, each holding the FULL clubbed quantity — and
+# groupby(...)['FNL_Q'].max() below would hand out the same stock twice.
+# Collapsing the RDC dimension to a constant is what makes it ONE pool.
+#
+# ARS_ALLOC_WORKING.RDC is never touched: it keeps meaning the store's own
+# warehouse (spec §B1.3), so every existing report still works.
+POOL_RDC_COL = "POOL_RDC"
+CLUBBED_POOL_RDC = "*"
+POOL_KEYS = [POOL_RDC_COL, "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
+
+
+def _add_pool_rdc(df, central_pool: bool):
+    """Materialise POOL_RDC. Called once per MAJ_CAT frame, before any pool
+    grouping. Safe on an empty frame."""
+    if df is None or getattr(df, "empty", True):
+        if df is not None and POOL_RDC_COL not in df.columns:
+            df[POOL_RDC_COL] = ""
+        return df
+    if central_pool:
+        df[POOL_RDC_COL] = CLUBBED_POOL_RDC
+    else:
+        df[POOL_RDC_COL] = df["RDC"] if "RDC" in df.columns else ""
+    return df
 
 # Post-pass PAK_SZ rounding (in-memory `_apply_pak_sz_rounding_df` + SQL
 # `_stage_d_apply_pak_sz_rounding`). RETIRED 2026-08-01: both rounded SHIP up
@@ -595,6 +626,11 @@ def run_listing_and_allocation_pandas(
     stock_threshold_pct: float = 0.6,
     default_acs_d: float = 18.0,
     tbl_hold_release_retry: bool = True,
+    # ── Central RDC Pool (spec v1.5 §B1.4 / correction M9) ──
+    # Resolved ONCE by listing.py at run start and passed down, never
+    # re-read from the rules cache mid-run. False is today's behaviour and
+    # is what every Own and Cross run passes.
+    central_pool: bool = False,
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -662,6 +698,7 @@ def run_listing_and_allocation_pandas(
                 pri_ct_check_tbc=pri_ct_check_tbc,
                 opt_types=opt_types,
                 alloc_type=alloc_type,
+                central_pool=central_pool,
             )
             logger.info(f"[B] alloc rows = {base_rows}")
             if base_rows == 0:
@@ -702,9 +739,16 @@ def run_listing_and_allocation_pandas(
 
     # ── Load tables once into pandas ──
     t_load = time.time()
+    # FS-RDC-03 — materialise POOL_RDC before ANY pool grouping happens.
     alloc_df, working_df, working_cols = _load_tables(
         engine, alloc_table, working_table, grids, only_majcats
     )
+    _add_pool_rdc(alloc_df, central_pool)
+    if central_pool:
+        logger.info(
+            f"[C-pd] FS-RDC-03: POOL_RDC='{CLUBBED_POOL_RDC}' on {len(alloc_df)} "
+            f"rows — one pool per option-size across all warehouses"
+        )
     logger.info(
         f"[C-pd] loaded alloc={len(alloc_df)} working={len(working_df)} "
         f"cols={len(working_cols)} in {time.time()-t_load:.1f}s"
