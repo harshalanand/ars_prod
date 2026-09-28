@@ -60,7 +60,14 @@ def _safe_int(x: Any) -> int:
 
 
 # Same constants as rule_engine_pandas to keep the pool/opt key contract identical.
-POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
+#
+# FS-RDC-03: the first element is POOL_RDC, a DERIVED column — the store's RDC
+# normally, the constant '*' when central pooling clubs the warehouses. The
+# pool dict is BUILT on it in rule_engine_pandas, so every lookup here must use
+# the SAME column. Keying on RDC instead makes every clubbed lookup miss and
+# the engine reports NO_POOL_MSA on a pool that is actually full.
+POOL_RDC_COL = "POOL_RDC"
+POOL_KEYS = [POOL_RDC_COL, "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
 OPT_KEYS = ["WERKS", "GEN_ART_NUMBER", "CLR"]
 
 
@@ -808,8 +815,17 @@ def _run_band_per_opt(
 
     # 2) Snapshot the eligible slice into a working DataFrame keyed by the
     #    original alloc_df index, so write-back at the end can use .loc[idx].
+    # POOL_RDC is added by the pandas orchestrator (FS-RDC-03). Derive it here
+    # when a caller has not — a direct caller or a unit-test fixture that knows
+    # nothing about central pooling then behaves exactly as it always did,
+    # because POOL_RDC simply mirrors RDC.
+    if POOL_RDC_COL not in alloc_df.columns:
+        alloc_df[POOL_RDC_COL] = (
+            alloc_df['RDC'] if 'RDC' in alloc_df.columns else ''
+        )
+
     cols = [
-        'WERKS', 'RDC', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'VAR_ART', 'SZ',
+        'WERKS', 'RDC', POOL_RDC_COL, 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'VAR_ART', 'SZ',
         'OPT_PRIORITY_RANK', 'ST_RANK', 'IS_NEW',
         'SZ_MBQ', 'SZ_MBQ_WH', 'SZ_STK', 'I_ROD',
         'POOL_CONSUMED', 'SHIP_QTY',
@@ -882,8 +898,10 @@ def _run_band_per_opt(
         opt_idx = opt_rows['_orig_idx'].to_numpy()
 
         # 5a) Read LIVE pool for every size of this OPT at this moment.
+        # POOL_RDC, not RDC — see the note on POOL_KEYS. Under clubbing these
+        # differ, and using RDC here silently empties the pool for every row.
         opt_pool_keys: List[Tuple] = list(zip(
-            opt_rows['RDC'].astype(str).tolist(),
+            opt_rows[POOL_RDC_COL].astype(str).tolist(),
             opt_rows['MAJ_CAT'].astype(str).tolist(),
             opt_rows['GEN_ART_NUMBER'].astype(str).tolist(),
             opt_rows['CLR'].astype(str).tolist(),

@@ -1297,11 +1297,10 @@ export default function ListingPage() {
   const autoRdcs = [...new Set((selectedStores || []).map(s => storeRdcMap[s]).filter(Boolean))]
   const otherRdcs = (config?.rdcs || []).filter(r => !autoRdcs.includes(r))
 
-  // Central RDC Pool state, straight from /listing/config.
-  // centralPoolOn is what decides whether `All RDCs` clubs or behaves as
-  // today — the panel must never imply the feature is live when it is not.
+  // Central RDC Pool defaults, straight from /listing/config.
+  // RDC Scope is the ONLY control: `All RDCs` clubs the warehouses, `Own`
+  // and `Cross` keep per-RDC pools. There is no second toggle.
   const rdcPool = config?.rdc_pool || {}
-  const centralPoolOn = !!rdcPool.central_pool_active
   const untaggedStores = Number(rdcPool.untagged_store_count || 0)
   // Untagged stores are dropped by autoRdcs' .filter(Boolean), so an Own run
   // silently excludes them today. Surfacing the count is defect D-2's
@@ -2866,7 +2865,7 @@ export default function ListingPage() {
                 {untaggedSelected > 0 && (
                   <div style={{ fontSize: 8.5, color: C.amber, lineHeight: 1.35 }}>
                     ⚠ {untaggedSelected} of {selectedStores.length} selected stores have no RDC tag —{' '}
-                    {rdcMode === 'all' && centralPoolOn
+                    {rdcMode === 'all'
                       ? 'sourcing will use the fallback order'
                       : 'these stores are excluded from this run'}
                   </div>
@@ -2876,21 +2875,16 @@ export default function ListingPage() {
                     `Own` BEFORE Generate rather than only in the logs. */}
                 {rdcMode === 'all' && (
                   <div style={{ fontSize: 8.5, color: C.textMuted, lineHeight: 1.35 }}>
-                    {centralPoolOn ? (
-                      <>Pool: <b>{(config?.rdcs || []).join(' + ') || '—'} → one pool</b></>
-                    ) : (
-                      <>Separate pool per RDC · <b>central pool OFF</b> — behaves as today</>
-                    )}
+                    Pool: <b>{(config?.rdcs || []).join(' + ') || '—'} → one pool</b>
                     {untaggedStores > 0 && <> · {untaggedStores} untagged in master</>}
                   </div>
                 )}
               </ParamGroup>
 
               {/* ── RDC Sourcing — progressive disclosure (FS-RDC-06 §B8.2) ──
-                  Rendered ONLY for `All RDCs` with central pooling active,
-                  because that is the only combination whose sourcing is
+                  Rendered ONLY for `All RDCs`, the one mode whose sourcing is
                   configurable. Own and Cross never see it. */}
-              {rdcMode === 'all' && centralPoolOn && (
+              {rdcMode === 'all' && (
                 <ParamGroup title="RDC Sourcing" color={C.amber}>
                   <div style={{ fontSize: 9, color: C.textSub, marginBottom: 2 }}>
                     When one warehouse cannot cover a line:

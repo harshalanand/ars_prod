@@ -16,6 +16,9 @@ env/
 .env
 .env.local
 .env.production
+# Any other .env variant, including the .bak copies made when switching a
+# dev box between database servers — they carry the same credentials as .env.
+.env.*
 
 # Runtime settings (contains DB/SMTP credentials — never commit)
 app_settings.json

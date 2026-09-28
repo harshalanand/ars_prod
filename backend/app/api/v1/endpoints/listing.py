@@ -81,8 +81,7 @@ class GenerateRequest(BaseModel):
     rdc_values: List[str] = []         # Own RDC: selected RDC(s)
     cross_from: List[str] = []         # Cross RDC: take options FROM these RDCs
     cross_to: List[str] = []           # Cross RDC: send TO stores of these RDCs
-    # ── Central RDC Pool (spec v1.5) — read ONLY when rdc_mode == 'all' AND
-    # business rule ALC_RDC_CENTRAL_POOL is active (BR-RDC-13). Ignored
+    # ── Central RDC Pool — read ONLY when rdc_mode == 'all'. Ignored
     # entirely by Own and Cross runs, which never reach the split pass.
     rdc_split_policy: str = "SINGLE_PREFERRED"   # SPLIT_ALWAYS | SINGLE_PREFERRED | SINGLE_STRICT
     rdc_max_split: int = 2                       # max source RDCs per SHIP line (BR-RDC-09)
@@ -481,7 +480,6 @@ def get_config(current_user: User = Depends(get_current_user)):
         except Exception:
             _untagged = 0
         result["rdc_pool"] = {
-            "central_pool_active": bool(rule_flag('ALC_RDC_CENTRAL_POOL', False)),
             "split_policy": rule_value('ALC_RDC_SPLIT_POLICY', 'SINGLE_PREFERRED'),
             "priority": rule_value('ALC_RDC_PRIORITY', None),
             "max_split": int(float(rule_value('ALC_RDC_MAX_SPLIT', 2) or 2)),
@@ -683,12 +681,12 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     # same pieces — the isolation is accidental but real. Clubbing destroys
     # it: both runs see one pool and both can allocate the same stock.
     # Refuse the combination rather than allow a silent over-allocation.
-    if _allow_mp and rule_flag('ALC_RDC_CENTRAL_POOL', False):
+    if _allow_mp and str(req.rdc_mode).strip().lower() == 'all':
         _allow_mp = False
         req.allow_multi_parked = False
         logger.warning(
-            "[generate] ALC_MULTI_PARKED suppressed — central RDC pooling is "
-            "active and two parked runs would draw the same clubbed stock (R10)"
+            "[generate] ALC_MULTI_PARKED suppressed — an All RDCs run clubs the "
+            "warehouses, so two parked runs would draw the same stock (R10)"
         )
     # Reflect the persisted value back onto the request so downstream
     # consumers (audit log, persisted-settings rewrite at line ~585) see
@@ -869,32 +867,21 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     start = time.time()
     de = get_data_engine()
 
-    # ── Central RDC Pool — resolved ONCE, here, and never re-read ──────────
-    # Spec v1.5 §B1.4 / correction M9. rule_flag() caches with a 30-second
-    # TTL, and a full Generate spans many refreshes. If Part 3.55 and Part
-    # 8.37 each asked independently, an admin toggling the switch mid-run
-    # would produce a half-clubbed, half-split run — the worst possible
-    # state. One resolution, passed down as an argument, makes that
-    # impossible.
+    # ── RDC Scope decides, and nothing else ───────────────────────────────
+    # `All RDCs` means club the warehouses. `Own` and `Cross` mean per-RDC
+    # pools. One control, one meaning — the cockpit's RDC Scope selection IS
+    # the switch. There is deliberately no second, hidden toggle: a planner
+    # who picks All RDCs must get All RDCs.
     #
-    # BR-RDC-13: BOTH conditions required. Own and Cross can never satisfy
-    # the first, so they cannot enter any of the new code paths even if the
-    # rule is switched on by accident.
-    _CENTRAL_POOL = (
-        str(req.rdc_mode).strip().lower() == "all"
-        and rule_flag("ALC_RDC_CENTRAL_POOL", False)
+    # Resolved ONCE here and passed down as an argument rather than re-read
+    # per site, so every Part of the run sees the same answer.
+    _CENTRAL_POOL = str(req.rdc_mode).strip().lower() == "all"
+    logger.info(
+        f"[rdc] scope={req.rdc_mode} -> "
+        + (f"CLUBBED across all RDCs; split policy={req.rdc_split_policy}, "
+           f"max_split={req.rdc_max_split}" if _CENTRAL_POOL
+           else "per-RDC pools")
     )
-    if _CENTRAL_POOL:
-        logger.info(
-            f"[rdc] CENTRAL POOL ACTIVE — stock clubbed across all RDCs; "
-            f"split policy={req.rdc_split_policy}, max_split={req.rdc_max_split}"
-        )
-    else:
-        logger.info(
-            f"[rdc] central pool OFF (rdc_mode={req.rdc_mode}, "
-            f"rule={'on' if rule_flag('ALC_RDC_CENTRAL_POOL', False) else 'off'}) "
-            f"— per-RDC pools, today's behaviour"
-        )
 
     # Snapshot which tracked tables existed before the run started, so the
     # post-run sweep can label each one CREATED vs. RECREATED/TRUNCATED.
@@ -1421,13 +1408,33 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         t0 = _time_step("Part 1 (Grid data INSERT)", t0)
 
         # ── PART 2: MSA missing options → IS_NEW = 1 ───────────────────
+        # FS-RDC-01 / correction M2 — the SELECT and the JOIN move together.
+        #
+        # The sub-query is DISTINCT per (RDC, option), so it emits one row per
+        # warehouse holding the option. `own` pins M.RDC = S.RDC and each store
+        # matches exactly one of them. Every other mode joins ON 1=1, so an
+        # option held at BOTH warehouses matches a store TWICE and the store is
+        # listed for it twice — identical rows, since RDC on the listing row
+        # comes from the store, not from M. Measured on the 455-store run:
+        # 971,488 rows in `own` vs 1,998,610 in `all`, 3,117 phantom pieces.
+        #
+        # Clubbing means dropping the RDC dimension from the SELECT as well as
+        # the join, exactly as Part 3.55 does below: one row per option, so the
+        # ON 1=1 join can no longer fan out. Keeping RDC in the SELECT and only
+        # blanking the join does NOT fix it — the duplicate rows survive.
+        #
+        # NOT fixed here: `cross` has the same fan-out (it also joins ON 1=1
+        # with RDC in the SELECT). It is left byte-for-byte as today because no
+        # Cross baseline exists to validate a change against — see BR-RDC-14.
         msa_rdc_join = ""
         if req.rdc_mode == "own":
             msa_rdc_join = f"AND M.[RDC] = S.[RDC]"
-        # MSA base (with RDC column preserved for joining)
+        _p2_rdc_select = "" if _CENTRAL_POOL else (
+            f"LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50)))) AS RDC,")
+        # MSA base (RDC column preserved for joining, except when clubbing)
         msa_with_rdc = f"""
             SELECT DISTINCT
-                LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50)))) AS RDC,
+                {_p2_rdc_select}
                 {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')}
             FROM [{req.msa_table}]
             WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}
@@ -3516,7 +3523,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             tbl_hold_release_retry=rule_flag('ALC_TBL_HOLD_RETRY', True),
             # Central RDC Pool — resolved once at run start (§B1.4 / M9).
             # False for every Own and Cross run, and for an All RDCs run
-            # while ALC_RDC_CENTRAL_POOL is inactive.
+            # on an Own or Cross run.
             central_pool=_CENTRAL_POOL,
         )
         alloc_rows = alloc_result.get("alloc_rows", 0)
@@ -3612,10 +3619,26 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     # through the existing column reconcile with no change to parked_history.
     #
     # BR-RDC-11 mode separation: this does not execute at all unless the run
-    # is `All RDCs` AND ALC_RDC_CENTRAL_POOL is active. An Own or Cross run
-    # leaves SRC_RDC NULL and writes zero split rows (invariant I-11 / V14).
+    # is `All RDCs`. An Own or Cross run leaves SRC_RDC NULL and writes zero
+    # split rows (invariant I-11 / V14).
+    # GUARD: only tag an allocation THIS run produced.
+    #
+    # ARS_ALLOC_WORKING carries no SESSION_ID — it is a working table that
+    # survives between runs. When the engine finds nothing to list it returns
+    # early WITHOUT rebuilding it, so the previous run's rows are still
+    # sitting there. Without this check the split pass tags those stale rows
+    # and writes a picking record for them under the CURRENT session id —
+    # i.e. a warehouse instruction for an allocation that is not part of this
+    # run. Caught by the Step 6 A/B test on 2026-09-22: a run that listed 0
+    # options still produced 70 split rows for a MAJ_CAT it never touched.
     rdc_split_summary = None
-    if _CENTRAL_POOL:
+    if _CENTRAL_POOL and not alloc_rows:
+        logger.info(
+            "Part 8.37 skipped — the engine allocated nothing this run, so "
+            "ARS_ALLOC_WORKING still holds the previous run's rows and must "
+            "not be tagged"
+        )
+    if _CENTRAL_POOL and alloc_rows:
         try:
             from app.services import rdc_split_service as _rdc
             with de.begin() as _sc:

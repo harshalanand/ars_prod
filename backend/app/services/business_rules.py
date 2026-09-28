@@ -59,14 +59,10 @@ SEED: List[tuple] = [
      "Freed pieces wait for the next run instead of shipping the same run (Part 8.55 still releases them post-run).",
      "flag", None, None, None, None, 1, 1),
     # ── Central RDC Pool (spec v1.5) ────────────────────────────────────────
-    # All six are is_wired=0 in Step 1: the schema exists but no code reads
-    # them yet, so the UI shows "wiring pending" and disables the toggle rather
-    # than letting someone switch on a feature that is not there. Step 2 flips
-    # ALC_RDC_CENTRAL_POOL to wired; Step 3 the policy/cap; Step 4 the rest.
-    ("Listing & Alloc", "ALC_RDC_CENTRAL_POOL", "Central RDC pool (club all warehouses)",
-     "Master switch for central pooling (BR-RDC-13). When ACTIVE and the run's RDC Scope is 'All RDCs', stock from every warehouse is summed into one pool, allocation runs against that pool with completely unchanged rules, and a new post-allocation pass (Part 8.37) tags each shipped and held piece with the warehouse that will physically ship it. When INACTIVE, 'All RDCs' behaves exactly as it does today. 'Own' and 'Cross' runs are never affected either way.",
-     "INACTIVE is the safe default and today's behaviour: each warehouse serves only its own stores. Measured 2026-09-21: that leaves 403,732 store-option rows with zero stock at their own warehouse while the other warehouse holds some.",
-     "flag", None, None, None, None, 0, 0),
+    # These are DEFAULTS for the cockpit's RDC Sourcing panel, not switches.
+    # Whether the warehouses are clubbed is decided by RDC Scope on the run
+    # itself (`All RDCs` vs `Own`/`Cross`) — deliberately NOT by a business
+    # rule, so there is exactly one control for the concept.
     ("Listing & Alloc", "ALC_RDC_SPLIT_POLICY", "RDC sourcing policy",
      "How a shipment line is sourced when the store's own warehouse cannot cover it (D1). SPLIT_ALWAYS takes what each warehouse has, in preference order, until the line is filled. SINGLE_PREFERRED first looks for one warehouse that can cover the WHOLE line and only splits as a last resort. SINGLE_STRICT never splits and reduces the line instead. Holds are always single-source regardless of this setting (BR-RDC-12).",
      "SINGLE_PREFERRED is used. SINGLE_STRICT is the only value that can lose served demand — it reduces a line no single warehouse can cover.",

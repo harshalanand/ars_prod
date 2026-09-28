@@ -2149,10 +2149,16 @@ def _rerank_opt_priority_pandas(
         return
 
     sub = alloc_df.loc[mask].copy()
+    if POOL_RDC_COL not in sub.columns:          # same fallback as per_opt
+        sub[POOL_RDC_COL] = sub['RDC'] if 'RDC' in sub.columns else ''
 
     # Build live pool availability per size row.
+    # POOL_RDC, not RDC (FS-RDC-03) — the pool dict is keyed on the derived
+    # column. Using RDC under clubbing makes every lookup miss, _has_pool
+    # collapses to 0 for every size, and R07 then skips the whole option as
+    # if it had no size coverage.
     pool_keys_arr = list(zip(
-        sub['RDC'].astype(str),
+        sub[POOL_RDC_COL].astype(str),
         sub['MAJ_CAT'].astype(str),
         sub['GEN_ART_NUMBER'].astype(str),
         sub['CLR'].astype(str),
