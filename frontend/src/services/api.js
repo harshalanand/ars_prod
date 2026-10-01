@@ -362,6 +362,74 @@ export const faConsAPI = {
   gapReport:    (stream, store_scope) => api.get('/fa-cons/gap', { params: { stream, store_scope }, timeout: 120000 }),
 }
 
+// GRT ALC — Bin-to-Bin Transfer (/b2b). Check and load are background jobs:
+// each returns an upload_id at once; poll upload(id) for progress.
+export const b2bAPI = {
+  overview:       ()        => api.get('/b2b/overview', { timeout: 120000 }),
+  repairTables:   ()        => api.post('/b2b/repair-tables'),
+  settings:       ()        => api.get('/b2b/settings'),
+  saveSettings:   (values)  => api.put('/b2b/settings', { values }),
+  resetSettings:  (keys)    => api.post('/b2b/settings/reset', { keys: keys || null }),
+  uploadDefaults: ()        => api.get('/b2b/upload/defaults'),
+  folder:         (folder)  => api.get('/b2b/upload/folder', { params: folder ? { folder } : {} }),
+  checkPath:      (body)    => api.post('/b2b/upload/check-path', body),
+  checkFile:      (file, { mode, sheets, bin_rdc, swap_store_cols }) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('mode', mode || 'OVERWRITE')
+    fd.append('sheets', (sheets || ['bin', 'store', 'req']).join(','))
+    fd.append('bin_rdc', bin_rdc || '')
+    fd.append('swap_store_cols', swap_store_cols ? 'true' : 'false')
+    return api.post('/b2b/upload/check-file', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' }, timeout: 10 * 60 * 1000,
+    })
+  },
+  load:           (id)      => api.post(`/b2b/upload/${id}/load`),
+  cancel:         (id)      => api.post(`/b2b/upload/${id}/cancel`),
+  upload:         (id)      => api.get(`/b2b/upload/${id}`),
+  uploads:        (limit)   => api.get('/b2b/uploads', { params: { limit: limit || 15 } }),
+  // Step 3 · Build MBQ
+  mbq:            ()        => api.get('/b2b/mbq'),
+  buildMbq:       ()        => api.post('/b2b/mbq/build'),
+  mbqBuild:       (id)      => api.get(`/b2b/mbq/build/${id}`),
+  cancelBuild:    (id)      => api.post(`/b2b/mbq/build/${id}/cancel`),
+  mbqRows:        (params)  => api.get('/b2b/mbq/rows', { params, timeout: 60000 }),
+  mbqExplain:     (store, art) => api.get('/b2b/mbq/explain', { params: { store, art } }),
+  // Step 4 · Run Allocation
+  runPage:        ()        => api.get('/b2b/run', { timeout: 60000 }),
+  startRun:       (body)    => api.post('/b2b/run', body),
+  runSession:     (id)      => api.get(`/b2b/run/${id}`),
+  cancelRun:      (id)      => api.post(`/b2b/run/${id}/cancel`),
+  sessions:       (limit)   => api.get('/b2b/sessions', { params: { limit: limit || 30 } }),
+  deleteSession:  (id)      => api.delete(`/b2b/sessions/${id}`, { params: { confirm: 'DELETE' } }),
+  // Step 5 · Sessions & Pick List
+  session:        (id)      => api.get(`/b2b/sessions/${id}`),
+  sessionLines:   (id, params) => api.get(`/b2b/sessions/${id}/lines`, { params }),
+  sessionPicks:   (id, params) => api.get(`/b2b/sessions/${id}/picks`, { params }),
+  sessionLeft:    (id, params) => api.get(`/b2b/sessions/${id}/leftovers`, { params }),
+  sessionWhy:     (id, store, art) => api.get(`/b2b/sessions/${id}/why`, { params: { store, art: art || undefined }, timeout: 120000 }),
+  compareSessions: (a, b)   => api.get('/b2b/sessions/compare', { params: { a, b } }),
+  exportSession:  (id, kind) => api.get(`/b2b/sessions/${id}/export`, { params: { kind }, responseType: 'blob', timeout: 600000 }),
+  // Reports
+  gap:            (sid)     => api.get('/b2b/gap', { params: sid ? { session_id: sid } : {}, timeout: 300000 }),
+  gapSheetCsv:    (sid, key) => api.get(`/b2b/gap/sheet/${key}`, { params: sid ? { session_id: sid } : {}, responseType: 'blob', timeout: 300000 }),
+  gapWorkbook:    (sid)     => api.get('/b2b/gap/workbook', { params: sid ? { session_id: sid } : {}, responseType: 'blob', timeout: 600000 }),
+  extractObjects: ()        => api.get('/b2b/extract/objects'),
+  extractParse:   (fd)      => api.post('/b2b/extract/parse', fd, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  extractPreview: (body)    => api.post('/b2b/extract/preview', body, { timeout: 300000 }),
+  extractDownload: (body)   => api.post('/b2b/extract/download', body, { responseType: 'blob', timeout: 600000 }),
+}
+
+/** Save a blob response as a file, using the server's file name. */
+export function saveBlob(res, fallback) {
+  const cd = res.headers?.['content-disposition'] || ''
+  const name = (cd.match(/filename="?([^";]+)"?/) || [])[1] || fallback
+  const url = URL.createObjectURL(res.data)
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 5000)
+  return name
+}
+
 // ============== Release Notes / Changelog ==============
 export const releaseNotesAPI = {
   list:   (params)      => api.get('/release-notes/entries', { params }),

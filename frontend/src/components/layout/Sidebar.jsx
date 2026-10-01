@@ -39,13 +39,19 @@ const dataPreparationItems = [
 // Bin Allocation submenu — greedy best-fit bin→store engine (no bin split),
 // fixed/cascading eligibility thresholds. ARS-native (server-side, job-driven,
 // audited); specced in the BRD/FSD (Bin-Allocation). Pages WIP.
+// GRT ALC — Bin-to-Bin Transfer. The numbered pages are the five steps in
+// order; the rest are tools. Routes keep the /bin-alloc/ prefix so existing
+// links and the MOD_GRT_ALC permission carry over.
 const binAllocItems = [
-  { label: 'Bin Master',       path: '/bin-alloc/bin-master',  icon: FileUp },
-  { label: 'Requirement',      path: '/bin-alloc/requirement', icon: ClipboardList },
-  { label: 'Run Allocation',   path: '/bin-alloc/run',         icon: Cpu },
-  { label: 'Results & Export', path: '/bin-alloc/results',     icon: ClipboardCheck },
-  { label: 'Eligibility Log',  path: '/bin-alloc/log',         icon: ScrollText },
-  { label: 'Help',             path: '/bin-alloc/help',        icon: BookOpen },
+  { label: 'Overview',                path: '/bin-alloc/overview',   icon: LayoutDashboard },
+  { label: '1 · Upload Data',         path: '/bin-alloc/upload',     icon: FileUp },
+  { label: '2 · Settings',            path: '/bin-alloc/settings',   icon: Sliders },
+  { label: '3 · Build MBQ',           path: '/bin-alloc/mbq',        icon: Layers },
+  { label: '4 · Run Allocation',      path: '/bin-alloc/run',        icon: Cpu },
+  { label: '5 · Sessions & Pick List', path: '/bin-alloc/sessions',  icon: ClipboardCheck },
+  { label: 'Gap Report',              path: '/bin-alloc/gap-report', icon: AlertTriangle },
+  { label: 'Store × Article Extract', path: '/bin-alloc/extract',    icon: Search },
+  { label: 'Help',                    path: '/bin-alloc/help',       icon: BookOpen },
 ]
 
 // Adhoc submenu

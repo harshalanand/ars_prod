@@ -169,6 +169,11 @@ api_router.include_router(upc_store_track_router)
 from app.api.v1.endpoints.facons import router as facons_router
 api_router.include_router(facons_router)
 
+# GRT ALC — Bin-to-Bin Transfer: RDC bin stock → store pick list. Port of the
+# GRT_ART_ALLOC Streamlit tool; owns the ARS_B2B_* tables (037_b2b_module.sql).
+from app.api.v1.endpoints.b2b import router as b2b_router
+api_router.include_router(b2b_router)
+
 # Release Notes / Changelog — recorded changes auto-compiled into daily notes.
 from app.api.v1.endpoints.release_notes import router as release_notes_router
 api_router.include_router(release_notes_router)

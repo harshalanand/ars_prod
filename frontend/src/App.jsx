@@ -93,7 +93,14 @@ const FaConsPendPage         = lazy(() => import('@/pages/FaConsPendPage'))
 const FaConsGapPage          = lazy(() => import('@/pages/FaConsGapPage'))
 const FaConsHelpPage         = lazy(() => import('@/pages/FaConsHelpPage'))
 const BinAllocHelpPage       = lazy(() => import('@/pages/BinAllocHelpPage'))
-const BinAllocPlaceholderPage = lazy(() => import('@/pages/BinAllocPlaceholderPage'))
+const B2BOverviewPage        = lazy(() => import('@/pages/b2b/B2BOverviewPage'))
+const B2BUploadPage          = lazy(() => import('@/pages/b2b/B2BUploadPage'))
+const B2BSettingsPage        = lazy(() => import('@/pages/b2b/B2BSettingsPage'))
+const B2BMbqPage             = lazy(() => import('@/pages/b2b/B2BMbqPage'))
+const B2BRunPage             = lazy(() => import('@/pages/b2b/B2BRunPage'))
+const B2BSessionsPage        = lazy(() => import('@/pages/b2b/B2BSessionsPage'))
+const B2BGapPage             = lazy(() => import('@/pages/b2b/B2BGapPage'))
+const B2BExtractPage         = lazy(() => import('@/pages/b2b/B2BExtractPage'))
 
 function PageLoader() {
   return (
@@ -238,13 +245,22 @@ export default function App() {
         <Route path="fa-cons/consumables" element={<ErrorBoundary><FaConsPlaceholderPage title="Consumables Allocation" description="Daily pan-India consumables allocation with an auto-computed MBQ = MIN(max-hold capacity, 15-day sale) + per-day sale × cover days." /></ErrorBoundary>} />
         <Route path="fa-cons/gap-report" element={<ErrorBoundary><FaConsGapPage /></ErrorBoundary>} />
         <Route path="fa-cons/help" element={<ErrorBoundary><FaConsHelpPage /></ErrorBoundary>} />
-        <Route path="bin-alloc/help" element={<ErrorBoundary><BinAllocHelpPage /></ErrorBoundary>} />
-        {/* Bin Allocation — greedy best-fit bin→store engine (WIP, see BRD/FSD Bin-Allocation) */}
-        <Route path="bin-alloc/bin-master"  element={<ErrorBoundary><BinAllocPlaceholderPage title="Bin Master" description="Load / review the bin master (BIN, MAJ_CAT, SIZE, qty). Multiple rows per bin — one per MAJ_CAT/SIZE combination. Sourced from the DC/vendor pack list." /></ErrorBoundary>} />
-        <Route path="bin-alloc/requirement" element={<ErrorBoundary><BinAllocPlaceholderPage title="Requirement (REQ)" description="Open store requirement at MAJ_CAT / SIZE / MAJ_CAT+SIZE level — reused from the latest allocation output rather than re-uploaded, so bins fit the live open REQ." /></ErrorBoundary>} />
-        <Route path="bin-alloc/run"         element={<ErrorBoundary><BinAllocPlaceholderPage title="Run Allocation" description="Configure level, strategy (one-bin→all-stores or one-store→all-bins), and a fixed or cascading eligibility threshold, then run the engine as an audited background job with pause / resume / stop." /></ErrorBoundary>} />
-        <Route path="bin-alloc/results"     element={<ErrorBoundary><BinAllocPlaceholderPage title="Results & Export" description="Aligned bins (store tag, aligned qty, excess %, threshold used), unaligned bins, and per-phase summary. Export to Excel / CSV / JSON, including partial results." /></ErrorBoundary>} />
-        <Route path="bin-alloc/log"         element={<ErrorBoundary><BinAllocPlaceholderPage title="Eligibility Log" description="Per (bin, store) evaluation audit: potential aligned qty, total bin qty, eligibility %, threshold, cascading step, and eligibility outcome." /></ErrorBoundary>} />
+        {/* GRT ALC — Bin-to-Bin Transfer (bin_alloc.md). Phase 1: overview, upload, settings. */}
+        <Route path="bin-alloc"             element={<Navigate to="/bin-alloc/overview" replace />} />
+        <Route path="bin-alloc/overview"    element={<ErrorBoundary><B2BOverviewPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/upload"      element={<ErrorBoundary><B2BUploadPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/settings"    element={<ErrorBoundary><B2BSettingsPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/mbq"         element={<ErrorBoundary><B2BMbqPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/run"         element={<ErrorBoundary><B2BRunPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/sessions"    element={<ErrorBoundary><B2BSessionsPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/gap-report"  element={<ErrorBoundary><B2BGapPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/extract"     element={<ErrorBoundary><B2BExtractPage /></ErrorBoundary>} />
+        <Route path="bin-alloc/help"        element={<ErrorBoundary><BinAllocHelpPage /></ErrorBoundary>} />
+        {/* The July placeholders' routes, kept so old links land somewhere useful. */}
+        <Route path="bin-alloc/bin-master"  element={<Navigate to="/bin-alloc/upload" replace />} />
+        <Route path="bin-alloc/requirement" element={<Navigate to="/bin-alloc/upload" replace />} />
+        <Route path="bin-alloc/results"     element={<Navigate to="/bin-alloc/sessions" replace />} />
+        <Route path="bin-alloc/log"         element={<Navigate to="/bin-alloc/sessions" replace />} />
         {/* Pending Allocation Lifecycle */}
         <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />

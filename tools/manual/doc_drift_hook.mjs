@@ -26,6 +26,7 @@ process.stdin.on('end', () => {
       { re: /(listing_allocator|listing_sessions|listing_job_manager|endpoints\/listing)/, m: 'listing', label: 'Listing & Allocation' },
       { re: /(hold_dashboard|parked_history)/,                                  m: 'hold',    label: 'Hold Process' },
       { re: /(pend_alc|alloc_queue|alloc_cancellation)/,                        m: 'pendalc', label: 'Pending Allocation' },
+      { re: /(b2b_[a-z_]+\.py|endpoints\/b2b|037_b2b_module)/,                  m: 'bin_alloc', label: 'GRT ALC · Bin-to-Bin' },
     ]
     const hit = RULES.find(r => r.re.test(p))
     if (!hit) return done()
