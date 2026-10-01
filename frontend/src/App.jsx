@@ -83,6 +83,12 @@ const SapConnectionPage      = lazy(() => import('@/pages/SapConnectionPage'))
 const SapPullsPage           = lazy(() => import('@/pages/SapPullsPage'))
 const SapExplorerPage        = lazy(() => import('@/pages/SapExplorerPage'))
 const SapRunsPage            = lazy(() => import('@/pages/SapRunsPage'))
+const GetDataOverviewPage    = lazy(() => import('@/pages/getdata/GetDataOverviewPage'))
+const GetDataViewsPage       = lazy(() => import('@/pages/getdata/GetDataViewsPage'))
+const GetDataJobsPage        = lazy(() => import('@/pages/getdata/GetDataJobsPage'))
+const GetDataRunsPage        = lazy(() => import('@/pages/getdata/GetDataRunsPage'))
+const GetDataComingSoonPage  = lazy(() => import('@/pages/getdata/GetDataComingSoonPage'))
+const GetDataHelpPage        = lazy(() => import('@/pages/getdata/GetDataHelpPage'))
 const FaConsPlaceholderPage  = lazy(() => import('@/pages/FaConsPlaceholderPage'))
 const FaConsMbqMasterPage    = lazy(() => import('@/pages/FaConsMbqMasterPage'))
 const FaConsSlocSettingsPage = lazy(() => import('@/pages/FaConsSlocSettingsPage'))
@@ -234,6 +240,16 @@ export default function App() {
         <Route path="sap/pulls" element={<ErrorBoundary><SapPullsPage /></ErrorBoundary>} />
         <Route path="sap/explorer" element={<ErrorBoundary><SapExplorerPage /></ErrorBoundary>} />
         <Route path="sap/runs" element={<ErrorBoundary><SapRunsPage /></ErrorBoundary>} />
+        {/* Get Data — outside sources → local SQL on a schedule (manual/get_data.md) */}
+        <Route path="get-data"                 element={<Navigate to="/get-data/overview" replace />} />
+        <Route path="get-data/overview"        element={<ErrorBoundary><GetDataOverviewPage /></ErrorBoundary>} />
+        <Route path="get-data/snowflake/views" element={<ErrorBoundary><GetDataViewsPage /></ErrorBoundary>} />
+        <Route path="get-data/snowflake/jobs"  element={<ErrorBoundary><GetDataJobsPage /></ErrorBoundary>} />
+        <Route path="get-data/runs"            element={<ErrorBoundary><GetDataRunsPage /></ErrorBoundary>} />
+        <Route path="get-data/excel"           element={<ErrorBoundary><GetDataComingSoonPage source="excel" /></ErrorBoundary>} />
+        <Route path="get-data/datav2"          element={<ErrorBoundary><GetDataComingSoonPage source="datav2" /></ErrorBoundary>} />
+        <Route path="get-data/sap"             element={<ErrorBoundary><GetDataComingSoonPage source="sap" /></ErrorBoundary>} />
+        <Route path="get-data/help"            element={<ErrorBoundary><GetDataHelpPage /></ErrorBoundary>} />
         {/* FA & CONS — data foundation (built) + allocation pages (WIP, see manual/fa_cons.md) */}
         <Route path="fa-cons/mbq-master" element={<ErrorBoundary><FaConsMbqMasterPage /></ErrorBoundary>} />
         <Route path="fa-cons/sloc-settings" element={<ErrorBoundary><FaConsSlocSettingsPage /></ErrorBoundary>} />

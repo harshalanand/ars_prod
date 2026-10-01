@@ -7,6 +7,7 @@ import {
   HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
   AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered,
   XCircle, Store, Sparkles, Container, Server,
+  DatabaseZap, Snowflake, RefreshCw, FileSpreadsheet, PlugZap,
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -138,6 +139,19 @@ const sapItems = [
   { label: 'Connection',   path: '/settings?tab=sap', icon: Cog },
 ]
 
+// Get Data submenu — outside sources → local SQL (Rep_data) on a schedule or on
+// demand, with AUTO/MANUAL run history. Phase 1 = Snowflake; the rest follow.
+const getDataItems = [
+  { label: 'Overview',        path: '/get-data/overview',        icon: LayoutDashboard },
+  { label: 'Snowflake Views', path: '/get-data/snowflake/views', icon: Snowflake },
+  { label: 'Sync Jobs',       path: '/get-data/snowflake/jobs',  icon: RefreshCw },
+  { label: 'Run History',     path: '/get-data/runs',            icon: History },
+  { label: 'Excel (soon)',    path: '/get-data/excel',           icon: FileSpreadsheet },
+  { label: 'DataV2 (soon)',   path: '/get-data/datav2',          icon: PlugZap },
+  { label: 'SAP (soon)',      path: '/get-data/sap',             icon: Server },
+  { label: 'Help',            path: '/get-data/help',            icon: BookOpen },
+]
+
 // Data Validation submenu
 const dataValidationItems = [
   { label: 'Store Sloc Validation', path: '/data-validation/store-sloc', icon: ShieldCheck, permission: 'STORE_SLOC_VIEW' },
@@ -194,6 +208,7 @@ const SECTIONS = [
   { title: 'ALC_Fixture',       icon: Boxes,          items: alcFixtureItems, permission: 'MOD_ALC_FIXTURE' },
   { title: 'Trends',            icon: TrendingUp,     items: trendsItems, permission: 'MOD_TRENDS' },
   { title: 'Reports',           icon: Activity,       items: reportsItems, permission: 'MOD_REPORTS' },
+  { title: 'Get Data',          icon: DatabaseZap,    items: getDataItems, permission: 'MOD_GET_DATA' },
   { title: 'SAP',               icon: Server,         items: sapItems, permission: 'MOD_SAP' },
   { title: 'FA & CONS',         icon: Store,          items: faConsItems, permission: 'MOD_FA_CONS' },
   { title: 'Pending Allocation',icon: Truck,          items: pendAlcItems, permission: 'MOD_PEND_ALC' },

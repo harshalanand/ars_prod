@@ -149,6 +149,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"SAP pull scheduler failed to start: {e}")
 
+    # Start Get Data scheduler (Snowflake → local SQL sync jobs, IST schedules)
+    try:
+        from app.services.get_data_scheduler import get_data_scheduler
+        get_data_scheduler.start()
+        logger.info("✅ Get Data scheduler started")
+    except Exception as e:
+        logger.warning(f"Get Data scheduler failed to start: {e}")
+
     yield
     logger.warning(f"Shutting down {settings.APP_NAME}...")
 
@@ -169,6 +177,13 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.sap_scheduler_service import sap_scheduler
         sap_scheduler.stop()
+    except Exception:
+        pass
+
+    # Stop Get Data scheduler
+    try:
+        from app.services.get_data_scheduler import get_data_scheduler
+        get_data_scheduler.stop()
     except Exception:
         pass
 
@@ -293,9 +308,12 @@ if os.path.exists(static_dir) and os.path.exists(os.path.join(static_dir, "index
     # Catch-all: serve index.html for SPA routing (must be LAST)
     @app.get("/{full_path:path}", tags=["Frontend"], include_in_schema=False)
     async def serve_frontend(full_path: str):
-        # Don't intercept API routes or docs
+        # Don't intercept API routes or docs. An unknown API path is a 404 —
+        # a bare `return` here answered 200 with a `null` body, which hid
+        # missing routes (e.g. a backend started before a module was added).
         if full_path.startswith(("api/", "docs", "redoc", "openapi", "health")):
-            return
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail=f"Not Found: /{full_path}")
         file_path = os.path.join(static_dir, full_path)
         if os.path.exists(file_path) and os.path.isfile(file_path):
             return FileResponse(file_path)

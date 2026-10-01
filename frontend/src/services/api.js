@@ -815,6 +815,45 @@ export const snowflakeConfigAPI = {
   tables:     (params)  => api.get('/settings/snowflake/tables', { params, timeout: 60000 }),
 }
 
+// ============== Get Data (Snowflake views → local GD_SF_* tables) ==============
+// Every call is quiet: the pages show errors inline or toast them themselves.
+const _GD = { quiet: true }
+const _GD_SF = { quiet: true, timeout: 330000 }   // Snowflake calls: 5 min statement cap
+// Every Get Data endpoint answers { success, message, data }. Anything else —
+// e.g. `null` from a backend started before the module existed — becomes one
+// clear error instead of a TypeError deep inside a page.
+const _gdChecked = (fns) => Object.fromEntries(Object.entries(fns).map(([k, fn]) => [k, (...a) =>
+  fn(...a).then((res) => {
+    const b = res?.data
+    if (!b || typeof b !== 'object' || !('success' in b)) {
+      throw new Error('This server has no Get Data API yet — restart the ARS backend so it loads the new module.')
+    }
+    return res
+  })]))
+export const getDataAPI = _gdChecked({
+  overview:   ()              => api.get('/get-data/overview', _GD),
+  sfStatus:   ()              => api.get('/get-data/snowflake/status', _GD),
+  sfSchemas:  ()              => api.get('/get-data/snowflake/schemas', _GD_SF),
+  sfObjects:  (params)        => api.get('/get-data/snowflake/objects', { ..._GD_SF, params }),
+  sfColumns:  (object)        => api.get('/get-data/snowflake/columns', { ..._GD_SF, params: { object } }),
+  validate:   (sql)           => api.post('/get-data/snowflake/validate', { sql }, _GD_SF),
+  preview:    (body)          => api.post('/get-data/snowflake/preview', body, _GD_SF),
+  listViews:  ()              => api.get('/get-data/snowflake/views', _GD_SF),
+  getView:    (name)          => api.get(`/get-data/snowflake/views/${encodeURIComponent(name)}`, _GD_SF),
+  saveView:   (body)          => api.post('/get-data/snowflake/views', body, _GD_SF),
+  dropView:   (name)          => api.delete(`/get-data/snowflake/views/${encodeURIComponent(name)}`, _GD_SF),
+  listJobs:   ()              => api.get('/get-data/jobs', _GD),
+  getJob:     (id)            => api.get(`/get-data/jobs/${id}`, _GD),
+  testJob:    (body)          => api.post('/get-data/jobs/test', body, _GD_SF),
+  createJob:  (body)          => api.post('/get-data/jobs', body, _GD),
+  updateJob:  (id, body)      => api.put(`/get-data/jobs/${id}`, body, _GD),
+  enableJob:  (id, enabled)   => api.post(`/get-data/jobs/${id}/enable`, {}, { ..._GD, params: { enabled } }),
+  deleteJob:  (id, dropTable) => api.delete(`/get-data/jobs/${id}`, { ..._GD, params: { drop_table: !!dropTable } }),
+  runJob:     (id, fullReload) => api.post(`/get-data/jobs/${id}/run`, {}, { ..._GD, params: { full_reload: !!fullReload } }),
+  listRuns:   (params)        => api.get('/get-data/runs', { ..._GD, params }),
+  getRun:     (id)            => api.get(`/get-data/runs/${id}`, _GD),
+})
+
 // ============== Trends ==============
 export const trendsAPI = {
   listTables:      ()                    => api.get('/trends/tables'),

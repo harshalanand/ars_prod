@@ -452,6 +452,8 @@ def seed_permissions_if_needed(db: Session):
         ("View Data Checklist", "CHECKLIST_VIEW", "validation", "READ", "checklist"),
         ("Manage Data Checklist", "CHECKLIST_MANAGE", "validation", "UPDATE", "checklist"),
         ("View Store SLOC Validation", "STORE_SLOC_VIEW", "validation", "READ", "store_sloc"),
+        ("Run Get Data Jobs", "GET_DATA_RUN", "get_data", "CREATE", "get_data"),
+        ("Manage Get Data Views & Jobs", "GET_DATA_MANAGE", "get_data", "UPDATE", "get_data"),
     ]
 
     # ── Module-access permissions (2026-07-31) ───────────────────────────
@@ -476,6 +478,7 @@ def seed_permissions_if_needed(db: Session):
         ("Module: Trends",             "MOD_TRENDS"),
         ("Module: Reports",            "MOD_REPORTS"),
         ("Module: SAP",                "MOD_SAP"),
+        ("Module: Get Data",           "MOD_GET_DATA"),
         ("Module: FA & CONS",          "MOD_FA_CONS"),
         ("Module: Pending Allocation", "MOD_PEND_ALC"),
         ("Module: Data Validation",    "MOD_DATA_VALIDATION"),

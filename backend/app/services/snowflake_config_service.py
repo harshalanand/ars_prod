@@ -221,8 +221,10 @@ def _load_private_key_der(path: str, passphrase: Optional[str]) -> bytes:
         encryption_algorithm=serialization.NoEncryption())
 
 
-def connect(require_enabled: bool = True):
-    """Open a snowflake.connector connection from the stored config."""
+def connect(require_enabled: bool = True, **overrides):
+    """Open a snowflake.connector connection from the stored config.
+    `overrides` are passed to snowflake.connector.connect() last (e.g. a longer
+    network_timeout for Get Data sync runs)."""
     try:
         import snowflake.connector  # noqa
     except ImportError as e:
@@ -252,6 +254,7 @@ def connect(require_enabled: bool = True):
         if not pwd:
             raise SnowflakeError("Password auth needs a password (Settings → Snowflake).")
         kwargs["password"] = pwd
+    kwargs.update(overrides)
     try:
         return snowflake.connector.connect(**kwargs)
     except Exception as e:

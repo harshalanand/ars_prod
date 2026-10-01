@@ -190,3 +190,8 @@ api_router.include_router(sap_router)
 # the SAP Snowflake door AND the Report Generation engine/scheduler.
 from app.api.v1.endpoints.snowflake_config import router as snowflake_config_router
 api_router.include_router(snowflake_config_router)
+
+# Get Data — brings data INTO local SQL from outside sources on a schedule or on
+# demand. Phase 1: Snowflake views → GD_SF_* tables, with AUTO/MANUAL run history.
+from app.api.v1.endpoints.get_data import router as get_data_router
+api_router.include_router(get_data_router)

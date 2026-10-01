@@ -239,6 +239,27 @@ SEED = [
      "ARS_B2B_BIN_PLAN", "1, 2, 3 … per bin + article in session order. Sort by BIN, ART, PICK_SEQ and BIN_QTY_LEFT falls to the bin's final balance.", "GRT ALC"),
     ("CROSS_RDC_UNITS", "Cross-Warehouse Units", "Units a session sends from one RDC's bins to another RDC's stores.",
      "ARS_B2B_SESSION", "Σ units drawn from a warehouse other than the store's own (BIN_RDC ≠ STORE_RDC). Always 0 under Own RDC only; under Own RDC first it is what the home warehouse could not cover.", "GRT ALC"),
+    # ── Get Data · Snowflake → local SQL (get_data.md) ──────────────────────
+    ("RUN_TYPE", "Run Trigger", "How a Get Data sync run started: AUTO (the job's IST schedule, or its automatic retry) or MANUAL (Run now, with the user's name in TRIGGERED_BY).",
+     "GD_RUN", "Set when the run starts. ATTEMPT = 2 marks the automatic retry of a failed AUTO run.", "Get Data"),
+    ("SOURCE_ROWS", "Snowflake Rows", "Rows Snowflake returned for the exact query that was loaded.",
+     "GD_RUN", "Snowflake's row count for the data query itself (not a separate COUNT), so it matches what was fetched.", "Get Data"),
+    ("ROWS_LOADED", "Rows Loaded", "Rows that reached SQL Server in a Get Data run.",
+     "GD_RUN, GD_JOB (LAST_ROWS)", "COUNT(*) of the stage table after the load. Must equal SOURCE_ROWS, otherwise the run fails with 'Count mismatch' and the live table is not changed.", "Get Data"),
+    ("LOAD_MODE", "Load Mode", "How a sync job writes its local table: replace (whole source, swapped in), incremental (rows with watermark ≥ last value, merged on key columns) or append (every run added).",
+     "GD_JOB, GD_RUN", "Chosen on the job. Changing it clears the stored watermark.", "Get Data"),
+    ("WATERMARK_VALUE", "Watermark", "The highest watermark-column value an incremental job has loaded. The next run reads rows at or above it.",
+     "GD_JOB (WATERMARK_VALUE), GD_RUN (WATERMARK_FROM, WATERMARK_TO)", "MAX(watermark column) of the rows loaded by the last successful run; timestamps are UTC. Cleared by a full reload or by changing the job's source, table, mode or watermark column.", "Get Data"),
+    ("_GD_RUN_ID", "Get Data Run Id", "Audit column on every GD_SF_* table: the run that wrote the row. Links to GD_RUN.",
+     "GD_SF_* tables, GD_RUN", "Stamped on every row at load; updated by an incremental MERGE when the row changes.", "Get Data"),
+    ("_GD_LOADED_AT", "Loaded At (UTC)", "Audit column on every GD_SF_* table: when the row was written, in UTC. In append mode it tells the daily snapshots apart.",
+     "GD_SF_* tables", "Bulk loader: SQL Server's UTC time when the load started, the same for every row of the run. Classic loader: SYSUTCDATETIME() at insert. Refreshed when an incremental MERGE updates the row.", "Get Data"),
+    ("LOADER", "Loader", "How a Get Data run wrote rows to SQL Server: bulk (bcp, the default, about 96,000 rows/s) or classic (parameterised inserts, the fallback).",
+     "GD_RUN", "bulk unless the job is set to classic, bcp is missing, GET_DATA_FAST_LOADER=0, no bcp login works, a column is BINARY, or a text value contains 0x1E/0x1F/NUL — the run message gives the reason.", "Get Data"),
+    ("LOADER_PREF", "Loader Choice", "The loader a sync job asks for: bulk (default) or classic. Chosen in the job form.",
+     "GD_JOB", "Set on the job. A bulk job still runs classic when its data can't go through bcp exactly; that run's LOADER says classic and the message says why.", "Get Data"),
+    ("ALLOW_EMPTY", "Allow Empty Result", "Whether a full-replace job may empty its local table when Snowflake returns 0 rows.",
+     "GD_JOB", "Off (default): 0 rows from Snowflake while the local table has rows fails the run and keeps the rows. On: the empty result replaces the table.", "Get Data"),
 ]
 
 

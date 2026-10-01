@@ -27,6 +27,7 @@ process.stdin.on('end', () => {
       { re: /(hold_dashboard|parked_history)/,                                  m: 'hold',    label: 'Hold Process' },
       { re: /(pend_alc|alloc_queue|alloc_cancellation)/,                        m: 'pendalc', label: 'Pending Allocation' },
       { re: /(b2b_[a-z_]+\.py|endpoints\/b2b|037_b2b_module)/,                  m: 'bin_alloc', label: 'GRT ALC · Bin-to-Bin' },
+      { re: /(get_data_[a-z_]+\.py|endpoints\/get_data|038_get_data_module)/,   m: 'get_data', label: 'Get Data' },
     ]
     const hit = RULES.find(r => r.re.test(p))
     if (!hit) return done()
