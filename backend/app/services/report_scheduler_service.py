@@ -20,7 +20,9 @@ Concurrency model:
 Event firing is background: emit_event() submits matching reports to the same
 pool and returns immediately, so approving a listing is never blocked.
 
-Times are treated as UTC (compared against SQL Server SYSUTCDATETIME()).
+Times are the SERVER'S LOCAL time (compared against SQL Server SYSDATETIME()),
+so schedule times, run start/end, and session codes all match the wall clock the
+user sees. (Single-site on-prem deployment — no cross-timezone concern.)
 """
 import json
 import os
@@ -108,8 +110,8 @@ def ensure_report_tables() -> None:
                 LAST_RUN_AT      DATETIME       NULL,
                 LAST_STATUS      NVARCHAR(20)   NULL,
                 CREATED_BY       NVARCHAR(100)  NULL,
-                CREATED_AT       DATETIME       NOT NULL DEFAULT SYSUTCDATETIME(),
-                UPDATED_AT       DATETIME       NOT NULL DEFAULT SYSUTCDATETIME()
+                CREATED_AT       DATETIME       NOT NULL DEFAULT SYSDATETIME(),
+                UPDATED_AT       DATETIME       NOT NULL DEFAULT SYSDATETIME()
             )
         """))
         # Self-heal: add columns to tables created before they existed.
@@ -158,7 +160,7 @@ def ensure_report_tables() -> None:
                 STARTED_AT     DATETIME       NULL,
                 COMPLETED_AT   DATETIME       NULL,
                 DURATION_MS    INT            NULL,
-                CREATED_AT     DATETIME       NOT NULL DEFAULT SYSUTCDATETIME(),
+                CREATED_AT     DATETIME       NOT NULL DEFAULT SYSDATETIME(),
                 CREATED_BY     NVARCHAR(100)  NULL
             )
         """))
@@ -211,7 +213,7 @@ def reconcile_orphaned_runs() -> int:
             UPDATE {RUNS_TABLE}
             SET STATUS='failed',
                 ERRORS='[{{"step":"server","error":"run interrupted — server restarted"}}]',
-                COMPLETED_AT=SYSUTCDATETIME()
+                COMPLETED_AT=SYSDATETIME()
             WHERE STATUS='running'
         """))
         # A report whose LAST_STATUS got stuck at 'running' is stale too.
@@ -225,9 +227,40 @@ def reconcile_orphaned_runs() -> int:
     return n
 
 
+def recompute_all_schedules() -> int:
+    """Re-base every enabled schedule's NEXT_RUN_AT using the current LOCAL clock.
+    Run once at startup so schedule times are interpreted as local (not UTC) —
+    prevents a stale UTC-based next-run time from misfiring after the timezone
+    change. Returns how many schedules were re-based."""
+    engine = get_data_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT REPORT_ID, SCHEDULE_CONFIG FROM {REPORTS_TABLE}
+            WHERE TRIGGER_TYPE='schedule' AND ENABLED=1
+        """)).fetchall()
+    n = 0
+    for rid, sched_json in rows:
+        try:
+            cfg = json.loads(sched_json or "{}")
+        except Exception:
+            cfg = {}
+        try:
+            nr = compute_next_run(cfg)
+            with engine.begin() as conn:
+                conn.execute(text(f"""
+                    UPDATE {REPORTS_TABLE} SET NEXT_RUN_AT = :nr WHERE REPORT_ID = :rid
+                """), {"nr": nr, "rid": rid})
+            n += 1
+        except Exception as e:
+            logger.warning(f"[report-sched] recompute schedule {rid} failed: {e}")
+    if n:
+        logger.info(f"[report-sched] re-based {n} schedule(s) to local time")
+    return n
+
+
 def compute_next_run(cfg: Dict[str, Any],
                      now: Optional[datetime] = None) -> Optional[datetime]:
-    """Next fire time (UTC) from a schedule config dict.
+    """Next fire time (server LOCAL time) from a schedule config dict.
 
     freq: once | daily | weekly | monthly | every_n_hours.
       once    -> cfg['datetime'] (ISO); returns None once it's in the past
@@ -238,7 +271,7 @@ def compute_next_run(cfg: Dict[str, Any],
       every_n_hours -> cfg['every_n_hours'].
     Returns the earliest upcoming time strictly after `now`, or None.
     """
-    now = now or datetime.utcnow()
+    now = now or datetime.now()
     freq = str(cfg.get("freq", "daily")).lower()
 
     if freq == "once":
@@ -251,7 +284,10 @@ def compute_next_run(cfg: Dict[str, Any],
             return None
         return dt if dt > now else None
 
-    if freq in ("hourly", "every_n_hours") or cfg.get("every_n_hours"):
+    # Branch STRICTLY on freq. The report form saves EVERY field (so a "daily"
+    # schedule still carries a leftover every_n_hours/start/end), so we must not
+    # let the mere presence of every_n_hours hijack a daily/weekly/monthly job.
+    if freq in ("hourly", "every_n_hours"):
         n = max(1, int(cfg.get("every_n_hours", 1)))
         start, end = cfg.get("start"), cfg.get("end")
         if not start or not end:
@@ -341,6 +377,7 @@ class ReportSchedulerService:
             try:
                 ensure_report_tables()
                 reconcile_orphaned_runs()
+                recompute_all_schedules()   # re-base NEXT_RUN_AT to local time
             except Exception as e:
                 logger.warning(f"[report-sched] ensure tables failed: {e}")
             self._executor = ThreadPoolExecutor(
@@ -365,14 +402,69 @@ class ReportSchedulerService:
         logger.info("[report-sched] stopped")
 
     # ── Public triggers ──────────────────────────────────────────────────────
-    def run_now(self, report_id: int, user: Optional[str] = None) -> Dict[str, Any]:
-        """Queue a manual run. Returns immediately; status shows in run history."""
+    def run_now(self, report_id: int, user: Optional[str] = None,
+                param_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Queue a manual run. Returns immediately; status shows in run history.
+
+        `param_overrides` lets the caller tweak stored-proc / query parameters for
+        THIS run only, without editing the saved report. Shape (both accepted):
+          * flat   {"WERKS": "HB05", "MAJ_CAT": "M_JEANS,L_JEANS"} — applied to
+            every step that already declares that parameter.
+          * by-step {"0": {"WERKS": "HB05"}, "1": {...}} — keyed by step index.
+        The saved definition is never mutated; only the in-memory copy handed to
+        the worker for this one run.
+        """
         report = self._load_report(report_id)
         if not report:
             return {"queued": False, "error": "report not found"}
+        if param_overrides:
+            try:
+                report = self._apply_param_overrides(report, param_overrides)
+            except Exception as e:
+                return {"queued": False, "error": f"bad parameters: {e}"}
         session_code = make_session_code()
         self._submit(report, "manual", session_code, user)
         return {"queued": True, "session_code": session_code}
+
+    @staticmethod
+    def _apply_param_overrides(report: Dict[str, Any],
+                               overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a COPY of `report` with step params merged from `overrides`.
+
+        A per-step override (keyed by numeric step index) wins over a flat one and
+        is scoped to that step. A flat override only touches parameters a step
+        already declares (so it never invents 'sql' on a query step or leaks
+        WERKS onto a proc that has no such param). Empty-string clears to NULL.
+        """
+        report = dict(report)
+        raw = report.get("STEPS")
+        steps = raw if isinstance(raw, list) else json.loads(raw or "[]")
+        # split flat vs by-index
+        by_index: Dict[int, Dict[str, Any]] = {}
+        flat: Dict[str, Any] = {}
+        for k, v in overrides.items():
+            if isinstance(v, dict):
+                try:
+                    by_index[int(k)] = v
+                except (ValueError, TypeError):
+                    continue
+            else:
+                flat[str(k)] = v
+        new_steps = []
+        for idx, s in enumerate(steps):
+            s = dict(s)
+            params = dict(s.get("params") or {})
+            merged = dict(flat)
+            merged.update(by_index.get(idx, {}))
+            for pk, pv in merged.items():
+                # flat keys only touch params the step already declares; a
+                # by-index override may introduce a new param for that step.
+                if pk in params or idx in by_index:
+                    params[pk] = None if (pv is None or pv == "") else pv
+            s["params"] = params
+            new_steps.append(s)
+        report["STEPS"] = json.dumps(new_steps)
+        return report
 
     def emit_event(self, event_name: str, session_id: Optional[str] = None,
                    user: Optional[str] = None) -> int:
@@ -429,7 +521,7 @@ class ReportSchedulerService:
             elapsed += 5
 
     def _tick(self) -> None:
-        self._last_tick = datetime.utcnow()
+        self._last_tick = datetime.now()
         for report in self._claim_due_schedules():
             self._submit(report, "schedule", make_session_code(), report.get("CREATED_BY"))
 
@@ -441,29 +533,32 @@ class ReportSchedulerService:
         """
         engine = get_data_engine()
         claimed: List[Dict[str, Any]] = []
-        import json
+        # Compare against the APP clock (same clock that computes NEXT_RUN_AT and
+        # stamps session codes) so a schedule fires on the wall-clock time the
+        # user set, independent of any DB-server clock skew.
+        now = datetime.now()
         with engine.connect() as conn:
             candidates = conn.execute(text(f"""
                 SELECT REPORT_ID, SCHEDULE_CONFIG FROM {REPORTS_TABLE}
                 WHERE TRIGGER_TYPE='schedule' AND ENABLED=1
                   AND NEXT_RUN_AT IS NOT NULL
-                  AND NEXT_RUN_AT <= SYSUTCDATETIME()
-            """)).fetchall()
+                  AND NEXT_RUN_AT <= :now
+            """), {"now": now}).fetchall()
 
         for rid, sched_json in candidates:
             try:
                 cfg = json.loads(sched_json or "{}")
             except Exception:
                 cfg = {}
-            next_run = compute_next_run(cfg)
+            next_run = compute_next_run(cfg, now=now)
             with engine.begin() as conn:
                 res = conn.execute(text(f"""
                     UPDATE {REPORTS_TABLE}
-                    SET NEXT_RUN_AT = :nr, UPDATED_AT = SYSUTCDATETIME()
+                    SET NEXT_RUN_AT = :nr, UPDATED_AT = :now
                     WHERE REPORT_ID = :rid
                       AND TRIGGER_TYPE='schedule' AND ENABLED=1
-                      AND NEXT_RUN_AT <= SYSUTCDATETIME()
-                """), {"nr": next_run, "rid": rid})
+                      AND NEXT_RUN_AT <= :now
+                """), {"nr": next_run, "rid": rid, "now": now})
             if res.rowcount == 1:
                 report = self._load_report(rid)
                 if report:
@@ -560,7 +655,7 @@ class ReportSchedulerService:
                     UPDATE {RUNS_TABLE}
                     SET STATUS='cancelled',
                         ERRORS='[{{"step":"cancel","error":"cancelled by user"}}]',
-                        COMPLETED_AT=SYSUTCDATETIME()
+                        COMPLETED_AT=SYSDATETIME()
                     WHERE REPORT_ID=:rid AND STATUS='running'
                 """), {"rid": report_id})
         except Exception as e:
@@ -584,7 +679,7 @@ class ReportSchedulerService:
                     UPDATE {RUNS_TABLE}
                     SET STATUS='failed',
                         ERRORS='[{{"step":"worker","error":"worker process exited abnormally (code {rc})"}}]',
-                        COMPLETED_AT=SYSUTCDATETIME()
+                        COMPLETED_AT=SYSDATETIME()
                     WHERE REPORT_ID=:rid AND SESSION_CODE=:sc AND STATUS='running'
                 """), {"rid": report_id, "sc": session_code})
                 if res.rowcount == 0:
@@ -599,7 +694,7 @@ class ReportSchedulerService:
                                 (REPORT_ID, SESSION_CODE, TRIGGER_SOURCE, STATUS,
                                  ERRORS, STARTED_AT, COMPLETED_AT)
                             VALUES (:rid, :sc, 'manual', 'failed',
-                                    :err, SYSUTCDATETIME(), SYSUTCDATETIME())
+                                    :err, SYSDATETIME(), SYSDATETIME())
                         """), {"rid": report_id, "sc": session_code,
                                "err": f'[{{"step":"worker","error":"worker failed to start (code {rc})"}}]'})
             logger.warning(f"[report-sched] report {report_id} worker exited {rc} — run marked failed")
@@ -621,7 +716,7 @@ class ReportSchedulerService:
                         (REPORT_ID, SESSION_CODE, TRIGGER_SOURCE, STATUS,
                          ERRORS, STARTED_AT, COMPLETED_AT, CREATED_BY)
                     VALUES (:rid, :sc, :ts, 'skipped',
-                            :err, SYSUTCDATETIME(), SYSUTCDATETIME(), :cb)
+                            :err, SYSDATETIME(), SYSDATETIME(), :cb)
                 """), {"rid": report_id, "sc": session_code, "ts": trigger_source,
                        "err": '[{"error": "previous run still active"}]', "cb": user})
         except Exception as e:

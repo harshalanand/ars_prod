@@ -11,7 +11,7 @@ import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text, bindparam
 from loguru import logger
@@ -96,7 +96,7 @@ def _validate_trigger(body: ReportBody) -> None:
                 dt = datetime.fromisoformat(str(cfg["datetime"]))
             except Exception:
                 raise HTTPException(400, "one-time 'datetime' must be ISO format")
-            if dt <= datetime.utcnow():
+            if dt <= datetime.now():
                 raise HTTPException(400, "one-time date & time must be in the future")
         if freq == "monthly":
             days = cfg.get("days")
@@ -205,7 +205,7 @@ def update_report(report_id: int, body: ReportBody,
                 SPLIT_CONFIG=:split, EMAIL_CONFIG=:email, WHATSAPP_CONFIG=:wa, SMS_CONFIG=:sms,
                 FOLDER_PER_RUN=:fpr,
                 TRIGGER_TYPE=:ttype, SCHEDULE_CONFIG=:sched, TRIGGER_EVENT=:tev,
-                ENABLED=:en, NEXT_RUN_AT=:nr, UPDATED_AT=SYSUTCDATETIME()
+                ENABLED=:en, NEXT_RUN_AT=:nr, UPDATED_AT=SYSDATETIME()
             WHERE REPORT_ID=:id
         """), {
             "name": body.name, "desc": body.description,
@@ -247,7 +247,7 @@ def toggle_report(report_id: int, body: ToggleBody,
                 next_run = None
         conn.execute(text(f"""
             UPDATE {REPORTS_TABLE} SET ENABLED=:en, NEXT_RUN_AT=:nr,
-                   UPDATED_AT=SYSUTCDATETIME() WHERE REPORT_ID=:id
+                   UPDATED_AT=SYSDATETIME() WHERE REPORT_ID=:id
         """), {"en": 1 if body.enabled else 0, "nr": next_run, "id": report_id})
     return APIResponse(success=True, message="enabled" if body.enabled else "disabled")
 
@@ -263,11 +263,58 @@ def delete_report(report_id: int, current_user: User = Depends(get_current_user)
     return APIResponse(success=True, message="Report deleted")
 
 
+@router.post("/reports/{report_id}/duplicate", response_model=APIResponse)
+def duplicate_report(report_id: int, current_user: User = Depends(get_current_user)):
+    """Clone a report definition (all steps + delivery + split config). The copy
+    is created DISABLED with a MANUAL trigger, so a duplicate of an event- or
+    schedule-triggered report can never silently double-fire — the user reviews
+    it (rename, change delivery, re-enable) before it runs."""
+    engine = get_data_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text(f"SELECT * FROM {REPORTS_TABLE} WHERE REPORT_ID=:id"),
+                           {"id": report_id}).mappings().fetchone()
+    if not row:
+        raise HTTPException(404, "Report not found")
+    d = dict(row)
+    new_name = f"{d.get('NAME') or 'Report'} (copy)"
+    with engine.begin() as conn:
+        new = conn.execute(text(f"""
+            INSERT INTO {REPORTS_TABLE}
+                (NAME, DESCRIPTION, STEPS, OUTPUT_TYPE, BASE_DIR, FILE_FORMAT,
+                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, WHATSAPP_CONFIG, SMS_CONFIG,
+                 FOLDER_PER_RUN, TRIGGER_TYPE, SCHEDULE_CONFIG, TRIGGER_EVENT, ENABLED,
+                 NEXT_RUN_AT, CREATED_BY)
+            OUTPUT inserted.REPORT_ID
+            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :wa, :sms,
+                    :fpr, 'manual', NULL, NULL, 0, NULL, :cb)
+        """), {
+            "name": new_name, "desc": d.get("DESCRIPTION"),
+            "steps": d.get("STEPS"), "otype": d.get("OUTPUT_TYPE"),
+            "bdir": d.get("BASE_DIR"), "fmt": d.get("FILE_FORMAT"),
+            "sf": d.get("SNOWFLAKE_CONFIG"), "split": d.get("SPLIT_CONFIG"),
+            "email": d.get("EMAIL_CONFIG"), "wa": d.get("WHATSAPP_CONFIG"),
+            "sms": d.get("SMS_CONFIG"), "fpr": d.get("FOLDER_PER_RUN", 1),
+            "cb": getattr(current_user, "username", None),
+        }).fetchone()
+    logger.info(f"[report-gen] duplicated report {report_id} → {new[0]} '{new_name}'")
+    return APIResponse(success=True, message="Report duplicated (disabled, manual)",
+                       data={"report_id": int(new[0]), "name": new_name})
+
+
 @router.post("/reports/{report_id}/run", response_model=APIResponse)
-def run_report_now(report_id: int, current_user: User = Depends(get_current_user)):
-    """Generate the report now (queued through the same worker pool)."""
+def run_report_now(report_id: int,
+                   body: Optional[Dict[str, Any]] = Body(default=None),
+                   current_user: User = Depends(get_current_user)):
+    """Generate the report now (queued through the same worker pool).
+
+    Optional body {"params": {...}} overrides stored-proc / query parameters for
+    THIS run only, without editing the saved report — e.g.
+    {"params": {"WERKS": "HB05", "MAJ_CAT": "M_JEANS,L_JEANS"}}.
+    """
+    overrides = (body or {}).get("params") or None
     result = report_scheduler.run_now(
-        report_id, getattr(current_user, "username", None))
+        report_id, getattr(current_user, "username", None),
+        param_overrides=overrides)
     if not result.get("queued"):
         raise HTTPException(404, result.get("error", "could not queue"))
     return APIResponse(success=True, message="Report queued", data=result)
@@ -290,7 +337,7 @@ def cancel_report_run(report_id: int, current_user: User = Depends(get_current_u
             UPDATE {RUNS_TABLE}
             SET STATUS='cancelled',
                 ERRORS='[{{"step":"cancel","error":"cleared stale run (was not active)"}}]',
-                COMPLETED_AT=SYSUTCDATETIME()
+                COMPLETED_AT=SYSDATETIME()
             WHERE REPORT_ID=:id AND STATUS='running'
         """), {"id": report_id})
     if res.rowcount:
@@ -524,4 +571,19 @@ def scheduler_status(current_user: User = Depends(get_current_user)):
     # scheduler's process table, not the (per-process) in-memory token registry.
     data = dict(report_scheduler.status)
     data["running_report_ids"] = report_scheduler.active_report_ids()
+    # Live completion % per running report (worker writes PROGRESS_* to the run row).
+    progress = {}
+    try:
+        engine = get_data_engine()
+        with engine.connect() as conn:
+            for row in conn.execute(text(f"""
+                SELECT REPORT_ID, PROGRESS_PCT, PROGRESS_STEP, PROGRESS_TOTAL
+                FROM {RUNS_TABLE} WHERE STATUS='running'
+            """)).mappings():
+                progress[int(row["REPORT_ID"])] = {
+                    "pct": row["PROGRESS_PCT"], "step": row["PROGRESS_STEP"],
+                    "total": row["PROGRESS_TOTAL"]}
+    except Exception:
+        pass
+    data["progress"] = progress
     return APIResponse(success=True, data=data)

@@ -114,32 +114,37 @@ class SapSchedulerService:
             elapsed += 5
 
     def _tick(self) -> None:
-        self._last_tick = datetime.utcnow()
+        self._last_tick = datetime.now()
         for pull in self._claim_due():
             self._submit(pull)
 
     def _claim_due(self) -> List[Dict[str, Any]]:
         eng = get_data_engine()
         claimed: List[Dict[str, Any]] = []
+        # Use ONE app clock for the due-check, compute_next_run, and the advance
+        # guard. Mixing the DB clock (SYSUTCDATETIME) with compute's app clock
+        # caused a schedule to re-fire every 30s tick for the duration of any
+        # clock skew between the two boxes (the "runs 8 times" bug).
+        now = datetime.now()
         with eng.connect() as conn:
             candidates = conn.execute(text(f"""
                 SELECT PULL_ID, SCHEDULE_CONFIG FROM {DEF_TABLE}
                 WHERE TRIGGER_TYPE='schedule' AND ENABLED=1
-                  AND NEXT_RUN_AT IS NOT NULL AND NEXT_RUN_AT <= SYSUTCDATETIME()
-            """)).fetchall()
+                  AND NEXT_RUN_AT IS NOT NULL AND NEXT_RUN_AT <= :now
+            """), {"now": now}).fetchall()
         for pid, sched_json in candidates:
             try:
                 cfg = json.loads(sched_json or "{}")
             except Exception:
                 cfg = {}
-            next_run = compute_next_run(cfg)
+            next_run = compute_next_run(cfg, now=now)
             with eng.begin() as conn:
                 res = conn.execute(text(f"""
                     UPDATE {DEF_TABLE}
-                    SET NEXT_RUN_AT=:nr, UPDATED_AT=SYSUTCDATETIME()
+                    SET NEXT_RUN_AT=:nr, UPDATED_AT=:now
                     WHERE PULL_ID=:pid AND TRIGGER_TYPE='schedule' AND ENABLED=1
-                      AND NEXT_RUN_AT <= SYSUTCDATETIME()
-                """), {"nr": next_run, "pid": pid})
+                      AND NEXT_RUN_AT <= :now
+                """), {"nr": next_run, "pid": pid, "now": now})
             if res.rowcount == 1:
                 row = pulls.get_pull(pid)
                 if row:

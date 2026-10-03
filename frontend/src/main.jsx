@@ -2,6 +2,7 @@ import React, { Component } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import { Toaster } from 'react-hot-toast'
+import { ConfirmHost } from './components/ui/ConfirmDialog'
 import App from './App'
 import './styles/globals.css'
 
@@ -11,12 +12,14 @@ import './styles/globals.css'
  * the ENTIRE app — the user just saw a blank white page (hit on
  * /pend-alc/adhoc-close, 2026-08-03). This boundary keeps a bad toast from
  * ever taking the app down again: the toast layer disappears, the app
- * keeps running. Callers should still pass strings — see errText(). */
-class ToasterBoundary extends Component {
+ * keeps running. Callers should still pass strings — see errText().
+ * <ConfirmHost> gets the same treatment: if it ever throws, confirmDialog()
+ * falls back to the native dialog instead of leaving the app dead. */
+class OverlayBoundary extends Component {
   constructor(props) { super(props); this.state = { failed: false } }
   static getDerivedStateFromError() { return { failed: true } }
   componentDidCatch(error, info) {
-    console.error('Toaster crashed (non-string toast payload?):', error, info)
+    console.error('Overlay layer crashed (non-string toast payload?):', error, info)
   }
   render() { return this.state.failed ? null : this.props.children }
 }
@@ -25,14 +28,17 @@ ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <BrowserRouter>
       <App />
-      <ToasterBoundary>
+      <OverlayBoundary>
         <Toaster position="top-right" toastOptions={{
           duration: 4000,
           style: { fontSize: '14px', borderRadius: '8px' },
           success: { iconTheme: { primary: '#10b981', secondary: '#fff' } },
           error: { iconTheme: { primary: '#ef4444', secondary: '#fff' } },
         }} />
-      </ToasterBoundary>
+      </OverlayBoundary>
+      <OverlayBoundary>
+        <ConfirmHost />
+      </OverlayBoundary>
     </BrowserRouter>
   </React.StrictMode>
 )

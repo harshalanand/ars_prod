@@ -12,6 +12,8 @@ code steps). run_report():
 Trigger source is free text: "schedule", "manual", or "event:<name>".
 """
 import json
+import os
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -65,6 +67,29 @@ def _storage_maintenance(base_dir: Optional[str]) -> None:
             logger.warning(f"[report] retention cleanup issue: {e}")
     except Exception as e:
         logger.warning(f"[report] storage maintenance skipped: {e}")
+
+
+def _cleanup_local_output(export_dir: str, files: List[Dict[str, Any]],
+                          per_run: bool) -> int:
+    """Delete this run's local output after a successful Snowflake upload.
+    per_run → remove the whole session folder; otherwise (shared date folder)
+    remove only the files THIS run wrote. Never raises; returns items removed."""
+    removed = 0
+    try:
+        if per_run and export_dir and os.path.isdir(export_dir):
+            shutil.rmtree(export_dir, ignore_errors=True)
+            return 1
+        for f in files:
+            p = f.get("file")
+            if p and os.path.isfile(p):
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning(f"[report] local cleanup after upload failed: {e}")
+    return removed
 
 
 # ── Cancellation ────────────────────────────────────────────────────────────
@@ -147,6 +172,85 @@ def make_session_code() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
+STEP_TIMING_TABLE = "ARS_REPORT_STEP_TIMING"
+
+
+def _ensure_progress_schema() -> None:
+    """Self-heal: progress columns on the run row + a per-step timing table used
+    to weight the completion %. Idempotent; never raises."""
+    try:
+        eng = get_data_engine()
+        with eng.begin() as c:
+            for col, ddl in (("PROGRESS_PCT", "INT"),
+                             ("PROGRESS_STEP", "NVARCHAR(300)"),
+                             ("PROGRESS_TOTAL", "INT")):
+                c.execute(text(f"""
+                    IF NOT EXISTS (SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('dbo.{RUNS_TABLE}') AND name = '{col}')
+                    ALTER TABLE dbo.{RUNS_TABLE} ADD {col} {ddl} NULL
+                """))
+            c.execute(text(f"""
+                IF OBJECT_ID('dbo.{STEP_TIMING_TABLE}', 'U') IS NULL
+                CREATE TABLE dbo.{STEP_TIMING_TABLE} (
+                    REPORT_ID  INT           NOT NULL,
+                    STEP_IDX   INT           NOT NULL,
+                    STEP_NAME  NVARCHAR(300) NULL,
+                    LAST_MS    INT           NULL,
+                    UPDATED_AT DATETIME2     NULL DEFAULT SYSDATETIME(),
+                    CONSTRAINT PK_{STEP_TIMING_TABLE} PRIMARY KEY (REPORT_ID, STEP_IDX)
+                )
+            """))
+    except Exception as e:
+        logger.debug(f"[report] progress schema ensure skipped: {e}")
+
+
+def _load_step_weights(report_id: int, n: int) -> List[float]:
+    """Per-step time weights from the last run (ms), so the % advances in
+    proportion to how long each step actually takes. Equal weights if no history."""
+    weights = [1.0] * n
+    try:
+        eng = get_data_engine()
+        with eng.connect() as c:
+            rows = c.execute(text(
+                f"SELECT STEP_IDX, LAST_MS FROM {STEP_TIMING_TABLE} WHERE REPORT_ID=:r"),
+                {"r": report_id}).fetchall()
+        m = {int(i): float(ms) for i, ms in rows if ms}
+        if m:
+            weights = [max(m.get(i + 1, 1.0), 1.0) for i in range(n)]
+    except Exception as e:
+        logger.debug(f"[report] step-weight load skipped: {e}")
+    return weights
+
+
+def _save_step_timing(report_id: int, idx: int, name: str, ms: int) -> None:
+    try:
+        eng = get_data_engine()
+        with eng.begin() as c:
+            c.execute(text(f"""
+                MERGE {STEP_TIMING_TABLE} AS t
+                USING (SELECT :r AS REPORT_ID, :i AS STEP_IDX) AS s
+                ON t.REPORT_ID=s.REPORT_ID AND t.STEP_IDX=s.STEP_IDX
+                WHEN MATCHED THEN UPDATE SET LAST_MS=:ms, STEP_NAME=:n, UPDATED_AT=SYSDATETIME()
+                WHEN NOT MATCHED THEN INSERT (REPORT_ID, STEP_IDX, STEP_NAME, LAST_MS)
+                    VALUES (:r, :i, :n, :ms);
+            """), {"r": report_id, "i": idx, "n": name[:300], "ms": int(ms)})
+    except Exception as e:
+        logger.debug(f"[report] step-timing save skipped: {e}")
+
+
+def _update_progress(run_id: int, pct: int, step_label: str, total: int) -> None:
+    """Write live progress to the run row (read by the UI's 5s poll). Never raises."""
+    try:
+        eng = get_data_engine()
+        with eng.begin() as c:
+            c.execute(text(f"""
+                UPDATE {RUNS_TABLE} SET PROGRESS_PCT=:p, PROGRESS_STEP=:s, PROGRESS_TOTAL=:t
+                WHERE RUN_ID=:id
+            """), {"p": int(pct), "s": (step_label or "")[:300], "t": int(total), "id": run_id})
+    except Exception as e:
+        logger.debug(f"[report] progress update skipped: {e}")
+
+
 def _parse_json(value: Any) -> Optional[Dict[str, Any]]:
     if not value:
         return None
@@ -185,14 +289,18 @@ def _insert_run(report_id: int, session_code: str, export_dir: str,
                 trigger_source: str, created_by: Optional[str]) -> int:
     engine = get_data_engine()
     with engine.begin() as conn:
+        # Stamp STARTED_AT from the APP clock (same source as session_code) so
+        # run times match the session code and the user's wall clock, regardless
+        # of any clock skew on the DB server.
         row = conn.execute(text(f"""
             INSERT INTO {RUNS_TABLE}
                 (REPORT_ID, SESSION_CODE, TRIGGER_SOURCE, STATUS,
                  EXPORT_DIR, STARTED_AT, CREATED_BY)
             OUTPUT inserted.RUN_ID
-            VALUES (:rid, :sc, :ts, 'running', :ed, SYSUTCDATETIME(), :cb)
+            VALUES (:rid, :sc, :ts, 'running', :ed, :started, :cb)
         """), {"rid": report_id, "sc": session_code, "ts": trigger_source,
-               "ed": export_dir, "cb": created_by}).fetchone()
+               "ed": export_dir, "cb": created_by,
+               "started": datetime.now()}).fetchone()
     return int(row[0])
 
 
@@ -200,23 +308,30 @@ def _finalize_run(run_id: int, report_id: int, status: str,
                   files: List[Dict], errors: List[Dict],
                   duration_ms: int) -> None:
     engine = get_data_engine()
-    total_rows = sum(int(f.get("rows", 0) or 0) for f in files)
+    # Count rows from the actual exported FILES only. Delivery summaries appended
+    # to `files` (Snowflake upload / email / whatsapp / sms) carry their own
+    # "rows" and would otherwise double-count (e.g. a Snowflake report showed 2×
+    # — once for the CSV, once for the upload of the same rows). In DIRECT mode
+    # there is no CSV, so fall back to the Snowflake upload ("target") entries.
+    file_rows = sum(int(f.get("rows", 0) or 0) for f in files if f.get("file"))
+    total_rows = file_rows or sum(int(f.get("rows", 0) or 0) for f in files if f.get("target"))
+    now = datetime.now()   # app clock — consistent with STARTED_AT & session code
     with engine.begin() as conn:
         conn.execute(text(f"""
             UPDATE {RUNS_TABLE} SET
                 STATUS = :st, FILES = :files, ERRORS = :errs,
-                ROW_COUNT = :rc, COMPLETED_AT = SYSUTCDATETIME(),
+                ROW_COUNT = :rc, COMPLETED_AT = :now,
                 DURATION_MS = :dur
             WHERE RUN_ID = :id
         """), {"st": status, "files": json.dumps(files),
                "errs": json.dumps(errors), "rc": total_rows,
-               "dur": duration_ms, "id": run_id})
+               "dur": duration_ms, "id": run_id, "now": now})
         conn.execute(text(f"""
             UPDATE {REPORTS_TABLE} SET
-                LAST_RUN_AT = SYSUTCDATETIME(), LAST_STATUS = :st,
-                UPDATED_AT = SYSUTCDATETIME()
+                LAST_RUN_AT = :now, LAST_STATUS = :st,
+                UPDATED_AT = :now
             WHERE REPORT_ID = :rid
-        """), {"st": status, "rid": report_id})
+        """), {"st": status, "rid": report_id, "now": now})
 
 
 def run_report(report: Dict[str, Any], trigger_source: str,
@@ -229,6 +344,7 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     """
     report_id = int(report["REPORT_ID"])
     session_code = session_code or make_session_code()
+    _ensure_progress_schema()
     steps = _parse_steps(report.get("STEPS"))
     file_format = (report.get("FILE_FORMAT") or "csv").lower()
     base_dir = report.get("BASE_DIR") or None
@@ -236,26 +352,39 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     split_config = _parse_split(report.get("SPLIT_CONFIG"))
     per_run = bool(report.get("FOLDER_PER_RUN", 1))
 
-    # Retention cleanup FIRST — prune old run folders so this run has room.
-    _storage_maintenance(base_dir)
+    # DIRECT Snowflake mode: for a snowflake-ONLY report (unless direct=false),
+    # stream each step straight from SQL Server into Snowflake with NO CSV export.
+    sf_cfg = _parse_json(report.get("SNOWFLAKE_CONFIG")) or {}
+    # Default = the fast CSV pipeline (write CSV → upload). 'direct' (stream with
+    # no CSV) is OPT-IN — it's slower because it processes rows in Python instead
+    # of pandas' C-optimised to_csv/read_csv.
+    direct_sf = (output_type == "snowflake") and bool(sf_cfg.get("direct", False))
 
-    export_dir = make_session_dir(session_code, base_dir, per_run=per_run)
-    run_id = _insert_run(report_id, session_code, export_dir,
-                         trigger_source, created_by)
-    token = _register_run(run_id, report_id)
-
-    # Disk pre-flight — fail fast (with the run recorded) if the output volume is
-    # too low, instead of producing a half-written report.
-    try:
-        assert_free_space(export_dir, _report_storage_cfg().get("min_free_mb", 500))
-    except Exception as e:
-        _unregister_run(run_id)
-        errs = [{"step": "preflight", "error": str(e)}]
-        _finalize_run(run_id, report_id, "failed", [], errs, 0)
-        logger.error(f"[report {report_id}] pre-flight failed: {e}")
-        return {"run_id": run_id, "report_id": report_id, "session_code": session_code,
-                "export_dir": export_dir, "status": "failed", "files": [],
-                "errors": errs, "duration_ms": 0}
+    if direct_sf:
+        # No file output → no export folder, no retention/disk pre-flight.
+        export_dir = ""
+        run_id = _insert_run(report_id, session_code, export_dir,
+                             trigger_source, created_by)
+        token = _register_run(run_id, report_id)
+    else:
+        # Retention cleanup FIRST — prune old run folders so this run has room.
+        _storage_maintenance(base_dir)
+        export_dir = make_session_dir(session_code, base_dir, per_run=per_run)
+        run_id = _insert_run(report_id, session_code, export_dir,
+                             trigger_source, created_by)
+        token = _register_run(run_id, report_id)
+        # Disk pre-flight — fail fast (with the run recorded) if the output volume
+        # is too low, instead of producing a half-written report.
+        try:
+            assert_free_space(export_dir, _report_storage_cfg().get("min_free_mb", 500))
+        except Exception as e:
+            _unregister_run(run_id)
+            errs = [{"step": "preflight", "error": str(e)}]
+            _finalize_run(run_id, report_id, "failed", [], errs, 0)
+            logger.error(f"[report {report_id}] pre-flight failed: {e}")
+            return {"run_id": run_id, "report_id": report_id, "session_code": session_code,
+                    "export_dir": export_dir, "status": "failed", "files": [],
+                    "errors": errs, "duration_ms": 0}
 
     # For event-triggered runs, suffix output files with the triggering session
     # id so each export is tied to the process run that fired it.
@@ -266,62 +395,99 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     errors: List[Dict[str, Any]] = []
     cancelled = False
 
-    try:
-        for idx, step in enumerate(steps, start=1):
-            if token.cancelled:
-                cancelled = True
-                break
-            label = f"step {idx} ({step['type']}:{step['name']})"
-            try:
-                if step["type"] == "sql":
-                    # A FANOUT param (e.g. usp_ars_msa_master.@Level) with a comma
-                    # list expands into one run per value -> a SEPARATE output file
-                    # suffixed with the value (e.g. MSA_OP_CL_DETAIL, _GEN_CLR, ...).
-                    for run_params, fo_sfx in fanout_param_runs(step["name"], step["params"]):
-                        if token.cancelled:
-                            cancelled = True
-                            break
-                        sfx = "_".join([p for p in (fo_sfx, event_suffix) if p]) or None
-                        files.extend(run_procedure_to_files(
-                            {"name": step["name"], "params": run_params},
-                            export_dir, file_format, split_config, cancel_token=token,
-                            output_name=step.get("label"), name_suffix=sfx))
-                elif step["type"] == "query":
-                    # Raw read-only SQL pasted into the report. step["name"] is
-                    # the output file label; the SQL lives in params.sql.
-                    files.extend(run_query_to_files(
-                        step["params"].get("sql", ""), step["name"],
-                        export_dir, file_format, split_config, cancel_token=token,
-                        name_suffix=event_suffix))
-                else:  # code
-                    ctx = StepContext(
-                        session_code=session_code, export_dir=export_dir,
-                        params=step["params"], prior_files=list(files))
-                    files.extend(run_code_step(step["name"], ctx))
-            except Exception as e:
-                # A cancel interrupts the running query with a DB error — treat
-                # it as cancellation, not a failure.
+    if direct_sf:
+        _unregister_run(run_id)   # direct mode has no per-step cancel token
+        try:
+            from app.services.snowflake_sync import sync_report_direct_to_snowflake
+            res = sync_report_direct_to_snowflake(report, session_code)
+            files.extend(res.get("files", []))
+            errors.extend(res.get("errors", []))
+        except Exception as e:
+            logger.error(f"[report {report_id}] snowflake direct sync failed: {e}")
+            errors.append({"step": "snowflake_direct", "error": str(e)})
+    else:
+        # Completion % — weight each step by its last run's duration so the bar
+        # advances in proportion to real time; equal weights on the first run.
+        n_steps = len(steps)
+        weights = _load_step_weights(report_id, n_steps)
+        total_w = sum(weights) or 1.0
+        done_w = 0.0
+        try:
+            for idx, step in enumerate(steps, start=1):
                 if token.cancelled:
                     cancelled = True
                     break
-                logger.error(f"[report {report_id}] {label} failed: {e}")
-                errors.append({"step": idx, "type": step["type"],
-                               "name": step["name"], "error": str(e)})
-    finally:
-        _unregister_run(run_id)
+                _update_progress(run_id, int(done_w / total_w * 100),
+                                 f"{idx}/{n_steps}: {step['name']}", n_steps)
+                step_t0 = time.monotonic()
+                label = f"step {idx} ({step['type']}:{step['name']})"
+                try:
+                    if step["type"] == "sql":
+                        # A FANOUT param (e.g. usp_ars_msa_master.@Level) with a comma
+                        # list expands into one run per value -> a SEPARATE output file
+                        # suffixed with the value (e.g. MSA_OP_CL_DETAIL, _GEN_CLR, ...).
+                        for run_params, fo_sfx in fanout_param_runs(step["name"], step["params"]):
+                            if token.cancelled:
+                                cancelled = True
+                                break
+                            sfx = "_".join([p for p in (fo_sfx, event_suffix) if p]) or None
+                            files.extend(run_procedure_to_files(
+                                {"name": step["name"], "params": run_params},
+                                export_dir, file_format, split_config, cancel_token=token,
+                                output_name=step.get("label"), name_suffix=sfx))
+                    elif step["type"] == "query":
+                        # Raw read-only SQL pasted into the report. step["name"] is
+                        # the output file label; the SQL lives in params.sql.
+                        files.extend(run_query_to_files(
+                            step["params"].get("sql", ""), step["name"],
+                            export_dir, file_format, split_config, cancel_token=token,
+                            name_suffix=event_suffix))
+                    else:  # code
+                        ctx = StepContext(
+                            session_code=session_code, export_dir=export_dir,
+                            params=step["params"], prior_files=list(files))
+                        files.extend(run_code_step(step["name"], ctx))
+                except Exception as e:
+                    # A cancel interrupts the running query with a DB error — treat
+                    # it as cancellation, not a failure.
+                    if token.cancelled:
+                        cancelled = True
+                        break
+                    logger.error(f"[report {report_id}] {label} failed: {e}")
+                    errors.append({"step": idx, "type": step["type"],
+                                   "name": step["name"], "error": str(e)})
+                finally:
+                    if not cancelled:
+                        _save_step_timing(report_id, idx, step["name"],
+                                          int((time.monotonic() - step_t0) * 1000))
+                        done_w += weights[idx - 1]
+        finally:
+            _unregister_run(run_id)
 
-    # Optional Snowflake push (deferred feature — records a clear error if the
-    # connector or config is missing, rather than crashing the run).
-    # Skip Snowflake + email entirely if the run was cancelled.
-    if not cancelled and output_type in ("snowflake", "both"):
-        try:
-            from app.services.snowflake_sync import sync_report_to_snowflake
-            sf_result = sync_report_to_snowflake(report, export_dir, files)
-            files.extend(sf_result.get("files", []))
-            errors.extend(sf_result.get("errors", []))
-        except Exception as e:
-            logger.error(f"[report {report_id}] snowflake sync failed: {e}")
-            errors.append({"step": "snowflake", "error": str(e)})
+        # File-based Snowflake push (reads the CSVs produced above).
+        if not cancelled and output_type in ("snowflake", "both"):
+            _update_progress(run_id, max(int(done_w / total_w * 100), 95),
+                             "uploading to Snowflake", n_steps)
+            sf_ok = False
+            try:
+                from app.services.snowflake_sync import sync_report_to_snowflake
+                sf_result = sync_report_to_snowflake(report, export_dir, files, session_code)
+                files.extend(sf_result.get("files", []))
+                errors.extend(sf_result.get("errors", []))
+                sf_ok = not sf_result.get("errors")   # every target uploaded cleanly
+            except Exception as e:
+                logger.error(f"[report {report_id}] snowflake sync failed: {e}")
+                errors.append({"step": "snowflake", "error": str(e)})
+
+            # Cleanup: for a snowflake-ONLY report, delete the local CSV once it's
+            # safely in Snowflake. Never for 'both' (folder is the deliverable),
+            # and only when the upload SUCCEEDED (keep files on failure to retry).
+            if (output_type == "snowflake" and sf_ok
+                    and sf_cfg.get("cleanup_after_upload", True)):
+                removed = _cleanup_local_output(export_dir, files, per_run)
+                files.append({"procedure": "cleanup", "rows": 0,
+                              "note": f"local files deleted after upload ({removed})"})
+                logger.info(f"[report {report_id}] cleaned up local output after upload")
 
     # Snapshot the RUN outcome BEFORE email bookkeeping: whether steps errored
     # and how many real output files they produced. Email/alert entries get

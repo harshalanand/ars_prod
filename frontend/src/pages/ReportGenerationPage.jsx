@@ -5,13 +5,14 @@
  * List existing reports, generate on-demand, and create/edit definitions.
  */
 import { useState, useEffect, useRef, Fragment } from 'react'
-import { reportGenAPI } from '@/services/api'
+import { reportGenAPI, snowflakeConfigAPI } from '@/services/api'
+import { confirmDialog } from '@/components/ui/ConfirmDialog'
 import toast from 'react-hot-toast'
 import {
   FileText, RefreshCw, Plus, Play, Trash2, Pencil, Clock, Link2,
   MousePointerClick, X, CheckCircle, AlertTriangle, Loader2, ChevronDown, GripVertical,
   Mail, Scissors, CalendarClock, Zap, Hand, LayoutList, FolderOutput, Database,
-  Square, MessageCircle, MessageSquare,
+  Square, MessageCircle, MessageSquare, Copy, Info, SlidersHorizontal,
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 
@@ -29,7 +30,7 @@ const EMPTY_FORM = {
     enabled: false, to: [], cc: [], bcc: [], subject: '', body: '',
     attach_format: 'xlsx', attach_scope: 'all', zip: false, notify_on_fail: false,
   },
-  snowflake_config: { database: '', schema: '', warehouse: '', targets: [] },
+  snowflake_config: { database: '', schema: '', warehouse: '', direct: false, cleanup_after_upload: true, targets: [] },
   whatsapp_config: { enabled: false, to: [], message: 'Report {report} is ready — {rows} rows.', attach: true, attach_format: 'xlsx', template: '' },
   sms_config: { enabled: false, to: [], message: 'ARS {report}: {status}, {rows} rows on {when}' },
 }
@@ -61,6 +62,8 @@ export default function ReportGenerationPage() {
   const [filter, setFilter] = useState('all')      // all|schedule|event|manual|enabled
   const [runs, setRuns] = useState({})            // report_id -> runs[]
   const [newProc, setNewProc] = useState('')
+  const [runCfg, setRunCfg] = useState(null)      // {id,name,steps} → run-with-parameters popup
+  const [sfDefaults, setSfDefaults] = useState({ database: '', schema: '', warehouse: '' })  // Settings → Snowflake connection
   const pollRef = useRef(null)
 
   const load = async () => {
@@ -78,6 +81,11 @@ export default function ReportGenerationPage() {
     reportGenAPI.codeSteps().then(({ data }) => setCodeSteps(data?.data || [])).catch(() => {})
     reportGenAPI.procedures().then(({ data }) => setProcs(data?.data || [])).catch(() => {})
     reportGenAPI.events().then(({ data }) => setEvents(data?.data || [])).catch(() => {})
+    // Snowflake connection defaults (Settings → Snowflake) — used to default the
+    // report's Snowflake DB/schema/warehouse so they don't have to be retyped.
+    snowflakeConfigAPI.getConfig()
+      .then(({ data }) => { const c = data?.data || {}; setSfDefaults({ database: c.database || '', schema: c.schema || '', warehouse: c.warehouse || '' }) })
+      .catch(() => {})
     pollRef.current = setInterval(load, 5000)
     return () => clearInterval(pollRef.current)
   }, [])
@@ -91,9 +99,29 @@ export default function ReportGenerationPage() {
     } catch { toast.error('Failed to load runs') }
   }
 
-  const generate = async (id) => {
-    try { await reportGenAPI.runNow(id); toast.success('Report queued'); setTimeout(load, 800) }
-    catch { toast.error('Could not queue report') }
+  // `params` (optional) overrides step variables for THIS run only — the saved
+  // report definition is untouched.
+  const generate = async (id, params = null) => {
+    try {
+      await reportGenAPI.runNow(id, params)
+      toast.success(params ? 'Report queued with your parameters' : 'Report queued')
+      setRunCfg(null)
+      setTimeout(load, 800)
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Could not queue report') }
+  }
+
+  // Open the "run with parameters" popup: pull the report's steps so the dialog
+  // can show each proc's current variables as editable defaults.
+  const openRunParams = async (r) => {
+    let steps = Array.isArray(r.STEPS) ? r.STEPS : []
+    if (!steps.length) {
+      try {
+        const { data } = await reportGenAPI.get(r.REPORT_ID)
+        const d = data?.data || {}
+        steps = Array.isArray(d.STEPS) ? d.STEPS : JSON.parse(d.STEPS || '[]')
+      } catch { toast.error('Could not load report steps'); return }
+    }
+    setRunCfg({ id: r.REPORT_ID, name: r.NAME || `#${r.REPORT_ID}`, steps })
   }
 
   const stop = async (id) => {
@@ -105,7 +133,12 @@ export default function ReportGenerationPage() {
   }
 
   const removeRun = async (reportId, runId) => {
-    if (!confirm('Delete this run from history? Its per-run export folder is also removed.')) return
+    if (!await confirmDialog({
+      tone: 'danger',
+      title: 'Delete this run from history?',
+      body: 'Its per-run export folder is removed from disk too.',
+      confirmLabel: 'Delete run',
+    })) return
     try {
       await reportGenAPI.deleteRun(reportId, runId)
       toast.success('Run deleted')
@@ -117,7 +150,12 @@ export default function ReportGenerationPage() {
 
   const removeRuns = async (reportId, runIds) => {
     if (!runIds.length) return
-    if (!confirm(`Delete ${runIds.length} run(s) from history? Per-run export folders are also removed.`)) return
+    if (!await confirmDialog({
+      tone: 'danger',
+      title: `Delete ${runIds.length} run(s) from history?`,
+      body: 'Their per-run export folders are removed from disk too.',
+      confirmLabel: `Delete ${runIds.length} run(s)`,
+    })) return
     try {
       const { data } = await reportGenAPI.bulkDeleteRuns(reportId, runIds)
       toast.success(data?.message || `Deleted ${runIds.length} run(s)`)
@@ -133,9 +171,22 @@ export default function ReportGenerationPage() {
   }
 
   const remove = async (id) => {
-    if (!confirm('Delete this report?')) return
+    if (!await confirmDialog({
+      tone: 'danger',
+      title: 'Delete this report?',
+      body: 'Its steps, schedule and run history go with it. Files already exported stay on disk.',
+      confirmLabel: 'Delete report',
+    })) return
     try { await reportGenAPI.remove(id); toast.success('Deleted'); load() }
     catch { toast.error('Delete failed') }
+  }
+
+  const duplicate = async (id) => {
+    try {
+      const { data } = await reportGenAPI.duplicate(id)
+      toast.success(`Duplicated → "${data?.data?.name || 'copy'}" (disabled, review & enable)`)
+      await load()
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Duplicate failed') }
   }
 
   const startEdit = (r) => {
@@ -155,7 +206,7 @@ export default function ReportGenerationPage() {
       whatsapp_config: r.WHATSAPP_CONFIG || { ...EMPTY_FORM.whatsapp_config },
       sms_config: r.SMS_CONFIG || { ...EMPTY_FORM.sms_config },
     })
-    window.scrollTo({ top: 9999, behavior: 'smooth' })
+    // The form opens in a popup — no scrolling needed.
   }
 
   const addProc = (label) => {
@@ -327,7 +378,21 @@ export default function ReportGenerationPage() {
                   </td>
                   <td style={td}>
                     {runningIds.has(r.REPORT_ID)
-                      ? <span style={statusPill('running')}><Loader2 size={11} className="spin" /> running</span>
+                      ? (() => {
+                          const pr = (sched?.progress || {})[r.REPORT_ID] || {}
+                          const pct = typeof pr.pct === 'number' ? pr.pct : null
+                          return (
+                            <div style={{ minWidth: 150 }}>
+                              <span style={statusPill('running')}><Loader2 size={11} className="spin" /> running{pct != null ? ` ${pct}%` : ''}</span>
+                              {pct != null && (
+                                <div style={{ height: 4, background: C.grayBg, borderRadius: 3, marginTop: 4, overflow: 'hidden' }}>
+                                  <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', background: C.primary, transition: 'width .4s' }} />
+                                </div>
+                              )}
+                              {pr.step && <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{pr.step}</div>}
+                            </div>
+                          )
+                        })()
                       : r.LAST_STATUS
                         ? <span style={statusPill(r.LAST_STATUS)}>{statusIcon(r.LAST_STATUS, 11)} {r.LAST_STATUS}</span>
                         : <span style={{ color: C.textMuted }}>Never</span>}
@@ -343,8 +408,12 @@ export default function ReportGenerationPage() {
                     <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       {runningIds.has(r.REPORT_ID)
                         ? <button onClick={() => stop(r.REPORT_ID)} title="Stop this run" style={iconBtn(C.red)}><Square size={13} fill={C.red} /></button>
-                        : <button onClick={() => generate(r.REPORT_ID)} title="Generate now" style={iconBtn(C.primary)}><Play size={13} /></button>}
+                        : <>
+                            <button onClick={() => generate(r.REPORT_ID)} title="Generate now (saved parameters)" style={iconBtn(C.primary)}><Play size={13} /></button>
+                            <button onClick={() => openRunParams(r)} title="Run with parameters (this run only — doesn't change the report)" style={iconBtn(C.textSub)}><SlidersHorizontal size={13} /></button>
+                          </>}
                       <button onClick={() => startEdit(r)} title="Edit" style={iconBtn(C.textSub)}><Pencil size={13} /></button>
+                      <button onClick={() => duplicate(r.REPORT_ID)} title="Duplicate (creates a disabled copy)" style={iconBtn(C.textSub)}><Copy size={13} /></button>
                       <button onClick={() => remove(r.REPORT_ID)} title="Delete" style={iconBtn(C.red)}><Trash2 size={13} /></button>
                     </div>
                   </td>
@@ -362,14 +431,24 @@ export default function ReportGenerationPage() {
         </table>
       </div>
 
-      {/* Create / edit form */}
+      {/* Create / edit form — opens as a popup so the report list stays put */}
       {form && (
-        <ReportForm
-          form={form} setForm={setForm} codeSteps={codeSteps} events={events} procs={procs}
-          newProc={newProc} setNewProc={setNewProc}
-          addProc={addProc} addCode={addCode} addQuery={addQuery} removeStep={removeStep}
-          onSave={save} onCancel={() => setForm(null)}
-        />
+        <Modal title={form.report_id ? 'Edit report' : 'New report'} onClose={() => setForm(null)}>
+          <ReportForm
+            form={form} setForm={setForm} codeSteps={codeSteps} events={events} procs={procs}
+            newProc={newProc} setNewProc={setNewProc} sfDefaults={sfDefaults}
+            addProc={addProc} addCode={addCode} addQuery={addQuery} removeStep={removeStep}
+            onSave={save} onCancel={() => setForm(null)}
+          />
+        </Modal>
+      )}
+
+      {/* Run with parameters — override this run's variables without editing */}
+      {runCfg && (
+        <Modal title={`Run “${runCfg.name}” with parameters`} onClose={() => setRunCfg(null)} width={720}>
+          <RunParamsDialog cfg={runCfg} onCancel={() => setRunCfg(null)}
+                           onRun={(params) => generate(runCfg.id, params)} />
+        </Modal>
       )}
 
       <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }`}</style>
@@ -379,6 +458,8 @@ export default function ReportGenerationPage() {
 
 function RunHistory({ runs, onStop, onDelete, onBulkDelete }) {
   const [sel, setSel] = useState(() => new Set())
+  const [openDetail, setOpenDetail] = useState(() => new Set())
+  const toggleDetail = (id) => setOpenDetail(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
   if (!runs) return <div style={{ color: C.textMuted, fontSize: 11 }}>Loading runs…</div>
   if (!runs.length) return <div style={{ color: C.textMuted, fontSize: 11 }}>No runs yet.</div>
   const deletable = runs.filter(r => r.STATUS !== 'running')
@@ -414,8 +495,14 @@ function RunHistory({ runs, onStop, onDelete, onBulkDelete }) {
         </tr>
       </thead>
       <tbody>
-        {runs.map(run => (
-          <tr key={run.RUN_ID} style={{ borderTop: `1px solid ${C.cardBorder}`, background: sel.has(run.RUN_ID) ? C.primaryLight : 'transparent' }}>
+        {runs.map(run => {
+          const errs = Array.isArray(run.ERRORS) ? run.ERRORS : []
+          const notes = (Array.isArray(run.FILES) ? run.FILES : []).filter(f => f && (f.target || f.note || f.email || f.delivery))
+          const hasDetail = errs.length > 0 || notes.length > 0
+          const open = openDetail.has(run.RUN_ID)
+          return (
+          <Fragment key={run.RUN_ID}>
+          <tr style={{ borderTop: `1px solid ${C.cardBorder}`, background: sel.has(run.RUN_ID) ? C.primaryLight : 'transparent' }}>
             <td style={{ ...td, textAlign: 'center' }}>
               {onBulkDelete && run.STATUS !== 'running' && (
                 <input type="checkbox" checked={sel.has(run.RUN_ID)} onChange={() => toggle(run.RUN_ID)} style={{ cursor: 'pointer' }} />
@@ -439,20 +526,57 @@ function RunHistory({ runs, onStop, onDelete, onBulkDelete }) {
             <td style={{ ...td, color: C.textMuted }}>{fmtTime(run.COMPLETED_AT)}</td>
             <td style={{ ...td, textAlign: 'right', color: C.textSub }}>{fmtDuration(run.DURATION_MS)}</td>
             <td style={{ ...td, fontFamily: 'monospace', color: C.textMuted, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={run.EXPORT_DIR}>{run.EXPORT_DIR || '—'}</td>
-            <td style={{ ...td, textAlign: 'right' }}>
+            <td style={{ ...td, textAlign: 'right', whiteSpace: 'nowrap' }}>
+              {hasDetail && (
+                <button onClick={() => toggleDetail(run.RUN_ID)}
+                  title={errs.length ? `${errs.length} error(s) — click to view` : 'View details'}
+                  style={iconBtn(errs.length ? C.red : C.textSub)}>
+                  <Info size={12} />
+                </button>
+              )}
               {onDelete && run.STATUS !== 'running' && (
                 <button onClick={() => onDelete(run.RUN_ID)} title="Delete this run (and its folder)" style={iconBtn(C.red)}><Trash2 size={12} /></button>
               )}
             </td>
           </tr>
-        ))}
+          {open && hasDetail && (
+            <tr style={{ background: '#fafbfc' }}>
+              <td colSpan={10} style={{ padding: '8px 12px', borderTop: `1px solid ${C.cardBorder}` }}>
+                {errs.length > 0 && (
+                  <div style={{ marginBottom: notes.length ? 8 : 0 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: C.red, marginBottom: 4 }}>Errors ({errs.length})</div>
+                    {errs.map((e, i) => (
+                      <div key={i} style={{ fontSize: 11, color: C.red, fontFamily: 'monospace', padding: '3px 8px', background: C.redBg, borderRadius: 4, marginBottom: 3, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                        {(e.step != null ? `step ${e.step} ` : '') + (e.name || e.target || '') + (e.name || e.target ? ' — ' : '') + (e.error || JSON.stringify(e))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {notes.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: C.textSub, marginBottom: 4 }}>Outputs / delivery</div>
+                    {notes.map((f, i) => (
+                      <div key={i} style={{ fontSize: 11, color: C.textSub, marginBottom: 2 }}>
+                        {f.target ? `↑ ${f.target}: ${(f.rows ?? 0).toLocaleString()} rows${f.note ? ' — ' + f.note : ''}`
+                          : f.email ? `✉ email: ${f.email.sent ? 'sent' : (f.email.error || 'not sent')}`
+                          : f.delivery ? `➤ ${f.delivery.channel || 'delivery'}: ${f.delivery.sent ? 'sent' : (f.delivery.error || 'not sent')}`
+                          : (f.note || JSON.stringify(f))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </td>
+            </tr>
+          )}
+          </Fragment>
+        )})}
       </tbody>
     </table>
     </>
   )
 }
 
-function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewProc, addProc, addCode, addQuery, removeStep, onSave, onCancel }) {
+function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewProc, sfDefaults = { database: '', schema: '', warehouse: '' }, addProc, addCode, addQuery, removeStep, onSave, onCancel }) {
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
   const setSched = (k, v) => setForm(f => ({ ...f, schedule_config: { ...f.schedule_config, [k]: v } }))
   const setSplit = (k, v) => setForm(f => ({ ...f, split_config: { ...f.split_config, [k]: v } }))
@@ -467,7 +591,7 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
   const sf = form.snowflake_config || {}
   const sfTargets = sf.targets || []
   const setTarget = (i, k, v) => setSnow('targets', sfTargets.map((t, idx) => idx === i ? { ...t, [k]: v } : t))
-  const addTarget = () => setSnow('targets', [...sfTargets, { source_file: '', table: '', key_cols: [], watermark_col: '' }])
+  const addTarget = () => setSnow('targets', [...sfTargets, { source_file: '', table: '', mode: 'append', key_cols: [], watermark_col: '' }])
   const removeTarget = (i) => setSnow('targets', sfTargets.filter((_, idx) => idx !== i))
   const presetBtn = { background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 10, color: C.primary, textDecoration: 'underline', fontWeight: 600 }
   // Deliver-to derives from output_type (folder/snowflake) + email enabled.
@@ -577,8 +701,8 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
     setQName(''); setQSql(''); setShowQuery(false); setEditIdx(null)
   }
   return (
-    <div style={{ background: C.cardBg, border: `1px solid ${C.cardBorder}`, borderRadius: 12, padding: 20, marginTop: 20 }}>
-      <h2 style={{ fontSize: 15, fontWeight: 800, margin: '0 0 16px' }}>{form.report_id ? 'Edit report' : 'New report'}</h2>
+    // Rendered inside <Modal> — the popup supplies the card chrome and title.
+    <div style={{ padding: 20 }}>
       <div style={{ marginBottom: 14 }}>
         <Field label="Name"><input value={form.name} onChange={e => set('name', e.target.value)} style={inp} /></Field>
       </div>
@@ -797,46 +921,90 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
         <div style={{ marginBottom: 16 }}>
           <label style={lbl}>Snowflake sync</label>
           <div style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: 12, background: '#f8fafc' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 4 }}>
               <div>
                 <label style={lbl}>Database</label>
                 <input value={sf.database || ''} onChange={e => setSnow('database', e.target.value)}
-                       placeholder="ANALYTICS" style={{ ...inp, fontSize: 12 }} />
+                       placeholder={sfDefaults.database ? `default: ${sfDefaults.database}` : 'ANALYTICS'} style={{ ...inp, fontSize: 12 }} />
               </div>
               <div>
                 <label style={lbl}>Schema</label>
                 <input value={sf.schema || ''} onChange={e => setSnow('schema', e.target.value)}
-                       placeholder="ARS" style={{ ...inp, fontSize: 12 }} />
+                       placeholder={sfDefaults.schema ? `default: ${sfDefaults.schema}` : 'MIS_REPORTS'} style={{ ...inp, fontSize: 12 }} />
               </div>
               <div>
                 <label style={lbl}>Warehouse (optional)</label>
                 <input value={sf.warehouse || ''} onChange={e => setSnow('warehouse', e.target.value)}
-                       placeholder="uses default" style={{ ...inp, fontSize: 12 }} />
+                       placeholder={sfDefaults.warehouse ? `default: ${sfDefaults.warehouse}` : 'uses default'} style={{ ...inp, fontSize: 12 }} />
               </div>
             </div>
-            <label style={lbl}>Targets — one per file to upsert</label>
+            {form.output_type === 'snowflake' && (
+              <>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, marginBottom: 6 }}>
+                  <input type="checkbox" checked={sf.cleanup_after_upload !== false} onChange={e => setSnow('cleanup_after_upload', e.target.checked)}
+                         style={{ width: 14, height: 14, cursor: 'pointer' }} />
+                  <span><b>Delete local files after upload</b> — remove this run's CSVs once they're in Snowflake (kept if the upload fails)</span>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, marginBottom: 8 }}>
+                  <input type="checkbox" checked={sf.direct === true} onChange={e => setSnow('direct', e.target.checked)}
+                         style={{ width: 14, height: 14, cursor: 'pointer' }} />
+                  <span><b>Direct load</b> (no CSV) — stream straight to Snowflake. Slower than CSV+upload; leave off unless you need zero disk writes.</span>
+                </label>
+              </>
+            )}
+            {form.output_type === 'both' && (
+              <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 8 }}>
+                Output is <b>both</b> → files are written for the folder and reused for Snowflake; local files are kept.
+              </div>
+            )}
+            <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 10, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span>Blank fields use the Settings → Snowflake connection{sfDefaults.database ? ` (${sfDefaults.database}.${sfDefaults.schema || '—'}${sfDefaults.warehouse ? ' / ' + sfDefaults.warehouse : ''})` : ''}.</span>
+              {(sf.schema || sfDefaults.schema || '').toUpperCase() === 'BRONZE' && (
+                <span style={{ color: C.red, fontWeight: 600 }}>
+                  ⚠ {(sf.schema || sfDefaults.schema).toUpperCase()} is the SAP data lake — set a reporting schema (e.g. MIS_REPORTS) or its tables get swept.
+                </span>
+              )}
+              {!sf.schema && !sfDefaults.schema && (
+                <button type="button" onClick={() => { setSnow('database', sfDefaults.database || sf.database); setSnow('schema', 'MIS_REPORTS'); if (sfDefaults.warehouse) setSnow('warehouse', sfDefaults.warehouse) }}
+                        style={{ ...btn(), fontSize: 10 }}>Use MIS_REPORTS</button>
+              )}
+            </div>
+            <label style={lbl}>Targets — one per file → Snowflake table</label>
             {sfTargets.length === 0 && (
               <div style={{ fontSize: 11, color: C.textMuted, margin: '2px 0 8px' }}>No targets yet.</div>
             )}
-            {sfTargets.map((t, i) => (
-              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr 1fr auto', gap: 8, marginBottom: 8, alignItems: 'center' }}>
+            {sfTargets.map((t, i) => {
+              const upsert = (t.mode || 'append') === 'upsert'
+              return (
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: upsert ? '1fr 1fr 0.8fr 1.2fr 1fr auto' : '1fr 1fr 0.8fr auto', gap: 8, marginBottom: 8, alignItems: 'center' }}>
                 <input value={t.source_file || ''} onChange={e => setTarget(i, 'source_file', e.target.value)}
                        placeholder="source file/proc" title="Which step's output (proc or query name)"
                        style={{ ...inp, fontSize: 11, fontFamily: 'monospace' }} />
                 <input value={t.table || ''} onChange={e => setTarget(i, 'table', e.target.value)}
                        placeholder="target table" style={{ ...inp, fontSize: 11, fontFamily: 'monospace' }} />
-                <input value={(t.key_cols || []).join(', ')} onChange={e => setTarget(i, 'key_cols', e.target.value.split(',').map(c => c.trim()).filter(Boolean))}
-                       placeholder="key cols (merge on)" style={{ ...inp, fontSize: 11, fontFamily: 'monospace' }} />
-                <input value={t.watermark_col || ''} onChange={e => setTarget(i, 'watermark_col', e.target.value)}
-                       placeholder="watermark col" title="Column tracking new/changed rows (incremental)"
-                       style={{ ...inp, fontSize: 11, fontFamily: 'monospace' }} />
+                <select value={t.mode || 'append'} onChange={e => setTarget(i, 'mode', e.target.value)}
+                        title="append = INSERT rows; upsert = MERGE on key cols"
+                        style={{ ...inp, fontSize: 11 }}>
+                  <option value="append">append</option>
+                  <option value="upsert">upsert</option>
+                </select>
+                {upsert && (
+                  <input value={(t.key_cols || []).join(', ')} onChange={e => setTarget(i, 'key_cols', e.target.value.split(',').map(c => c.trim()).filter(Boolean))}
+                         placeholder="key cols (merge on)" style={{ ...inp, fontSize: 11, fontFamily: 'monospace' }} />
+                )}
+                {upsert && (
+                  <input value={t.watermark_col || ''} onChange={e => setTarget(i, 'watermark_col', e.target.value)}
+                         placeholder="watermark col (opt)" title="Only rows newer than last sync"
+                         style={{ ...inp, fontSize: 11, fontFamily: 'monospace' }} />
+                )}
                 <button onClick={() => removeTarget(i)} style={iconBtn(C.textMuted)}><X size={13} /></button>
               </div>
-            ))}
+            )})}
             <button onClick={addTarget} style={btn()}><Plus size={12} /> Add target</button>
             <div style={{ fontSize: 10, color: C.textMuted, marginTop: 8 }}>
-              Key cols = merge/upsert keys. Watermark col (optional) = only rows newer than last sync
-              are sent. Connection is configured in Settings → Snowflake.
+              <b>append</b> = insert the file's rows each run (stamped with _SESSION_CODE / _LOADED_AT).
+              <b> upsert</b> = merge on key cols (+ optional watermark for incremental). The target table
+              is auto-created if missing; DB/schema/warehouse fall back to Settings → Snowflake.
             </div>
           </div>
         </div>
@@ -1186,6 +1354,172 @@ const DeliverChip = ({ active, icon, label, onClick }) => (
     {active && <CheckCircle size={13} />}
   </button>
 )
+
+/** Centered popup shell. Click-outside / Esc closes; the body scrolls, not the page. */
+function Modal({ title, onClose, width = 980, children }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'   // no scroll behind the popup
+    return () => { window.removeEventListener('keydown', onKey); document.body.style.overflow = prev }
+  }, [onClose])
+  return (
+    <div onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}
+         style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15,23,42,.45)',
+                  display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '32px 16px', overflowY: 'auto' }}>
+      <div style={{ width: '100%', maxWidth: width, background: C.cardBg, borderRadius: 12,
+                    boxShadow: '0 20px 50px rgba(0,0,0,.28)', display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 64px)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+                      padding: '14px 20px', borderBottom: `1px solid ${C.cardBorder}`, flexShrink: 0 }}>
+          <h2 style={{ fontSize: 15, fontWeight: 800, margin: 0 }}>{title}</h2>
+          <button onClick={onClose} title="Close (Esc)" style={iconBtn(C.textMuted)}><X size={16} /></button>
+        </div>
+        <div style={{ overflowY: 'auto', padding: '0 4px 4px' }}>{children}</div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Run-with-parameters popup. Shows every proc/query step's variables prefilled
+ * with the report's saved values, lets you change them (or add a brand-new
+ * parameter) and run — WITHOUT editing the saved report. Overrides are sent
+ * per step index, so two steps can take different values for the same name.
+ */
+function RunParamsDialog({ cfg, onCancel, onRun }) {
+  const [rows, setRows] = useState(() =>
+    (cfg.steps || []).map((s, i) => ({
+      idx: i, type: s.type, name: s.name, label: s.label,
+      params: Object.entries(s.params || {})
+        .filter(([k]) => !(s.type === 'query' && k === 'sql'))   // never expose raw SQL here
+        .map(([k, v]) => ({ name: k, value: v == null ? '' : String(v), allowed: null })),
+    })))
+  const [loading, setLoading] = useState(false)
+
+  // Pull declared @params + their allowed-value lists for every proc step, so a
+  // parameter the saved report never set can still be supplied at run time.
+  const loadAll = async () => {
+    setLoading(true)
+    try {
+      const next = await Promise.all(rows.map(async (r) => {
+        if (r.type !== 'sql') return r
+        try {
+          const { data } = await reportGenAPI.procParams(r.name)
+          const declared = data?.data || []
+          const byName = Object.fromEntries(r.params.map(p => [p.name, p.value]))
+          const merged = declared.map(d => ({ name: d.name, value: byName[d.name] ?? '', type: d.type, allowed: d.allowed }))
+          // keep any extra params the report set that the proc no longer declares
+          const dn = new Set(declared.map(d => d.name))
+          return { ...r, params: [...merged, ...r.params.filter(p => !dn.has(p.name))] }
+        } catch { return r }
+      }))
+      setRows(next)
+    } finally { setLoading(false) }
+  }
+  useEffect(() => { loadAll() }, [])   // prefill on open
+
+  const setP = (ri, pi, k, v) => setRows(rs => rs.map((r, i) =>
+    i !== ri ? r : { ...r, params: r.params.map((p, j) => j === pi ? { ...p, [k]: v } : p) }))
+  const addP = (ri) => setRows(rs => rs.map((r, i) =>
+    i !== ri ? r : { ...r, params: [...r.params, { name: '', value: '', allowed: null }] }))
+  const rmP = (ri, pi) => setRows(rs => rs.map((r, i) =>
+    i !== ri ? r : { ...r, params: r.params.filter((_, j) => j !== pi) }))
+  const toggleVal = (ri, pi, val) => setRows(rs => rs.map((r, i) => {
+    if (i !== ri) return r
+    return { ...r, params: r.params.map((p, j) => {
+      if (j !== pi) return p
+      const list = String(p.value || '').split(',').map(x => x.trim()).filter(Boolean)
+      const at = list.indexOf(val)
+      if (at >= 0) list.splice(at, 1); else list.push(val)
+      return { ...p, value: list.join(',') }
+    }) }
+  }))
+
+  const run = () => {
+    // Send by step index so each step gets exactly its own values.
+    const params = {}
+    for (const r of rows) {
+      const one = {}
+      for (const p of r.params) {
+        const n = String(p.name || '').trim()
+        if (!n) continue
+        one[n] = p.value === '' ? null : p.value   // blank = NULL (no filter)
+      }
+      if (Object.keys(one).length) params[String(r.idx)] = one
+    }
+    onRun(Object.keys(params).length ? params : null)
+  }
+
+  return (
+    <div style={{ padding: 16 }}>
+      <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 12 }}>
+        These values apply to <b>this run only</b> — the saved report is not changed.
+        Blank = <b>NULL</b> (no filter). For multi-value parameters use a comma list, e.g. <code>M_JEANS,L_JEANS</code>.
+        <button onClick={loadAll} disabled={loading} style={{ ...btn(), marginLeft: 10 }}>
+          <RefreshCw size={12} className={loading ? 'spin' : ''} /> Reload parameters
+        </button>
+      </div>
+
+      {rows.length === 0 && <div style={{ fontSize: 12, color: C.textMuted }}>This report has no steps.</div>}
+
+      {rows.map((r, ri) => (
+        <div key={ri} style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: 12, marginBottom: 10, background: '#f8fafc' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                           background: C.primaryLight, color: C.primary }}>{String(r.type).toUpperCase()}</span>
+            <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{r.name}</span>
+            {r.label && <span style={{ fontSize: 11, color: C.textSub }}>→ <span style={{ fontFamily: 'monospace' }}>{r.label}</span></span>}
+          </div>
+
+          {r.params.length === 0 && (
+            <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 6 }}>No parameters for this step.</div>
+          )}
+
+          {r.params.map((p, pi) => (
+            <div key={pi} style={{ display: 'flex', gap: 8, marginBottom: 6, alignItems: 'flex-start' }}>
+              <span style={{ fontFamily: 'monospace', fontSize: 12, color: C.textSub, paddingTop: 7 }}>@</span>
+              <input value={p.name} onChange={e => setP(ri, pi, 'name', e.target.value)} placeholder="param name"
+                     style={{ ...inp, width: 190, fontFamily: 'monospace', fontSize: 12 }} />
+              <span style={{ color: C.textMuted, paddingTop: 7 }}>=</span>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <input value={p.value} onChange={e => setP(ri, pi, 'value', e.target.value)}
+                       placeholder={p.allowed?.length ? 'blank = NULL — click values below, or type' : 'blank = NULL'}
+                       style={{ ...inp, width: p.allowed?.length ? 340 : 240, fontSize: 12 }} />
+                {p.allowed?.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {p.allowed.map(o => {
+                      const list = String(p.value || '').split(',').map(x => x.trim()).filter(Boolean)
+                      const pos = list.indexOf(o.value)
+                      const on = pos >= 0
+                      return (
+                        <button key={o.value} type="button" onClick={() => toggleVal(ri, pi, o.value)} title={o.label}
+                          style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11,
+                                   padding: '2px 8px', borderRadius: 20, cursor: 'pointer',
+                                   border: `1px solid ${on ? C.primary : C.cardBorder}`,
+                                   background: on ? C.primary : '#fff', color: on ? '#fff' : C.textSub }}>
+                          {on && <span style={{ fontWeight: 700 }}>{pos + 1}</span>}{o.value}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+              {p.type && <span style={{ fontSize: 10, color: C.textMuted, paddingTop: 8 }}>{p.type}</span>}
+              <button onClick={() => rmP(ri, pi)} title="Remove for this run" style={{ ...iconBtn(C.textMuted), marginTop: 4 }}><X size={13} /></button>
+            </div>
+          ))}
+          <button onClick={() => addP(ri)} style={btn()}><Plus size={12} /> Add parameter</button>
+        </div>
+      ))}
+
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+        <button onClick={onCancel} style={btn()}>Cancel</button>
+        <button onClick={run} style={btn(C.primary, '#fff')}><Play size={12} /> Run now</button>
+      </div>
+    </div>
+  )
+}
 
 const Badge = ({ icon, text, bg, fg }) => (
   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 600,
