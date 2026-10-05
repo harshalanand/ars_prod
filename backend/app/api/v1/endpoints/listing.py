@@ -458,6 +458,37 @@ def get_config(current_user: User = Depends(get_current_user)):
         # Load saved listing variables from AppSettings
         result["settings"] = _load_listing_settings(conn)
 
+        # ── Parking mode: the business rule is authoritative ─────────────
+        # ALC_MULTI_PARKED became the source of truth on 2026-07-31, and
+        # /generate reads it (rule_flag at ~line 677) with the AppSettings
+        # key only as a fallback when the rules table is unreachable. But
+        # the cockpit kept reading the AppSettings copy, and the two write
+        # paths do not both maintain it: PUT /listing/parking-mode mirrors
+        # into AppSettings, while Settings -> Business Rules calls
+        # business_rules.update_rule, which does not.
+        #
+        # Toggling the rule ON therefore left `listing.allow_multi_parked`
+        # stale at 'false', and ListingPage computed
+        #     parkedBlocks = parkedRuns.length > 0 && !allowMultiParked
+        # disabling Generate for a run the SERVER would have accepted
+        # (observed 2026-10-05: rule active, key 'false', button greyed).
+        #
+        # Overriding here rather than at the UI keeps one source of truth
+        # for every consumer of /listing/config, and leaves the AppSettings
+        # key readable for the legacy Settings -> Application toggle.
+        try:
+            result["settings"]["allow_multi_parked"] = (
+                "true" if rule_flag(
+                    'ALC_MULTI_PARKED',
+                    str(result["settings"].get("allow_multi_parked", "false")
+                        ).strip().lower() in ("true", "1", "yes"),
+                ) else "false"
+            )
+        except Exception as _e:
+            # Rules table unreachable — keep the AppSettings value, which is
+            # exactly the fallback /generate uses.
+            logger.warning(f"[config] parking-mode rule read failed: {_e}")
+
         # Distinct seasons for SSN filter
         try:
             ssn_rows = conn.execute(text(
