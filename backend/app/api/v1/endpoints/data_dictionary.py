@@ -76,8 +76,9 @@ SEED = [
      "ARS_MSA_GEN_ART, ARS_LISTING", "Read from the article master — no calculation.", "Master"),
     ("WERKS", "Plant / Store code (SAP term)", "The store the row belongs to. Same as ST_CD in master tables.",
      "ARS_LISTING, ARS_ALLOC_WORKING, Master_ALC_INPUT_ST_MASTER", "Read from the store master — no calculation (SAP plant code = ST_CD).", "Master"),
-    ("RDC", "Regional Distribution Centre", "Warehouse that serves the store. MSA output ST_CD column was renamed RDC.",
-     "Master_ALC_INPUT_ST_MASTER, ARS_MSA_GEN_ART", "Read from the store master (store→RDC mapping) — no calculation.", "Master"),
+    ("RDC", "Regional Distribution Centre", "Warehouse. Which warehouse depends on the table, and the difference matters under All RDCs. On the store master, MSA, LISTING and ALLOC tables it is the STORE's own warehouse — never redefined. On ARS_PEND_ALC and ARS_NL_TBL_HOLD_TRACKING it is the SOURCING warehouse: the one that physically ships or reserves the pieces, and so the pool MSA deducts from. Under Own and Cross the two coincide. MSA output ST_CD column was renamed RDC.",
+     "Master_ALC_INPUT_ST_MASTER, ARS_MSA_GEN_ART, ARS_LISTING, ARS_ALLOC_WORKING (store's) · ARS_PEND_ALC, ARS_NL_TBL_HOLD_TRACKING (sourcing)",
+     "Store's: read from the store master (store→RDC mapping) — no calculation. Sourcing: taken from the Part 8.37 split rows at Approve, falling back to the store master when a run wrote none. A separate SRC_RDC column carried the sourcing value on those two ledgers between 2026-09-21 and 2026-10-03 and was removed — it duplicated what RDC was already documented to hold, while RDC kept the store's warehouse and sent the deduction to the wrong pool.", "Master"),
     ("HUB", "Hub", "Delivery hub between RDC and stores; used for grouping and truck planning.",
      "Master_ALC_INPUT_ST_MASTER", "Read from the store master — no calculation.", "Master"),
     ("MANUAL_ST_PRIORITY", "Manual Store Priority", "Optional manual pin for a store's ST_RANK. Positive integer P forces the store to ST_RANK=P inside every MAJ_CAT it is listed in; blank/0/negative = ranked by W_SCORE. Non-manual stores keep score order but skip pinned slots (per MAJ_CAT).",
@@ -181,11 +182,11 @@ SEED = [
     # ── Allocation columns ──
     ("ALLOC_TYPE", "Allocation Pool Type", "FRESH or GRT — which warehouse SLOC pool the run allocated from. Stamped on every alloc output row; pend/hold deductions are typed to the pool.",
      "ARS_ALLOC_WORKING, ARS_PEND_ALC, ARS_SLOC_SETTINGS", "Chosen at run start: FRESH or GRT — which warehouse SLOC pool to ship from. Stamped on every output row; pending and hold deductions are kept separate per pool. Not a calculation.", "Allocation"),
-    # ── Central RDC Pool (spec v1.5) ────────────────────────────────────────
-    # Active only under RDC Scope = All RDCs with business rule
-    # ALC_RDC_CENTRAL_POOL ON. Every Own / Cross run leaves these NULL.
-    ("SRC_RDC", "Source RDC (sourcing warehouse)", "The warehouse that PHYSICALLY ships a line, which under central pooling need not be the store's own. 'MULTI' on ARS_ALLOC_WORKING means the line was split — read ARS_ALLOC_RDC_SPLIT for the per-warehouse breakdown. NULL on every Own/Cross row; readers use ISNULL(SRC_RDC, RDC) so a NULL falls back to today's value.",
-     "ARS_ALLOC_RDC_SPLIT, ARS_ALLOC_WORKING, ARS_PEND_ALC, ARS_NL_TBL_HOLD_TRACKING", "Decided by the Part 8.37 split pass: try the store's own warehouse first, then the fallback order, against one shared running balance. Never more than ALC_RDC_MAX_SPLIT warehouses per shipment line; a hold is always sourced from exactly one. Not a formula — the outcome of the sourcing walk.", "Allocation"),
+    # ── Central RDC Pool ────────────────────────────────────────────────────
+    # Active only under RDC Scope = All RDCs. Every Own / Cross run leaves
+    # SRC_RDC / SRC_SPLIT_CNT NULL and writes no split rows.
+    ("SRC_RDC", "Source RDC (sourcing warehouse)", "The warehouse that PHYSICALLY ships a line, which under central pooling need not be the store's own. 'MULTI' on ARS_ALLOC_WORKING means the line was split — read ARS_ALLOC_RDC_SPLIT for the per-warehouse breakdown. NULL on every Own/Cross row.",
+     "ARS_ALLOC_RDC_SPLIT, ARS_ALLOC_WORKING", "Decided by the Part 8.37 split pass: try the store's own warehouse first, then the fallback order, against one shared running balance. Never more than ALC_RDC_MAX_SPLIT warehouses per shipment line; a hold is always sourced from exactly one. Not a formula — the outcome of the sourcing walk.", "Allocation"),
     ("SRC_SPLIT_CNT", "Source Split Count", "How many warehouses supply one allocation line. 1 = single source; 2+ = the line was split and the store receives that many dispatch documents.",
      "ARS_ALLOC_WORKING", "Count of ARS_ALLOC_RDC_SPLIT rows for the line. NULL on Own/Cross runs.", "Allocation"),
     ("PREF_TIER", "Sourcing Preference Tier", "Which rule decided the warehouse order for a line: 1 = the store's own RDC first, 2 = the global fallback order (store tag blank/'ALL'/unknown), 3 = largest-available-first (no order configured). Audit only — it never changes a quantity.",
@@ -260,6 +261,10 @@ SEED = [
      "GD_JOB", "Set on the job. A bulk job still runs classic when its data can't go through bcp exactly; that run's LOADER says classic and the message says why.", "Get Data"),
     ("ALLOW_EMPTY", "Allow Empty Result", "Whether a full-replace job may empty its local table when Snowflake returns 0 rows.",
      "GD_JOB", "Off (default): 0 rows from Snowflake while the local table has rows fails the run and keeps the rows. On: the empty result replaces the table.", "Get Data"),
+    ("COLUMN_MAP", "Column Mapping", "Which Snowflake columns a sync job loads and the name each gets in the local table — rename or skip, set in the job's Columns section.",
+     "GD_JOB (the choice: [{source, name, load}]), GD_RUN (what a run used: {source: name, or null when skipped})", "Set on the job. Empty = every column under its Snowflake name. Columns not listed load under their own name.", "Get Data"),
+    ("APPLIED_COLUMN_MAP", "Applied Column Names", "The local column names a sync job's table has after its last successful run, by Snowflake column.",
+     "GD_JOB", "Written after each successful run. An incremental/append run renames a column in place (sp_rename) from this name to the new mapped name, so rows are kept.", "Get Data"),
 ]
 
 

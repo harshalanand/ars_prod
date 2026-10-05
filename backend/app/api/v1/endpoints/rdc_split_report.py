@@ -17,7 +17,7 @@ does not show the block.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query
 from loguru import logger
@@ -38,14 +38,48 @@ def _rows(conn, sql: str, params: Dict[str, Any]) -> list:
     return [dict(zip(cols, r)) for r in rs.fetchall()]
 
 
-def _has_rows(conn, session_id: str) -> bool:
-    if not conn.execute(text(
-        f"SELECT CASE WHEN OBJECT_ID('dbo.{SPLIT}','U') IS NULL THEN 0 ELSE 1 END"
-    )).scalar():
-        return False
+def _exists(conn, table: str) -> bool:
     return bool(conn.execute(text(
-        f"SELECT TOP 1 1 FROM [{SPLIT}] WHERE [SESSION_ID] = :s"
-    ), {"s": session_id}).scalar())
+        f"SELECT CASE WHEN OBJECT_ID('dbo.{table}','U') IS NULL THEN 0 ELSE 1 END"
+    )).scalar())
+
+
+def _resolve_split(conn, session_id: str
+                   ) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+    """Find which table holds this session's split rows.
+
+    Since 2026-10-03 the picklist follows the same lifecycle as every other
+    output, so a session's rows sit in exactly one place depending on where
+    the run is in review:
+
+        HISTORY  approved
+        PARKED   awaiting approve / reject
+        WORKING  the run just finished and has not parked yet
+
+    Checked newest-state-first, because approve leaves no parked rows behind
+    and reject leaves none anywhere. The WORKING fallback has no SESSION_ID
+    to match on — the column only exists on the parked and history copies as
+    a control column — so it is only offered when `session_id` IS the latest
+    run. In practice Part 8.4 parks immediately after Part 8.37, so that
+    window is a few seconds wide.
+
+    Returns (table, sid_where, params), or None when the session has no split
+    rows anywhere: an Own/Cross run, or a rejected one.
+    """
+    for tbl in (f"{SPLIT}_HISTORY", f"{SPLIT}_PARKED"):
+        if not _exists(conn, tbl):
+            continue
+        if conn.execute(text(f"SELECT TOP 1 1 FROM [{tbl}] WHERE [SESSION_ID] = :s"),
+                        {"s": session_id}).scalar():
+            return tbl, "[SESSION_ID] = :s", {"s": session_id}
+    if _exists(conn, SPLIT):
+        latest = conn.execute(text(
+            "SELECT MAX(SESSION_ID) FROM ARS_LISTING_SESSIONS"
+        )).scalar()
+        if latest == session_id and conn.execute(
+                text(f"SELECT TOP 1 1 FROM [{SPLIT}]")).scalar():
+            return SPLIT, "1=1", {}
+    return None
 
 
 @router.get("/summary/{session_id}")
@@ -63,17 +97,19 @@ def rdc_split_summary(session_id: str,
     single-sourcing or a binding split cap took quantity away (§B6.3.3).
     """
     with get_data_engine().connect() as conn:
-        if not _has_rows(conn, session_id):
+        src = _resolve_split(conn, session_id)
+        if src is None:
             return {"success": True, "data": {"central_pool": False,
                                               "session_id": session_id}}
+        tbl, sw, sp = src
         by_rdc = _rows(conn, f"""
             SELECT [SRC_RDC]                                AS src_rdc,
                    SUM(ISNULL([SHIP_QTY],0))                AS ship_qty,
                    SUM(ISNULL([HOLD_QTY],0))                AS hold_qty,
                    COUNT(*)                                 AS lines_
-            FROM   [{SPLIT}] WHERE [SESSION_ID] = :s
+            FROM   [{tbl}] WHERE {sw}
             GROUP  BY [SRC_RDC] ORDER BY [SRC_RDC]
-        """, {"s": session_id})
+        """, sp)
 
         tot = _rows(conn, f"""
             SELECT COUNT(DISTINCT CAST([WERKS] AS NVARCHAR(50))
@@ -86,39 +122,42 @@ def rdc_split_summary(session_id: str,
                             THEN ISNULL([SHIP_QTY],0) ELSE 0 END) AS cross_ship_qty,
                    COUNT(DISTINCT CASE WHEN [IS_CROSS] = 1
                                        THEN [WERKS] END)    AS cross_stores
-            FROM   [{SPLIT}] WHERE [SESSION_ID] = :s
-        """, {"s": session_id})[0]
+            FROM   [{tbl}] WHERE {sw}
+        """, sp)[0]
 
         # A split line is one store-size with more than one source row.
         split_lines = conn.execute(text(f"""
             SELECT COUNT(*) FROM (
                 SELECT [WERKS], [VAR_ART], [SZ]
-                FROM   [{SPLIT}] WHERE [SESSION_ID] = :s
+                FROM   [{tbl}] WHERE {sw}
                 GROUP  BY [WERKS], [VAR_ART], [SZ]
                 HAVING COUNT(*) > 1
             ) X
-        """), {"s": session_id}).scalar() or 0
+        """), sp).scalar() or 0
 
         by_tier = _rows(conn, f"""
             SELECT ISNULL([PREF_TIER],'?')  AS pref_tier,
                    COUNT(*)                 AS rows_,
                    SUM(ISNULL([SHIP_QTY],0)) AS ship_qty
-            FROM   [{SPLIT}] WHERE [SESSION_ID] = :s
+            FROM   [{tbl}] WHERE {sw}
             GROUP  BY ISNULL([PREF_TIER],'?') ORDER BY 1
-        """, {"s": session_id})
+        """, sp)
 
         # Lines the split pass had to reduce. Stamped in ALLOC_REMARKS, so the
         # count is read from the allocation, not the split rows.
         reduced = {"lines": 0, "detail": []}
         try:
-            for tbl in ("ARS_ALLOC_HISTORY", "ARS_ALLOC_PARKED", "ARS_ALLOC_WORKING"):
+            # `_atbl`, not `tbl`: `tbl` is already bound to this session's
+            # resolved SPLIT table above, and reusing the name here would
+            # silently point any later split query at an alloc table.
+            for _atbl in ("ARS_ALLOC_HISTORY", "ARS_ALLOC_PARKED", "ARS_ALLOC_WORKING"):
                 if not conn.execute(text(
-                    f"SELECT CASE WHEN OBJECT_ID('dbo.{tbl}','U') IS NULL "
+                    f"SELECT CASE WHEN OBJECT_ID('dbo.{_atbl}','U') IS NULL "
                     f"THEN 0 ELSE 1 END")).scalar():
                     continue
                 sid_filter = ("WHERE [SESSION_ID] = :s AND "
                               if conn.execute(text(
-                                  f"SELECT CASE WHEN COL_LENGTH('{tbl}',"
+                                  f"SELECT CASE WHEN COL_LENGTH('{_atbl}',"
                                   f"'SESSION_ID') IS NULL THEN 0 ELSE 1 END"
                               )).scalar() else "WHERE ")
                 d = _rows(conn, f"""
@@ -128,7 +167,7 @@ def rdc_split_summary(session_id: str,
                              ELSE 'RDC_SPLIT_CAPPED'
                            END          AS reason,
                            COUNT(*)     AS lines_
-                    FROM   [{tbl}]
+                    FROM   [{_atbl}]
                     {sid_filter} ([ALLOC_REMARKS] LIKE '%RDC_SINGLE_SHORT%'
                                   OR [ALLOC_REMARKS] LIKE '%RDC_SPLIT_CAPPED%'
                                   OR [ALLOC_REMARKS] LIKE '%RDC_HOLD_SHORT%')
@@ -174,10 +213,12 @@ def rdc_picklist(session_id: str,
     on the store's warehouse.
     """
     with get_data_engine().connect() as conn:
-        if not _has_rows(conn, session_id):
+        src = _resolve_split(conn, session_id)
+        if src is None:
             return {"success": True, "data": {"central_pool": False, "rows": []}}
-        where = "WHERE [SESSION_ID] = :s"
-        params: Dict[str, Any] = {"s": session_id}
+        tbl, sw, sp = src
+        where = f"WHERE {sw}"
+        params: Dict[str, Any] = dict(sp)
         if src_rdc:
             where += " AND [SRC_RDC] = :r"
             params["r"] = src_rdc
@@ -188,7 +229,7 @@ def rdc_picklist(session_id: str,
                    [ALLOC_TYPE] AS alloc_type,
                    SUM(ISNULL([SHIP_QTY],0)) AS pick_qty,
                    SUM(ISNULL([HOLD_QTY],0)) AS hold_qty
-            FROM   [{SPLIT}] {where}
+            FROM   [{tbl}] {where}
             GROUP  BY [SRC_RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
                       [VAR_ART], [SZ], [ALLOC_TYPE]
             HAVING SUM(ISNULL([SHIP_QTY],0)) + SUM(ISNULL([HOLD_QTY],0)) > 0
@@ -211,8 +252,10 @@ def store_dispatch(session_id: str,
     option, which is the operational cost of clubbing (risk R4).
     """
     with get_data_engine().connect() as conn:
-        if not _has_rows(conn, session_id):
+        src = _resolve_split(conn, session_id)
+        if src is None:
             return {"success": True, "data": {"central_pool": False, "rows": []}}
+        tbl, sw, sp = src
         rows = _rows(conn, f"""
             SELECT [WERKS] AS werks, [STORE_RDC] AS store_rdc,
                    [SRC_RDC] AS src_rdc,
@@ -221,16 +264,16 @@ def store_dispatch(session_id: str,
                    COUNT(*)                  AS lines_,
                    -- CAST is required: SQL Server rejects MAX() on a BIT.
                    MAX(CAST([IS_CROSS] AS INT)) AS is_cross
-            FROM   [{SPLIT}] WHERE [SESSION_ID] = :s
+            FROM   [{tbl}] WHERE {sw}
             GROUP  BY [WERKS], [STORE_RDC], [SRC_RDC]
             ORDER  BY [WERKS], [SRC_RDC]
-        """, {"s": session_id})
+        """, sp)
         multi = conn.execute(text(f"""
             SELECT COUNT(*) FROM (
-                SELECT [WERKS] FROM [{SPLIT}] WHERE [SESSION_ID] = :s
+                SELECT [WERKS] FROM [{tbl}] WHERE {sw}
                 GROUP BY [WERKS] HAVING COUNT(DISTINCT [SRC_RDC]) > 1
             ) X
-        """), {"s": session_id}).scalar() or 0
+        """), sp).scalar() or 0
         return {"success": True, "data": {
             "central_pool": True, "session_id": session_id,
             "stores_with_two_sources": int(multi),
@@ -248,8 +291,10 @@ def cross_ship_exposure(session_id: str,
     inter-warehouse movements.
     """
     with get_data_engine().connect() as conn:
-        if not _has_rows(conn, session_id):
+        src = _resolve_split(conn, session_id)
+        if src is None:
             return {"success": True, "data": {"central_pool": False, "rows": []}}
+        tbl, sw, sp = src
         rows = _rows(conn, f"""
             SELECT ISNULL([STORE_RDC],'') AS store_rdc, [SRC_RDC] AS src_rdc,
                    COUNT(DISTINCT [WERKS])   AS stores,
@@ -258,11 +303,11 @@ def cross_ship_exposure(session_id: str,
                    AVG(ISNULL([SHIP_QTY],0)) AS avg_qty_per_line,
                    SUM(CASE WHEN ISNULL([SHIP_QTY],0) BETWEEN 1 AND 2
                             THEN 1 ELSE 0 END) AS tiny_lines
-            FROM   [{SPLIT}]
-            WHERE  [SESSION_ID] = :s AND [IS_CROSS] = 1
+            FROM   [{tbl}]
+            WHERE  {sw} AND [IS_CROSS] = 1
             GROUP  BY ISNULL([STORE_RDC],''), [SRC_RDC]
             ORDER  BY 5 DESC
-        """, {"s": session_id})
+        """, sp)
         return {"success": True, "data": {
             "central_pool": True, "session_id": session_id,
             "cross_ship_qty": sum(float(r["ship_qty"] or 0) for r in rows),
@@ -283,8 +328,10 @@ def residual_by_warehouse(session_id: str,
     `warehouse stock - taken from that warehouse` instead.
     """
     with get_data_engine().connect() as conn:
-        if not _has_rows(conn, session_id):
+        src = _resolve_split(conn, session_id)
+        if src is None:
             return {"success": True, "data": {"central_pool": False, "rows": []}}
+        tbl, sw, sp = src
         rows = _rows(conn, f"""
             WITH stock AS (
                 SELECT LTRIM(RTRIM(CAST([RDC] AS NVARCHAR(50)))) AS rdc,
@@ -295,7 +342,7 @@ def residual_by_warehouse(session_id: str,
             ), taken AS (
                 SELECT [SRC_RDC] AS rdc,
                        SUM(ISNULL([SHIP_QTY],0) + ISNULL([HOLD_QTY],0)) AS taken_qty
-                FROM   [{SPLIT}] WHERE [SESSION_ID] = :s
+                FROM   [{tbl}] WHERE {sw}
                 GROUP  BY [SRC_RDC]
             )
             SELECT ISNULL(s.rdc, t.rdc)                       AS rdc,
@@ -305,7 +352,7 @@ def residual_by_warehouse(session_id: str,
             FROM   stock s
             FULL OUTER JOIN taken t ON t.rdc = s.rdc
             ORDER  BY 1
-        """, {"s": session_id, "at": alloc_type})
+        """, {**sp, "at": alloc_type})
         return {"success": True, "data": {
             "central_pool": True, "session_id": session_id,
             "alloc_type": alloc_type, "rows": rows,

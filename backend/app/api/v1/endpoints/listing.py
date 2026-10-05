@@ -3644,7 +3644,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             with de.begin() as _sc:
                 rdc_split_summary = _rdc.run_split_pass(
                     _sc,
-                    session_id=session_id,
                     alloc_table=ALLOC_TABLE,
                     listing_table=FINAL_TABLE,
                     msa_var_table="ARS_MSA_VAR_ART",
@@ -3934,23 +3933,12 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
-            # Central RDC Pool (spec v1.5 §B7.3). RDC keeps its meaning — the
-            # STORE's warehouse, backfilled from the store master below. SRC_RDC
-            # is the warehouse PHYSICALLY reserving the hold, written only by an
-            # `All RDCs` run. NULL on every legacy and Own/Cross row, so
-            # ISNULL(SRC_RDC, RDC) reproduces today's value exactly and the
-            # 2.75 M existing rows need no backfill.
-            try:
-                _run(ac, """
-                    IF NOT EXISTS (
-                        SELECT 1 FROM sys.columns
-                        WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
-                          AND name = 'SRC_RDC'
-                    )
-                    ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING] ADD [SRC_RDC] NVARCHAR(20) NULL
-                """)
-            except Exception:
-                pass
+            # (2026-10-03) ARS_NL_TBL_HOLD_TRACKING.RDC is now the SOURCING
+            # warehouse — the one physically reserving the hold — written at
+            # Approve from the split rows. The short-lived SRC_RDC column that
+            # used to be added here is gone: it duplicated what RDC should
+            # always have held, and leaving RDC as the store's warehouse made
+            # MSA deduct the hold from a pool that was not holding anything.
 
             # Add ALLOC_TYPE if the table predates the Fresh/GRT change
             # (FS-DB-03 / FS-10 item 1 — mirrors the RDC guard above).
@@ -3972,24 +3960,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
-            # Backfill RDC on any rows still NULL by joining the store master.
-            # Idempotent — only touches rows where RDC IS NULL.
+            # Backfill RDC on any rows still blank by joining the store master.
+            # Idempotent — only touches rows where RDC IS NULL or ''.
             #
-            # Central RDC Pool (spec v1.5 §B7.3 i): the guard below must never
-            # reach a centrally-sourced row. That row already records the
-            # warehouse that PHYSICALLY reserved the hold; stamping the store's
-            # warehouse over it would make MSA debit the wrong pool. The
-            # predicate is composed in Python because SQL Server resolves
-            # column names at compile time — referencing a SRC_RDC that does
-            # not exist would fail the whole batch, not just skip the clause.
+            # That predicate is now the whole guard: a centrally-sourced hold
+            # already carries its reserving warehouse in RDC, so it is
+            # non-blank and this UPDATE cannot reach it. The separate
+            # SRC_RDC IS NULL clause that used to protect such rows went with
+            # the column.
             try:
-                _src_guard = ""
-                if ac.execute(text(
-                    "SELECT CASE WHEN COL_LENGTH("
-                    "'ARS_NL_TBL_HOLD_TRACKING','SRC_RDC') IS NULL "
-                    "THEN 0 ELSE 1 END"
-                )).scalar():
-                    _src_guard = "AND T.[SRC_RDC] IS NULL"
                 _run(ac, f"""
                     IF EXISTS (SELECT 1 FROM sys.columns
                                WHERE object_id = OBJECT_ID('ARS_NL_TBL_HOLD_TRACKING')
@@ -4001,7 +3980,6 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                         INNER JOIN [Master_ALC_INPUT_ST_MASTER] S
                             ON S.[ST_CD] = T.[WERKS]
                         WHERE (T.[RDC] IS NULL OR T.[RDC] = '')
-                          {_src_guard}
                     END
                 """)
             except Exception:
@@ -5527,9 +5505,10 @@ def _compute_listing_summary(conn):
     # pick view is ADDED rather than substituted: replacing it would silently
     # change a number ops reads every day.
     #
-    # This function summarises the CURRENT working tables, which belong to the
-    # latest run, so the matching split rows are the latest SESSION_ID. Session
-    # ids are timestamp-prefixed (YYYYMMDD_HHMMSS_mmm), so MAX() is the newest.
+    # This function summarises the CURRENT working tables, and since
+    # 2026-10-03 the split table is a working table too — it holds this run
+    # and only this run, so no SESSION_ID filter is needed (and none exists:
+    # the column moved to the PARKED / HISTORY copies as a control column).
     # An Own/Cross run writes no split rows, so this stays empty for them.
     summary["by_maj_cat_src_rdc"] = []
     try:
@@ -5541,9 +5520,6 @@ def _compute_listing_summary(conn):
                        SUM(CASE WHEN [IS_CROSS] = 1
                                 THEN ISNULL([SHIP_QTY],0) ELSE 0 END) AS cross_qty
                 FROM   [ARS_ALLOC_RDC_SPLIT]
-                WHERE  [SESSION_ID] = (
-                    SELECT MAX([SESSION_ID]) FROM [ARS_ALLOC_RDC_SPLIT]
-                )
                 GROUP  BY [MAJ_CAT], [SRC_RDC]
                 ORDER  BY [MAJ_CAT], [SRC_RDC]
             """)).fetchall()

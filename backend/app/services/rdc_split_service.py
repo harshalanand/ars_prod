@@ -47,10 +47,28 @@ VALID_POLICIES = (SPLIT_ALWAYS, SINGLE_PREFERRED, SINGLE_STRICT)
 # after pak rounding, but FLOAT arithmetic on the ledger can leave dust.
 EPS = 1e-6
 
+# ── Lifecycle (2026-10-03) ───────────────────────────────────────────────────
+# This table is the WORKING copy — it holds the CURRENT run only, exactly like
+# ARS_ALLOC_WORKING and ARS_LISTING. Parking copies it to
+# ARS_ALLOC_RDC_SPLIT_PARKED and Approve promotes that to
+# ARS_ALLOC_RDC_SPLIT_HISTORY, both driven by the generic machinery in
+# parked_history._SNAPSHOT_TARGETS.
+#
+# It deliberately carries NO SESSION_ID: the snapshot machinery copies the
+# whole source table (`SELECT … FROM <source>`, no WHERE) and stamps SESSION_ID
+# itself as a control column, so a SESSION_ID here would collide with it and a
+# multi-session source would be parked wholesale under one id.
+#
+# Before 2026-10-03 this was a single durable session-keyed table with
+# delete-on-reject / delete-on-revert. That could not survive a revert: the
+# other targets demote HISTORY→PARKED so a run can be re-approved, but split
+# rows were destroyed outright, and a 'MULTI' line's per-warehouse breakdown
+# exists nowhere else — so re-approval wrote the wrong per-source pending.
+# It also orphaned rows: session 20260926_085716_106 held 19,519 split rows
+# after its allocation data had gone, still reading as a live pick instruction.
 _DDL = f"""
 IF OBJECT_ID('dbo.{SPLIT_TABLE}','U') IS NULL
 CREATE TABLE dbo.{SPLIT_TABLE} (
-    SESSION_ID      NVARCHAR(50)   NOT NULL,
     WERKS           NVARCHAR(50)   NOT NULL,   -- DESTINATION store
     MAJ_CAT         NVARCHAR(200)  NULL,
     GEN_ART_NUMBER  BIGINT         NULL,
@@ -66,27 +84,49 @@ CREATE TABLE dbo.{SPLIT_TABLE} (
     IS_CROSS        BIT            NOT NULL DEFAULT 0,    -- SRC_RDC <> STORE_RDC
     CREATED_AT      DATETIME       NOT NULL DEFAULT GETDATE(),
     CONSTRAINT PK_{SPLIT_TABLE} PRIMARY KEY CLUSTERED
-        (SESSION_ID, WERKS, VAR_ART, SZ, SRC_RDC, ALLOC_TYPE)
+        (WERKS, VAR_ART, SZ, SRC_RDC, ALLOC_TYPE)
 )
 """
 
 # ALLOC_TYPE sits in the PK, mirroring the Fresh/GRT widening already applied to
 # ARS_NL_TBL_HOLD_TRACKING: one store-size can carry a FRESH and a GRT line in
-# the same session.
+# the same run.
 
 _INDEXES = [
-    # The picking requirement: GROUP BY SRC_RDC over one session.
+    # The picking requirement: GROUP BY SRC_RDC over the run.
     (f"IX_{SPLIT_TABLE}_PICK",
-     f"ON dbo.{SPLIT_TABLE} (SESSION_ID, SRC_RDC) INCLUDE (SHIP_QTY, HOLD_QTY)"),
-    # The Approve-time join in pend_alc_service.write_pend_alc (Step 4, §B7.3 ii).
+     f"ON dbo.{SPLIT_TABLE} (SRC_RDC) INCLUDE (SHIP_QTY, HOLD_QTY)"),
+    # The Approve-time join in pend_alc_service.write_pend_alc (Step 4, §B7.3 ii)
+    # now runs against the HISTORY copy, but the working table keeps the same
+    # covering index so the post-run summary and reports stay seek-based.
     (f"IX_{SPLIT_TABLE}_PEND",
-     f"ON dbo.{SPLIT_TABLE} (SESSION_ID, WERKS, VAR_ART, SZ)"),
+     f"ON dbo.{SPLIT_TABLE} (WERKS, VAR_ART, SZ)"),
 ]
 
 
+def _is_legacy_shape(conn) -> bool:
+    """True when the live table still carries SESSION_ID (pre-2026-10-03)."""
+    return bool(conn.execute(text(
+        f"SELECT CASE WHEN COL_LENGTH('dbo.{SPLIT_TABLE}','SESSION_ID') "
+        f"IS NULL THEN 0 ELSE 1 END"
+    )).scalar())
+
+
 def ensure_split_table(conn) -> None:
-    """Create the split table and its two indexes. Idempotent — safe on every
-    run, matching the house pattern used by pend_alc_service.ensure_pend_alc_table."""
+    """Create the working split table and its indexes. Idempotent — safe on
+    every run, matching pend_alc_service.ensure_pend_alc_table.
+
+    Refuses to run against the pre-2026-10-03 session-keyed shape rather than
+    silently writing into it: the INSERT would fail on the NOT NULL SESSION_ID
+    and any rows still there belong to other sessions. Run
+    `scripts/migrate_rdc_split_to_snapshot.py` once to convert.
+    """
+    if _is_legacy_shape(conn):
+        raise RuntimeError(
+            f"{SPLIT_TABLE} still has the legacy SESSION_ID column. Run "
+            f"scripts/migrate_rdc_split_to_snapshot.py to move existing rows "
+            f"into {SPLIT_TABLE}_PARKED and rebuild the working table."
+        )
     conn.execute(text(_DDL))
     for name, body in _INDEXES:
         conn.execute(text(
@@ -95,23 +135,18 @@ def ensure_split_table(conn) -> None:
         ))
 
 
-def delete_session(conn, session_id: str) -> int:
-    """Remove every split row for a session.
+def clear_working(conn) -> int:
+    """Empty the working table before Part 8.37 writes this run's rows.
 
-    Called from three places (§B7.2):
-      * Part 8.37, before writing  — re-run idempotency (gap G4 / check V16).
-        ARS_ALLOC_WORKING is dropped and rebuilt each Generate but this table is
-        durable, so a re-run would otherwise collide on the PK or leave stale rows.
-      * reject_parked               — a rejected run must leave no picking record.
-      * revert_approved_to_parked   — likewise.
+    The working table holds one run at a time, so a re-run must start clean or
+    it would collide on the PK and leave the previous run's lines behind.
+    Reject / revert no longer call in here — the parked and history copies are
+    managed by the generic snapshot machinery like every other target.
     """
-    res = conn.execute(
-        text(f"DELETE FROM dbo.{SPLIT_TABLE} WHERE SESSION_ID = :sid"),
-        {"sid": session_id},
-    )
+    res = conn.execute(text(f"DELETE FROM dbo.{SPLIT_TABLE}"))
     n = res.rowcount or 0
     if n:
-        logger.info(f"[rdc_split] cleared {n} split row(s) for session {session_id}")
+        logger.info(f"[rdc_split] cleared {n} row(s) from the working split table")
     return n
 
 
@@ -239,7 +274,6 @@ def _draw(avail: Dict[Tuple[str, Any, str], float],
 # Part 8.37 — the split pass
 # ---------------------------------------------------------------------------
 def run_split_pass(conn,
-                   session_id: str,
                    alloc_table: str,
                    listing_table: str,
                    msa_var_table: str = "ARS_MSA_VAR_ART",
@@ -264,10 +298,10 @@ def run_split_pass(conn,
     max_split = max(1, int(max_split or 2))
 
     ensure_split_table(conn)
-    # V16 — re-run idempotency. ARS_ALLOC_WORKING is dropped and rebuilt every
-    # Generate, but this table is durable and session-keyed, so a second
-    # attempt would collide on the PK or leave stale rows behind.
-    delete_session(conn, session_id)
+    # V16 — re-run idempotency. The working table holds one run at a time, so
+    # a second attempt must start clean or it collides on the PK and leaves
+    # the previous run's lines behind.
+    clear_working(conn)
 
     has_remarks = bool(conn.execute(text(
         f"SELECT CASE WHEN COL_LENGTH('{alloc_table}','ALLOC_REMARKS') "
@@ -340,15 +374,14 @@ def run_split_pass(conn,
 
     # ── 5. write the split rows ───────────────────────────────────────────
     if emit:
-        payload = [dict(v, SESSION_ID=session_id, ALLOC_TYPE=alloc_type)
-                   for v in emit.values()]
+        payload = [dict(v, ALLOC_TYPE=alloc_type) for v in emit.values()]
         conn.execute(text(f"""
             INSERT INTO dbo.{SPLIT_TABLE}
-                (SESSION_ID, WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
+                (WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
                  SRC_RDC, SHIP_QTY, HOLD_QTY, ALLOC_TYPE, STORE_RDC,
                  PREF_TIER, IS_CROSS)
             VALUES
-                (:SESSION_ID, :WERKS, :MAJ_CAT, :GEN_ART_NUMBER, :CLR, :VAR_ART, :SZ,
+                (:WERKS, :MAJ_CAT, :GEN_ART_NUMBER, :CLR, :VAR_ART, :SZ,
                  :SRC_RDC, :SHIP_QTY, :HOLD_QTY, :ALLOC_TYPE, :STORE_RDC,
                  :PREF_TIER, :IS_CROSS)
         """), payload)
@@ -393,7 +426,7 @@ def _walk_lines(lines, avail, live_rdcs, priority, policy, max_split) -> Dict[st
     a synthetic fixture and no database."""
     # emit[(werks, var_art, sz, src_rdc)] — SHIP and HOLD for the same line and
     # warehouse MERGE into one row, because the split PK is
-    # (SESSION_ID, WERKS, VAR_ART, SZ, SRC_RDC, ALLOC_TYPE).
+    # (WERKS, VAR_ART, SZ, SRC_RDC, ALLOC_TYPE).
     emit: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     reductions: List[Dict[str, Any]] = []
     src_by_line: Dict[Tuple[Any, ...], List[str]] = {}
@@ -691,28 +724,43 @@ def release_holds_for_mix_options(conn, session_id: str,
     §B6.6. Part 8.55 releases warehouse holds on options that end the run
     without display cover, and it runs AFTER parking — so it already has to
     zero three copies (the option row, the alloc size rows, and this
-    session's parked rows). The split table is a fourth copy: without this
+    session's parked rows). The split rows are a fourth copy: without this
     cascade the RDC-wise picking requirement would keep reserving stock the
     run has already handed back to the pool.
+
+    Since 2026-10-03 the split rows live in TWO places by the time this runs —
+    the working table (this run) and ARS_ALLOC_RDC_SPLIT_PARKED (this
+    session's snapshot, written moments earlier at Part 8.4). Both must be
+    zeroed, exactly as the alloc rows are, or Approve would promote a parked
+    hold the run has already released.
 
     Set-based and joined exactly like the other three updates, so it stays in
     step with them if the MIX criterion ever changes.
     """
-    res = conn.execute(text(f"""
-        UPDATE S
-           SET S.[HOLD_QTY] = 0
-        FROM dbo.{SPLIT_TABLE} S
-        INNER JOIN [{listing_table}] L
-            ON  L.[WERKS]          = S.[WERKS]
-            AND L.[MAJ_CAT]        = S.[MAJ_CAT]
-            AND L.[GEN_ART_NUMBER] = S.[GEN_ART_NUMBER]
-            AND ISNULL(L.[CLR],'') = ISNULL(S.[CLR],'')
-        WHERE S.[SESSION_ID] = :sid
-          AND L.[OPT_STATUS] = 'MIX'
-          AND ISNULL(L.[HOLD_RELEASED_QTY], 0) > 0
-          AND ISNULL(S.[HOLD_QTY], 0) > 0
-    """), {"sid": session_id})
-    n = res.rowcount or 0
+    def _zero(table: str, sid_filter: str, params: dict) -> int:
+        res = conn.execute(text(f"""
+            UPDATE S
+               SET S.[HOLD_QTY] = 0
+            FROM [{table}] S
+            INNER JOIN [{listing_table}] L
+                ON  L.[WERKS]          = S.[WERKS]
+                AND L.[MAJ_CAT]        = S.[MAJ_CAT]
+                AND L.[GEN_ART_NUMBER] = S.[GEN_ART_NUMBER]
+                AND ISNULL(L.[CLR],'') = ISNULL(S.[CLR],'')
+            WHERE L.[OPT_STATUS] = 'MIX'
+              AND ISNULL(L.[HOLD_RELEASED_QTY], 0) > 0
+              AND ISNULL(S.[HOLD_QTY], 0) > 0
+              {sid_filter}
+        """), params)
+        return int(res.rowcount or 0)
+
+    n = _zero(SPLIT_TABLE, "", {})
+    parked_tbl = f"{SPLIT_TABLE}_PARKED"
+    if conn.execute(text(
+        f"SELECT CASE WHEN OBJECT_ID('dbo.{parked_tbl}','U') "
+        f"IS NULL THEN 0 ELSE 1 END"
+    )).scalar():
+        n += _zero(parked_tbl, "AND S.[SESSION_ID] = :sid", {"sid": session_id})
     if n:
         logger.info(
             f"[rdc_split] Part 8.55 cascade: cleared the hold on {n} split "

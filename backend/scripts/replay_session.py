@@ -110,8 +110,11 @@ def main() -> int:
         parked = c.execute(text(
             "SELECT COUNT(*) FROM ARS_ALLOC_PARKED WHERE SESSION_ID=:s"),
             {"s": sid}).scalar()
+        # Since 2026-10-03 the split table is the per-run WORKING copy with no
+        # SESSION_ID; this run's rows are in the parked snapshot by now
+        # (Part 8.4 ran before we got here).
         split = c.execute(text(
-            "SELECT COUNT(*) FROM ARS_ALLOC_RDC_SPLIT WHERE SESSION_ID=:s"),
+            "SELECT COUNT(*) FROM ARS_ALLOC_RDC_SPLIT_PARKED WHERE SESSION_ID=:s"),
             {"s": sid}).scalar()
     print(f"listed_opts={row[0]} alloc_rows={row[1]} ship={row[2]} hold={row[3]}")
     print(f"parked_rows={parked}  split_rows={split}")

@@ -189,13 +189,14 @@ def hold_agg_sql(grain: str, st_master_table: str = DEFAULT_ST_MASTER) -> str:
     grain 'gen' → (RDC_KEY, GEN_KEY, CLR_KEY, HOLD_T)
     Bind param: :pool_alloc_type
     """
-    # Central RDC Pool — correction M7 (spec v1.5 §B7.3 iv). This expression
-    # was already the right SHAPE: it prefers the hold row's own warehouse and
-    # falls back to the store master. SRC_RDC simply goes in FRONT, because
-    # under central pooling the piece is physically reserved at the SOURCING
-    # warehouse, which need not be the store's own. Every legacy and Own/Cross
-    # row has SRC_RDC NULL, so the result is unchanged for them.
-    rdc = "COALESCE(NULLIF(H.[SRC_RDC], ''), NULLIF(H.[RDC], ''), SM.[RDC])"
+    # This expression was always the right shape: prefer the hold row's own
+    # warehouse, fall back to the store master. Since 2026-10-03 H.RDC IS the
+    # sourcing warehouse — the one physically reserving the piece, written at
+    # Approve from the split rows — so the brief SRC_RDC detour in front of it
+    # is gone. msa_service._hold_src_expr now resolves identically, which ends
+    # the disagreement where that loader went straight to the store master and
+    # this one did not (234,285 of 234,285 open rows on 2026-09-22).
+    rdc = "COALESCE(NULLIF(H.[RDC], ''), SM.[RDC])"
     where = ("ISNULL(H.[IS_CLOSED], 0) = 0 AND ISNULL(H.[HOLD_REM], 0) > 0 "
              f"AND {_typed_match('H')}")
     if grain == "var":

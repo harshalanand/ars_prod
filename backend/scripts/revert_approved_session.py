@@ -43,7 +43,13 @@ def snapshot(c, sid: str) -> dict:
                                "FROM ARS_PEND_ALC WHERE IS_CLOSED=0 AND PEND_QTY>0"),
         "hist_rows":  one("SELECT COUNT(*) FROM ARS_ALLOC_HISTORY WHERE SESSION_ID=:sid"),
         "parked_rows": one("SELECT COUNT(*) FROM ARS_ALLOC_PARKED WHERE SESSION_ID=:sid"),
-        "split_rows": one("SELECT COUNT(*) FROM ARS_ALLOC_RDC_SPLIT WHERE SESSION_ID=:sid"),
+        # The split table became the per-run WORKING copy on 2026-10-03 and
+        # has no SESSION_ID; a session's rows live in the parked / history
+        # snapshots, which is what a revert moves between.
+        "split_parked":  one("SELECT COUNT(*) FROM ARS_ALLOC_RDC_SPLIT_PARKED "
+                             "WHERE SESSION_ID=:sid"),
+        "split_history": one("SELECT COUNT(*) FROM ARS_ALLOC_RDC_SPLIT_HISTORY "
+                             "WHERE SESSION_ID=:sid"),
     }
 
 

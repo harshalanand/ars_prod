@@ -42,40 +42,34 @@ def _df_to_native_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
 def _hold_src_expr(db, hold_table: str, rdc_col: str) -> str:
     """SQL expression for the warehouse a hold is PHYSICALLY reserved at.
 
-    Central RDC Pool, correction M7 (spec v1.5 §B7.3 iv). MSA deducts open
-    holds from FNL_Q per warehouse. Under central pooling a hold can be
-    reserved at a warehouse other than the store's own, so resolving it from
-    the store master — which is what both loaders used to do — debits the
-    wrong pool twice over: the store's warehouse loses stock that was never
-    reserved there, and the sourcing warehouse keeps counting committed
-    pieces as free.
+    MSA deducts open holds from FNL_Q per warehouse, so this must name the
+    warehouse that is actually holding the pieces. Since 2026-10-03
+    ARS_NL_TBL_HOLD_TRACKING.RDC carries exactly that — the sourcing
+    warehouse, written at Approve from the split rows — so the hold row
+    answers for itself.
 
     Resolution order, first non-blank wins:
-        1. H.SRC_RDC  — written at Approve by an `All RDCs` run
-        2. S.<rdc>    — the store master, exactly as today
+        1. H.RDC      — the reserving warehouse
+        2. S.<rdc>    — the store master, for legacy rows with a blank RDC
 
-    Every legacy and Own/Cross row has SRC_RDC NULL, so this reduces to
-    today's expression on every existing row — which is what check V13
-    asserts. The column guard keeps pre-migration databases working.
+    This also closes a long-standing split brain. `alloc_pool._typed_hold_sql`
+    already preferred the hold row's own RDC while this loader ignored it and
+    went to the store master, so the two disagreed for any store re-tagged
+    after its hold was created — measured 2026-09-22 at 234,285 of 234,285
+    open hold rows (346,258 pcs, 412 stores). Both now resolve to
+    COALESCE(NULLIF(H.RDC,''), store master) and cannot drift apart.
 
-    DELIBERATELY NOT INCLUDED: H.RDC. `alloc_pool._typed_hold_sql` prefers
-    the hold row's own RDC over the store master, and these two loaders
-    therefore disagree for any store re-tagged after its hold was created —
-    measured 2026-09-22 at 234,285 of 234,285 open hold rows (346,258 pcs,
-    412 stores). That is a real pre-existing defect, but it is NOT this
-    change's to fix: adding H.RDC here would move the MSA deduction for
-    every one of those rows and V13 could no longer prove that central
-    pooling left the existing behaviour alone. Tracked separately.
+    Safe to change now because every one of those 2.75 M hold rows is CLOSED
+    (0 open as of 2026-10-03), so no existing deduction moves; the earlier
+    objection to touching this was the 234 k open rows, and they are gone.
+
+    A short hold still names one warehouse: BR-RDC-12 forbids splitting a
+    hold, so the tracker's PK (WERKS, VAR_ART, SZ, ALLOC_TYPE) holds.
     """
-    try:
-        has_src = bool(db.execute(text(
-            "SELECT CASE WHEN COL_LENGTH(:t,'SRC_RDC') IS NULL THEN 0 ELSE 1 END"
-        ), {"t": hold_table}).scalar())
-    except Exception:
-        has_src = False
-    if not has_src:
-        return f"S.[{rdc_col}]"
-    return f"COALESCE(NULLIF(H.[SRC_RDC],''), S.[{rdc_col}])"
+    # `db` and `hold_table` are no longer needed — the probe for a SRC_RDC
+    # column went with it — but the signature is kept so the two call sites
+    # stay unchanged.
+    return f"COALESCE(NULLIF(H.[RDC],''), S.[{rdc_col}])"
 
 
 class MSAService:

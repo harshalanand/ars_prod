@@ -374,8 +374,10 @@ def test_hold_only_line_emits_no_ship_quantity():
 
 
 def test_ship_and_hold_to_the_same_warehouse_merge_into_one_row():
-    """The split PK is (SESSION_ID, WERKS, VAR_ART, SZ, SRC_RDC, ALLOC_TYPE) —
-    a second row for the same key would collide."""
+    """The split PK is (WERKS, VAR_ART, SZ, SRC_RDC, ALLOC_TYPE) — a second
+    row for the same key would collide. SESSION_ID left the key on
+    2026-10-03 when the table became the per-run working copy; it now lives
+    on the _PARKED / _HISTORY snapshots as a control column."""
     avail = {(A, 5002, "M"): 20}
     s = walk([line("HS11", A, 5002, "M", ship=5, hold=2)], avail, [A], [A])
     assert len(s["_emit"]) == 1
