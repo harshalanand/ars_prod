@@ -108,6 +108,14 @@ def ensure_tables(force: bool = False) -> None:
                     UPDATED_AT      DATETIME2(0)   NOT NULL DEFAULT SYSUTCDATETIME()
                 )
             """))
+            # Self-heal (2026-10-03): column mapping — rename / skip source columns.
+            # COLUMN_MAP = what the user chose; APPLIED_COLUMN_MAP = the local
+            # names the table actually has (so a rename can be done in place).
+            for col in ("COLUMN_MAP", "APPLIED_COLUMN_MAP"):
+                c.execute(text(f"""
+                    IF COL_LENGTH('dbo.{JOB_TABLE}', '{col}') IS NULL
+                    ALTER TABLE dbo.{JOB_TABLE} ADD {col} NVARCHAR(MAX) NULL
+                """))
             # Self-heal (2026-10-01): per-job loader choice and the empty-source guard.
             c.execute(text(f"""
                 IF COL_LENGTH('dbo.{JOB_TABLE}', 'LOADER_PREF') IS NULL
@@ -160,6 +168,11 @@ def ensure_tables(force: bool = False) -> None:
             c.execute(text(f"""
                 IF COL_LENGTH('dbo.{RUN_TABLE}', 'LOADER') IS NULL
                 ALTER TABLE dbo.{RUN_TABLE} ADD LOADER NVARCHAR(20) NULL
+            """))
+            # Self-heal: the column mapping a run used (source → local name), 2026-10-03.
+            c.execute(text(f"""
+                IF COL_LENGTH('dbo.{RUN_TABLE}', 'COLUMN_MAP') IS NULL
+                ALTER TABLE dbo.{RUN_TABLE} ADD COLUMN_MAP NVARCHAR(MAX) NULL
             """))
             c.execute(text(f"""
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_{RUN_TABLE}_job')

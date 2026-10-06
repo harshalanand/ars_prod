@@ -76,7 +76,7 @@ def _iso(v: Any) -> Any:
 
 def _row(r) -> Dict[str, Any]:
     d = {k: _iso(v) for k, v in dict(r).items()}
-    for jk in ("KEY_COLS", "SCHEDULE_CONFIG"):
+    for jk in ("KEY_COLS", "SCHEDULE_CONFIG", "COLUMN_MAP", "APPLIED_COLUMN_MAP"):
         if isinstance(d.get(jk), str) and d[jk]:
             try:
                 d[jk] = json.loads(d[jk])
@@ -168,7 +168,8 @@ def _validate_schedule(cfg: Any) -> Dict[str, Any]:
 
 # ── Job CRUD ─────────────────────────────────────────────────────────────────
 _JOB_COLS = """j.JOB_ID, j.JOB_NAME, j.DESCRIPTION, j.SOURCE_TYPE, j.SOURCE_OBJECT, j.TARGET_TABLE,
-    j.LOAD_MODE, j.LOADER_PREF, j.ALLOW_EMPTY, j.KEY_COLS, j.WATERMARK_COL, j.WATERMARK_VALUE, j.TRIGGER_TYPE,
+    j.LOAD_MODE, j.LOADER_PREF, j.ALLOW_EMPTY, j.COLUMN_MAP, j.APPLIED_COLUMN_MAP,
+    j.KEY_COLS, j.WATERMARK_COL, j.WATERMARK_VALUE, j.TRIGGER_TYPE,
     j.SCHEDULE_CONFIG, j.RETRY_ON_FAIL, j.RETRY_DELAY_MIN, j.ENABLED, j.NEXT_RUN_AT,
     j.RETRY_AT, j.LOCK_RUN_ID, j.LOCK_HEARTBEAT, j.LAST_RUN_ID, j.LAST_RUN_AT,
     j.LAST_STATUS, j.LAST_ROWS, j.LAST_MESSAGE, j.CREATED_BY, j.CREATED_AT,
@@ -202,6 +203,8 @@ def get_job(job_id: int, raw: bool = False) -> Optional[Dict[str, Any]]:
         d = dict(r)
         d["KEY_COLS"] = json.loads(d["KEY_COLS"]) if d.get("KEY_COLS") else []
         d["SCHEDULE_CONFIG"] = json.loads(d["SCHEDULE_CONFIG"]) if d.get("SCHEDULE_CONFIG") else None
+        d["COLUMN_MAP"] = json.loads(d["COLUMN_MAP"]) if d.get("COLUMN_MAP") else None
+        d["APPLIED_COLUMN_MAP"] = json.loads(d["APPLIED_COLUMN_MAP"]) if d.get("APPLIED_COLUMN_MAP") else None
         return d
     return _row(r)
 
@@ -233,6 +236,7 @@ def _clean_payload(p: Dict[str, Any], job_id: Optional[int]) -> Dict[str, Any]:
     loader = str(p.get("loader") or "bulk").lower()
     if loader not in VALID_LOADERS:
         raise GetDataError("Loader must be bulk or classic.")
+    cmap = _clean_column_map(p.get("column_map"), keys, wm)
 
     with get_data_engine().connect() as c:
         clash = c.execute(text(f"""
@@ -252,7 +256,85 @@ def _clean_payload(p: Dict[str, Any], job_id: Optional[int]) -> Dict[str, Any]:
         "en": 1 if enabled else 0,
         "next": next_run_utc(trig, sched) if enabled else None,
         "loader": loader, "allow_empty": 1 if p.get("allow_empty") else 0,
+        "cmap": json.dumps(cmap) if cmap else None,
     }
+
+
+_LOCAL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,119}$")
+
+
+def _clean_column_map(raw: Any, keys: List[str], wm: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    """Validate the job's column mapping: [{source, name, load}, ...].
+    Returns None when it changes nothing (every column loaded under its own
+    name), so an untouched form stores no mapping at all."""
+    if not raw:
+        return None
+    if not isinstance(raw, list):
+        raise GetDataError("Columns: the mapping must be a list.")
+    out: List[Dict[str, Any]] = []
+    seen_src, seen_name, errs = set(), {}, []
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        src = str(e.get("source") or "").strip()
+        if not src:
+            continue
+        if src.upper() in seen_src:
+            errs.append(f"{src} is listed twice")
+            continue
+        seen_src.add(src.upper())
+        load = e.get("load", True) is not False
+        name = str(e.get("name") or "").strip() or src
+        if load:
+            if not _LOCAL_NAME.match(name):
+                errs.append(f"'{name}' for {src} — use letters, digits and _, starting with a letter")
+            elif name.upper() in seen_name:
+                errs.append(f"'{name}' is used for both {seen_name[name.upper()]} and {src}")
+            else:
+                seen_name[name.upper()] = src
+        out.append({"source": src, "name": name, "load": load})
+    protected = {k.upper() for k in keys} | ({wm.upper()} if wm else set())
+    blocked = [e["source"] for e in out if not e["load"] and e["source"].upper() in protected]
+    if blocked:
+        errs.append("key and watermark columns can't be skipped: " + ", ".join(blocked))
+    if out and not any(e["load"] for e in out):
+        errs.append("at least one column must be loaded")
+    if errs:
+        raise GetDataError("Columns: " + "; ".join(errs[:5]) + ".")
+    if all(e["load"] and e["name"] == e["source"] for e in out):
+        return None
+    return out
+
+
+def _apply_column_map(metas: List[Dict[str, Any]], cmap: Optional[List[Dict[str, Any]]],
+                      applied: Optional[Dict[str, str]] = None):
+    """(loaded metas, {source: local name} for renamed ones, notes). Columns the
+    mapping doesn't list load under their own name, so nothing goes missing
+    silently. A column is reported as new only if the last good run didn't
+    load it either (`applied`), so a short mapping doesn't flag old columns."""
+    if not cmap:
+        return metas, {}, []
+    by_src = {e["source"].upper(): e for e in cmap}
+    known = {str(k).upper() for k in (applied or {})}
+    loaded, rename, new_cols = [], {}, []
+    for m in metas:
+        e = by_src.get(str(m["name"]).upper())
+        if e is None:
+            if known and str(m["name"]).upper() not in known:
+                new_cols.append(m["name"])
+            loaded.append(m)
+        elif e.get("load", True) is not False:
+            loaded.append(m)
+            if e["name"] != m["name"]:
+                rename[m["name"]] = e["name"]
+    present = {str(m["name"]).upper() for m in metas}
+    gone = [e["source"] for e in cmap if e["source"].upper() not in present]
+    notes = []
+    if new_cols:
+        notes.append("not in the job's Columns list, loaded under its own name: " + ", ".join(new_cols[:5]))
+    if gone:
+        notes.append("mapped but no longer in Snowflake: " + ", ".join(gone[:5]))
+    return loaded, rename, notes
 
 
 def create_job(p: Dict[str, Any], user: str) -> Dict[str, Any]:
@@ -262,12 +344,12 @@ def create_job(p: Dict[str, Any], user: str) -> Dict[str, Any]:
     with get_data_engine().begin() as c:
         new_id = c.execute(text(f"""
             INSERT INTO {JOB_TABLE} (JOB_NAME, DESCRIPTION, SOURCE_TYPE, SOURCE_OBJECT,
-                TARGET_TABLE, LOAD_MODE, LOADER_PREF, ALLOW_EMPTY, KEY_COLS, WATERMARK_COL,
-                TRIGGER_TYPE, SCHEDULE_CONFIG, RETRY_ON_FAIL, RETRY_DELAY_MIN, ENABLED,
-                NEXT_RUN_AT, CREATED_BY, UPDATED_BY)
+                TARGET_TABLE, LOAD_MODE, LOADER_PREF, ALLOW_EMPTY, COLUMN_MAP, KEY_COLS,
+                WATERMARK_COL, TRIGGER_TYPE, SCHEDULE_CONFIG, RETRY_ON_FAIL, RETRY_DELAY_MIN,
+                ENABLED, NEXT_RUN_AT, CREATED_BY, UPDATED_BY)
             OUTPUT INSERTED.JOB_ID
-            VALUES (:name, :desc, 'SNOWFLAKE', :src, :tgt, :mode, :loader, :allow_empty, :keys,
-                :wm, :trig, :sched, :retry, :delay, :en, :next, :user, :user)
+            VALUES (:name, :desc, 'SNOWFLAKE', :src, :tgt, :mode, :loader, :allow_empty, :cmap,
+                :keys, :wm, :trig, :sched, :retry, :delay, :en, :next, :user, :user)
         """), v).scalar()
     logger.info(f"[get-data] job {new_id} '{v['name']}' created by {user}")
     return get_job(int(new_id))
@@ -287,6 +369,7 @@ def update_job(job_id: int, p: Dict[str, Any], user: str) -> Dict[str, Any]:
         c.execute(text(f"""
             UPDATE {JOB_TABLE} SET JOB_NAME=:name, DESCRIPTION=:desc, SOURCE_OBJECT=:src,
                 TARGET_TABLE=:tgt, LOAD_MODE=:mode, LOADER_PREF=:loader, ALLOW_EMPTY=:allow_empty,
+                COLUMN_MAP=:cmap,
                 KEY_COLS=:keys, WATERMARK_COL=:wm,
                 WATERMARK_VALUE = CASE WHEN :reset = 1 THEN NULL ELSE WATERMARK_VALUE END,
                 TRIGGER_TYPE=:trig, SCHEDULE_CONFIG=:sched, RETRY_ON_FAIL=:retry,
@@ -594,15 +677,23 @@ def _drop(table: str) -> None:
         c.execute(text(f"IF OBJECT_ID('dbo.[{table}]','U') IS NOT NULL DROP TABLE dbo.[{table}]"))
 
 
-def _build_specs(metas: List[Dict[str, Any]], profiles: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    specs, used = [], set()
+def _build_specs(metas: List[Dict[str, Any]], profiles: Dict[str, Dict[str, Any]],
+                 rename: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """One spec per loaded column. `rename` = {source: local name} from the
+    job's mapping; those names are reserved first, so a column that turns up
+    later under the same name gets the _2 suffix, not the mapped one."""
+    rename = rename or {}
+    specs, used = [], {v.upper() for v in rename.values()}
     for m in metas:
-        base = str(m["name"])[:120]
-        sql_name, i = base, 2
-        while sql_name.upper() in used:   # SQL Server compares names case-insensitively
-            sql_name = f"{base}_{i}"
-            i += 1
-        used.add(sql_name.upper())
+        if m["name"] in rename:
+            sql_name = rename[m["name"]]
+        else:
+            base = str(m["name"])[:120]
+            sql_name, i = base, 2
+            while sql_name.upper() in used:   # SQL Server compares names case-insensitively
+                sql_name = f"{base}_{i}"
+                i += 1
+            used.add(sql_name.upper())
         prof = profiles.get(m["name"]) or {}
         spec = gsf.map_column(m, prof)
         spec.update({"sf_name": m["name"], "sql_name": sql_name,
@@ -848,6 +939,34 @@ def _align_schema(target: str, specs: List[Dict[str, Any]]) -> List[str]:
     return changes
 
 
+def _rename_in_place(target: str, specs: List[Dict[str, Any]],
+                     applied: Optional[Dict[str, str]]) -> List[str]:
+    """Incremental / append tables keep their rows, so a column renamed on the
+    job is renamed in the table (sp_rename) rather than started afresh.
+    `applied` = {source: local name} the table had after its last good run;
+    a table loaded before mappings existed used the Snowflake names."""
+    applied_up = {str(k).upper(): v for k, v in (applied or {}).items()}
+    done = []
+    with get_data_engine().begin() as c:
+        have = _target_columns(c, target)
+        for s in specs:
+            new = s["sql_name"]
+            old = applied_up.get(str(s["sf_name"]).upper(), s["sf_name"])
+            if str(old).upper() == new.upper():
+                continue                      # same name (SQL Server ignores case)
+            if new.upper() in have:
+                continue                      # the new name is already there
+            col = have.get(str(old).upper())
+            if not col:
+                continue                      # nothing to rename; _align_schema adds the column
+            c.execute(text("EXEC sp_rename @objname = :obj, @newname = :new, @objtype = 'COLUMN'"),
+                      {"obj": f"dbo.{_sql_ident(target)}.{_sql_ident(col['name'])}", "new": new})
+            have[new.upper()] = dict(col, name=new)
+            have.pop(str(old).upper(), None)
+            done.append(f"renamed {col['name']} → {new}")
+    return done
+
+
 def _merge(stage: str, target: str, specs: List[Dict[str, Any]], key_sql: List[str],
            wm_sql: str) -> Tuple[int, int, int]:
     """Upsert the batch on the key columns. Duplicate keys inside the batch keep
@@ -935,27 +1054,38 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
     try:
         cur = sfconn.cursor()
         try:
-            metas = gsf.describe(cur, f"SELECT * FROM {src}")
+            metas_all = gsf.describe(cur, f"SELECT * FROM {src}")
         except Exception as e:
             raise GetDataError(f"Cannot read {fq}: {gsf.sf_message(e)}")
+        # The job's column mapping: skipped columns are never read; renamed
+        # ones get their local name. Keys and the watermark stay Snowflake names.
+        cmap = job.get("COLUMN_MAP") or None
+        metas, rename, map_notes = _apply_column_map(metas_all, cmap, job.get("APPLIED_COLUMN_MAP"))
         names = [m["name"] for m in metas]
-        dups = gsf._dup_names(metas)
+        local = [rename.get(n, n) for n in names]
+        seen, dups = set(), []
+        for n in local:
+            if n.upper() in seen:
+                dups.append(n)
+            seen.add(n.upper())
         if dups:
-            raise GetDataError(f"Source has duplicate column names (case-insensitive): {', '.join(dups)}")
-        reserved = [n for n in names if n.upper() in gsf.AUDIT_COLS]
+            raise GetDataError(f"Two loaded columns would share the name {', '.join(dups)} "
+                               f"(names are case-insensitive) — rename one in the job's Columns.")
+        reserved = [n for n in local if n.upper() in gsf.AUDIT_COLS]
         if reserved:
-            raise GetDataError(f"Source column {', '.join(reserved)} clashes with a load audit column.")
+            raise GetDataError(f"Column {', '.join(reserved)} clashes with a load audit column — "
+                               f"rename or skip it in the job's Columns.")
         key_sf = []
         for k in keys:
             real = _resolve_col(names, k)
             if not real:
-                raise GetDataError(f"Key column {k} is not in {fq}.")
+                raise GetDataError(f"Key column {k} is not loaded from {fq}.")
             key_sf.append(real)
         wm_sf = None
         if mode == "incremental":
             wm_sf = _resolve_col(names, wm_col or "")
             if not wm_sf:
-                raise GetDataError(f"Watermark column {wm_col} is not in {fq}.")
+                raise GetDataError(f"Watermark column {wm_col} is not loaded from {fq}.")
 
         where, params = "", None
         wm_from = job.get("WATERMARK_VALUE") if (mode == "incremental" and not as_new_table) else None
@@ -988,7 +1118,7 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
                 f"'Allow an empty Snowflake result' on the job.")
         hb.step("Profiling columns")
         profiles = _profile(sfconn, qid, metas)
-        specs = _build_specs(metas, profiles)
+        specs = _build_specs(metas, profiles, rename)
         by_sf = {s["sf_name"]: s for s in specs}
 
         if (job.get("LOADER_PREF") or "bulk") == "classic":
@@ -1057,7 +1187,8 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
             "full reload" if full and mode != "replace" else MODE_LABEL["replace"])
     elif mode == "incremental":
         hb.step("Merging changes")
-        changes = _align_schema(target, specs)
+        changes = _rename_in_place(target, specs, job.get("APPLIED_COLUMN_MAP"))
+        changes += _align_schema(target, specs)
         ins, upd, dup = _merge(stage, target, specs, key_sql, wm_sql)
         _drop(stage)
         stats.update(ROWS_INSERTED=ins, ROWS_UPDATED=upd)
@@ -1065,7 +1196,8 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
             f", {dup:,} duplicate key(s) in the batch kept the latest" if dup else "")
     else:
         hb.step("Appending rows")
-        changes = _align_schema(target, specs)
+        changes = _rename_in_place(target, specs, job.get("APPLIED_COLUMN_MAP"))
+        changes += _align_schema(target, specs)
         _append(stage, target, specs)
         _drop(stage)
         stats.update(ROWS_INSERTED=staged, ROWS_UPDATED=0)
@@ -1076,9 +1208,21 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
     loader = (f"bulk copy ({gdb.auth_label()})" if stats.get("LOADER") == "bulk"
               else f"classic insert ({stats.get('LOADER_NOTE')})")
     msg = f"Loaded {staged:,} row(s) into {target} ({how}) via {loader}; {verified}."
+    if cmap:
+        skipped = [e["source"] for e in cmap if e.get("load", True) is False]
+        msg += f" Columns: {len(rename)} renamed, {len(skipped)} skipped."
+    if map_notes:
+        note = "; ".join(map_notes)
+        msg += " " + note[:1].upper() + note[1:] + "."
     if changes:
         msg += " Schema: " + "; ".join(changes) + "."
     stats["MESSAGE"] = msg
+    # The names the table has now — the starting point for the next in-place rename.
+    stats["APPLIED_COLUMN_MAP"] = json.dumps({s["sf_name"]: s["sql_name"] for s in specs})
+    if cmap:
+        used = {s["sf_name"]: s["sql_name"] for s in specs}
+        used.update({e["source"]: None for e in cmap if e.get("load", True) is False})
+        stats["COLUMN_MAP"] = json.dumps(used)
     return stats
 
 
@@ -1142,23 +1286,27 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
                 SOURCE_ROWS=COALESCE(:src, SOURCE_ROWS), ROWS_LOADED=COALESCE(:rl, ROWS_LOADED),
                 ROWS_INSERTED=:ri, ROWS_UPDATED=:ru, TARGET_ROWS_BEFORE=:tb,
                 TARGET_ROWS_AFTER=:ta, WATERMARK_FROM=:wf, WATERMARK_TO=:wt, SF_QUERY_ID=:q,
-                LOADER=:ld
+                LOADER=:ld, COLUMN_MAP=:cm
             WHERE RUN_ID=:id
         """), {"st": status, "d": dur, "m": message[:4000],
                "src": stats.get("SOURCE_ROWS"), "rl": stats.get("ROWS_LOADED"),
                "ri": stats.get("ROWS_INSERTED"), "ru": stats.get("ROWS_UPDATED"),
                "tb": stats.get("TARGET_ROWS_BEFORE"), "ta": stats.get("TARGET_ROWS_AFTER"),
                "wf": stats.get("WATERMARK_FROM"), "wt": stats.get("WATERMARK_TO"),
-               "q": stats.get("SF_QUERY_ID"), "ld": stats.get("LOADER"), "id": run_id})
+               "q": stats.get("SF_QUERY_ID"), "ld": stats.get("LOADER"),
+               "cm": stats.get("COLUMN_MAP"), "id": run_id})
         c.execute(text(f"""
             UPDATE {JOB_TABLE} SET LAST_RUN_AT=SYSUTCDATETIME(), LAST_STATUS=:st,
                 LAST_ROWS=:rows, LAST_MESSAGE=:m,
                 WATERMARK_VALUE = CASE WHEN :st = 'success' AND :wm IS NOT NULL THEN :wm
                                        ELSE WATERMARK_VALUE END,
-                RETRY_AT = CASE WHEN :st = 'success' THEN NULL ELSE COALESCE(:retry, RETRY_AT) END
+                RETRY_AT = CASE WHEN :st = 'success' THEN NULL ELSE COALESCE(:retry, RETRY_AT) END,
+                APPLIED_COLUMN_MAP = CASE WHEN :st = 'success' AND :acm IS NOT NULL THEN :acm
+                                          ELSE APPLIED_COLUMN_MAP END
             WHERE JOB_ID=:jid
         """), {"st": status, "rows": stats.get("ROWS_LOADED") if status == "success" else None,
-               "m": message[:1000], "wm": new_wm, "retry": retry_at, "jid": job_id})
+               "m": message[:1000], "wm": new_wm, "retry": retry_at,
+               "acm": stats.get("APPLIED_COLUMN_MAP"), "jid": job_id})
         c.execute(text(f"""
             UPDATE {JOB_TABLE} SET LOCK_RUN_ID=NULL, LOCK_HEARTBEAT=NULL
             WHERE JOB_ID=:jid AND LOCK_RUN_ID=:rid

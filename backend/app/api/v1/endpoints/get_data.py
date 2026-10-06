@@ -98,6 +98,7 @@ class JobReq(BaseModel):
     enabled: Optional[bool] = True
     loader: Optional[str] = "bulk"          # bulk (default) | classic
     allow_empty: Optional[bool] = False     # let a 0-row result empty a filled table
+    column_map: Optional[Any] = None        # [{source, name, load}] — rename / skip columns
 
 
 class JobTestReq(BaseModel):

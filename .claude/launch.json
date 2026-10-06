@@ -2,11 +2,33 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "backend",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8080"],
+      "cwd": "backend",
+      "port": 8080
+    },
+    {
       "name": "frontend",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
       "cwd": "frontend",
       "port": 3000,
+      "autoPort": true
+    },
+    {
+      "name": "backend-b2b",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "uvicorn", "b2b_test_app:app", "--app-dir", "C:\\Users\\SANTOS~1.KUM\\AppData\\Local\\Temp\\claude\\D--PROJECTS-ars-v3\\fbc143d7-d9d9-48e0-8cd3-96c4c0e3c4bc\\scratchpad", "--host", "127.0.0.1", "--port", "8090"],
+      "cwd": "backend",
+      "port": 8090
+    },
+    {
+      "name": "frontend-b2b",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "set API_TARGET=http://127.0.0.1:8090&& npm run dev"],
+      "cwd": "frontend",
+      "port": 3100,
       "autoPort": true
     }
   ]

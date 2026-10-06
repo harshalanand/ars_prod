@@ -47,6 +47,7 @@ const SECTIONS = [
       ['Skipped', 'A scheduled run found the previous run of the same job still going, so it did not start a second one.'],
       ['Retry', 'A failed scheduled run is retried once after the delay set on the job (default 15 minutes).'],
       ['Loader', '**Bulk copy** is the default and the fast way in; choose **Classic insert** on the job only if bulk copy gives trouble. A bulk job still uses classic when its data can’t go through bulk copy exactly — the run message says why. Both are checked the same way: row count, values per column and number totals must match Snowflake.'],
+      ['Column names', 'In the job’s **Columns** section (after Check source) type a new name to **rename** a column in the local table, or untick Load to **skip** it. Full-replace tables get the new names on the next run; incremental and append tables are renamed in place, so no rows are lost. New Snowflake columns load under their own name, and the run says so.'],
       ['Empty result', 'If Snowflake returns **0 rows** for a full-replace job while the local table has data, the run fails and **keeps the data** — an emptied source is usually a mistake upstream. Tick “Allow an empty Snowflake result” on the job if empty is expected.'],
     ],
   },

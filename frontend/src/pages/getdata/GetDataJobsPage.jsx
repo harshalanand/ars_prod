@@ -16,6 +16,45 @@ const blank = {
   key_cols: '', watermark_col: '', trigger_type: 'schedule', freq: 'daily', times: ['07:00'],
   weekdays: [0], days: '1', every_n_hours: 6, win_start: '', win_end: '',
   retry_on_fail: true, retry_delay_min: 15, enabled: true, loader: 'bulk', allow_empty: false,
+  column_map: [],
+}
+
+// Column mapping: [{ source, name, load }] — rename / skip Snowflake columns.
+const LOCAL_NAME = /^[A-Za-z][A-Za-z0-9_]{0,119}$/
+
+// Keep saved names/choices for columns still in Snowflake; new ones start as-is.
+const mergeColumns = (cols, map) => {
+  const by = Object.fromEntries((map || []).map(e => [e.source.toUpperCase(), e]))
+  return cols.map(c => {
+    const e = by[c.name.toUpperCase()]
+    return { source: c.name, name: e ? e.name : c.name, load: e ? e.load !== false : true }
+  })
+}
+
+// Same rules as the server (get_data_sync_service._clean_column_map).
+const columnIssues = (map, keyList, wm) => {
+  const row = {}, general = []
+  const seen = {}
+  const protectedCols = new Set([...keyList, ...(wm ? [wm.toUpperCase()] : [])])
+  for (const e of map) {
+    const src = e.source.toUpperCase()
+    if (!e.load) {
+      if (protectedCols.has(src)) row[src] = 'Key and watermark columns can’t be skipped'
+      continue
+    }
+    const n = (e.name || '').trim()
+    if (!LOCAL_NAME.test(n)) row[src] = 'Letters, digits and _ only, starting with a letter'
+    else if (seen[n.toUpperCase()]) row[src] = `“${n}” is already used for ${seen[n.toUpperCase()]}`
+    else seen[n.toUpperCase()] = e.source
+  }
+  if (map.length && !map.some(e => e.load)) general.push('Load at least one column')
+  return { row, general, any: Object.keys(row).length > 0 || general.length > 0 }
+}
+
+const mapSummary = (map) => {
+  const m = map || []
+  return { renamed: m.filter(e => e.load !== false && e.name !== e.source).length,
+           skipped: m.filter(e => e.load === false).length }
 }
 
 const suggestTarget = (fq) => {
@@ -78,6 +117,7 @@ export default function GetDataJobsPage() {
       win_start: c.start || '', win_end: c.end || '',
       retry_on_fail: !!j.RETRY_ON_FAIL, retry_delay_min: j.RETRY_DELAY_MIN || 15, enabled: !!j.ENABLED,
       loader: j.LOADER_PREF || 'bulk', allow_empty: !!j.ALLOW_EMPTY,
+      column_map: (j.COLUMN_MAP || []).map(e => ({ source: e.source, name: e.name, load: e.load !== false })),
     })
   }
 
@@ -149,6 +189,10 @@ export default function GetDataJobsPage() {
                     <td className="px-4 py-2.5 text-xs">
                       {MODE_LABEL[j.LOAD_MODE] || j.LOAD_MODE}
                       <span className="text-gray-400"> · {j.LOADER_PREF === 'classic' ? 'classic' : 'bulk'}</span>
+                      {j.COLUMN_MAP?.length > 0 && (() => {
+                        const s = mapSummary(j.COLUMN_MAP)
+                        return <div className="text-primary-700">{s.renamed} renamed{s.skipped ? ` · ${s.skipped} skipped` : ''}</div>
+                      })()}
                       {j.LOAD_MODE === 'incremental' && (
                         <div className="text-gray-400">on {j.WATERMARK_COL}{j.WATERMARK_VALUE ? ` ≥ ${j.WATERMARK_VALUE}` : ' · first run loads all'}</div>
                       )}
@@ -233,9 +277,13 @@ function JobModal({ initial, onClose, onSaved }) {
     getDataAPI.listViews().then(({ data }) => setViews(data.data.items || [])).catch(() => {})
   }, [])
 
+  const [mapNote, setMapNote] = useState(null)
+
   const setSource = (v) => {
-    setF(p => ({ ...p, source_object: v, target_table: targetTouched ? p.target_table : suggestTarget(v) }))
-    setTest(null)
+    // A different source has different columns — its mapping starts over.
+    setF(p => ({ ...p, source_object: v, target_table: targetTouched ? p.target_table : suggestTarget(v),
+                 column_map: [] }))
+    setTest(null); setMapNote(null)
   }
 
   const runTest = async () => {
@@ -245,6 +293,13 @@ function JobModal({ initial, onClose, onSaved }) {
       const { data } = await getDataAPI.testJob({ source_object: f.source_object, load_mode: f.load_mode,
         key_cols: f.key_cols, watermark_col: f.watermark_col })
       setTest(data.data)
+      const cols = data.data.columns || []
+      if (cols.length) {
+        const present = new Set(cols.map(c => c.name.toUpperCase()))
+        const gone = (f.column_map || []).filter(e => !present.has(e.source.toUpperCase())).map(e => e.source)
+        setMapNote(gone.length ? `No longer in Snowflake, removed from the list: ${gone.join(', ')}` : null)
+        setF(p => ({ ...p, column_map: mergeColumns(cols, p.column_map) }))
+      }
     } catch (e) {
       setTest({ ok: false, checks: [{ label: 'Check', ok: false, detail: errText(e) }], columns: [] })
     } finally { setTesting(false) }
@@ -276,8 +331,14 @@ function JobModal({ initial, onClose, onSaved }) {
       trigger_type: f.trigger_type, schedule_config,
       retry_on_fail: !!f.retry_on_fail, retry_delay_min: Number(f.retry_delay_min) || 15, enabled: !!f.enabled,
       loader: f.loader || 'bulk', allow_empty: !!f.allow_empty,
+      // Only a mapping that changes something is stored; otherwise columns keep Snowflake's names.
+      column_map: (f.column_map || []).some(e => !e.load || e.name !== e.source)
+        ? f.column_map.map(({ source, name, load }) => ({ source, name: (name || '').trim() || source, load: !!load }))
+        : null,
     }
   }
+
+  const issues = columnIssues(f.column_map || [], keyList, f.load_mode === 'incremental' ? f.watermark_col : '')
 
   const save = async () => {
     if (!f.job_name.trim()) { setErr('Give the job a name'); return }
@@ -285,6 +346,7 @@ function JobModal({ initial, onClose, onSaved }) {
     if (!f.target_table.trim()) { setErr('Name the local table'); return }
     if (f.load_mode === 'incremental' && (!keyList.length || !f.watermark_col)) { setErr('Incremental needs key column(s) and a watermark column'); return }
     if (f.trigger_type === 'schedule' && f.freq !== 'every_n_hours' && !f.times.filter(Boolean).length) { setErr('Add at least one run time'); return }
+    if (issues.any) { setErr('Fix the column names marked in red under Columns'); return }
     setSaving(true)
     try {
       if (f.job_id) await getDataAPI.updateJob(f.job_id, payload())
@@ -426,6 +488,12 @@ function JobModal({ initial, onClose, onSaved }) {
             )}
           </div>
 
+          {/* Columns — rename / skip */}
+          {(f.column_map || []).length > 0 && (
+            <ColumnsEditor map={f.column_map} cols={cols} issues={issues} note={mapNote}
+              onChange={m => set('column_map', m)} />
+          )}
+
           {/* Schedule */}
           <div className="pt-4 border-t space-y-3">
             <div className="flex flex-wrap items-center gap-4">
@@ -462,6 +530,67 @@ function JobModal({ initial, onClose, onSaved }) {
           <button onClick={save} disabled={saving} className="btn-primary">{saving ? 'Saving…' : 'Save job'}</button>
         </div>
       </div>
+    </div>
+  )
+}
+
+function ColumnsEditor({ map, cols, issues, note, onChange }) {
+  const typeOf = Object.fromEntries((cols || []).map(c => [c.name.toUpperCase(), c]))
+  const s = mapSummary(map)
+  const update = (i, patch) => onChange(map.map((e, j) => (j === i ? { ...e, ...patch } : e)))
+  return (
+    <div className="pt-4 border-t space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="label mb-0">Columns</label>
+        {s.renamed > 0 && <span className="text-[11px] px-2 py-0.5 rounded-full bg-primary-50 text-primary-700">{s.renamed} renamed</span>}
+        {s.skipped > 0 && <span className="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-600">{s.skipped} skipped</span>}
+        <span className="flex-1" />
+        <button type="button" onClick={() => onChange(map.map(e => ({ ...e, name: e.source })))} className="btn-ghost text-xs">Reset names</button>
+        <button type="button" onClick={() => onChange(map.map(e => ({ ...e, load: true })))} className="btn-ghost text-xs">Load all</button>
+      </div>
+      <div className="text-[11px] text-gray-500">
+        Type a new name to rename a column in the local table, or untick Load to leave it out. Keys and the watermark are still picked by their Snowflake name.
+        {!cols?.length && ' Click “Check source” to refresh types and see any new Snowflake columns.'}
+      </div>
+      {note && <div className="text-[11px] text-amber-700">{note}</div>}
+      <div className="border border-gray-200 rounded-lg overflow-auto max-h-80">
+        <table className="w-full text-xs">
+          <thead className="bg-gray-50 sticky top-0 z-10">
+            <tr>
+              <th className="px-2 py-1.5 text-left">Snowflake column</th>
+              <th className="px-2 py-1.5 text-left">Snowflake type</th>
+              <th className="px-2 py-1.5 text-center">Load</th>
+              <th className="px-2 py-1.5 text-left">Name in local table</th>
+              <th className="px-2 py-1.5 text-left">Local type</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {map.map((e, i) => {
+              const t = typeOf[e.source.toUpperCase()]
+              const bad = issues.row[e.source.toUpperCase()]
+              const renamed = e.load && e.name !== e.source
+              return (
+                <tr key={e.source} className={e.load ? '' : 'opacity-50'}>
+                  <td className="px-2 py-1 font-mono">{e.source}</td>
+                  <td className="px-2 py-1 font-mono text-gray-500">{t?.sf_type_label || '—'}</td>
+                  <td className="px-2 py-1 text-center">
+                    <input type="checkbox" className="w-4 h-4 rounded" checked={!!e.load} onChange={ev => update(i, { load: ev.target.checked })} />
+                  </td>
+                  <td className="px-2 py-1">
+                    {e.load ? (
+                      <input className={`input font-mono py-0.5 ${bad ? 'border-red-400' : renamed ? 'border-primary-400' : ''}`}
+                        value={e.name} onChange={ev => update(i, { name: ev.target.value })} />
+                    ) : <span className="text-gray-400">not loaded</span>}
+                    {bad && <div className="text-[11px] text-red-600 mt-0.5">{bad}</div>}
+                  </td>
+                  <td className="px-2 py-1 font-mono text-gray-500">{e.load ? (t?.sql_type || '—') : '—'}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      {issues.general.map(g => <div key={g} className="text-[11px] text-red-600">{g}</div>)}
     </div>
   )
 }

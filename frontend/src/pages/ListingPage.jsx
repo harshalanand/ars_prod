@@ -1658,8 +1658,27 @@ export default function ListingPage() {
   // Calls /listing/active-job on mount and every 5s. If the server reports
   // an in-flight batch and we don't already have one locally, adopt it so
   // the Live Run dashboard updates without the user having to refresh.
+  // Self-scheduling (not setInterval) and paused while the tab is hidden: a
+  // throttled/sleeping tab used to queue hundreds of ticks and flush them on
+  // wake, exhausting the backend's DB pool (QueuePool limit … reached).
   useEffect(() => {
     let cancelled = false
+    let inFlight = false
+    const schedule = () => {
+      if (cancelled) return
+      activeJobPollRef.current = setTimeout(run, 5000)
+    }
+    const run = async () => {
+      if (cancelled || inFlight) return
+      if (document.hidden) { schedule(); return }
+      inFlight = true
+      try { await tick() } finally { inFlight = false; schedule() }
+    }
+    const onVisible = () => {
+      if (document.hidden || cancelled) return
+      if (activeJobPollRef.current) clearTimeout(activeJobPollRef.current)
+      run()
+    }
     const tick = async () => {
       try {
         const { data } = await listingAPI.activeJob()
@@ -1686,12 +1705,13 @@ export default function ListingPage() {
         }
       } catch { /* ignore — keep polling */ }
     }
-    tick()
-    activeJobPollRef.current = setInterval(tick, 5000)
+    run()
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
       cancelled = true
+      document.removeEventListener('visibilitychange', onVisible)
       if (activeJobPollRef.current) {
-        clearInterval(activeJobPollRef.current)
+        clearTimeout(activeJobPollRef.current)
         activeJobPollRef.current = null
       }
     }

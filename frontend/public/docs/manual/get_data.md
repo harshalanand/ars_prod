@@ -62,6 +62,23 @@ and SAP (phase 4, absorbs SAP → Data Pulls) plug into the same jobs and histor
   Snowflake → SQL Server type for every column.
 - Every loaded table gets two audit columns: `_GD_RUN_ID` (the run that wrote the row)
   and `_GD_LOADED_AT` (UTC).
+- **Columns** (`GD_JOB.COLUMN_MAP`, JSON `[{source, name, load}]`): after Check source the
+  form lists every Snowflake column. Type a **new local name** to rename it, untick
+  **Load** to skip it (a skipped column is not even read from Snowflake). Rules, checked in
+  the form and again on save: letters, digits and `_`, starting with a letter (so
+  `_GD_*` can't be used), ≤ 120 characters, unique ignoring case, at least one column
+  loaded, key and watermark columns can't be skipped (they are always picked by their
+  Snowflake name). A form left untouched stores no mapping.
+  - Full replace: the next run builds the table with the new names.
+  - Incremental / append: the table keeps its rows, so a renamed column is renamed in place
+    (`sp_rename`) using `GD_JOB.APPLIED_COLUMN_MAP` — the names the table had after its last
+    good run (tables loaded before mappings existed use the Snowflake names). A skipped
+    column stays in the table and is NULL for new rows.
+  - A Snowflake column the mapping doesn't list loads under its own name and the run
+    message says so ("not in the job's Columns list"); a mapped column that has vanished
+    from Snowflake is noted, not an error. Mapped names are reserved first, so a newcomer
+    with the same name gets `_2`, never the mapped column.
+  - `GD_RUN.COLUMN_MAP` records the names each run used (`{source: local name or null}`).
 - **Loader** (`GD_JOB.LOADER_PREF`): **Bulk copy** (default) or **Classic insert**, chosen
   in the job form. Bulk still falls back to classic, with the reason in the run, when the
   data can't go through bcp exactly (see step 5). Classic is never upgraded to bulk.
@@ -241,6 +258,10 @@ Filters: IST date range, job, trigger, status. Summary: auto, manual, rows loade
   VENDOR_DESIGN_NO and M_FAB_1, and was forced to classic (18–24 min) until this change.
   TIME and VARIANT/OBJECT/ARRAY now go through bulk too; only BINARY stays classic.
 - 2026-10-01 · Loader is a job setting (bulk default, classic optional).
+- 2026-10-03 · Column mapping: rename or skip Snowflake columns per job. Renames on
+  incremental/append tables happen in place (rows kept); new Snowflake columns load under
+  their own name automatically. Tested: replace 3 renamed + 1 skipped identical through bulk
+  and classic; incremental WERKS → ST_CD → STORE with all 1,000 rows and values kept.
 - 2026-10-01 · Empty-source guard: a full replace that gets 0 rows while the local table
   has rows fails and keeps them, unless the job allows empty. Added after run 57: the
   Snowflake source AKS_GOLD.GLD_MONTH_PLAN_APPROVED was emptied upstream at 09:31:53 IST

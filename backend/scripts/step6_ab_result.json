@@ -1,0 +1,107 @@
+{
+  "own": {
+    "session_id": "AB_OWN_20260922_141930",
+    "alloc_rows": 107,
+    "ship": 66.0,
+    "hold": 0.0,
+    "stores": 3,
+    "by_store": {
+      "HN40": 45.0,
+      "HN50": 21.0,
+      "HX55": 0.0
+    },
+    "src_rdc_col_exists": true,
+    "src_rdc_non_null": 0,
+    "split_rows": 0,
+    "split_ship": 0.0,
+    "split_hold": 0.0,
+    "by_src_rdc": {},
+    "cross_qty": 0.0,
+    "split_lines": 0,
+    "reduced_lines": 0,
+    "listing_rows": 502,
+    "error": null
+  },
+  "all": {
+    "session_id": "AB_ALL_20260922_141941",
+    "alloc_rows": 199,
+    "ship": 66.0,
+    "hold": 0.0,
+    "stores": 3,
+    "by_store": {
+      "HN40": 45.0,
+      "HN50": 21.0,
+      "HX55": 0.0
+    },
+    "src_rdc_col_exists": true,
+    "src_rdc_non_null": 15,
+    "split_rows": 15,
+    "split_ship": 66.0,
+    "split_hold": 0.0,
+    "by_src_rdc": {
+      "DH24": 56.0,
+      "DW01": 10.0
+    },
+    "cross_qty": 10.0,
+    "split_lines": 0,
+    "reduced_lines": 0,
+    "listing_rows": 1033,
+    "error": null
+  },
+  "checks": [
+    {
+      "gate": "V14",
+      "name": "Own run writes NO SRC_RDC",
+      "pass": true,
+      "detail": "0 non-null"
+    },
+    {
+      "gate": "V14",
+      "name": "Own run writes NO split rows",
+      "pass": true,
+      "detail": "0 rows"
+    },
+    {
+      "gate": "V14",
+      "name": "All-RDCs run writes SRC_RDC",
+      "pass": true,
+      "detail": "15 rows stamped"
+    },
+    {
+      "gate": "V4",
+      "name": "split SHIP == alloc SHIP",
+      "pass": true,
+      "detail": "split 66 vs alloc 66"
+    },
+    {
+      "gate": "V4",
+      "name": "split HOLD == alloc HOLD",
+      "pass": true,
+      "detail": "split 0 vs alloc 0"
+    },
+    {
+      "gate": "V10",
+      "name": "no reduced lines at N=2",
+      "pass": true,
+      "detail": "0 reduced"
+    },
+    {
+      "gate": "BR-RDC-01",
+      "name": "DW01 stores gain supply from the clubbed pool",
+      "pass": false,
+      "detail": "Own 0 -> All 0"
+    },
+    {
+      "gate": "BR-RDC-05",
+      "name": "cross-ship actually occurred",
+      "pass": true,
+      "detail": "10 pcs"
+    },
+    {
+      "gate": "V3",
+      "name": "no warehouse over-drawn",
+      "pass": true,
+      "detail": "0 violations"
+    }
+  ]
+}

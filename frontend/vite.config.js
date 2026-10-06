@@ -12,7 +12,8 @@ export default defineConfig({
     host: true,
     strictPort: false,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true, proxyTimeout:1200000 }
+      // API_TARGET lets a second dev server point at a second backend; the default is unchanged.
+      '/api': { target: process.env.API_TARGET || 'http://127.0.0.1:8080', changeOrigin: true, proxyTimeout:1200000 }
     },
     allowedHosts: ['ars.v2retail.net']
   },
