@@ -26,7 +26,7 @@ Stage 4 of the [[Pipeline Overview|pipeline]] — the staging + hand-off layer b
 | 3.55 | `MSA_FNL_Q` (typed by `alloc_type`), `VAR_COUNT`/`VAR_FNL_COUNT` |
 | **3.6** | **OPT_TYPE classification** (see below) |
 | **4 pre-resolve** | **MP-resolve**: ALTER + populate `FAB/MACRO_MVGR/MICRO_MVGR/M_VND_CD/RNG_SEG…` onto `ARS_LISTING` in ONE join to `vw_master_product`. Origin of sec-cap grid extras (invariant 4). *(No function literally named `_resolve_mp_cols` — it's this inline block.)* |
-| 4a–4e | per-grid column joins, `PER_OPT_SALE`, `OPT_MBQ`/`OPT_REQ`/`OPT_MBQ_WH`/`MAX_DAILY_SALE`, `ART_EXCESS`, per-grid REQ |
+| 4a–4e | per-grid column joins, `PER_OPT_SALE`, `OPT_MBQ`/`OPT_REQ`/`OPT_MBQ_WH`/**`OPT_REQ_ROD`**/`MAX_DAILY_SALE`, `ART_EXCESS`, per-grid REQ |
 | **6** | Store ranking → `ARS_STORE_RANKING` (`W_SCORE`, `ST_RANK`, `MANUAL_ST_PRIORITY` pin) |
 | **6.6** | `ELIG_FLAG`/`ELIG_REASON` materialization |
 | **7** | project `ELIG_FLAG=1` → `ARS_LISTING_WORKING`; growth lift; `GH_`/`H_`/`PRI_CT%`/`SEC_CT%`/`ALLOC_FLAG` |
@@ -43,6 +43,8 @@ Stage 4 of the [[Pipeline Overview|pipeline]] — the staging + hand-off layer b
 
 ## Eligibility gate (Part 6.6, AND of all, first failure named)
 `NOT_LISTED` → `NO_STOCK` → `NO_DEMAND` → `NO_DISPLAY` → `TBL_SIZE_LT_60` → `OK`. Only `ELIG_FLAG=1` rows reach `ARS_LISTING_WORKING`.
+
+**`NO_DEMAND` is I_ROD-aware since 2026-08-13** (BR-16 / FS-10 → [[project_irod_eligibility]]). Default OFF. When `use_irod_eligibility` / `RULE_R05_USE_IROD` is on, the gate tests `OPT_REQ_ROD >= 1` (shortfall vs the **full** `I_ROD` entitlement) instead of the single-round `OPT_REQ_WH`. `OPT_REQ_ROD = MAX(0, rod_target − STK_TTL)` where `rod_target = OPT_MBQ_WH + (I_ROD−1)×OPT_MBQ` for TBL (hold buffer counted **once**) else `I_ROD × OPT_MBQ`; `I_ROD=0` counts as 1. ⚠ Part 6.6 and Stage A `R05_REQ_POS` must resolve to the **same** column — a mismatch silently drops rows at Part 7, which filters `ELIG_FLAG=1`. Reason strings unchanged.
 
 ## Run cockpit → engine params (defaults)
 `stock_threshold_pct` 0.6 · `size_threshold` 0.6 · `min_size_count` 3 · `excess_multiplier` 2.0 · `hold_days` 0 (TBL-only) · `age_threshold` 15 · `default_acs_d` 18 · `req_weight`/`fill_weight` 0.4/0.6 · `mj_req_growth_pct` 100 (MJ+grid growth) · `rl/tbc/tbl_mbq_cap_pct` & `_mj_req_cap_pct` (downward caps) · `pri_ct_check_rl/tbc` false · `rl/tbc_dispatch_mode` COMPLETE · `apply_sec_cap_in_normal` true · `allocation_mode` **per_opt** (only value) · **`alloc_type` FRESH|GRT (required, 422 if missing)** · `cont_fallback_mode` P4_UNIFORM · hold-suppression `skip_hold_upc`/`apply_hold_seg_app`/`apply_hold_seg_gm`.
@@ -65,4 +67,4 @@ Stage 4 of the [[Pipeline Overview|pipeline]] — the staging + hand-off layer b
 - **`listing_allocator.py` is DELETED** — the manual/KB E1–E7 "allocator" section is stale; that logic is now in [[Rule Engine (per_opt)]].
 
 ## Cross-links
-[[MSA Stock Calculation]] · [[Grid Builder]] · [[Rule Engine (per_opt)]] · [[Pending Allocation and Hold]] · [[Fresh-GRT Allocation]] · [[Review and Approve]].
+[[MSA Stock Calculation]] · [[Grid Builder]] · [[Rule Engine (per_opt)]] · [[Pending Allocation and Hold]] · [[Fresh-GRT Allocation]] · [[Review and Approve]] · [[project_irod_eligibility]].

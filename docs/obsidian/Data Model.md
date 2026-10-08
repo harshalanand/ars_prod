@@ -27,21 +27,21 @@ Two logical databases on `HOPC866`: **Claude** (system — RBAC/RLS/audit/jobs, 
 | `ET_STORE_STOCK` | store stock | store-level `STK_TTL` for Grid/Listing |
 
 ### MSA → Grid → Listing/Alloc
-| Table | Grain | Role |
-|-------|-------|------|
-| `ARS_MSA_TOTAL` / `_VAR_ART` / `_GEN_ART` | RDC×article×SZ×ALLOC_TYPE (+ rollups) | [[MSA Stock Calculation\|MSA]] outputs (replaced legacy `cl_*`) |
-| `MSA_Calculation_Sequence` / `MSA_Column_Definitions` | run / table×column | run tracking / dynamic-column registry |
-| `ARS_MSA_SLOC_SETTINGS` | sloc | FRESH/GRT pool classification |
-| `ARS_GRID_BUILDER` | grid | [[Grid Builder\|grid]] defs (group, sec_cap, pivot_only, hierarchy_columns) |
-| `ARS_GRID_<name>` (`MJ`, `MJ_MERGE_RNG_SEG`, `MJ_RNG_SEG`…) | grid grain | per-grid MBQ/OPT_CNT/DISP_Q/STK_TTL |
-| `ARS_GRID_HIERARCHY`, `ARS_CALC_ST_MAJ_CAT`, `ARS_CALC_ST_ART` | MAJ_CAT / store / article | applicability registry (ADD-ONLY) + cascaded params |
-| `ARS_MERGE_RULES` | (source_col, source_value) | merge ruleset |
-| `ARS_LISTING` / `_WORKING` | OPT / eligible OPT | [[Listing\|listing]] full build / engine input |
-| `ARS_LISTED_OPT` | listed OPT | Stage A output |
-| `ARS_ALLOC_WORKING` | VAR_ART×SZ | per-size SHIP/HOLD/remarks + `ALLOC_TYPE`, `STOCK_CONSIDER_DT`, `PICKING_DT` (info-only run dates, stamped Part 8.36). **DROP+SELECT INTO each run** |
-| `ARS_STORE_RANKING` | store×MAJ_CAT | W_SCORE / ST_RANK |
-| `ARS_LISTING_SESSIONS` | session | run history/log, ALLOC_TYPE, REQUEST_JSON |
-| `ARS_*_PARKED` / `ARS_*_HISTORY` | run snapshot / promoted | park-then-promote on [[Review and Approve\|approve]] |
+| Table                                                          | Grain                                 | Role                                                                                                                                                 |
+| -------------------------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ARS_MSA_TOTAL` / `_VAR_ART` / `_GEN_ART`                      | RDC×article×SZ×ALLOC_TYPE (+ rollups) | [[MSA Stock Calculation\|MSA]] outputs (replaced legacy `cl_*`)                                                                                      |
+| `MSA_Calculation_Sequence` / `MSA_Column_Definitions`          | run / table×column                    | run tracking / dynamic-column registry                                                                                                               |
+| `ARS_MSA_SLOC_SETTINGS`                                        | sloc                                  | FRESH/GRT pool classification                                                                                                                        |
+| `ARS_GRID_BUILDER`                                             | grid                                  | [[Grid Builder\|grid]] defs (group, sec_cap, pivot_only, hierarchy_columns)                                                                          |
+| `ARS_GRID_<name>` (`MJ`, `MJ_MERGE_RNG_SEG`, `MJ_RNG_SEG`…)    | grid grain                            | per-grid MBQ/OPT_CNT/DISP_Q/STK_TTL                                                                                                                  |
+| `ARS_GRID_HIERARCHY`, `ARS_CALC_ST_MAJ_CAT`, `ARS_CALC_ST_ART` | MAJ_CAT / store / article             | applicability registry (ADD-ONLY) + cascaded params                                                                                                  |
+| `ARS_MERGE_RULES`                                              | (source_col, source_value)            | merge ruleset                                                                                                                                        |
+| `ARS_LISTING` / `_WORKING`                                     | OPT / eligible OPT                    | [[Listing\|listing]] full build / engine input                                                                                                       |
+| `ARS_LISTED_OPT`                                               | listed OPT                            | Stage A output                                                                                                                                       |
+| `ARS_ALLOC_WORKING`                                            | VAR_ART×SZ                            | per-size SHIP/HOLD/remarks + `ALLOC_TYPE`, `STOCK_CONSIDER_DT`, `PICKING_DT` (info-only run dates, stamped Part 8.36). **DROP+SELECT INTO each run** |
+| `ARS_STORE_RANKING`                                            | store×MAJ_CAT                         | W_SCORE / ST_RANK                                                                                                                                    |
+| `ARS_LISTING_SESSIONS`                                         | session                               | run history/log, ALLOC_TYPE, REQUEST_JSON                                                                                                            |
+| `ARS_*_PARKED` / `ARS_*_HISTORY`                               | run snapshot / promoted               | park-then-promote on [[Review and Approve\|approve]]                                                                                                 |
 
 ### Pend / Hold / BDC (feedback loop)
 | Table | Grain | Role |
