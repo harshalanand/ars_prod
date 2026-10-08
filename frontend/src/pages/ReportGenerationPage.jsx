@@ -612,13 +612,26 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
   const dSms = !!sms.enabled
   const sqlt = form.sqltable_config || {}
   const dSqlT = !!sqlt.enabled
-  // Folder / Snowflake / SQL Table are MUTUALLY EXCLUSIVE — exactly one primary
-  // destination. Email / WhatsApp / SMS stay independent notification channels.
-  const pickDest = (dest) => setForm(f => ({
-    ...f,
-    output_type: dest === 'snowflake' ? 'snowflake' : 'folder',
-    sqltable_config: { ...f.sqltable_config, enabled: dest === 'sqltable', skip_files: true },
-  }))
+  // Folder / Snowflake / SQL Table are MUTUALLY EXCLUSIVE — at most ONE primary
+  // destination. Clicking the active chip clears it, leaving none (valid: the
+  // report can deliver by email/WhatsApp/SMS alone). 'email' is the existing
+  // sentinel for "no file destination". Those three stay independent channels.
+  // output_type carries the destination: folder | snowflake | both | sqltable |
+  // none. 'email' stays valid for legacy email-only reports, but is NOT reused as
+  // a stand-in for "no destination" — the API validates it as real email delivery
+  // and rejects the save without recipients.
+  const curDest = sqlt.enabled ? 'sqltable'
+    : form.output_type === 'snowflake' ? 'snowflake'
+      : (form.output_type === 'folder' || form.output_type === 'both') ? 'folder'
+        : form.output_type === 'email' ? 'email' : 'none'
+  const pickDest = (dest) => setForm(f => {
+    const next = curDest === dest ? 'none' : dest
+    return {
+      ...f,
+      output_type: next,
+      sqltable_config: { ...f.sqltable_config, enabled: next === 'sqltable', skip_files: true },
+    }
+  })
   const [showQuery, setShowQuery] = useState(false)
   const [qName, setQName] = useState('')
   const [qSql, setQSql] = useState('')
@@ -889,14 +902,15 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
           Email / WhatsApp / SMS are separate notification channels. */}
       <label style={lbl}>Deliver to</label>
       <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 6 }}>
-        Pick one destination. Email, WhatsApp and SMS can be added on top of it.
+        Pick at most one destination — click it again to clear. Email, WhatsApp and SMS
+        can be added on top, and work on their own if no destination is chosen.
       </div>
       <div style={{ display: 'flex', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
-        <DeliverChip active={dFolder && !dSqlT} icon={<FolderOutput size={14} />} label="Folder"
+        <DeliverChip active={curDest === 'folder'} icon={<FolderOutput size={14} />} label="Folder"
           onClick={() => pickDest('folder')} />
-        <DeliverChip active={dSnow && !dSqlT} icon={<Database size={14} />} label="Snowflake"
+        <DeliverChip active={curDest === 'snowflake'} icon={<Database size={14} />} label="Snowflake"
           onClick={() => pickDest('snowflake')} />
-        <DeliverChip active={dSqlT} icon={<Table2 size={14} />} label="SQL Table"
+        <DeliverChip active={curDest === 'sqltable'} icon={<Table2 size={14} />} label="SQL Table"
           onClick={() => pickDest('sqltable')} />
         <DeliverChip active={dEmail} icon={<Mail size={14} />} label="Email"
           onClick={() => setEmail('enabled', !dEmail)} />
@@ -926,15 +940,25 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
               <input value={sqlt.table_prefix || ''} onChange={e => setSqlT('table_prefix', e.target.value)}
                      placeholder="ARS_RPT_" style={{ ...inp, width: 170, fontFamily: 'monospace' }} />
             </Field>
-            <Field label="Keep days (0 = forever)">
-              <input type="number" min="0" value={sqlt.retention_days ?? 5}
-                     onChange={e => setSqlT('retention_days', Number(e.target.value))}
-                     style={{ ...inp, width: 140 }} />
+            <Field label="Mode">
+              <select value={sqlt.mode || 'append'} onChange={e => setSqlT('mode', e.target.value)}
+                      style={{ ...inp, width: 230 }}>
+                <option value="append">Append — keep history per run</option>
+                <option value="replace">Replace — latest run only</option>
+              </select>
             </Field>
+            {(sqlt.mode || 'append') === 'append' && (
+              <Field label="Keep days (0 = forever)">
+                <input type="number" min="0" value={sqlt.retention_days ?? 5}
+                       onChange={e => setSqlT('retention_days', Number(e.target.value))}
+                       style={{ ...inp, width: 140 }} />
+              </Field>
+            )}
           </div>
           <div style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>
-            After each append, rows older than the keep-days window are deleted so the table
-            does not grow without bound. Set 0 to keep everything.
+            {(sqlt.mode || 'append') === 'append'
+              ? 'Rows accumulate across runs. After each append, rows older than the keep-days window are deleted so the table does not grow without bound. Set 0 to keep everything.'
+              : 'The table is emptied at the start of each run and holds only that run’s rows, so keep-days does not apply.'}
           </div>
         </div>
       )}
@@ -943,9 +967,9 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
           Email only — files are generated just to build the attachment, not kept.
         </div>
       )}
-      {!dFolder && !dSnow && !dEmail && (
+      {curDest === 'none' && !dEmail && !dWa && !dSms && (
         <div style={{ fontSize: 11, color: C.amber, marginBottom: 12 }}>
-          Pick at least one destination.
+          Nothing to deliver to — pick a destination, or enable Email / WhatsApp / SMS.
         </div>
       )}
       <div style={{ height: 8 }} />

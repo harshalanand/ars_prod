@@ -40,6 +40,41 @@ def main() -> int:
     rid = report.get("REPORT_ID")
     logger.info(f"[report-worker] pid={os.getpid()} report={rid} "
                 f"session={payload.get('session_code')} — starting")
+
+    # Re-read the definition from the DB rather than trusting the queue-time
+    # snapshot in the payload. Two reasons, both seen in practice:
+    #   * a report edited between pressing Run and the worker starting used the
+    #     OLD settings — on a 7-minute run that window is wide;
+    #   * the scheduler's own SELECT had a hand-maintained column list and was
+    #     missing SQLTABLE_CONFIG, so that destination never reached the worker.
+    # SELECT * here deliberately: a column list is what caused the second bug.
+    # Any run-time parameter overrides are re-applied AFTER the re-read, since
+    # they are no longer pre-merged into the snapshot.
+    if rid is not None:
+        try:
+            from sqlalchemy import text
+            from app.database.session import get_data_engine
+            from app.services.report_scheduler_service import (
+                REPORTS_TABLE, ReportSchedulerService)
+            with get_data_engine().connect() as conn:
+                row = conn.execute(
+                    text(f"SELECT * FROM {REPORTS_TABLE} WHERE REPORT_ID = :rid"),
+                    {"rid": rid}).mappings().fetchone()
+            if row:
+                report = dict(row)
+                logger.info(f"[report-worker] report {rid} re-read from DB "
+                            f"(output_type={report.get('OUTPUT_TYPE')})")
+            else:
+                logger.warning(f"[report-worker] report {rid} not found on re-read "
+                               f"— using the queued snapshot")
+            overrides = payload.get("param_overrides")
+            if overrides:
+                report = ReportSchedulerService._apply_param_overrides(report, overrides)
+                logger.info(f"[report-worker] applied {len(overrides)} param override(s)")
+        except Exception as e:
+            logger.warning(f"[report-worker] re-read failed ({e}) — "
+                           f"falling back to the queued snapshot")
+            report = payload.get("report") or {}
     try:
         run_report(report, payload.get("trigger_source") or "manual",
                    payload.get("session_code"), payload.get("user"))

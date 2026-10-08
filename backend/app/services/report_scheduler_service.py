@@ -418,12 +418,17 @@ class ReportSchedulerService:
         if not report:
             return {"queued": False, "error": "report not found"}
         if param_overrides:
+            # Validate now so a bad shape fails fast with a clear message, but do
+            # NOT merge into the snapshot: the worker re-reads the report from the
+            # DB and applies the overrides there, so an edit made between queueing
+            # and starting is still honoured.
             try:
-                report = self._apply_param_overrides(report, param_overrides)
+                self._apply_param_overrides(report, param_overrides)
             except Exception as e:
                 return {"queued": False, "error": f"bad parameters: {e}"}
         session_code = make_session_code()
-        self._submit(report, "manual", session_code, user)
+        self._submit(report, "manual", session_code, user,
+                     param_overrides=param_overrides)
         return {"queued": True, "session_code": session_code}
 
     @staticmethod
@@ -566,18 +571,22 @@ class ReportSchedulerService:
         return claimed
 
     def _submit(self, report: Dict[str, Any], trigger_source: str,
-                session_code: str, user: Optional[str]) -> None:
+                session_code: str, user: Optional[str],
+                param_overrides: Optional[Dict[str, Any]] = None) -> None:
         if not self._executor:
             # Scheduler not started (e.g. unit test) — run inline.
-            self._run_guarded(report, trigger_source, session_code, user)
+            self._run_guarded(report, trigger_source, session_code, user,
+                              param_overrides)
             return
         with self._active_lock:
             self._queued += 1
         self._executor.submit(
-            self._run_guarded, report, trigger_source, session_code, user)
+            self._run_guarded, report, trigger_source, session_code, user,
+            param_overrides)
 
     def _run_guarded(self, report: Dict[str, Any], trigger_source: str,
-                     session_code: str, user: Optional[str]) -> None:
+                     session_code: str, user: Optional[str],
+                     param_overrides: Optional[Dict[str, Any]] = None) -> None:
         rid = int(report["REPORT_ID"])
         with self._active_lock:
             if self._queued > 0:
@@ -595,7 +604,8 @@ class ReportSchedulerService:
             # (pandas / CSV writing) never holds the API worker's GIL — the web
             # UI stays responsive while the report generates.
             payload = {"report": report, "trigger_source": trigger_source,
-                       "session_code": session_code, "user": user}
+                       "session_code": session_code, "user": user,
+                       "param_overrides": param_overrides}
             fd, payload_path = tempfile.mkstemp(prefix="arsrpt_", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, default=str)
@@ -728,7 +738,8 @@ class ReportSchedulerService:
             row = conn.execute(text(f"""
                 SELECT REPORT_ID, NAME, STEPS, OUTPUT_TYPE, BASE_DIR,
                        FILE_FORMAT, SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG,
-                       WHATSAPP_CONFIG, SMS_CONFIG, FOLDER_PER_RUN, CREATED_BY
+                       WHATSAPP_CONFIG, SMS_CONFIG, SQLTABLE_CONFIG,
+                       FOLDER_PER_RUN, CREATED_BY
                 FROM {REPORTS_TABLE} WHERE REPORT_ID = :rid
             """), {"rid": report_id}).mappings().fetchone()
         return dict(row) if row else None
@@ -739,7 +750,8 @@ class ReportSchedulerService:
             rows = conn.execute(text(f"""
                 SELECT REPORT_ID, NAME, STEPS, OUTPUT_TYPE, BASE_DIR,
                        FILE_FORMAT, SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG,
-                       WHATSAPP_CONFIG, SMS_CONFIG, FOLDER_PER_RUN, CREATED_BY
+                       WHATSAPP_CONFIG, SMS_CONFIG, SQLTABLE_CONFIG,
+                       FOLDER_PER_RUN, CREATED_BY
                 FROM {REPORTS_TABLE}
                 WHERE TRIGGER_TYPE='event' AND ENABLED=1 AND TRIGGER_EVENT=:ev
             """), {"ev": event_name}).mappings().fetchall()

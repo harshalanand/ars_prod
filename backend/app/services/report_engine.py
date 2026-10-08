@@ -364,6 +364,10 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     _sqlt = _parse_json(report.get("SQLTABLE_CONFIG")) or {}
     sqltable_cfg = _sqlt if _sqlt.get("enabled") else None
     sqltable_results: List[Dict[str, Any]] = []
+    # REPLACE mode clears each TABLE once per run, not once per write: a fan-out
+    # step executes several times, and when they share one table clearing each
+    # time would leave only the last value. The writer owns the keying.
+    sqltable_cleared: set = set()
     _msg_wants_files = any(
         (_parse_json(report.get(k)) or {}).get("enabled")
         for k in ("EMAIL_CONFIG", "WHATSAPP_CONFIG", "SMS_CONFIG"))
@@ -375,8 +379,11 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     # of pandas' C-optimised to_csv/read_csv.
     direct_sf = (output_type == "snowflake") and bool(sf_cfg.get("direct", False))
 
-    if direct_sf:
-        # No file output → no export folder, no retention/disk pre-flight.
+    # No files will be written → no export folder, no retention sweep, no disk
+    # pre-flight. Worth skipping explicitly: BASE_DIR is often a UNC share, and
+    # the retention sweep walks it, so a SQL-table-only report was paying for
+    # remote directory work and leaving an empty folder behind every run.
+    if direct_sf or not want_files:
         export_dir = ""
         run_id = _insert_run(report_id, session_code, export_dir,
                              trigger_source, created_by)
@@ -454,7 +461,7 @@ def run_report(report: Dict[str, Any], trigger_source: str,
                                 sqltable_results.append(write_step_to_table(
                                     sql_c, vals_c, sqltable_cfg, session_code,
                                     "_".join([p for p in (step.get("label") or step["name"], fo_sfx) if p]),
-                                    cancel_token=token))
+                                    cancel_token=token, cleared=sqltable_cleared))
                             if want_files:
                                 files.extend(run_procedure_to_files(
                                     {"name": step["name"], "params": run_params},
@@ -467,7 +474,7 @@ def run_report(report: Dict[str, Any], trigger_source: str,
                             sqltable_results.append(write_step_to_table(
                                 step["params"].get("sql", ""), None, sqltable_cfg,
                                 session_code, step.get("label") or step["name"],
-                                cancel_token=token))
+                                cancel_token=token, cleared=sqltable_cleared))
                         if want_files:
                             files.extend(run_query_to_files(
                                 step["params"].get("sql", ""), step["name"],

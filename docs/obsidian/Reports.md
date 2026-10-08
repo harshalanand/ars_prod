@@ -434,6 +434,18 @@ Some output columns are legally named `SESSION_ID` (e.g., `usp_ars_grid_report.S
 ### Cross-links
 [[Report Generation Hub]] · [[ARS Work Log]] · [[Data Model]]
 
+### Performance Results (2026-10-08) — The Headline
+
+**Report 104** (8 steps, 2.77M rows/run): **291.2s (4m51s) writing SQL tables + zero files**, vs **7m45s** when writing CSVs. The **server-side INSERT path is 3.2x faster** than streaming. Measured **0.045 ms/row** vs streaming's **0.200 ms/row** (on 446,717 rows: 20.0s vs 89.3s write time).
+
+**Major finding:** The 291.2s run is **86% stored-proc execution**, not delivery. Bottleneck = **395 GB ARS_LISTING_WORKING_HISTORY table (14x buffer pool)**. Page Life Expectancy = 103 seconds; nothing stays cached. **Proc tuning won't help; trimming retention** ([[project_rep_data_30day_purge]]) **is where the gains live.**
+
+Per-step: USP_PARK_TEMP 109.6s (446k rows), ALLRDC grid RNG_SEG 103.9s (675k), MERGE_RNG_SEG 70.5s, M_YARN_02 57.6s, ALLRDC grid 29.3s, VAR_ART 19.5s, MSA 5.4s, Fresh 2.4s. Four ALLRDC calls = 261s (66% of run).
+
+**Cache warmth lesson:** I blamed ALLRDC's CTEs for 1.6x overhead (wrong — compared COLD ALLRDC vs WARM base). Fairly measured (both warm), ALLRDC costs 1.19-1.25x only. Always warm the cache before comparing two queries on HOPC866.
+
+---
+
 ## App modules (not stored procs)
 - [[UPC Store Tracking]] — store-opening lifecycle tracker (`/reports/upc-tracking`): opening-date & remarks/status history, live MBQ/stock/SLOC/FR by segment, dispatch-lead-based Bal Days / Repl Days / **D.GAP**, priority synced to the store master.
 

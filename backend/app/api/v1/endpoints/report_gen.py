@@ -46,7 +46,7 @@ class ReportBody(BaseModel):
     name: str
     description: Optional[str] = None
     steps: List[ReportStep] = Field(default_factory=list)
-    output_type: str = Field("folder", pattern="^(folder|snowflake|both|email)$")
+    output_type: str = Field("folder", pattern="^(folder|snowflake|both|email|sqltable|none)$")
     base_dir: Optional[str] = None
     file_format: str = Field("csv", pattern="^(csv|xlsx)$")
     folder_per_run: bool = True      # False = reuse one <base>/data folder
@@ -119,11 +119,23 @@ def _validate_trigger(body: ReportBody) -> None:
 
 
 def _validate_output(body: ReportBody) -> None:
-    if body.output_type == "email":
-        em = body.email_config or {}
-        if not em.get("enabled") or not (em.get("to") or em.get("cc") or em.get("bcc")):
-            raise HTTPException(400, "Email-only output needs email enabled with at least "
-                                     "one recipient")
+    """Destinations: folder | snowflake | both | sqltable, or none at all.
+    'email' is the legacy value for email-only; 'none' means no file/table
+    destination, which is valid as long as some channel will carry the result."""
+    em = body.email_config or {}
+    has_email = bool(em.get("enabled")
+                     and (em.get("to") or em.get("cc") or em.get("bcc")))
+    if body.output_type == "email" and not has_email:
+        raise HTTPException(400, "Email-only output needs email enabled with at least "
+                                 "one recipient")
+    if body.output_type == "sqltable" and not (body.sqltable_config or {}).get("enabled"):
+        raise HTTPException(400, "SQL Table output needs the SQL Table destination configured")
+    if body.output_type == "none":
+        wa = bool((body.whatsapp_config or {}).get("enabled"))
+        sms = bool((body.sms_config or {}).get("enabled"))
+        if not (has_email or wa or sms):
+            raise HTTPException(400, "Nothing to deliver to — pick Folder, Snowflake or "
+                                     "SQL Table, or enable Email / WhatsApp / SMS")
 
 
 def _next_run_for(body: ReportBody):
