@@ -159,13 +159,18 @@ def _ensure_table(conn, schema: str, table: str, description,
     if not existing:
         defs = ", ".join(
             f"{_qname(n)} {_sql_type(d)} NULL" for n, d in zip(uniq, description))
+        # The stamp columns are created ONLY when stamping is on. Creating them
+        # unconditionally collided with a result set that has its own SESSION_ID
+        # (usp_ars_grid_report does), because resolve_data_columns only reserves
+        # those names when stamp is True.
+        head = (f"{_qname(SESSION_COL)} NVARCHAR(100) NULL, "
+                f"{_qname(RUNAT_COL)} DATETIME2 NULL, ") if stamp else ""
         conn.execute(
-            f"CREATE TABLE {_qname(schema)}.{_qname(table)} ("
-            f"{_qname(SESSION_COL)} NVARCHAR(100) NULL, "
-            f"{_qname(RUNAT_COL)} DATETIME2 NULL, {defs})")
-        conn.execute(
-            f"CREATE INDEX {_qname('IX_' + table + '_SESSION')} "
-            f"ON {_qname(schema)}.{_qname(table)} ({_qname(SESSION_COL)}, {_qname(RUNAT_COL)})")
+            f"CREATE TABLE {_qname(schema)}.{_qname(table)} ({head}{defs})")
+        if stamp:
+            conn.execute(
+                f"CREATE INDEX {_qname('IX_' + table + '_SESSION')} "
+                f"ON {_qname(schema)}.{_qname(table)} ({_qname(SESSION_COL)}, {_qname(RUNAT_COL)})")
         logger.info(f"[sql_table] created {schema}.{table} with {len(uniq)} data column(s)")
     else:
         for n, d in zip(uniq, description):
@@ -190,10 +195,13 @@ def _ensure_table(conn, schema: str, table: str, description,
                         f"ALTER COLUMN {_qname(n)} {newt} NULL")
                     logger.info(f"[sql_table] {schema}.{table}: widened {n} "
                                 f"{cur_type}({cur_len}) -> {newt}")
-        for stamp, ddl in ((SESSION_COL, "NVARCHAR(100)"), (RUNAT_COL, "DATETIME2")):
-            if stamp not in existing:
-                conn.execute(
-                    f"ALTER TABLE {_qname(schema)}.{_qname(table)} ADD {_qname(stamp)} {ddl} NULL")
+        # Add the stamp columns to a pre-existing table only when stamping is on.
+        # (The loop variable used to be called `stamp`, shadowing the parameter.)
+        if stamp:
+            for scol, ddl in ((SESSION_COL, "NVARCHAR(100)"), (RUNAT_COL, "DATETIME2")):
+                if scol not in existing:
+                    conn.execute(
+                        f"ALTER TABLE {_qname(schema)}.{_qname(table)} ADD {_qname(scol)} {ddl} NULL")
     return uniq
 
 
