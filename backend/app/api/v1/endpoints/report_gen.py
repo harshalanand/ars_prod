@@ -30,7 +30,7 @@ from app.services.report_scheduler_service import (
 router = APIRouter(prefix="/report-gen", tags=["Report Generation"])
 
 _JSON_COLS = ("STEPS", "SCHEDULE_CONFIG", "SNOWFLAKE_CONFIG", "SPLIT_CONFIG",
-              "EMAIL_CONFIG", "WHATSAPP_CONFIG", "SMS_CONFIG")
+              "EMAIL_CONFIG", "WHATSAPP_CONFIG", "SMS_CONFIG", "SQLTABLE_CONFIG")
 _RUN_JSON_COLS = ("FILES", "ERRORS")
 
 
@@ -55,6 +55,7 @@ class ReportBody(BaseModel):
     email_config: Optional[Dict[str, Any]] = None
     whatsapp_config: Optional[Dict[str, Any]] = None
     sms_config: Optional[Dict[str, Any]] = None
+    sqltable_config: Optional[Dict[str, Any]] = None
     trigger_type: str = Field("manual", pattern="^(schedule|event|manual)$")
     schedule_config: Optional[Dict[str, Any]] = None
     trigger_event: Optional[str] = None
@@ -165,10 +166,10 @@ def create_report(body: ReportBody, current_user: User = Depends(get_current_use
         row = conn.execute(text(f"""
             INSERT INTO {REPORTS_TABLE}
                 (NAME, DESCRIPTION, STEPS, OUTPUT_TYPE, BASE_DIR, FILE_FORMAT,
-                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, WHATSAPP_CONFIG, SMS_CONFIG,
+                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, WHATSAPP_CONFIG, SMS_CONFIG, SQLTABLE_CONFIG,
                  FOLDER_PER_RUN, TRIGGER_TYPE, SCHEDULE_CONFIG, TRIGGER_EVENT, ENABLED, NEXT_RUN_AT, CREATED_BY)
             OUTPUT inserted.REPORT_ID
-            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :wa, :sms, :fpr,
+            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :wa, :sms, :sqlt, :fpr,
                     :ttype, :sched, :tev, :en, :nr, :cb)
         """), {
             "name": body.name, "desc": body.description,
@@ -180,6 +181,7 @@ def create_report(body: ReportBody, current_user: User = Depends(get_current_use
             "email": json.dumps(body.email_config) if body.email_config else None,
             "wa": json.dumps(body.whatsapp_config) if body.whatsapp_config else None,
             "sms": json.dumps(body.sms_config) if body.sms_config else None,
+            "sqlt": json.dumps(body.sqltable_config) if body.sqltable_config else None,
             "ttype": body.trigger_type,
             "sched": json.dumps(body.schedule_config) if body.schedule_config else None,
             "tev": body.trigger_event, "en": 1 if body.enabled else 0,
@@ -202,7 +204,7 @@ def update_report(report_id: int, body: ReportBody,
             UPDATE {REPORTS_TABLE} SET
                 NAME=:name, DESCRIPTION=:desc, STEPS=:steps, OUTPUT_TYPE=:otype,
                 BASE_DIR=:bdir, FILE_FORMAT=:fmt, SNOWFLAKE_CONFIG=:sf,
-                SPLIT_CONFIG=:split, EMAIL_CONFIG=:email, WHATSAPP_CONFIG=:wa, SMS_CONFIG=:sms,
+                SPLIT_CONFIG=:split, EMAIL_CONFIG=:email, WHATSAPP_CONFIG=:wa, SMS_CONFIG=:sms, SQLTABLE_CONFIG=:sqlt,
                 FOLDER_PER_RUN=:fpr,
                 TRIGGER_TYPE=:ttype, SCHEDULE_CONFIG=:sched, TRIGGER_EVENT=:tev,
                 ENABLED=:en, NEXT_RUN_AT=:nr, UPDATED_AT=SYSDATETIME()
@@ -217,6 +219,7 @@ def update_report(report_id: int, body: ReportBody,
             "email": json.dumps(body.email_config) if body.email_config else None,
             "wa": json.dumps(body.whatsapp_config) if body.whatsapp_config else None,
             "sms": json.dumps(body.sms_config) if body.sms_config else None,
+            "sqlt": json.dumps(body.sqltable_config) if body.sqltable_config else None,
             "ttype": body.trigger_type,
             "sched": json.dumps(body.schedule_config) if body.schedule_config else None,
             "tev": body.trigger_event, "en": 1 if body.enabled else 0,
@@ -281,11 +284,11 @@ def duplicate_report(report_id: int, current_user: User = Depends(get_current_us
         new = conn.execute(text(f"""
             INSERT INTO {REPORTS_TABLE}
                 (NAME, DESCRIPTION, STEPS, OUTPUT_TYPE, BASE_DIR, FILE_FORMAT,
-                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, WHATSAPP_CONFIG, SMS_CONFIG,
+                 SNOWFLAKE_CONFIG, SPLIT_CONFIG, EMAIL_CONFIG, WHATSAPP_CONFIG, SMS_CONFIG, SQLTABLE_CONFIG,
                  FOLDER_PER_RUN, TRIGGER_TYPE, SCHEDULE_CONFIG, TRIGGER_EVENT, ENABLED,
                  NEXT_RUN_AT, CREATED_BY)
             OUTPUT inserted.REPORT_ID
-            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :wa, :sms,
+            VALUES (:name, :desc, :steps, :otype, :bdir, :fmt, :sf, :split, :email, :wa, :sms, :sqlt,
                     :fpr, 'manual', NULL, NULL, 0, NULL, :cb)
         """), {
             "name": new_name, "desc": d.get("DESCRIPTION"),
@@ -293,7 +296,8 @@ def duplicate_report(report_id: int, current_user: User = Depends(get_current_us
             "bdir": d.get("BASE_DIR"), "fmt": d.get("FILE_FORMAT"),
             "sf": d.get("SNOWFLAKE_CONFIG"), "split": d.get("SPLIT_CONFIG"),
             "email": d.get("EMAIL_CONFIG"), "wa": d.get("WHATSAPP_CONFIG"),
-            "sms": d.get("SMS_CONFIG"), "fpr": d.get("FOLDER_PER_RUN", 1),
+            "sms": d.get("SMS_CONFIG"), "sqlt": d.get("SQLTABLE_CONFIG"),
+            "fpr": d.get("FOLDER_PER_RUN", 1),
             "cb": getattr(current_user, "username", None),
         }).fetchone()
     logger.info(f"[report-gen] duplicated report {report_id} → {new[0]} '{new_name}'")

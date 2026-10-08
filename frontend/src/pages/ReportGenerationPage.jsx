@@ -12,7 +12,7 @@ import {
   FileText, RefreshCw, Plus, Play, Trash2, Pencil, Clock, Link2,
   MousePointerClick, X, CheckCircle, AlertTriangle, Loader2, ChevronDown, GripVertical,
   Mail, Scissors, CalendarClock, Zap, Hand, LayoutList, FolderOutput, Database,
-  Square, MessageCircle, MessageSquare, Copy, Info, SlidersHorizontal,
+  Square, MessageCircle, MessageSquare, Copy, Info, SlidersHorizontal, Table2,
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 
@@ -33,6 +33,10 @@ const EMPTY_FORM = {
   snowflake_config: { database: '', schema: '', warehouse: '', direct: false, cleanup_after_upload: true, targets: [] },
   whatsapp_config: { enabled: false, to: [], message: 'Report {report} is ready — {rows} rows.', attach: true, attach_format: 'xlsx', template: '' },
   sms_config: { enabled: false, to: [], message: 'ARS {report}: {status}, {rows} rows on {when}' },
+  sqltable_config: {
+    enabled: false, schema: 'dbo', table_prefix: 'ARS_RPT_',
+    retention_days: 5, add_session_col: true, skip_files: true,
+  },
 }
 
 const statusColor = (s) => ({
@@ -205,6 +209,7 @@ export default function ReportGenerationPage() {
       snowflake_config: r.SNOWFLAKE_CONFIG || { ...EMPTY_FORM.snowflake_config },
       whatsapp_config: r.WHATSAPP_CONFIG || { ...EMPTY_FORM.whatsapp_config },
       sms_config: r.SMS_CONFIG || { ...EMPTY_FORM.sms_config },
+      sqltable_config: { ...EMPTY_FORM.sqltable_config, ...(r.SQLTABLE_CONFIG || {}), skip_files: true },
     })
     // The form opens in a popup — no scrolling needed.
   }
@@ -245,6 +250,8 @@ export default function ReportGenerationPage() {
       snowflake_config: ['snowflake', 'both'].includes(form.output_type) ? form.snowflake_config : null,
       whatsapp_config: form.whatsapp_config?.enabled ? form.whatsapp_config : null,
       sms_config: form.sms_config?.enabled ? form.sms_config : null,
+      sqltable_config: form.sqltable_config?.enabled
+        ? { ...form.sqltable_config, skip_files: true } : null,
     }
     try {
       if (form.report_id) { await reportGenAPI.update(form.report_id, body); toast.success('Report updated') }
@@ -583,6 +590,7 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
   const setEmail = (k, v) => setForm(f => ({ ...f, email_config: { ...f.email_config, [k]: v } }))
   const setWa = (k, v) => setForm(f => ({ ...f, whatsapp_config: { ...f.whatsapp_config, [k]: v } }))
   const setSms = (k, v) => setForm(f => ({ ...f, sms_config: { ...f.sms_config, [k]: v } }))
+  const setSqlT = (k, v) => setForm(f => ({ ...f, sqltable_config: { ...f.sqltable_config, [k]: v } }))
   const setSnow = (k, v) => setForm(f => ({ ...f, snowflake_config: { ...f.snowflake_config, [k]: v } }))
   const parseAddrs = (s) => s.split(/[,;]/).map(x => x.trim()).filter(Boolean)
   const sc = form.schedule_config || {}
@@ -602,8 +610,15 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
   const sms = form.sms_config || {}
   const dWa = !!wa.enabled
   const dSms = !!sms.enabled
-  const setDeliver = (folder, snow) =>
-    set('output_type', folder && snow ? 'both' : snow ? 'snowflake' : folder ? 'folder' : 'email')
+  const sqlt = form.sqltable_config || {}
+  const dSqlT = !!sqlt.enabled
+  // Folder / Snowflake / SQL Table are MUTUALLY EXCLUSIVE — exactly one primary
+  // destination. Email / WhatsApp / SMS stay independent notification channels.
+  const pickDest = (dest) => setForm(f => ({
+    ...f,
+    output_type: dest === 'snowflake' ? 'snowflake' : 'folder',
+    sqltable_config: { ...f.sqltable_config, enabled: dest === 'sqltable', skip_files: true },
+  }))
   const [showQuery, setShowQuery] = useState(false)
   const [qName, setQName] = useState('')
   const [qSql, setQSql] = useState('')
@@ -870,13 +885,19 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
         </div>
       )}
 
-      {/* Deliver to — combine any of folder / snowflake / email */}
+      {/* Destination — exactly ONE of Folder / Snowflake / SQL Table.
+          Email / WhatsApp / SMS are separate notification channels. */}
       <label style={lbl}>Deliver to</label>
+      <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 6 }}>
+        Pick one destination. Email, WhatsApp and SMS can be added on top of it.
+      </div>
       <div style={{ display: 'flex', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
-        <DeliverChip active={dFolder} icon={<FolderOutput size={14} />} label="Folder"
-          onClick={() => setDeliver(!dFolder, dSnow)} />
-        <DeliverChip active={dSnow} icon={<Database size={14} />} label="Snowflake"
-          onClick={() => setDeliver(dFolder, !dSnow)} />
+        <DeliverChip active={dFolder && !dSqlT} icon={<FolderOutput size={14} />} label="Folder"
+          onClick={() => pickDest('folder')} />
+        <DeliverChip active={dSnow && !dSqlT} icon={<Database size={14} />} label="Snowflake"
+          onClick={() => pickDest('snowflake')} />
+        <DeliverChip active={dSqlT} icon={<Table2 size={14} />} label="SQL Table"
+          onClick={() => pickDest('sqltable')} />
         <DeliverChip active={dEmail} icon={<Mail size={14} />} label="Email"
           onClick={() => setEmail('enabled', !dEmail)} />
         <DeliverChip active={dWa} icon={<MessageCircle size={14} />} label="WhatsApp"
@@ -884,6 +905,39 @@ function ReportForm({ form, setForm, codeSteps, events, procs, newProc, setNewPr
         <DeliverChip active={dSms} icon={<MessageSquare size={14} />} label="SMS"
           onClick={() => setSms('enabled', !dSms)} />
       </div>
+
+      {/* SQL-table destination — the result set goes ONLY here, no files */}
+      {dSqlT && (
+        <div style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: 12,
+                      marginBottom: 14, background: '#f8fafc' }}>
+          <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 10 }}>
+            Each step is appended to its own table, one table per step, named
+            <b> prefix + step output name</b>. Every row is stamped with <code>SESSION_ID</code> and
+            <code> RUN_AT</code>. The table is created on the first run and new columns are added
+            automatically, so reports whose columns vary by run keep working.
+            <b> No files are written</b> — that is the point of this destination.
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <Field label="Schema">
+              <input value={sqlt.schema || ''} onChange={e => setSqlT('schema', e.target.value)}
+                     placeholder="dbo" style={{ ...inp, width: 110 }} />
+            </Field>
+            <Field label="Table prefix">
+              <input value={sqlt.table_prefix || ''} onChange={e => setSqlT('table_prefix', e.target.value)}
+                     placeholder="ARS_RPT_" style={{ ...inp, width: 170, fontFamily: 'monospace' }} />
+            </Field>
+            <Field label="Keep days (0 = forever)">
+              <input type="number" min="0" value={sqlt.retention_days ?? 5}
+                     onChange={e => setSqlT('retention_days', Number(e.target.value))}
+                     style={{ ...inp, width: 140 }} />
+            </Field>
+          </div>
+          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>
+            After each append, rows older than the keep-days window are deleted so the table
+            does not grow without bound. Set 0 to keep everything.
+          </div>
+        </div>
+      )}
       {!dFolder && !dSnow && dEmail && (
         <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 12 }}>
           Email only — files are generated just to build the attachment, not kept.

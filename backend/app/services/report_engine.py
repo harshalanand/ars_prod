@@ -26,12 +26,14 @@ from app.database.session import get_data_engine
 from app.services.data_export_service import (
     make_session_dir,
     fanout_param_runs,
+    build_procedure_call,
     run_procedure_to_files,
     run_query_to_files,
     cleanup_old_run_folders,
     assert_free_space,
     DEFAULT_BASE_DIR,
 )
+from app.services.sql_table_export import write_step_to_table
 from app.services.report_code_steps import StepContext, run_code_step
 
 REPORTS_TABLE = "ARS_REPORTS"
@@ -354,6 +356,19 @@ def run_report(report: Dict[str, Any], trigger_source: str,
 
     # DIRECT Snowflake mode: for a snowflake-ONLY report (unless direct=false),
     # stream each step straight from SQL Server into Snowflake with NO CSV export.
+    # SQL-table delivery. Folder / Snowflake / SQL Table are mutually exclusive
+    # in the UI, so selecting the table means the result set goes ONLY there —
+    # no CSV is written, which is the whole point for "when a process completes"
+    # reports. Files are still produced if a messaging channel needs an
+    # attachment, otherwise the export step is skipped entirely.
+    _sqlt = _parse_json(report.get("SQLTABLE_CONFIG")) or {}
+    sqltable_cfg = _sqlt if _sqlt.get("enabled") else None
+    sqltable_results: List[Dict[str, Any]] = []
+    _msg_wants_files = any(
+        (_parse_json(report.get(k)) or {}).get("enabled")
+        for k in ("EMAIL_CONFIG", "WHATSAPP_CONFIG", "SMS_CONFIG"))
+    want_files = (not sqltable_cfg) or _msg_wants_files
+
     sf_cfg = _parse_json(report.get("SNOWFLAKE_CONFIG")) or {}
     # Default = the fast CSV pipeline (write CSV → upload). 'direct' (stream with
     # no CSV) is OPT-IN — it's slower because it processes rows in Python instead
@@ -431,17 +446,33 @@ def run_report(report: Dict[str, Any], trigger_source: str,
                                 cancelled = True
                                 break
                             sfx = "_".join([p for p in (fo_sfx, event_suffix) if p]) or None
-                            files.extend(run_procedure_to_files(
-                                {"name": step["name"], "params": run_params},
-                                export_dir, file_format, split_config, cancel_token=token,
-                                output_name=step.get("label"), name_suffix=sfx))
+                            if sqltable_cfg:
+                                # Append straight into the managed table. A fanned-out
+                                # step writes each value to its own table.
+                                sql_c, vals_c = build_procedure_call(
+                                    {"name": step["name"], "params": run_params})
+                                sqltable_results.append(write_step_to_table(
+                                    sql_c, vals_c, sqltable_cfg, session_code,
+                                    "_".join([p for p in (step.get("label") or step["name"], fo_sfx) if p]),
+                                    cancel_token=token))
+                            if want_files:
+                                files.extend(run_procedure_to_files(
+                                    {"name": step["name"], "params": run_params},
+                                    export_dir, file_format, split_config, cancel_token=token,
+                                    output_name=step.get("label"), name_suffix=sfx))
                     elif step["type"] == "query":
                         # Raw read-only SQL pasted into the report. step["name"] is
                         # the output file label; the SQL lives in params.sql.
-                        files.extend(run_query_to_files(
-                            step["params"].get("sql", ""), step["name"],
-                            export_dir, file_format, split_config, cancel_token=token,
-                            name_suffix=event_suffix))
+                        if sqltable_cfg:
+                            sqltable_results.append(write_step_to_table(
+                                step["params"].get("sql", ""), None, sqltable_cfg,
+                                session_code, step.get("label") or step["name"],
+                                cancel_token=token))
+                        if want_files:
+                            files.extend(run_query_to_files(
+                                step["params"].get("sql", ""), step["name"],
+                                export_dir, file_format, split_config, cancel_token=token,
+                                name_suffix=event_suffix))
                     else:  # code
                         ctx = StepContext(
                             session_code=session_code, export_dir=export_dir,
@@ -583,4 +614,5 @@ def run_report(report: Dict[str, Any], trigger_source: str,
     return {"run_id": run_id, "report_id": report_id,
             "session_code": session_code, "export_dir": export_dir,
             "status": db_status, "files": files, "errors": errors,
+            "sql_tables": sqltable_results,
             "duration_ms": duration_ms}

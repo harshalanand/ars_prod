@@ -1,72 +1,5 @@
-/* ============================================================================
-   usp_ars_msa_master — MSA master (opening vs closing) reconciliation,
-   rolled up to any @Level, optionally as an ORDERED SEQUENCE OF STEPS.
 
-   Detail grain (finest) = (RDC, SEG, DIV, SUB_DIV, MAJ_CAT, GEN_ART_NUMBER, CLR,
-     ARTICLE_NUMBER, PAK_SZ, SZ, FAB-MVGR-1, FAB-MVGR-2, RNG_SEG, ALLOC_TYPE).
-   All measures are additive, so higher levels just SUM the detail rows.
-
-   Params
-     @Level : report grain. Levels (see dbo.vw_ars_msa_master_levels, or run
-              @Level='LIST'):  DETAIL > ARTICLE > GEN_CLR > MAJ_CAT > RDC.
-              @Level='LIST' (or '?' / 'HELP') returns the level catalogue.
-              *** SEQUENCE / STEPS ***  @Level may also be a COMMA LIST that runs
-              each level IN ORDER, returned as ONE combined grid (summary->detail):
-                  @Level = N'RDC,MAJ_CAT,GEN_CLR,DETAIL'
-              Every row carries leading STEP (1..n) + LEVEL columns; a column that
-              a level does not use is NULL on that step's rows. Rows are ordered
-              by STEP then by key, so the steps read top-to-bottom in order.
-     @SESSION_ID : opening session (default = latest ARS_LISTING_HISTORY)
-     @RDC, @MAJ_CAT : optional filters
-
-   Zero rows: line items whose every quantity column sums to 0 are dropped.
-
-   Sources / column map:
-     opening  = ARS_MSA_TOTAL_HISTORY (session)   closing = ARS_MSA_TOTAL (live)
-     movement = ARS_ALLOC_HISTORY (session, summed over RDC stores)
-     FAB-MVGR = vw_master_product (M_YARN_02, WEAVE_2 per ARTICLE_NUMBER)
-     V02 BEFORE ALC = V02_FRESH (FRESH rows) / V02_GRT (GRT rows)
-     PEND INT / HOLD INT / OP MSA-Q USE IN ALC = opening PEND_QTY / HOLD_QTY / FNL_Q
-     ALC-Q / TD-ALC FROM HOLD_Q / TD-HOLD ALC-Q = alloc SUM(ALLOC_QTY/FROM_HOLD_QTY/HOLD_QTY)
-     PEND AFT ALC / HOLD AFT ALC / REM MSA-Q = closing PEND_QTY / HOLD_QTY / FNL_Q
-
-   Examples
-     EXEC dbo.usp_ars_msa_master @Level=N'LIST';
-     EXEC dbo.usp_ars_msa_master @Level=N'GEN_CLR', @RDC=N'DW01', @MAJ_CAT=N'M_JEANS';
-     EXEC dbo.usp_ars_msa_master @Level=N'RDC,MAJ_CAT,GEN_CLR,DETAIL', @RDC=N'DW01';
-   ============================================================================ */
-
--- ---------------------------------------------------------------------------
--- Level catalogue — single source of truth for @Level.  Drives both the proc
--- (KEY_COLS) and the discoverable list (@Level='LIST').  Add a level = add a row.
--- ---------------------------------------------------------------------------
-CREATE OR ALTER VIEW dbo.vw_ars_msa_master_levels AS
-SELECT SORT_ORDER, LEVEL_CODE, LEVEL_NAME, GRAIN, [DESCRIPTION], KEY_COLS
-FROM (VALUES
- (1, N'DETAIL',  N'Article + Size',
-     N'RDC · SEG · DIV · SUB_DIV · MAJ_CAT · GEN_ART · CLR · ARTICLE_NUMBER · PAK_SZ · SZ · RNG_SEG · ALLOC_TYPE',
-     N'Finest grain — one row per variant article, size and pool (FRESH/GRT). Full attributes incl. FAB-MVGR.',
-     N'RDC, SEG, DIV, SUB_DIV, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER, PAK_SZ, SZ, FAB_MVGR_1, FAB_MVGR_2, RNG_SEG, ALLOC_TYPE'),
- (2, N'ARTICLE', N'Article (sizes merged)',
-     N'RDC · SEG · DIV · SUB_DIV · MAJ_CAT · GEN_ART · CLR · ARTICLE_NUMBER · PAK_SZ · RNG_SEG · ALLOC_TYPE',
-     N'One row per variant article and pool; sizes collapsed. Keeps article attributes (FAB-MVGR, RNG_SEG).',
-     N'RDC, SEG, DIV, SUB_DIV, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER, PAK_SZ, FAB_MVGR_1, FAB_MVGR_2, RNG_SEG, ALLOC_TYPE'),
- (3, N'GEN_CLR', N'Gen-Article + Colour',
-     N'RDC · SEG · DIV · SUB_DIV · MAJ_CAT · GEN_ART · CLR',
-     N'One row per RDC + category + generic article + colour (the OPT grain). FRESH/GRT pools combined.',
-     N'RDC, SEG, DIV, SUB_DIV, MAJ_CAT, GEN_ART_NUMBER, CLR'),
- (4, N'MAJ_CAT', N'Major Category',
-     N'RDC · SEG · DIV · SUB_DIV · MAJ_CAT',
-     N'One row per RDC + major category. Category-level opening vs closing summary.',
-     N'RDC, SEG, DIV, SUB_DIV, MAJ_CAT'),
- (5, N'RDC',     N'RDC (grand total)',
-     N'RDC',
-     N'One row per RDC — highest-level rollup.',
-     N'RDC')
-) v(SORT_ORDER, LEVEL_CODE, LEVEL_NAME, GRAIN, [DESCRIPTION], KEY_COLS);
-GO
-
-CREATE OR ALTER PROCEDURE dbo.usp_ars_msa_master
+CREATE OR ALTER PROCEDURE dbo.ALLRDC_usp_ars_msa_master
     @Level      NVARCHAR(200) = N'DETAIL',
     @SESSION_ID NVARCHAR(50)  = NULL,
     @RDC        NVARCHAR(50)  = NULL,
@@ -158,6 +91,47 @@ UNION ALL
     END
 
     ------------------------------------------------------------------ assemble + run once
+    /* ---- allocation movement, attributed to the SOURCING RDC ----------------
+       ALC_Q / TD_HOLD_ALC_Q come from ARS_ALLOC_RDC_SPLIT_HISTORY keyed on
+       SRC_RDC (the RDC the stock actually shipped FROM) rather than the store's
+       connected RDC. Cross-RDC supply is routine in ARS, so store-RDC
+       attribution depletes the wrong pool AND loses every allocation whose
+       store RDC has no matching MSA grain.
+
+       ARS_ALLOC_RDC_SPLIT_HISTORY is written by rdc_split_service.py on the
+       feat/central-rdc-pool branch, which is NOT merged into ars_v2. It exists
+       on PROD but not everywhere, so fall back to ARS_ALLOC_HISTORY when it is
+       absent -- otherwise this proc dies with "Invalid object name".
+
+       TD_ALC_FROM_HOLD_Q always comes from ARS_ALLOC_HISTORY: the split table
+       carries SHIP_QTY and HOLD_QTY but NOT FROM_HOLD_QTY. When that column is
+       added, fold alloc_fh into alloc and drop it.                           */
+    DECLARE @allocCTE NVARCHAR(MAX) =
+      CASE WHEN OBJECT_ID('dbo.ARS_ALLOC_RDC_SPLIT_HISTORY') IS NOT NULL THEN
+        N'alloc AS (                       -- SOURCING RDC (split table)
+    SELECT SRC_RDC AS RDC, VAR_ART, SZ, ALLOC_TYPE,
+           SUM(ISNULL(SHIP_QTY,0)) AS ALC_Q, SUM(ISNULL(HOLD_QTY,0)) AS TD_HOLD_ALC_Q
+    FROM ARS_ALLOC_RDC_SPLIT_HISTORY WITH (NOLOCK)
+    WHERE SESSION_ID=@pSid AND (@pRDC IS NULL OR SRC_RDC=@pRDC) AND (@pMC IS NULL OR MAJ_CAT=@pMC)
+    GROUP BY SRC_RDC, VAR_ART, SZ, ALLOC_TYPE
+)'
+      ELSE
+        N'alloc AS (                       -- FALLBACK: no split table, store-RDC attribution
+    SELECT RDC, VAR_ART, SZ, ALLOC_TYPE,
+           SUM(ISNULL(ALLOC_QTY,0)) AS ALC_Q, SUM(ISNULL(HOLD_QTY,0)) AS TD_HOLD_ALC_Q
+    FROM ARS_ALLOC_HISTORY WITH (NOLOCK)
+    WHERE SESSION_ID=@pSid AND (@pRDC IS NULL OR RDC=@pRDC) AND (@pMC IS NULL OR MAJ_CAT=@pMC)
+    GROUP BY RDC, VAR_ART, SZ, ALLOC_TYPE
+)' END
+      + N',
+alloc_fh AS (                        -- TD-ALC FROM HOLD_Q (no SRC_RDC available)
+    SELECT RDC, VAR_ART, SZ, ALLOC_TYPE,
+           SUM(ISNULL(FROM_HOLD_QTY,0)) AS TD_ALC_FROM_HOLD_Q
+    FROM ARS_ALLOC_HISTORY WITH (NOLOCK)
+    WHERE SESSION_ID=@pSid AND (@pRDC IS NULL OR RDC=@pRDC) AND (@pMC IS NULL OR MAJ_CAT=@pMC)
+    GROUP BY RDC, VAR_ART, SZ, ALLOC_TYPE
+)';
+
     DECLARE @sql NVARCHAR(MAX) = N'
 ;WITH pmap AS (                      -- article -> FAB-MVGR attrs (CAST bigint->nvarchar so join stays a hash join)
     SELECT CAST(ARTICLE_NUMBER AS NVARCHAR(50)) AS ARTICLE_NUMBER,
@@ -173,13 +147,7 @@ op AS (                              -- OPENING snapshot (session)
     WHERE SESSION_ID=@pSid AND (@pRDC IS NULL OR RDC=@pRDC) AND (@pMC IS NULL OR MAJ_CAT=@pMC)
     GROUP BY RDC, SEG, DIV, SUB_DIV, MAJ_CAT, GEN_ART_NUMBER, CLR, ARTICLE_NUMBER, PAK_SZ, SZ, RNG_SEG, ALLOC_TYPE
 ),
-alloc AS (                           -- movement this run, summed over RDC stores
-    SELECT RDC, VAR_ART, SZ, ALLOC_TYPE,
-           SUM(ISNULL(ALLOC_QTY,0)) AS ALC_Q, SUM(ISNULL(FROM_HOLD_QTY,0)) AS TD_ALC_FROM_HOLD_Q, SUM(ISNULL(HOLD_QTY,0)) AS TD_HOLD_ALC_Q
-    FROM ARS_ALLOC_HISTORY WITH (NOLOCK)
-    WHERE SESSION_ID=@pSid AND (@pRDC IS NULL OR RDC=@pRDC) AND (@pMC IS NULL OR MAJ_CAT=@pMC)
-    GROUP BY RDC, VAR_ART, SZ, ALLOC_TYPE
-),
+' + @allocCTE + N',
 cl AS (                              -- CLOSING / live MSA
     SELECT RDC, ARTICLE_NUMBER, SZ, ALLOC_TYPE,
            SUM(ISNULL(PEND_QTY,0)) AS PEND_AFT_ALC, SUM(ISNULL(HOLD_QTY,0)) AS HOLD_AFT_ALC, SUM(ISNULL(FNL_Q,0)) AS REM_MSA_Q
@@ -192,11 +160,12 @@ base AS (                            -- detail grain, all measures resolved
            pmap.M_YARN_02 AS FAB_MVGR_1, pmap.WEAVE_2 AS FAB_MVGR_2, op.RNG_SEG, op.ALLOC_TYPE,
            CASE WHEN op.ALLOC_TYPE=''GRT'' THEN op.V02_GRT ELSE op.V02_FRESH END AS V02_BEFORE_ALC,
            op.PEND_INT, op.HOLD_INT, op.OP_MSA_Q,
-           ISNULL(alloc.ALC_Q,0) AS ALC_Q, ISNULL(alloc.TD_ALC_FROM_HOLD_Q,0) AS TD_ALC_FROM_HOLD_Q, ISNULL(alloc.TD_HOLD_ALC_Q,0) AS TD_HOLD_ALC_Q,
+           ISNULL(alloc.ALC_Q,0) AS ALC_Q, ISNULL(alloc_fh.TD_ALC_FROM_HOLD_Q,0) AS TD_ALC_FROM_HOLD_Q, ISNULL(alloc.TD_HOLD_ALC_Q,0) AS TD_HOLD_ALC_Q,
            ISNULL(cl.PEND_AFT_ALC,0) AS PEND_AFT_ALC, ISNULL(cl.HOLD_AFT_ALC,0) AS HOLD_AFT_ALC, ISNULL(cl.REM_MSA_Q,0) AS REM_MSA_Q
     FROM op
     LEFT JOIN pmap  ON pmap.ARTICLE_NUMBER = op.ARTICLE_NUMBER
     LEFT JOIN alloc ON alloc.RDC=op.RDC AND alloc.VAR_ART=op.ARTICLE_NUMBER AND alloc.SZ=op.SZ AND alloc.ALLOC_TYPE=op.ALLOC_TYPE
+    LEFT JOIN alloc_fh ON alloc_fh.RDC=op.RDC AND alloc_fh.VAR_ART=op.ARTICLE_NUMBER AND alloc_fh.SZ=op.SZ AND alloc_fh.ALLOC_TYPE=op.ALLOC_TYPE
     LEFT JOIN cl    ON cl.RDC=op.RDC AND cl.ARTICLE_NUMBER=op.ARTICLE_NUMBER AND cl.SZ=op.SZ AND cl.ALLOC_TYPE=op.ALLOC_TYPE
 )
 ' + @unionAll + N'

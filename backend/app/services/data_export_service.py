@@ -757,6 +757,18 @@ def fanout_param_runs(
     return [(params, None)]
 
 
+def build_procedure_call(proc: Union[str, Dict[str, Any]]):
+    """Return (sql, values) for a procedure step — the same parameterised EXEC
+    that run_procedure_to_files uses. Exposed so SQL-table delivery can execute
+    the identical call without duplicating the normalisation/validation."""
+    normalized = _normalize_procedures([proc])[0]
+    name, params = normalized["name"], normalized["params"]
+    if params:
+        placeholders = ", ".join(f"@{p} = ?" for p in params)
+        return f"EXEC {name} {placeholders}", list(params.values())
+    return f"EXEC {name}", None
+
+
 def run_procedure_to_files(
     proc: Union[str, Dict[str, Any]],
     export_dir: str,
