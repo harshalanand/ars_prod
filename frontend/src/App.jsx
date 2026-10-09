@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { useEffect, Component, lazy, Suspense } from 'react'
 import useAuthStore from '@/store/authStore'
 import Layout from '@/components/layout/Layout'
+import { HomeRedirect } from '@/components/layout/ModuleGate'
 import FaConsBusyBar from '@/components/facons/FaConsBusyBar'
 
 // Eager-load: login (always needed on first paint)
@@ -168,7 +169,8 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-        <Route index element={<Navigate to="/ars-dashboard" replace />} />
+        {/* Home = first page the role can open (ARS Dashboard unless its module is off) */}
+        <Route index element={<HomeRedirect />} />
         {/* ARS Dashboard — unified allocation analytics (Overview/Drill/Date/Hold/Pending/Gap) */}
         <Route path="ars-dashboard" element={<ProtectedRoute permission="ALLOC_READ"><ErrorBoundary><ArsDashboardPage /></ErrorBoundary></ProtectedRoute>} />
         {/* Allocation Review — session-wise listing/alloc review from PARKED + HISTORY archives */}

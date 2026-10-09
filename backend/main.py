@@ -244,11 +244,33 @@ app.add_exception_handler(Exception, global_exception_handler)
 # Log 422 validation errors to terminal so we can debug
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+
+def _describe_validation_error(err: dict) -> str:
+    """One pydantic error -> 'Username must be at least 3 characters (entered 2)'."""
+    loc = [str(p) for p in err.get("loc", ()) if p not in ("body", "query", "path")]
+    field = loc[-1].replace("_", " ").capitalize() if loc else "Request"
+    ctx = err.get("ctx") or {}
+    value = err.get("input")
+    kind = err.get("type", "")
+    if kind == "missing":
+        return f"{field} is required"
+    if kind == "string_too_short":
+        got = f" (entered {len(value)})" if isinstance(value, str) else ""
+        return f"{field} must be at least {ctx.get('min_length')} characters{got}"
+    if kind == "string_too_long":
+        got = f" (entered {len(value)})" if isinstance(value, str) else ""
+        return f"{field} must be at most {ctx.get('max_length')} characters{got}"
+    return f"{field}: {err.get('msg', 'invalid value')}"
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
-    logger.error(f"422 Validation Error on {request.method} {request.url.path}: {exc.errors()}")
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    errors = exc.errors()
+    logger.error(f"422 Validation Error on {request.method} {request.url.path}: {errors}")
+    # `detail` is a readable sentence for toasts; raw pydantic list stays under `errors`.
+    detail = "; ".join(_describe_validation_error(e) for e in errors) or "Invalid request"
+    return JSONResponse(status_code=422, content={"detail": detail, "errors": jsonable_encoder(errors)})
 
 # ============================================================================
 # Routes

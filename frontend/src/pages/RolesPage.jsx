@@ -1,201 +1,193 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
-  Plus, Shield, Check, X, ChevronDown,
-  PackageCheck, Database, Cpu, BarChart3,
-  TrendingUp, Activity, ClipboardCheck, Settings,
+  Plus, Shield, Check, X, ChevronDown, Pencil, Trash2, EyeOff,
 } from 'lucide-react'
 import { rolesAPI } from '@/services/api'
 import toast from 'react-hot-toast'
+import { confirmDialog } from '@/components/ui/ConfirmDialog'
+import { navItems, SECTIONS, MODULE_ACTIONS } from '@/components/layout/navRegistry'
 
-// Mirrors sidebar menu sections exactly
-const MENU_SECTIONS = [
-  {
-    key: 'allocations',
-    label: 'Allocations',
-    icon: PackageCheck,
-    prefixes: ['ALLOC_'],
-  },
-  {
-    key: 'data_management',
-    label: 'Data Management',
-    icon: Database,
-    prefixes: ['DATA_', 'TABLE_', 'JOBS_'],
-  },
-  {
-    key: 'data_preparation',
-    label: 'Data Preparation',
-    icon: Cpu,
-    prefixes: ['MSA_', 'GRID_', 'LOOKUP_'],
-  },
-  {
-    key: 'contribution',
-    label: 'Contribution %',
-    icon: BarChart3,
-    prefixes: ['CONTRIB_'],
-  },
-  {
-    key: 'trends',
-    label: 'Trends',
-    icon: TrendingUp,
-    prefixes: ['TRENDS_'],
-  },
-  {
-    key: 'reports',
-    label: 'Reports',
-    icon: Activity,
-    prefixes: ['REPORT_', 'REPORTS_'],
-  },
-  {
-    key: 'data_validation',
-    label: 'Data Validation',
-    icon: ClipboardCheck,
-    prefixes: ['STORE_', 'CHECKLIST_'],
-  },
-  {
-    key: 'settings',
-    label: 'Settings & Admin',
-    icon: Settings,
-    prefixes: ['ADMIN_', 'COLUMN_', 'PRODUCT_'],
-  },
-]
-
+// Friendlier names for action permissions; everything else falls back to the
+// permission_name stored in rbac_permissions.
 const PERM_LABELS = {
-  // Allocations
-  ALLOC_READ: 'View Allocations',
   ALLOC_CREATE: 'Create Allocations',
   ALLOC_UPDATE: 'Edit Allocations',
   ALLOC_DELETE: 'Delete Allocations',
   ALLOC_APPROVE: 'Approve Allocations',
   ALLOC_EXECUTE: 'Execute Allocations',
-  // Data Management
-  DATA_VIEW: 'View Tables',
-  DATA_UPLOAD: 'Upload Data',
-  DATA_EXPORT: 'Export Data',
+  MSA_EXECUTE: 'Run MSA Calculation',
+  GRID_RUN: 'Run Grid Builder',
+  GRID_MANAGE: 'Manage Grid Builder',
+  BDC_VIEW: 'View BDC Creation',
+  BDC_EXECUTE: 'Execute BDC Creation',
+  TABLE_READ: 'Read Tables',
+  TABLE_DELETE: 'Delete Tables',
   DATA_EDIT: 'Edit Data',
   DATA_CHANGE_LOG_VIEW: 'View Change Log',
-  DATA_EDITOR: 'Data Editor',
-  TABLE_CREATE: 'Create Tables',
-  TABLE_ALTER: 'Alter / Manage Tables',
-  TABLE_DELETE: 'Delete Tables',
-  TABLE_READ: 'Read Tables',
-  JOBS_VIEW: 'Jobs Dashboard',
-  // Data Preparation
-  MSA_VIEW: 'MSA Stock Calculation',
-  GRID_VIEW: 'Grid Builder',
-  LOOKUP_VIEW: 'Lookup Art Master',
-  // Contribution %
-  CONTRIB_PRESETS: 'Manage Presets',
-  CONTRIB_MAPPINGS: 'Manage Mappings',
-  CONTRIB_EXECUTE: 'Execute Calculation',
-  CONTRIB_REVIEW: 'Review Results',
-  // Trends
-  TRENDS_DASHBOARD: 'View Dashboard',
-  TRENDS_UPLOAD: 'Upload Trends Data',
-  TRENDS_REVIEW: 'Review Trends',
-  // Reports
   REPORT_VIEW: 'View Reports',
   REPORT_EXPORT: 'Export Reports',
-  REPORTS_PEND_ALC: 'Pending Allocation Report',
-  // Data Validation
-  STORE_SLOC_VIEW: 'Store Sloc Validation',
-  CHECKLIST_VIEW: 'Data Checklist',
-  // Settings & Admin
-  ADMIN_SETTINGS: 'App Settings',
-  ADMIN_USERS_READ: 'View Users',
+  GET_DATA_RUN: 'Run Get Data Jobs',
+  GET_DATA_MANAGE: 'Manage Views & Jobs',
+  CHECKLIST_MANAGE: 'Manage Data Checklist',
   ADMIN_USERS_CREATE: 'Create Users',
   ADMIN_USERS_UPDATE: 'Edit Users',
   ADMIN_USERS_DELETE: 'Delete Users',
-  ADMIN_ROLES_MANAGE: 'Manage Roles & Permissions',
-  ADMIN_RLS_MANAGE: 'Row-Level Security',
-  ADMIN_AUDIT_READ: 'View Audit Log',
+  ADMIN_PERMS_MANAGE: 'Assign Permissions',
   COLUMN_EDIT_MANAGE: 'Column Restrictions',
-  PRODUCT_MANAGE: 'Manage Products',
   PRODUCT_READ: 'View Products',
+  PRODUCT_MANAGE: 'Manage Products',
+  MOD_BACKUP: 'Backup Manager',
 }
 
-function getLabel(code) {
-  return PERM_LABELS[code] || code.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase())
+// One card per sidebar FATHER MENU, built from the same registry the Sidebar
+// renders, so this page always matches what users actually see.
+const MODULES = [
+  ...navItems.map(i => ({
+    key: i.module || i.path, title: i.label, icon: i.icon, moduleCode: i.module, items: [i],
+  })),
+  ...SECTIONS.map(s => ({
+    key: s.permission || s.title, title: s.title, icon: s.icon, moduleCode: s.permission, items: s.items,
+  })),
+].map(m => ({ ...m, actions: MODULE_ACTIONS[m.moduleCode] || [] }))
+
+// Every grantable permission a module card controls (module switch + pages + actions)
+const moduleCodes = (m, available) => [...new Set([
+  m.moduleCode,
+  ...m.items.filter(i => !i.superadminOnly).map(i => i.permission),
+  ...m.actions,
+])].filter(c => c && available.has(c))
+
+function Switch({ on, onClick, title }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-pressed={on}
+      className={`w-9 h-5 rounded-full transition-colors shrink-0 relative ${on ? 'bg-primary-600' : 'bg-gray-300'}`}
+    >
+      <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${on ? 'left-4' : 'left-0.5'}`} />
+    </button>
+  )
 }
 
-function groupBySection(allCodes) {
-  const assigned = new Set()
-  const sections = MENU_SECTIONS.map(sec => {
-    const codes = allCodes.filter(c => sec.prefixes.some(p => c.startsWith(p)))
-    codes.forEach(c => assigned.add(c))
-    return { ...sec, codes }
-  })
-  const other = allCodes.filter(c => !assigned.has(c))
-  return { sections, other }
+function PermCheckbox({ code, label, sub, rolePerms, onToggle, dim }) {
+  const active = rolePerms.includes(code)
+  return (
+    <label className={`flex items-center gap-2.5 px-3 py-2 rounded-lg border cursor-pointer transition-colors select-none ${
+      active ? 'bg-primary-50 border-primary-300 text-primary-800' : 'bg-white border-gray-200 hover:border-gray-300 text-gray-600'
+    } ${dim ? 'opacity-60' : ''}`}>
+      <input type="checkbox" checked={active} onChange={() => onToggle(code)} className="rounded text-primary-600 shrink-0" />
+      <span className="min-w-0">
+        <span className="block text-xs font-medium leading-tight truncate">{label}</span>
+        {sub && <span className="block text-[10px] text-gray-400 leading-tight truncate">{sub}</span>}
+      </span>
+    </label>
+  )
 }
 
-// ── Section Accordion ─────────────────────────────────────────────────────────
-function PermSection({ section, rolePerms, onToggle }) {
-  const [open, setOpen] = useState(true)
-  const { codes, label, icon: Icon } = section
-
-  if (codes.length === 0) return null
-
+// ── Module card ───────────────────────────────────────────────────────────────
+function ModuleCard({ mod, open, onOpen, rolePerms, onToggle, onSetMany, available, permLabel }) {
+  const { title, icon: Icon, moduleCode, items, actions } = mod
+  const codes = moduleCodes(mod, available)
   const granted = codes.filter(c => rolePerms.includes(c)).length
-  const allGranted = granted === codes.length
-  const someGranted = granted > 0 && !allGranted
-
-  const toggleAll = (e) => {
-    e.stopPropagation()
-    if (allGranted) codes.forEach(c => rolePerms.includes(c) && onToggle(c))
-    else codes.forEach(c => !rolePerms.includes(c) && onToggle(c))
-  }
+  const hasSwitch = !!moduleCode && available.has(moduleCode)
+  const moduleOn = !hasSwitch || rolePerms.includes(moduleCode)
+  const allOn = codes.length > 0 && granted === codes.length
+  const actionCodes = actions.filter(c => available.has(c))
+  const seen = new Set() // a permission shared by two pages is one tick, shown on both
 
   return (
-    <div className="border border-gray-200 rounded-xl overflow-hidden">
-      {/* Section Header */}
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center gap-3 px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
+    <div className={`border rounded-xl overflow-hidden ${moduleOn ? 'border-gray-200' : 'border-dashed border-gray-300'}`}>
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onClick={onOpen}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen() } }}
+        className="w-full flex items-center gap-3 px-4 py-2.5 bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer"
       >
-        <div className="w-7 h-7 rounded-lg bg-primary-100 flex items-center justify-center shrink-0">
-          <Icon size={14} className="text-primary-600" />
+        <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${moduleOn ? 'bg-primary-100' : 'bg-gray-200'}`}>
+          <Icon size={14} className={moduleOn ? 'text-primary-600' : 'text-gray-400'} />
         </div>
-        <span className="flex-1 text-sm font-semibold text-gray-800">{label}</span>
+        <div className="flex-1 min-w-0">
+          <div className={`text-sm font-semibold truncate ${moduleOn ? 'text-gray-800' : 'text-gray-400'}`}>{title}</div>
+          <div className="text-[10px] text-gray-400">
+            {items.length > 0
+              ? `${items.length} menu page${items.length === 1 ? '' : 's'}`
+              : 'Not tied to a sidebar menu'}
+            {items.length > 0 && actionCodes.length > 0 && ` · ${actionCodes.length} action${actionCodes.length === 1 ? '' : 's'}`}
+            {!moduleOn && ' · hidden from sidebar'}
+          </div>
+        </div>
         <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${granted > 0 ? 'bg-primary-100 text-primary-700' : 'bg-gray-200 text-gray-500'}`}>
           {granted}/{codes.length}
         </span>
-        {/* Grant / Revoke All toggle */}
-        <div
-          role="button"
-          tabIndex={0}
-          onClick={toggleAll}
-          onKeyDown={e => e.key === 'Enter' && toggleAll(e)}
-          title={allGranted ? 'Revoke All' : 'Grant All'}
-          className={`w-9 h-5 rounded-full transition-colors shrink-0 relative ${allGranted ? 'bg-primary-600' : someGranted ? 'bg-primary-300' : 'bg-gray-300'}`}
-        >
-          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${allGranted ? 'left-4' : 'left-0.5'}`} />
-        </div>
+        {hasSwitch && (
+          <div className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
+            <span className="text-[10px] text-gray-500 hidden sm:inline">Module access</span>
+            <Switch on={moduleOn} onClick={() => onToggle(moduleCode)}
+                    title={moduleOn ? 'Hide this menu from the role' : 'Show this menu to the role'} />
+          </div>
+        )}
         <ChevronDown size={14} className={`text-gray-400 transition-transform shrink-0 ${open ? 'rotate-180' : ''}`} />
-      </button>
+      </div>
 
-      {/* Permission Checkboxes */}
       {open && (
-        <div className="p-3 grid grid-cols-2 gap-2 bg-white">
-          {codes.map(code => {
-            const active = rolePerms.includes(code)
-            return (
-              <label
-                key={code}
-                className={`flex items-center gap-2.5 px-3 py-2 rounded-lg border cursor-pointer transition-colors select-none ${
-                  active ? 'bg-primary-50 border-primary-300 text-primary-800' : 'bg-white border-gray-200 hover:border-gray-300 text-gray-600'
-                }`}
-              >
-                <input
-                  type="checkbox"
-                  checked={active}
-                  onChange={() => onToggle(code)}
-                  className="rounded text-primary-600 shrink-0"
-                />
-                <span className="text-xs font-medium leading-tight">{getLabel(code)}</span>
-              </label>
-            )
-          })}
+        <div className="p-3 space-y-3 bg-white">
+          {!moduleOn && (
+            <div className="flex items-center gap-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
+              <EyeOff size={13} className="shrink-0" />
+              Module access is off, so this menu is hidden for the role. The ticks below take effect once it is on.
+            </div>
+          )}
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+              {items.length > 0 ? 'Menu pages' : 'Permissions'}
+            </span>
+            {codes.length > 0 && (
+              <button type="button" onClick={() => onSetMany(codes, !allOn)}
+                      className="text-[11px] text-primary-600 hover:underline">
+                {allOn ? 'Clear all' : 'Grant all'}
+              </button>
+            )}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {items.map(item => {
+              const IIcon = item.icon
+              if (item.superadminOnly || !item.permission || !available.has(item.permission)) {
+                return (
+                  <div key={item.path} className="flex items-center gap-2.5 px-3 py-2 rounded-lg border border-gray-100 bg-gray-50/60 text-gray-500">
+                    <IIcon size={13} className="shrink-0 text-gray-400" />
+                    <span className="text-xs font-medium truncate flex-1">{item.label}</span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">
+                      {item.superadminOnly ? 'Super admin only' : 'Visible with module'}
+                    </span>
+                  </div>
+                )
+              }
+              const shared = seen.has(item.permission)
+              seen.add(item.permission)
+              return (
+                <PermCheckbox key={item.path} code={item.permission} label={item.label}
+                  sub={shared ? `${item.permission} · same tick as above` : item.permission}
+                  rolePerms={rolePerms} onToggle={onToggle} dim={!moduleOn} />
+              )
+            })}
+          </div>
+          {actionCodes.length > 0 && (
+            <>
+              {items.length > 0 && (
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-400 pt-1">Actions</div>
+              )}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {actionCodes.map(code => (
+                  <PermCheckbox key={code} code={code} label={permLabel(code)} sub={code}
+                    rolePerms={rolePerms} onToggle={onToggle} dim={!moduleOn} />
+                ))}
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -212,13 +204,37 @@ export default function RolesPage() {
   const [saving, setSaving] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
 
+  const [editRole, setEditRole] = useState(null)
+
   const load = async () => {
     setLoading(true)
     try {
       const [r, p] = await Promise.allSettled([rolesAPI.list(), rolesAPI.permissions()])
-      if (r.status === 'fulfilled') setRoles(r.value.data.data || [])
+      if (r.status === 'fulfilled') {
+        const list = r.value.data.data || []
+        setRoles(list)
+        // Keep the open role's name/description fresh after an edit
+        setSelectedRole(sel => (sel ? list.find(x => x.id === sel.id) || null : sel))
+      }
       if (p.status === 'fulfilled') setPermissions(p.value.data.data || [])
     } finally { setLoading(false) }
+  }
+
+  const deleteRole = async (role) => {
+    if (!await confirmDialog({
+      tone: 'danger',
+      title: `Delete role "${role.role_name}"?`,
+      body: 'Its permission assignments are removed too. This cannot be undone. '
+          + 'A role still assigned to users cannot be deleted.',
+      confirmLabel: 'Delete role',
+    })) return
+    try {
+      await rolesAPI.delete(role.id)
+      toast.success(`Role "${role.role_name}" deleted`)
+      setSelectedRole(null)
+      setRolePerms([])
+      load()
+    } catch { /* api interceptor already shows the reason */ }
   }
 
   useEffect(() => { load() }, [])
@@ -231,6 +247,16 @@ export default function RolesPage() {
   const togglePerm = (code) => {
     setRolePerms(rp => rp.includes(code) ? rp.filter(c => c !== code) : [...rp, code])
   }
+  const setMany = (codes, on) => {
+    setRolePerms(rp => on ? [...new Set([...rp, ...codes])] : rp.filter(c => !codes.includes(c)))
+  }
+
+  const [openMods, setOpenMods] = useState(() => new Set())
+  const toggleOpen = (key) => setOpenMods(s => {
+    const n = new Set(s)
+    n.has(key) ? n.delete(key) : n.add(key)
+    return n
+  })
 
   const savePerms = async () => {
     if (!selectedRole) return
@@ -244,8 +270,16 @@ export default function RolesPage() {
     } finally { setSaving(false) }
   }
 
-  const allCodes = permissions.map(p => p.permission_code || p)
-  const { sections, other } = groupBySection(allCodes)
+  const available = useMemo(() => new Set(permissions.map(p => p.permission_code || p)), [permissions])
+  const permNames = useMemo(
+    () => Object.fromEntries(permissions.map(p => [p.permission_code, p.permission_name])), [permissions])
+  const permLabel = (code) => PERM_LABELS[code] || permNames[code] || code
+  // Permissions no module card claims; listed last so nothing is ever unreachable
+  const otherCodes = useMemo(() => {
+    const placed = new Set(MODULES.flatMap(m => moduleCodes(m, available)))
+    return [...available].filter(c => !placed.has(c)).sort()
+  }, [available])
+  const modulesOn = MODULES.filter(m => !m.moduleCode || !available.has(m.moduleCode) || rolePerms.includes(m.moduleCode)).length
   const totalGranted = rolePerms.length
 
   return (
@@ -292,28 +326,62 @@ export default function RolesPage() {
               {selectedRole && (
                 <span className="text-xs text-gray-500 shrink-0">{totalGranted} granted</span>
               )}
+              {selectedRole?.is_system_role && (
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 shrink-0"
+                      title="Built-in roles can't be renamed or deleted">
+                  System role
+                </span>
+              )}
             </div>
             {selectedRole && (
-              <button onClick={savePerms} disabled={saving} className="btn-primary btn-sm shrink-0">
-                <Check size={14} /> {saving ? 'Saving...' : 'Save'}
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {!selectedRole.is_system_role && (
+                  <>
+                    <button onClick={() => setEditRole(selectedRole)} className="btn-secondary btn-sm">
+                      <Pencil size={14} /> Edit
+                    </button>
+                    <button onClick={() => deleteRole(selectedRole)}
+                            className="btn-secondary btn-sm text-red-600 hover:bg-red-50">
+                      <Trash2 size={14} /> Delete
+                    </button>
+                  </>
+                )}
+                <button onClick={savePerms} disabled={saving} className="btn-primary btn-sm">
+                  <Check size={14} /> {saving ? 'Saving...' : 'Save'}
+                </button>
+              </div>
             )}
           </div>
 
           {selectedRole ? (
             <div className="p-4 space-y-3 overflow-y-auto max-h-[calc(100vh-220px)]">
-              {/* Sections matching sidebar */}
-              {sections.map(sec => (
-                <PermSection key={sec.key} section={sec} rolePerms={rolePerms} onToggle={togglePerm} />
+              {/* One card per sidebar father menu, in sidebar order */}
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500">
+                <span>
+                  <b className="text-gray-700">{modulesOn}</b> of {MODULES.length} sidebar modules visible to this role.
+                  Turn <b>Module access</b> off to hide a whole menu; tick pages and actions inside it.
+                </span>
+                <span className="flex gap-3 shrink-0">
+                  <button type="button" className="text-primary-600 hover:underline"
+                          onClick={() => setOpenMods(new Set([...MODULES.map(m => m.key), 'other']))}>Expand all</button>
+                  <button type="button" className="text-primary-600 hover:underline"
+                          onClick={() => setOpenMods(new Set())}>Collapse all</button>
+                </span>
+              </div>
+
+              {MODULES.map(mod => (
+                <ModuleCard key={mod.key} mod={mod} open={openMods.has(mod.key)} onOpen={() => toggleOpen(mod.key)}
+                  rolePerms={rolePerms} onToggle={togglePerm} onSetMany={setMany}
+                  available={available} permLabel={permLabel} />
               ))}
 
-              {/* Any permissions not matched to a section */}
-              {other.length > 0 && (
-                <PermSection
-                  section={{ key: 'other', label: 'Other', icon: Shield, codes: other }}
-                  rolePerms={rolePerms}
-                  onToggle={togglePerm}
-                />
+              {/* Permissions no sidebar module claims — kept reachable */}
+              {otherCodes.length > 0 && (
+                <ModuleCard
+                  mod={{ key: 'other', title: 'Other permissions', icon: Shield, moduleCode: null, items: [], actions: otherCodes }}
+                  open={openMods.has('other')} onOpen={() => toggleOpen('other')}
+                  rolePerms={rolePerms} onToggle={togglePerm} onSetMany={setMany}
+                  available={available} permLabel={permLabel} />
               )}
             </div>
           ) : (
@@ -326,16 +394,20 @@ export default function RolesPage() {
       </div>
 
       {showCreate && (
-        <CreateRoleModal onClose={() => setShowCreate(false)} onCreated={() => { setShowCreate(false); load() }} />
+        <RoleModal onClose={() => setShowCreate(false)} onSaved={() => { setShowCreate(false); load() }} />
+      )}
+      {editRole && (
+        <RoleModal role={editRole} onClose={() => setEditRole(null)} onSaved={() => { setEditRole(null); load() }} />
       )}
     </div>
   )
 }
 
-// ── Create Role Modal ─────────────────────────────────────────────────────────
-function CreateRoleModal({ onClose, onCreated }) {
-  const [name, setName] = useState('')
-  const [desc, setDesc] = useState('')
+// ── Create / Edit Role Modal ──────────────────────────────────────────────────
+function RoleModal({ role, onClose, onSaved }) {
+  const isEdit = !!role
+  const [name, setName] = useState(role?.role_name || '')
+  const [desc, setDesc] = useState(role?.description || '')
   const [saving, setSaving] = useState(false)
 
   const handleSubmit = async (e) => {
@@ -343,19 +415,23 @@ function CreateRoleModal({ onClose, onCreated }) {
     if (!name.trim()) return toast.error('Role name required')
     setSaving(true)
     try {
-      await rolesAPI.create({ role_name: name.trim(), description: desc })
-      toast.success('Role created')
-      onCreated()
-    } catch (e) {
-      toast.error(e.response?.data?.detail || 'Create failed')
-    } finally { setSaving(false) }
+      if (isEdit) {
+        await rolesAPI.update(role.id, { role_name: name.trim(), description: desc })
+        toast.success('Role updated')
+      } else {
+        await rolesAPI.create({ role_name: name.trim(), description: desc })
+        toast.success('Role created')
+      }
+      onSaved()
+    } catch { /* api interceptor already shows the reason */ }
+    finally { setSaving(false) }
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
       <div className="bg-white rounded-xl shadow-xl w-full max-w-md m-4">
         <div className="flex items-center justify-between px-6 py-4 border-b">
-          <h2 className="text-lg font-semibold">Create Role</h2>
+          <h2 className="text-lg font-semibold">{isEdit ? 'Edit Role' : 'Create Role'}</h2>
           <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded-lg"><X size={18} /></button>
         </div>
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
@@ -369,7 +445,9 @@ function CreateRoleModal({ onClose, onCreated }) {
           </div>
           <div className="flex justify-end gap-3">
             <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
-            <button type="submit" disabled={saving} className="btn-primary">{saving ? 'Creating...' : 'Create'}</button>
+            <button type="submit" disabled={saving} className="btn-primary">
+              {isEdit ? (saving ? 'Saving...' : 'Save') : (saving ? 'Creating...' : 'Create')}
+            </button>
           </div>
         </form>
       </div>

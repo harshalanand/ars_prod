@@ -489,8 +489,77 @@ def seed_permissions_if_needed(db: Session):
     for mname, mcode in MODULE_PERMISSIONS:
         ALL_PERMISSIONS.append((mname, mcode, "module_access", "READ", "module"))
 
+    # ── Page-access permissions (2026-10-09) ─────────────────────────────
+    # One PAGE_* per sidebar CHILD page that had no permission of its own, so
+    # Settings → Roles can show/hide every page, not just whole modules.
+    # (name, code, parent MOD_*) — mirrors `permission:` on the items in
+    # frontend/src/components/layout/navRegistry.js; keep the two in step.
+    # A brand-new PAGE_* is granted once to every active role that holds its
+    # parent module, so no page disappears the day this lands.
+    PAGE_PERMISSIONS = [
+        ("Page: Data Management › Data Dictionary", "PAGE_DATA_DICTIONARY",            "MOD_DATA_MGMT"),
+        ("Page: Listing & Alloc › Listing", "PAGE_LISTING",                            "MOD_LISTING_ALLOC"),
+        ("Page: GRT ALC › Overview", "PAGE_GRT_OVERVIEW",                              "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Upload Data", "PAGE_GRT_UPLOAD",                             "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Settings", "PAGE_GRT_SETTINGS",                              "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Build MBQ", "PAGE_GRT_MBQ",                                  "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Run Allocation", "PAGE_GRT_RUN",                             "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Sessions & Pick List", "PAGE_GRT_SESSIONS",                  "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Gap Report", "PAGE_GRT_GAP_REPORT",                          "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Store × Article Extract", "PAGE_GRT_EXTRACT",                "MOD_GRT_ALC"),
+        ("Page: GRT ALC › Help", "PAGE_GRT_HELP",                                      "MOD_GRT_ALC"),
+        ("Page: Reports › Report Generation", "PAGE_REPORT_GENERATION",                "MOD_REPORTS"),
+        ("Page: Reports › Hold Dashboard", "PAGE_HOLD_DASHBOARD",                      "MOD_REPORTS"),
+        ("Page: Reports › UPC Store Tracking", "PAGE_UPC_TRACKING",                    "MOD_REPORTS"),
+        ("Page: Get Data › Overview", "PAGE_GD_OVERVIEW",                              "MOD_GET_DATA"),
+        ("Page: Get Data › Snowflake Views", "PAGE_GD_SNOWFLAKE_VIEWS",                "MOD_GET_DATA"),
+        ("Page: Get Data › Sync Jobs", "PAGE_GD_SYNC_JOBS",                            "MOD_GET_DATA"),
+        ("Page: Get Data › Run History", "PAGE_GD_RUNS",                               "MOD_GET_DATA"),
+        ("Page: Get Data › Excel (soon)", "PAGE_GD_EXCEL",                             "MOD_GET_DATA"),
+        ("Page: Get Data › DataV2 (soon)", "PAGE_GD_DATAV2",                           "MOD_GET_DATA"),
+        ("Page: Get Data › SAP (soon)", "PAGE_GD_SAP",                                 "MOD_GET_DATA"),
+        ("Page: Get Data › Help", "PAGE_GD_HELP",                                      "MOD_GET_DATA"),
+        ("Page: SAP › Data Pulls", "PAGE_SAP_PULLS",                                   "MOD_SAP"),
+        ("Page: SAP › SAP Explorer", "PAGE_SAP_EXPLORER",                              "MOD_SAP"),
+        ("Page: SAP › Run History", "PAGE_SAP_RUNS",                                   "MOD_SAP"),
+        ("Page: SAP › Connection", "PAGE_SAP_CONNECTION",                              "MOD_SAP"),
+        ("Page: FA & CONS › SLOC Settings", "PAGE_FA_SLOC_SETTINGS",                   "MOD_FA_CONS"),
+        ("Page: FA & CONS › Stock & MSA", "PAGE_FA_STOCK",                             "MOD_FA_CONS"),
+        ("Page: FA & CONS › MBQ Master", "PAGE_FA_MBQ_MASTER",                         "MOD_FA_CONS"),
+        ("Page: FA & CONS › UPC Store List", "PAGE_FA_STORE_LIST",                     "MOD_FA_CONS"),
+        ("Page: FA & CONS › Allocation", "PAGE_FA_ALLOCATION",                         "MOD_FA_CONS"),
+        ("Page: FA & CONS › Pending Alloc", "PAGE_FA_PENDING",                         "MOD_FA_CONS"),
+        ("Page: FA & CONS › Gap Report", "PAGE_FA_GAP_REPORT",                         "MOD_FA_CONS"),
+        ("Page: FA & CONS › Help", "PAGE_FA_HELP",                                     "MOD_FA_CONS"),
+        ("Page: Pending Allocation › Overview", "PAGE_PEND_OVERVIEW",                  "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Manual Entry", "PAGE_PEND_MANUAL_ENTRY",          "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Adhoc Close", "PAGE_PEND_ADHOC_CLOSE",            "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Daily DO Entry", "PAGE_PEND_DO_ENTRY",            "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Reconciliation", "PAGE_PEND_RECO",                "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Open BDC Report", "PAGE_PEND_OPEN_BDC",           "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › BDC Schedule", "PAGE_PEND_BDC_SCHEDULE",          "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Schedule Audit", "PAGE_PEND_SCHEDULE_AUDIT",      "MOD_PEND_ALC"),
+        ("Page: Pending Allocation › Operations Log", "PAGE_PEND_OPERATIONS",          "MOD_PEND_ALC"),
+        ("Page: Project Tracker › Dashboard", "PAGE_PT_DASHBOARD",                     "MOD_PROJECT_TRACKER"),
+        ("Page: Project Tracker › All Projects", "PAGE_PT_PROJECTS",                   "MOD_PROJECT_TRACKER"),
+        ("Page: Project Tracker › My Tasks", "PAGE_PT_MY_TASKS",                       "MOD_PROJECT_TRACKER"),
+        ("Page: Training Manual › Screenshot Gallery", "PAGE_MANUAL_GALLERY",          "MOD_TRAINING"),
+        ("Page: Training Manual › Getting Started", "PAGE_MANUAL_START",               "MOD_TRAINING"),
+        ("Page: Training Manual › Step 1 · MSA Stock", "PAGE_MANUAL_MSA",              "MOD_TRAINING"),
+        ("Page: Training Manual › Step 2 · Grid Builder", "PAGE_MANUAL_GRID",          "MOD_TRAINING"),
+        ("Page: Training Manual › Step 3 · Merge Rules", "PAGE_MANUAL_MERGE",          "MOD_TRAINING"),
+        ("Page: Training Manual › Step 4 · Listing & Alloc", "PAGE_MANUAL_LISTING",    "MOD_TRAINING"),
+        ("Page: Training Manual › Step 5 · Review Results", "PAGE_MANUAL_REVIEW",      "MOD_TRAINING"),
+        ("Page: Training Manual › Step 6 · Hold Process", "PAGE_MANUAL_HOLD",          "MOD_TRAINING"),
+        ("Page: Training Manual › Step 7 · Pending Allocation", "PAGE_MANUAL_PENDALC", "MOD_TRAINING"),
+        ("Page: Training Manual › Data Dictionary", "PAGE_MANUAL_DICTIONARY",          "MOD_TRAINING"),
+    ]
+    for pname, pcode, parent in PAGE_PERMISSIONS:
+        ALL_PERMISSIONS.append((pname, pcode, "page_access", "READ", parent))
+
     added = 0
     new_module_perm_codes = []
+    new_page_perms = {}  # PAGE_* code -> parent MOD_* code
     for name, code, module, action, resource in ALL_PERMISSIONS:
         exists = db.query(Permission).filter(Permission.permission_code == code).first()
         if not exists:
@@ -501,6 +570,8 @@ def seed_permissions_if_needed(db: Session):
             added += 1
             if module == "module_access":
                 new_module_perm_codes.append(code)
+            elif module == "page_access":
+                new_page_perms[code] = resource
 
     if added:
         db.commit()
@@ -538,5 +609,26 @@ def seed_permissions_if_needed(db: Session):
             db.commit()
             logger.info(f"Granted {len(new_module_perm_codes)} new MOD_* permissions "
                         f"to all {len(roles)} active roles (visibility-preserving)")
+
+        # Same idea for pages: a new PAGE_* goes to each active role that can
+        # already see its module (only for perms created in THIS startup).
+        if new_page_perms:
+            page_perm_ids = {p.permission_code: p.id for p in db.query(Permission).filter(
+                Permission.permission_code.in_(list(new_page_perms))).all()}
+            parent_ids = {p.permission_code: p.id for p in db.query(Permission).filter(
+                Permission.permission_code.in_(set(new_page_perms.values()))).all()}
+            granted = 0
+            for role in db.query(Role).filter(Role.is_active == True).all():  # noqa: E712
+                have = {rp.permission_id for rp in
+                        db.query(RolePermission).filter(RolePermission.role_id == role.id).all()}
+                for code, parent in new_page_perms.items():
+                    pid = page_perm_ids.get(code)
+                    if pid and pid not in have and parent_ids.get(parent) in have:
+                        db.add(RolePermission(role_id=role.id, permission_id=pid,
+                                              granted_by="SYSTEM_PAGE_SEED"))
+                        granted += 1
+            db.commit()
+            logger.info(f"Granted {granted} new PAGE_* permission rows to roles holding "
+                        f"the parent module (visibility-preserving)")
     else:
         logger.info("All permissions already seeded")

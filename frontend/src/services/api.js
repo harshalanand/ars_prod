@@ -92,7 +92,19 @@ api.interceptors.response.use(
     // summary, config) pass { quiet: true } so transient timeouts/network
     // blips don't spam toasts. They retry on their own cadence.
     const quiet = error.config?.quiet === true
-    const msg = error.response?.data?.detail || error.message
+    // FastAPI 422s may carry `detail` as a list of {loc, msg}; flatten it so
+    // every caller's toast shows readable text instead of nothing.
+    const data = error.response?.data
+    if (data && Array.isArray(data.detail)) {
+      data.detail = data.detail
+        .map(d => {
+          const field = (d?.loc || []).filter(p => !['body', 'query', 'path'].includes(p)).pop()
+          return field ? `${String(field).replace(/_/g, ' ')}: ${d?.msg}` : d?.msg
+        })
+        .filter(Boolean)
+        .join('; ') || 'Invalid request'
+    }
+    const msg = data?.detail || error.message
     if (status !== 401 && !quiet) toast.error(msg)
     return Promise.reject(error)
   }
@@ -121,6 +133,7 @@ export const rolesAPI = {
   list: () => api.get('/roles'),
   create: (data) => api.post('/roles', data),
   update: (id, data) => api.put(`/roles/${id}`, data),
+  delete: (id) => api.delete(`/roles/${id}`),
   permissions: () => api.get('/roles/permissions'),
   assignPermissions: (id, data) => api.post(`/roles/${id}/permissions`, data),
 }

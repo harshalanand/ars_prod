@@ -102,7 +102,8 @@ class UserListResponse(BaseModel):
 
 class RoleCreate(BaseModel):
     role_name: str = Field(..., min_length=2, max_length=100)
-    role_code: str = Field(..., min_length=2, max_length=50)
+    # Optional: the Roles page sends only the name; the endpoint derives the code.
+    role_code: Optional[str] = Field(None, min_length=2, max_length=50)
     description: Optional[str] = None
 
 

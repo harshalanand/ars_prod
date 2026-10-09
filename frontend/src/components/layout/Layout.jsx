@@ -2,6 +2,7 @@ import { Outlet } from 'react-router-dom'
 import Sidebar from './Sidebar'
 import Header from './Header'
 import Footer from './Footer'
+import ModuleGate from './ModuleGate'
 import { useState } from 'react'
 
 export default function Layout() {
@@ -22,7 +23,7 @@ export default function Layout() {
         <Header />
         <main className="flex-1 overflow-y-auto p-4">
           <div className="animate-fade-in">
-            <Outlet />
+            <ModuleGate><Outlet /></ModuleGate>
           </div>
         </main>
         <Footer />
