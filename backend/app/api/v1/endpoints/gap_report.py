@@ -71,8 +71,11 @@ router = APIRouter(prefix="/gap-report", tags=["GAP Report"])
 # ---------------------------------------------------------------------------
 # Table constants
 # ---------------------------------------------------------------------------
-# Per-OPT listing snapshot (carries EXCESS_STK). The _WORKING_* equivalents
-# zero EXCESS_STK during allocation so we always read it from the snapshot.
+# Per-OPT listing snapshot. Since 2026-10-09 it is parked only when
+# LST_AUDIT_ALL_TO_WORKING is OFF — with audit ON the _WORKING_* tables hold
+# every listing row with identical EXCESS_STK (verified 40/40 sessions), so
+# EXCESS_STK is read via _excess_tables(): snapshot when it has the session,
+# else the working copy.
 LIST_SNAP_PARKED  = "ARS_LISTING_PARKED"
 LIST_SNAP_HISTORY = "ARS_LISTING_HISTORY"
 
@@ -119,6 +122,28 @@ def _resolve_sources(source: str, parked: str, history: str) -> List[str]:
     if s == "parked":  return [parked]
     if s == "history": return [history]
     return [parked, history]
+
+
+def _excess_tables(conn, source: str) -> List[Tuple[str, str]]:
+    """(table, extra_predicate) pairs that read each session's EXCESS_STK
+    exactly once: the listing snapshot where it holds the session (audit-OFF
+    runs, where working lacks the ineligible rows), else the working copy.
+    Tables that don't exist are left out; extra_predicate uses alias T."""
+    pairs = {"parked":  [(LIST_SNAP_PARKED,  LIST_WRK_PARKED)],
+             "history": [(LIST_SNAP_HISTORY, LIST_WRK_HISTORY)]}
+    s = (source or "both").lower()
+    chosen = pairs.get(s) or (pairs["parked"] + pairs["history"])
+    out: List[Tuple[str, str]] = []
+    for snap, wrk in chosen:
+        snap_ok = _table_exists(conn, snap)
+        if snap_ok:
+            out.append((snap, ""))
+        if _table_exists(conn, wrk):
+            out.append((wrk, (
+                f"NOT EXISTS (SELECT 1 FROM {snap} S WITH (NOLOCK) "
+                f"WHERE S.SESSION_ID = T.SESSION_ID)"
+            ) if snap_ok else ""))
+    return out
 
 
 def _where_listing(scope: Dict, params: Dict, alias: str = "T") -> str:
@@ -208,16 +233,15 @@ def get_summary(
     with eng.connect() as conn:
         # --- 1. excess-stk (listing snapshot, parked+history) ---
         rows = qty = 0
-        for tbl in (LIST_SNAP_PARKED, LIST_SNAP_HISTORY):
-            if not _table_exists(conn, tbl):
-                continue
+        for tbl, only in _excess_tables(conn, "both"):
             p: Dict = {}
             w = _where_listing(scope, p, "T")
             sep = " AND " if w else " WHERE "
+            only_sql = f" AND {only}" if only else ""
             sql = (
                 f"SELECT ISNULL(COUNT(*),0) AS rows_, "
                 f"       ISNULL(SUM(EXCESS_STK),0) AS qty "
-                f"FROM {tbl} T WITH (NOLOCK) {w}{sep} ISNULL(EXCESS_STK,0) > 0"
+                f"FROM {tbl} T WITH (NOLOCK) {w}{sep} ISNULL(EXCESS_STK,0) > 0{only_sql}"
             )
             r = conn.execute(text(sql), p).mappings().first()
             rows += int(r["rows_"] or 0); qty += int(r["qty"] or 0)
@@ -389,22 +413,21 @@ def get_excess_stk(
         group_by = "majcat"
     select_cols, group_cols = _EXCESS_GROUPS[group_by]
     scope = _parse_scope(request)
-    sources = _resolve_sources(source, LIST_SNAP_PARKED, LIST_SNAP_HISTORY)
-
     raw_cols = [c.strip() for c in select_cols.split(",")]  # ["GEN_ART_NUMBER","CLR"] etc.
 
     eng = _engine()
     with eng.connect() as conn:
-        present = [t for t in sources if _table_exists(conn, t)]
+        present = _excess_tables(conn, source)
         if not present:
             return _to_response([], group_by, [], {})
 
         # Per-table SELECT then merge in python — groups are small (<500 rows).
         agg: Dict[Tuple, Dict] = {}
-        for tbl in present:
+        for tbl, only in present:
             p: Dict = {}
             w = _where_listing(scope, p, "T")
             sep = " AND " if w else " WHERE "
+            only_sql = f" AND {only}" if only else ""
             sql = f"""
                 SELECT {select_cols},
                        SUM(ISNULL(EXCESS_STK,0)) AS excess_qty,
@@ -412,7 +435,7 @@ def get_excess_stk(
                        COUNT(DISTINCT WERKS)     AS stores,
                        COUNT(DISTINCT RDC)       AS rdcs
                 FROM {tbl} T WITH (NOLOCK)
-                {w}{sep} ISNULL(EXCESS_STK,0) > 0
+                {w}{sep} ISNULL(EXCESS_STK,0) > 0{only_sql}
                 GROUP BY {group_cols}
             """
             for r in conn.execute(text(sql), p).mappings().all():

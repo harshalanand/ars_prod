@@ -55,8 +55,10 @@ PROD_VIEW = "VW_MASTER_PRODUCT"              # adds DIV + SSN + SUB_DIV via ARTI
 # WORKING (current run, no SESSION_ID) → PARKED (parked sessions) → HISTORY (approved sessions).
 LIST_HISTORY = "ARS_LISTING_WORKING_HISTORY"
 LIST_PARKED  = "ARS_LISTING_WORKING_PARKED"
-# Snapshot/input listing tables — EXCESS_STK source. The _WORKING_* equivalents
-# zero out EXCESS_STK during allocation, so we read it from these instead.
+# Snapshot/input listing tables — EXCESS_STK source for audit-OFF runs only.
+# Since 2026-10-09 ARS_LISTING is parked only when LST_AUDIT_ALL_TO_WORKING is
+# OFF; with audit ON the _WORKING_* tables hold every listing row with the same
+# EXCESS_STK, so _session_review_snapshot_excess falls back to them.
 LIST_SNAPSHOT_HISTORY = "ARS_LISTING_HISTORY"
 LIST_SNAPSHOT_PARKED  = "ARS_LISTING_PARKED"
 # MSA stock archives — RDC-grain (not store-grain) — sourced via GEN_ART rollups.
@@ -1343,11 +1345,9 @@ def _sr_crumb_where(crumb: Dict, params: Dict, listing_alias: str = "L", mp_alia
 def _session_review_from_listing(conn, table: str, sid: str, dim: str, crumb: Dict):
     """Aggregate one of the listing archives at the requested dim × RDC grain.
 
-    EXCESS_STK is sourced from the snapshot listing table (ARS_LISTING_PARKED /
-    ARS_LISTING_HISTORY), NOT from the working table — the working table's
-    EXCESS_STK column is zeroed out during allocation. The snapshot CTE is
-    joined at OPT grain (WERKS, GEN_ART, CLR, RDC) so any crumb filter on L
-    (WERKS, MAJ_CAT, GEN_ART, CLR) naturally narrows the excess sum.
+    EXCESS_STK is aggregated separately by _session_review_snapshot_excess
+    (listing snapshot for audit-OFF runs, else this same working archive) and
+    merged per cell afterwards.
 
     Returns rows with: dim_val, RDC, mbq_qty, store_stk, req_qty, alloc_qty,
     hold_qty, excess_stk, st_nm/hub (store kind), opt_type/rank/seq/status/
@@ -1368,10 +1368,10 @@ def _session_review_from_listing(conn, table: str, sid: str, dim: str, crumb: Di
 
     extra_where = f" AND {crumb_where}" if crumb_where else ""
 
-    # EXCESS_STK is sourced separately (see _session_review_snapshot_excess) because
-    # ARS_LISTING_PARKED and ARS_LISTING_WORKING_PARKED have disjoint GEN_ART sets —
-    # joining them would silently drop excess rows. Listing SQL emits 0 here; the
-    # orchestrator overwrites each cell's excess_stk after both fetches complete.
+    # EXCESS_STK is sourced separately (see _session_review_snapshot_excess): on an
+    # audit-OFF run the working archive lacks the ineligible OPTs, so it must come
+    # from the listing snapshot. Listing SQL emits 0 here; the orchestrator
+    # overwrites each cell's excess_stk after both fetches complete.
     if kind == "mj":
         # MJ_* are MAJ_CAT+WERKS aggregates → dedup per (WERKS, MAJ_CAT, RDC) with MAX,
         # then SUM up to the requested dim × RDC. This works for SEG/DIV/SUB_DIV/MAJ_CAT.
@@ -1515,17 +1515,27 @@ def _session_review_from_listing(conn, table: str, sid: str, dim: str, crumb: Di
 
 
 def _session_review_snapshot_excess(conn, snapshot_tbl: str, sid: str,
-                                    dim: str, crumb: Dict) -> Dict:
-    """Aggregate EXCESS_STK from ARS_LISTING_PARKED / ARS_LISTING_HISTORY at the
-    requested dim × RDC grain, applying the same crumb filters as the listing
-    query. The snapshot table has *different* OPT rows than the working table
-    (snapshot rows include parked-out OPTs that don't make it to the working
-    pipeline), so we aggregate it independently and merge after-the-fact.
+                                    dim: str, crumb: Dict,
+                                    working_tbl: Optional[str] = None) -> Dict:
+    """Aggregate EXCESS_STK at the requested dim × RDC grain, applying the same
+    crumb filters as the listing query.
+
+    Source: the ARS_LISTING snapshot (PARKED / HISTORY) when it holds this
+    session — an audit-OFF run, whose working table lacks the ineligible
+    OPTs — else `working_tbl` (ARS_LISTING_WORKING_PARKED / _HISTORY), which in
+    audit mode carries every listing row with the same EXCESS_STK.
 
     Returns: { (dim_val_str, rdc_str): excess_stk_int }
     """
-    if not _table_exists(conn, snapshot_tbl) or dim == "ARTICLE":
+    if dim == "ARTICLE":
         return {}
+    has_snapshot = _table_exists(conn, snapshot_tbl) and conn.execute(text(
+        f"SELECT TOP 1 1 FROM {snapshot_tbl} WITH (NOLOCK) WHERE SESSION_ID = :sid"
+    ), {"sid": sid}).first() is not None
+    if not has_snapshot:
+        if not working_tbl or not _table_exists(conn, working_tbl):
+            return {}
+        snapshot_tbl = working_tbl
 
     cfg = _SR_DIM_CONFIG[dim]
     # Use the same dim_expr as the listing query (it already references the
@@ -1661,20 +1671,20 @@ def session_review(
                 if rows: source = "parked"
         else:
             # SEG/DIV/SUB_DIV/MAJ_CAT/ST_CD/GEN_ART — listing archive (MBQ/REQ/ALLOC/HOLD)
-            # + MSA stock (FNL_Q) + snapshot listing (EXCESS_STK, sourced separately
-            # because snapshot and working tables have disjoint GEN_ART sets).
+            # + MSA stock (FNL_Q) + EXCESS_STK (sourced separately: listing snapshot
+            # on audit-OFF runs, else the working archive itself).
             if _table_exists(conn, LIST_HISTORY):
                 rows = _session_review_from_listing(conn, LIST_HISTORY, sid, dim_up, crumb)
                 if rows:
                     source = "history"
                     msa_stock  = _session_review_msa_stock(conn, MSA_HISTORY, sid, dim_up, crumb)
-                    excess_map = _session_review_snapshot_excess(conn, LIST_SNAPSHOT_HISTORY, sid, dim_up, crumb)
+                    excess_map = _session_review_snapshot_excess(conn, LIST_SNAPSHOT_HISTORY, sid, dim_up, crumb, LIST_HISTORY)
             if not rows and _table_exists(conn, LIST_PARKED):
                 rows = _session_review_from_listing(conn, LIST_PARKED, sid, dim_up, crumb)
                 if rows:
                     source = "parked"
                     msa_stock  = _session_review_msa_stock(conn, MSA_PARKED, sid, dim_up, crumb)
-                    excess_map = _session_review_snapshot_excess(conn, LIST_SNAPSHOT_PARKED, sid, dim_up, crumb)
+                    excess_map = _session_review_snapshot_excess(conn, LIST_SNAPSHOT_PARKED, sid, dim_up, crumb, LIST_PARKED)
 
         if not rows:
             return APIResponse(success=True, data=out,

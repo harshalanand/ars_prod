@@ -1216,7 +1216,7 @@ export default function ListingPage() {
   const handleApproveParked = useCallback(async (sid) => {
     if (!sid) return
     if (!window.confirm(
-      `Approve session ${sid}?\n\nAll 6 snapshots will move to history and be removed from the parked queue:\n  • ARS_ALLOC_HISTORY\n  • ARS_LISTING_WORKING_HISTORY\n  • ARS_LISTING_HISTORY\n  • ARS_MSA_TOTAL_HISTORY\n  • ARS_MSA_GEN_ART_HISTORY\n  • ARS_MSA_VAR_ART_HISTORY`
+      `Approve session ${sid}?\n\nThe parked snapshots will move to history and be removed from the parked queue:\n  • ARS_ALLOC_HISTORY\n  • ARS_LISTING_WORKING_HISTORY\n  • ARS_MSA_TOTAL_HISTORY\n  • ARS_ALLOC_RDC_SPLIT_HISTORY (All-RDC runs)\n  • ARS_LISTING_HISTORY (only when audit mode is OFF)`
     )) return
     setParkedActionBusy(true)
     setParkedActionKind('approve')

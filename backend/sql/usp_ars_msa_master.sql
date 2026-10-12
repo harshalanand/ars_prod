@@ -16,7 +16,7 @@
               Every row carries leading STEP (1..n) + LEVEL columns; a column that
               a level does not use is NULL on that step's rows. Rows are ordered
               by STEP then by key, so the steps read top-to-bottom in order.
-     @SESSION_ID : opening session (default = latest ARS_LISTING_HISTORY)
+     @SESSION_ID : opening session (default = latest ARS_LISTING_WORKING_HISTORY)
      @RDC, @MAJ_CAT : optional filters
 
    Zero rows: line items whose every quantity column sums to 0 are dropped.
@@ -76,7 +76,7 @@ BEGIN
     SET NOCOUNT ON;
 
     IF @SESSION_ID IS NULL
-        SELECT @SESSION_ID = MAX(SESSION_ID) FROM ARS_LISTING_HISTORY WITH (NOLOCK);
+        SELECT @SESSION_ID = MAX(SESSION_ID) FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK);
 
     SET @Level = UPPER(LTRIM(RTRIM(@Level)));
 

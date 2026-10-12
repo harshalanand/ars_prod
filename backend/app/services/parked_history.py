@@ -14,6 +14,7 @@ Six source tables are parked in lock-step:
     ARS_ALLOC_WORKING    →  ARS_ALLOC_PARKED            →  ARS_ALLOC_HISTORY
     ARS_LISTING_WORKING  →  ARS_LISTING_WORKING_PARKED  →  ARS_LISTING_WORKING_HISTORY
     ARS_LISTING          →  ARS_LISTING_PARKED          →  ARS_LISTING_HISTORY
+                            (only when LST_AUDIT_ALL_TO_WORKING is OFF)
     ARS_MSA_TOTAL        →  ARS_MSA_TOTAL_PARKED        →  ARS_MSA_TOTAL_HISTORY
     ARS_MSA_GEN_ART      →  ARS_MSA_GEN_ART_PARKED      →  ARS_MSA_GEN_ART_HISTORY
     ARS_MSA_VAR_ART      →  ARS_MSA_VAR_ART_PARKED      →  ARS_MSA_VAR_ART_HISTORY
@@ -71,11 +72,20 @@ _SNAPSHOT_TARGETS: List[Dict[str, str]] = [
         "parked":  "ARS_LISTING_WORKING_PARKED",
         "history": "ARS_LISTING_WORKING_HISTORY",
     },
+    # ARS_LISTING is parked ONLY when audit mode is OFF (2026-10-09). With
+    # LST_AUDIT_ALL_TO_WORKING ON, Part 7 copies every ARS_LISTING row and
+    # column into ARS_LISTING_WORKING, so this snapshot duplicated
+    # ARS_LISTING_WORKING_HISTORY row for row (40/40 sessions, 258 GB on
+    # HOPC866) and nothing reads ARS_LISTING after Part 7. With audit OFF,
+    # WORKING keeps only ELIG_FLAG=1 rows and this snapshot is the only record
+    # of the ineligible rows, so it is still taken. Approve / reject / revert /
+    # purge keep looping over it — a no-op when nothing was parked.
     {
         "label":   "listing",
         "source":  "ARS_LISTING",
         "parked":  "ARS_LISTING_PARKED",
         "history": "ARS_LISTING_HISTORY",
+        "park_only_when_audit_off": "1",
     },
     {
         "label":   "msa_total",
@@ -332,6 +342,49 @@ def _reconcile_history_columns(conn, tgt: Dict[str, str],
     return payload_cols
 
 
+def _audit_all_to_working() -> bool:
+    """LST_AUDIT_ALL_TO_WORKING, with the same legacy app_settings fallback
+    listing.py Part 7 uses."""
+    legacy = False
+    try:
+        from app.core.config import APP_SETTINGS_FILE
+        if os.path.exists(APP_SETTINGS_FILE):
+            with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            legacy = bool((cfg.get("application") or {}).get("shift_all_to_working", False))
+    except Exception:
+        pass
+    from app.services.business_rules import rule_flag
+    return rule_flag("LST_AUDIT_ALL_TO_WORKING", legacy)
+
+
+def _listing_contained_in_working(source: str) -> bool:
+    """True when parking `source` (ARS_LISTING) would only duplicate
+    ARS_LISTING_WORKING: audit mode is ON *and* the working table really holds
+    every listing row. The row-count check covers a rule toggled between
+    Part 7 and parking — any doubt returns False, so the snapshot is taken."""
+    if not _audit_all_to_working():
+        return False
+    try:
+        with get_data_engine().connect() as conn:
+            n_src = conn.execute(text(
+                f"SELECT COUNT_BIG(*) FROM [{source}] WITH (NOLOCK)"
+            )).scalar()
+            n_wrk = conn.execute(text(
+                "SELECT COUNT_BIG(*) FROM [ARS_LISTING_WORKING] WITH (NOLOCK)"
+            )).scalar()
+    except Exception as e:
+        logger.warning(f"[parked_history] listing/working row check failed, parking anyway: {e}")
+        return False
+    if n_src != n_wrk:
+        logger.warning(
+            f"[parked_history] audit mode ON but {source}={n_src} rows vs "
+            f"ARS_LISTING_WORKING={n_wrk} — parking {source} to keep the excluded rows"
+        )
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Snapshot — called from listing.py right after Part 8 finishes
 # ---------------------------------------------------------------------------
@@ -342,6 +395,14 @@ def _snapshot_one_target(session_id: str, tgt: Dict[str, str]
     label  = tgt["label"]
     source = tgt["source"]
     parked = tgt["parked"]
+    if tgt.get("park_only_when_audit_off") and _listing_contained_in_working(source):
+        logger.info(
+            f"[parked_history:{label}] skipped for session {session_id} — "
+            f"LST_AUDIT_ALL_TO_WORKING is ON and ARS_LISTING_WORKING holds "
+            f"every {source} row"
+        )
+        return {"parked_rows": 0, "skipped": True, "error": None,
+                "reason": "audit_mode_on"}
     engine = get_data_engine()
     try:
         with engine.connect() as conn:

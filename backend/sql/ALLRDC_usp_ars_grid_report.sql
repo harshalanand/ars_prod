@@ -69,7 +69,7 @@ BEGIN
     -- (all report data comes from history/session). OPT_STATUS is stamped into the
     -- parked listing snapshot in listing.py Part 8.5 so Approve carries it here.
     -- The column set is built at runtime from distinct OPT_STATUS, so it grows/shrinks.
-    DECLARE @sid NVARCHAR(50) = (SELECT MAX(SESSION_ID) FROM ARS_LISTING_HISTORY WITH (NOLOCK));
+    DECLARE @sid NVARCHAR(50) = (SELECT MAX(SESSION_ID) FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK));
     DECLARE @statDim BIT = CASE WHEN @DimCol IS NOT NULL
         AND COL_LENGTH('ARS_LISTING_WORKING_HISTORY', @DimCol) IS NOT NULL THEN 1 ELSE 0 END;
     DECLARE @statAgg NVARCHAR(MAX), @statOut NVARCHAR(MAX),
@@ -435,7 +435,7 @@ WHERE 1 = 1' + @where;
 )' END;
 
     SET @sql = N'
-WITH sid AS (SELECT MAX(SESSION_ID) AS SESSION_ID FROM ARS_LISTING_HISTORY WITH (NOLOCK))' + @pdimCTE + N',
+WITH sid AS (SELECT MAX(SESSION_ID) AS SESSION_ID FROM ARS_LISTING_WORKING_HISTORY WITH (NOLOCK))' + @pdimCTE + N',
 ' + @lstCTE + N',
 ' + @msaCTE + N',
 ' + @optOpCTE + N',
