@@ -1360,11 +1360,72 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             stores_sql = _stores_sql()
             msa_rdc_filter = ""
 
+        # ── FS-LPP-01 — pool pre-filter on the DISTINCT option set ────────
+        # Part 2 fans every distinct MSA option across every active store as
+        # IS_NEW=1. An option with no stock in the chosen pool can never ship
+        # a piece, so fanning it, merging attributes onto it and classifying
+        # it is pure waste: 101,383 -> 3,343 distinct options on the live MSA
+        # (−96.7%), and a 2026-10-09 run hung 5h in the Part 3.5a merge over
+        # 38.8M rows produced this way.
+        #
+        # The gate must stay a strict SUBSET of what the existing stock gates
+        # admit, or this stops being a no-op. Those gates are NOT a plain
+        # FNL_Q > 0 — both keep an option that has zero pool stock but a live
+        # prior-run warehouse hold:
+        #     Part 6.6  gate_stock  = MSA_FNL_Q > 0 OR RL_HOLD_QTY > 0
+        #     Stage A   R04         = block only when BOTH are 0
+        # RL_HOLD_QTY is not populated until Part 3.54, two steps after this
+        # filter runs, so the hold has to be looked up directly here. The
+        # EXISTS below mirrors Part 3.54's own aggregate predicate exactly
+        # (same IS_CLOSED / HOLD_REM / ALLOC_TYPE rules, same join shape), so
+        # an option rescued here is precisely one that would later receive
+        # RL_HOLD_QTY > 0. Without it a held TBL option for a store carrying
+        # none would vanish — Part 1 cannot rescue it, since Part 1 only
+        # emits stores that already hold grid stock.
+        #
+        # Column-presence guards keep a legacy MSA (no ALLOC_TYPE / FNL_Q)
+        # byte-identical to before.
+        _msa_cols_pool = (_get_columns(conn, req.msa_table)
+                          if _table_exists(conn, req.msa_table) else [])
+        _msa_cols_pool = {c.upper() for c in _msa_cols_pool}
+        _msa_pool_filter = ""
+        _msa_pool_params: dict = {}
+        if "ALLOC_TYPE" in _msa_cols_pool:
+            _msa_pool_filter += " AND ISNULL([ALLOC_TYPE],'FRESH') = :pool_alloc_type"
+            _msa_pool_params["pool_alloc_type"] = req.alloc_type
+        if "FNL_Q" in _msa_cols_pool:
+            _hold_rescue = ""
+            if _table_exists(conn, "ARS_NL_TBL_HOLD_TRACKING"):
+                # Mirrors Part 3.54: a hold of the OTHER pool is invisible;
+                # legacy NULL/'' typed rows match any run type.
+                _hr_type = ""
+                if "ALLOC_TYPE" in {c.upper() for c in
+                                    _get_columns(conn, "ARS_NL_TBL_HOLD_TRACKING")}:
+                    _hr_type = ("\n                            AND (H.[ALLOC_TYPE] = :pool_alloc_type"
+                                " OR ISNULL(H.[ALLOC_TYPE],'') = '')")
+                    _msa_pool_params["pool_alloc_type"] = req.alloc_type
+                # The outer MSA columns MUST be table-qualified: H carries
+                # MAJ_CAT / GEN_ART_NUMBER / CLR too, so an unqualified
+                # reference inside the EXISTS would bind to H and the
+                # correlation would silently collapse to a self-match.
+                _hold_rescue = f"""
+                        OR EXISTS (
+                            SELECT 1 FROM [ARS_NL_TBL_HOLD_TRACKING] H
+                            WHERE ISNULL(H.[IS_CLOSED], 0) = 0
+                              AND ISNULL(H.[HOLD_REM],  0) > 0{_hr_type}
+                              AND H.[MAJ_CAT] = LTRIM(RTRIM(CAST([{req.msa_table}].[MAJ_CAT] AS NVARCHAR(200))))
+                              AND H.[GEN_ART_NUMBER] = TRY_CAST(TRY_CAST([{req.msa_table}].[GEN_ART_NUMBER] AS FLOAT) AS BIGINT)
+                              AND ISNULL(H.[CLR],'') = ISNULL(LTRIM(RTRIM(CAST([{req.msa_table}].[CLR] AS NVARCHAR(200)))),'')
+                        )"""
+            _msa_pool_filter += (
+                f" AND (TRY_CAST([FNL_Q] AS FLOAT) > 0{_hold_rescue}\n                    )"
+            )
+
         # ── MSA unique options (proper types + RDC filtered) ──────────────
         msa_sql = f"""
             SELECT DISTINCT {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')}
             FROM [{req.msa_table}]
-            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}
+            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}{_msa_pool_filter}
         """
 
         # ── Create listing table ────────────────────────────────────────
@@ -1415,8 +1476,15 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             f"SELECT COUNT(*) FROM [{req.grid_table}] WITH (NOLOCK) "
             f"WHERE [WERKS] IN (SELECT [ST_CD] FROM ({stores_sql}) X) {grid_mc}"
         )).scalar()
-        diag_msa = conn.execute(text(f"SELECT COUNT(*) FROM ({msa_sql}) X")).scalar()
-        logger.info(f"Diagnostic: stores={diag_stores}, grid_rows={diag_grid}, msa_options={diag_msa}")
+        # FS-LPP-02 — the suffix appears only when the filter is actually
+        # active, so a grep over historical logs still matches the old line.
+        diag_msa = conn.execute(
+            text(f"SELECT COUNT(*) FROM ({msa_sql}) X"), _msa_pool_params
+        ).scalar()
+        logger.info(
+            f"Diagnostic: stores={diag_stores}, grid_rows={diag_grid}, msa_options={diag_msa}"
+            f"{f' (pool={req.alloc_type}, FNL_Q>0 or held)' if _msa_pool_filter else ''}"
+        )
 
         # ── PART 1: Grid data (existing stock) → IS_NEW = 0 ────────────
         t0 = time.time()
@@ -1462,13 +1530,17 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             msa_rdc_join = f"AND M.[RDC] = S.[RDC]"
         _p2_rdc_select = "" if _CENTRAL_POOL else (
             f"LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50)))) AS RDC,")
-        # MSA base (RDC column preserved for joining, except when clubbing)
+        # MSA base (RDC column preserved for joining, except when clubbing).
+        # FS-LPP-03 — the same pool pre-filter as the diagnostic above, from
+        # the one `_msa_pool_filter` variable so the two can never disagree.
+        # This is where the fan-out saving lands: every option dropped here
+        # is one that would otherwise be written once per active store.
         msa_with_rdc = f"""
             SELECT DISTINCT
                 {_p2_rdc_select}
                 {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')}
             FROM [{req.msa_table}]
-            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}
+            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}{_msa_pool_filter}
         """
         _run(conn, f"""
             INSERT INTO [{LISTING_TABLE}] ({all_cols})
@@ -1485,7 +1557,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                   AND E.[GEN_ART_NUMBER] = M.[GEN_ART_NUMBER]
                   AND E.[CLR] = M.[CLR]
             )
-        """)
+        """, _msa_pool_params or None)
         total = conn.execute(text(f"SELECT COUNT(*) FROM [{LISTING_TABLE}]")).scalar()
         new_count = total - grid_count
         logger.info(f"Part 2 (MSA missing): {new_count} rows")
