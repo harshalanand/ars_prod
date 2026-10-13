@@ -829,7 +829,8 @@ def _run_band_per_opt(
         'OPT_PRIORITY_RANK', 'ST_RANK', 'IS_NEW',
         'SZ_MBQ', 'SZ_MBQ_WH', 'SZ_STK', 'I_ROD',
         'POOL_CONSUMED', 'SHIP_QTY',
-        'OPT_MBQ',   # for Fix B (TBL MJ_REQ_GATE pre-check)
+        'OPT_MBQ',   # for Fix B (TBL MJ_REQ_GATE pre-check) + 2026-10-12 per-round target
+        'CONT',      # 2026-10-12: per-round target = ROUND(r * OPT_MBQ * CONT)
     ]
     # PAK_SZ is optional in some upstream pulls; include only if present so
     # the in-loop pak rounding step downstream has access to it (no-op when absent).
@@ -853,14 +854,26 @@ def _run_band_per_opt(
     sz_stk = sub['SZ_STK'].to_numpy()
     pool_cons = sub['POOL_CONSUMED'].to_numpy()
     ship_qty = sub['SHIP_QTY'].to_numpy()
+    # 2026-10-12 — per-round target now derives from the OPT-level MBQ and the
+    # size contribution directly, with rounding applied AFTER multiplication by
+    # r. Previously `r × SZ_MBQ` used a per-size value rounded once at listing
+    # time, so a size whose fractional target rolled past the half-point at a
+    # higher r never gained the extra piece. ROUND here is half-away-from-zero
+    # (SQL Server semantics) to match the upstream SZ_MBQ definition. TBL's
+    # hold-buffer compound (`sz_mbq_wh + (r-1) × sz_mbq`) is deliberately
+    # untouched — it mixes OPT_MBQ_WH and OPT_MBQ at different r and would
+    # need its own CONT variant to recompute consistently.
+    opt_mbq = sub['OPT_MBQ'].to_numpy().astype('float64')
+    cont = sub['CONT'].to_numpy().astype('float64')
+    target_r = np.floor(r * opt_mbq * cont + 0.5)
 
-    need_ship = np.maximum(r * sz_mbq - sz_stk - ship_qty, 0.0)
+    need_ship = np.maximum(target_r - sz_stk - ship_qty, 0.0)
     if ot == 'TBL':
         tbl_cum = sz_mbq_wh + (r - 1) * sz_mbq
         need_pool = np.maximum(tbl_cum - sz_stk - pool_cons, 0.0)
         need_pool = np.where(need_ship == 0, 0.0, need_pool)
     else:
-        need_pool = np.maximum(r * sz_mbq - sz_stk - pool_cons, 0.0)
+        need_pool = np.maximum(target_r - sz_stk - pool_cons, 0.0)
 
     sub['need_pool'] = need_pool
     sub['need_ship'] = need_ship

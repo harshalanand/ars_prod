@@ -8,14 +8,14 @@ export default defineConfig({
     alias: { '@': path.resolve(__dirname, './src') }
   },
   server: {
-    port: process.env.PORT ? Number(process.env.PORT) : 3000,
+    port: process.env.PORT ? Number(process.env.PORT) : 3001,
     host: true,
     strictPort: false,
     proxy: {
       // API_TARGET lets a second dev server point at a second backend; the default is unchanged.
       '/api': { target: process.env.API_TARGET || 'http://127.0.0.1:8080', changeOrigin: true, proxyTimeout:1200000 }
     },
-    allowedHosts: ['ars.v2retail.net']
+    allowedHosts: ['ars.v2retail.net', 'arsv3.v2retail.net']
   },
   build: {
     target: 'es2020',
