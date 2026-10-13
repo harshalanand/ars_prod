@@ -20,7 +20,9 @@ export default function ModuleGate({ children }) {
   if (!user) return <Waiting />
   if (isSuperAdmin()) return children
   const moduleOk = hasPermission(mod.code)
-  if (moduleOk && (!mod.page || hasPermission(mod.page))) return children
+  // pages = any-of (a nav item with `perms`, e.g. 1SZ Prepare); empty = module only
+  const pageOk = !mod.pages?.length || mod.pages.some(p => hasPermission(p))
+  if (moduleOk && pageOk) return children
 
   const home = firstAllowedPage(hasPermission, false)
   const what = moduleOk ? `${mod.title} › ${mod.pageLabel}` : mod.title

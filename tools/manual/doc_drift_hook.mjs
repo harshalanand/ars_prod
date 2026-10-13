@@ -28,6 +28,7 @@ process.stdin.on('end', () => {
       { re: /(pend_alc|alloc_queue|alloc_cancellation)/,                        m: 'pendalc', label: 'Pending Allocation' },
       { re: /(b2b_[a-z_]+\.py|endpoints\/b2b|037_b2b_module)/,                  m: 'bin_alloc', label: 'GRT ALC · Bin-to-Bin' },
       { re: /(get_data_[a-z_]+\.py|endpoints\/get_data|038_get_data_module)/,   m: 'get_data', label: 'Get Data' },
+      { re: /(sz1_[a-z_]+\.py|endpoints\/sz1|039_sz1_module)/,                  m: 'sz1_alloc', label: '1SZ ALC · Size Allocation' },
     ]
     const hit = RULES.find(r => r.re.test(p))
     if (!hit) return done()

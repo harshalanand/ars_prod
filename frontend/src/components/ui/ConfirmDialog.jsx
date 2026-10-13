@@ -17,6 +17,10 @@
  *                                     input: { label: 'Note', optional: true } })
  *   if (note === null) return          // cancelled (empty string is a real value)
  *
+ * Stacking: z-index 9900 — above popups/modals (1SZ Modal 9000, 1SZ filter
+ * popover 9500) so a confirm asked from inside one is visible, and below
+ * tooltips and react-hot-toast (9999) so a toast raised while it is open shows.
+ *
  * <ConfirmHost/> is mounted once in main.jsx next to <Toaster/>. If it is not
  * mounted (or crashed inside its boundary) both helpers fall back to the native
  * dialog, so a call site never hangs on an unresolved promise.
@@ -111,6 +115,22 @@ export function ConfirmHost() {
     return () => clearTimeout(t)
   }, [req])
 
+  /* Esc cancels THIS dialog only. Caught on window in the capture phase so a
+   * popup underneath (e.g. the 1SZ Modal, which closes on a window-level Esc)
+   * does not close too — and it works even before focus lands in the dialog. */
+  const cancelFn = useRef(null)
+  useEffect(() => {
+    if (!req) return undefined
+    const onEsc = (e) => {
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      e.stopPropagation()
+      cancelFn.current?.()
+    }
+    window.addEventListener('keydown', onEsc, true)
+    return () => window.removeEventListener('keydown', onEsc, true)
+  }, [req])
+
   const close = (result) => {
     const item = pending.shift()
     item?.resolve(result)
@@ -147,9 +167,9 @@ export function ConfirmHost() {
     close(spec ? text.trim() : true)
   }
   const onCancel = () => close(spec ? null : false)
+  cancelFn.current = onCancel
 
   const onKeyDown = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); onCancel(); return }
     if (e.key === 'Enter' && !e.shiftKey) {
       if (e.target.tagName === 'TEXTAREA') return   // newline in a note field
       e.preventDefault()
@@ -159,7 +179,7 @@ export function ConfirmHost() {
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4 animate-fade-in"
+      className="fixed inset-0 z-[9900] flex items-center justify-center bg-black/40 p-4 animate-fade-in"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel() }}
       onKeyDown={onKeyDown}
       role="dialog"

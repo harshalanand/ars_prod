@@ -454,6 +454,10 @@ def seed_permissions_if_needed(db: Session):
         ("View Store SLOC Validation", "STORE_SLOC_VIEW", "validation", "READ", "store_sloc"),
         ("Run Get Data Jobs", "GET_DATA_RUN", "get_data", "CREATE", "get_data"),
         ("Manage Get Data Views & Jobs", "GET_DATA_MANAGE", "get_data", "UPDATE", "get_data"),
+        # 1SZ ALC phase 3: approving a session writes ARS_PEND_ALC (and moves MSA);
+        # revert undoes it. Not auto-granted to roles — SUPER_ADMIN only until an
+        # admin ticks it for a role in Settings → Roles.
+        ("Approve / revert 1SZ ALC sessions into Pend ALC", "ACT_1SZ_APPROVE", "sz1_alloc", "APPROVE", "sz1_session"),
     ]
 
     # ── Module-access permissions (2026-07-31) ───────────────────────────
@@ -471,6 +475,7 @@ def seed_permissions_if_needed(db: Session):
         ("Module: Data Management",    "MOD_DATA_MGMT"),
         ("Module: Listing & Alloc",    "MOD_LISTING_ALLOC"),
         ("Module: GRT ALC",            "MOD_GRT_ALC"),
+        ("Module: 1SZ ALC",            "MOD_1SZ_ALC"),
         ("Module: Adhoc",              "MOD_ADHOC"),
         ("Module: Contribution %",     "MOD_CONTRIB"),
         ("Module: Auto Cont %",        "MOD_AUTO_CONT"),
@@ -508,6 +513,12 @@ def seed_permissions_if_needed(db: Session):
         ("Page: GRT ALC › Gap Report", "PAGE_GRT_GAP_REPORT",                          "MOD_GRT_ALC"),
         ("Page: GRT ALC › Store × Article Extract", "PAGE_GRT_EXTRACT",                "MOD_GRT_ALC"),
         ("Page: GRT ALC › Help", "PAGE_GRT_HELP",                                      "MOD_GRT_ALC"),
+        ("Page: 1SZ ALC › 1 · SZ Base", "PAGE_1SZ_BASE",                               "MOD_1SZ_ALC"),
+        ("Page: 1SZ ALC › 2 · ST/MJ/SZ Req", "PAGE_1SZ_REQ",                           "MOD_1SZ_ALC"),
+        ("Page: 1SZ ALC › 3 · Store × Article Run", "PAGE_1SZ_RUN",                    "MOD_1SZ_ALC"),
+        ("Page: 1SZ ALC › 4 · Sessions", "PAGE_1SZ_SESSIONS",                          "MOD_1SZ_ALC"),
+        ("Page: 1SZ ALC › CONT Gap Report", "PAGE_1SZ_GAP",                            "MOD_1SZ_ALC"),
+        ("Page: 1SZ ALC › Help", "PAGE_1SZ_HELP",                                      "MOD_1SZ_ALC"),
         ("Page: Reports › Report Generation", "PAGE_REPORT_GENERATION",                "MOD_REPORTS"),
         ("Page: Reports › Hold Dashboard", "PAGE_HOLD_DASHBOARD",                      "MOD_REPORTS"),
         ("Page: Reports › UPC Store Tracking", "PAGE_UPC_TRACKING",                    "MOD_REPORTS"),

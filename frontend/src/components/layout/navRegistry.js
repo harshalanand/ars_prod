@@ -2,6 +2,9 @@
 // Settings → Roles, which renders one permission card per father menu.
 // `module` / `permission` on a section = its MOD_* switch; `permission`
 // on an item = the page's own gate. Add a menu here and both stay in step.
+// `perms` on an item (optional) = any-of page gate: the item shows, and its
+// route opens, when the role holds ANY of these codes. `permission` stays the
+// one code Settings → Roles ticks for that item. Use itemAllowed() to test.
 import {
   LayoutDashboard, Table2, Upload, PackageCheck, Users, Shield, Eye, ScrollText,
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
@@ -9,7 +12,7 @@ import {
   Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
   HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
   AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered,
-  XCircle, Store, Sparkles, Container, Server,
+  XCircle, Store, Sparkles, Container, Server, Ruler,
   DatabaseZap, Snowflake, RefreshCw, FileSpreadsheet, PlugZap,
 } from 'lucide-react'
 
@@ -54,6 +57,23 @@ const binAllocItems = [
   { label: 'Gap Report',              path: '/bin-alloc/gap-report', icon: AlertTriangle, permission: 'PAGE_GRT_GAP_REPORT' },
   { label: 'Store × Article Extract', path: '/bin-alloc/extract',    icon: Search, permission: 'PAGE_GRT_EXTRACT' },
   { label: 'Help',                    path: '/bin-alloc/help',       icon: BookOpen, permission: 'PAGE_GRT_HELP' },
+]
+
+// 1SZ ALC — size allocation of broken-size RDC stock to the stores short of
+// those sizes. The menu follows the work: Overview → Prepare (tabs Supply,
+// Demand, Gap) → Plan a run → Sessions; then Settings and Help.
+// Overview needs only the module. Settings uses PAGE_1SZ_BASE. Prepare opens
+// with ANY of its tab codes (Supply PAGE_1SZ_BASE, Demand PAGE_1SZ_REQ, Gap
+// PAGE_1SZ_GAP) and shows only the tabs the role holds; the old URLs below keep
+// their single code. No new permission code. Spec: manual/sz1_alloc.md.
+const sz1AllocItems = [
+  { label: 'Overview',                  path: '/sz1-alloc',          icon: LayoutDashboard, end: true },
+  { label: 'Prepare',                   path: '/sz1-alloc/prepare',  icon: Layers, permission: 'PAGE_1SZ_BASE',
+    perms: ['PAGE_1SZ_BASE', 'PAGE_1SZ_REQ', 'PAGE_1SZ_GAP'] },
+  { label: 'Plan a run',                path: '/sz1-alloc/run',      icon: Cpu, permission: 'PAGE_1SZ_RUN' },
+  { label: 'Sessions',                  path: '/sz1-alloc/sessions', icon: ClipboardCheck, permission: 'PAGE_1SZ_SESSIONS' },
+  { label: 'Settings',                  path: '/sz1-alloc/settings', icon: Sliders, permission: 'PAGE_1SZ_BASE' },
+  { label: 'Help',                      path: '/sz1-alloc/help',     icon: BookOpen, permission: 'PAGE_1SZ_HELP' },
 ]
 
 // Adhoc submenu
@@ -203,6 +223,7 @@ export const SECTIONS = [
   { title: 'Data Management',   icon: Database,       items: dataManagementItems, permission: 'MOD_DATA_MGMT' },
   { title: 'Listing & Alloc',   icon: Cpu,            items: dataPreparationItems, permission: 'MOD_LISTING_ALLOC' },
   { title: 'GRT ALC',           icon: Container,      items: binAllocItems, permission: 'MOD_GRT_ALC' },
+  { title: '1SZ ALC',           icon: Ruler,          items: sz1AllocItems, permission: 'MOD_1SZ_ALC' },
   { title: 'Adhoc',             icon: FolderOpen,     items: adhocItems, permission: 'MOD_ADHOC' },
   { title: 'Contribution %',    icon: BarChart3,      items: contributionItems, permission: 'MOD_CONTRIB' },
   { title: 'Auto Cont %',       icon: Cpu,            items: autoContItems, permission: 'MOD_AUTO_CONT' },
@@ -230,6 +251,8 @@ export const MODULE_ACTIONS = {
   MOD_REPORTS:         ['REPORT_VIEW', 'REPORT_EXPORT'],
   MOD_GET_DATA:        ['GET_DATA_RUN', 'GET_DATA_MANAGE'],
   MOD_DATA_VALIDATION: ['CHECKLIST_MANAGE'],
+  // 1SZ ALC: the Prepare tabs Demand and Gap (not menu items of their own any more)
+  MOD_1SZ_ALC:         ['PAGE_1SZ_REQ', 'PAGE_1SZ_GAP'],
   MOD_SETTINGS:        ['ADMIN_USERS_CREATE', 'ADMIN_USERS_UPDATE', 'ADMIN_USERS_DELETE',
                         'ADMIN_PERMS_MANAGE', 'COLUMN_EDIT_MANAGE', 'PRODUCT_READ', 'PRODUCT_MANAGE',
                         'MOD_BACKUP'],
@@ -245,6 +268,8 @@ const MODULE_ROUTE_EXTRAS = {
   MOD_DATA_MGMT:       ['/tables'],
   MOD_LISTING_ALLOC:   ['/data-prep/listing'],
   MOD_GRT_ALC:         ['/bin-alloc'],
+  MOD_1SZ_ALC:         ['/sz1-alloc', ['/sz1-alloc/base', 'PAGE_1SZ_BASE', 'Prepare › Supply'],
+                        ['/sz1-alloc/req', 'PAGE_1SZ_REQ', 'Prepare › Demand'], ['/sz1-alloc/gap', 'PAGE_1SZ_GAP', 'Prepare › Gap']],
   MOD_AUTO_CONT:       ['/auto-cont'],
   MOD_ALC_FIXTURE:     ['/alc-fixture'],
   MOD_CONTRIB:         ['/contribution'],
@@ -260,14 +285,22 @@ const MODULE_ROUTE_EXTRAS = {
   MOD_SETTINGS:        ['/settings', '/admin'],
 }
 
+/** Does the role pass this item's own page gate? (`perms` any-of, else `permission`, else open.) */
+export function itemAllowed(item, hasPermission) {
+  if (item.perms?.length) return item.perms.some(p => hasPermission(p))
+  return !item.permission || hasPermission(item.permission)
+}
+
 const ROUTE_MODULES = (() => {
   const out = []
+  // page = one code or an any-of array; kept as `pages` (array) + `page` (the first, for messages)
   const add = (prefix, code, title, page = null, pageLabel = null) => {
+    const pages = page == null ? [] : [].concat(page)
     // '/settings?tab=sap' is a link into another module's page, not a route it owns
-    if (code && prefix && !prefix.includes('?')) out.push({ prefix, code, title, page, pageLabel })
+    if (code && prefix && !prefix.includes('?')) out.push({ prefix, code, title, page: pages[0] || null, pages, pageLabel })
   }
   // superadminOnly pages keep their own route checks; only the module gates them here
-  const pageOf = i => (i.superadminOnly ? null : i.permission || null)
+  const pageOf = i => (i.superadminOnly ? null : (i.perms?.length ? i.perms : i.permission) || null)
   navItems.forEach(i => add(i.path, i.module, i.label, pageOf(i), i.label))
   SECTIONS.forEach(s => {
     s.items.forEach(i => add(i.path, s.permission, s.title, pageOf(i), i.label))
@@ -280,11 +313,12 @@ const ROUTE_MODULES = (() => {
 
 /**
  * What a URL needs: { code, title } of its module plus, when it is (or sits
- * under) a gated sidebar page, { page, pageLabel }. null if no module owns it.
+ * under) a gated sidebar page, { page, pages, pageLabel } — the role needs ANY
+ * code in `pages` (`page` = the first, for messages). null if no module owns it.
  */
 export function moduleForPath(pathname) {
   const hit = ROUTE_MODULES.find(r => pathname === r.prefix || pathname.startsWith(r.prefix + '/'))
-  return hit ? { code: hit.code, title: hit.title, page: hit.page, pageLabel: hit.pageLabel } : null
+  return hit ? { code: hit.code, title: hit.title, page: hit.page, pages: hit.pages, pageLabel: hit.pageLabel } : null
 }
 
 /** First sidebar page this user can open, used as the home page and the way out of a blocked page. */
@@ -293,7 +327,7 @@ export function firstAllowedPage(hasPermission, superadmin) {
     !item.path.includes('?')
     && (superadmin || !module || hasPermission(module))
     && !(item.superadminOnly && !superadmin)
-    && (!item.permission || hasPermission(item.permission))
+    && itemAllowed(item, hasPermission)
   for (const i of navItems) if (ok(i, i.module)) return { path: i.path, label: i.label }
   for (const s of SECTIONS) {
     const i = s.items.find(x => ok(x, s.permission))

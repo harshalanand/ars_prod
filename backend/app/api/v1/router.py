@@ -174,6 +174,12 @@ api_router.include_router(facons_router)
 from app.api.v1.endpoints.b2b import router as b2b_router
 api_router.include_router(b2b_router)
 
+# 1SZ ALC — size allocation of broken-size RDC stock to stores short of those
+# sizes. Port of the SZ1 Allocation Streamlit tool; owns the ARS_SZ1_* tables
+# (039_sz1_module.sql). Spec: manual/sz1_alloc.md.
+from app.api.v1.endpoints.sz1 import router as sz1_router
+api_router.include_router(sz1_router)
+
 # Release Notes / Changelog — recorded changes auto-compiled into daily notes.
 from app.api.v1.endpoints.release_notes import router as release_notes_router
 api_router.include_router(release_notes_router)

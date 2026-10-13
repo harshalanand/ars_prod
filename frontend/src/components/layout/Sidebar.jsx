@@ -1,6 +1,6 @@
 import { NavLink, useLocation } from 'react-router-dom'
 import { ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react'
-import { navItems, SECTIONS } from './navRegistry'
+import { navItems, SECTIONS, itemAllowed } from './navRegistry'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
 import { useState, useRef, useEffect, useLayoutEffect } from 'react'
@@ -51,7 +51,7 @@ function SubMenu({ title, icon: Icon, items, collapsed, hasPermission, isSuperAd
 
   const visibleItems = items.filter(i => {
     if (i.superadminOnly && !isSuperAdmin) return false
-    return !i.permission || hasPermission(i.permission)
+    return itemAllowed(i, hasPermission)              // `perms` = any-of (e.g. 1SZ Prepare)
   })
 
   // Clamp the flyout inside the viewport (long menus scroll internally),
@@ -340,7 +340,7 @@ export default function Sidebar({ collapsed, onToggle }) {
         {navItems
           .filter(item => !(item.superadminOnly && !superadmin))
           .filter(item => superadmin || !item.module || hasPermission(item.module))
-          .filter(item => !item.permission || hasPermission(item.permission))
+          .filter(item => itemAllowed(item, hasPermission))
           .map(item => <SideLink key={item.path} item={item} collapsed={collapsed} />)}
 
         {/* Module gate (2026-07-31): each father menu carries a MOD_*

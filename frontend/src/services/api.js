@@ -433,6 +433,60 @@ export const b2bAPI = {
   extractDownload: (body)   => api.post('/b2b/extract/download', body, { responseType: 'blob', timeout: 600000 }),
 }
 
+// 1SZ ALC — size allocation (/sz1). Builds and runs are background jobs: each
+// returns an id at once; poll build(id) / runSession(id) for progress.
+export const sz1API = {
+  status:         ()        => api.get('/sz1/status', { timeout: 120000 }),
+  readiness:      (scope)   => api.get('/sz1/readiness', { params: { scope }, timeout: 120000 }),
+  // Review: the rows behind one readiness item (item.has_rows) — read only
+  readinessRows:  (scope, key, top) => api.get(`/sz1/readiness/${scope}/items/${encodeURIComponent(key)}/rows`, { params: top ? { top } : {}, timeout: 300000 }),
+  exportReadiness: (scope, key) => api.get(`/sz1/readiness/${scope}/items/${encodeURIComponent(key)}/export`, { responseType: 'blob', timeout: 600000 }),
+  repairTables:  ()        => api.post('/sz1/repair-tables'),
+  repairBalances: ()        => api.post('/sz1/repair-balances', null, { timeout: 300000 }),
+  preview:        (step, values) => api.post(`/sz1/preview/${step}`, values ? { values } : null, { timeout: 600000 }),
+  settings:       ()        => api.get('/sz1/settings'),
+  saveSettings:   (values)  => api.put('/sz1/settings', { values }),
+  resetSettings:  ()        => api.post('/sz1/settings/reset'),
+  startBuild:     (step)    => api.post(`/sz1/build/${step}`, null, { params: { confirm: true } }),
+  build:          (id)      => api.get(`/sz1/build/${id}`),
+  builds:         (step)    => api.get('/sz1/builds', { params: { step } }),
+  clearBuilds:    (step)    => api.delete('/sz1/builds', { params: { step, confirm: 'CLEAR' } }),
+  gap:            ()        => api.get('/sz1/gap', { timeout: 120000 }),
+  gapRows:        (params)  => api.get('/sz1/gap/rows', { params, timeout: 120000 }),
+  exportGap:      (params)  => api.get('/sz1/gap/export', { params, responseType: 'blob', timeout: 600000 }),
+  // Master data quality (read only; the server keeps the findings 5 min). key = A … F
+  quality:        (refresh) => api.get('/sz1/quality', { params: refresh ? { refresh: true } : {}, timeout: 300000 }),
+  qualityRows:    (key, params) => api.get(`/sz1/quality/${key}/rows`, { params, timeout: 300000 }),
+  qualityDistinct: (key, params) => api.get(`/sz1/quality/${key}/distinct`, { params, timeout: 120000 }),
+  exportQuality:  (key, params) => api.get(`/sz1/quality/${key}/export`, { params, responseType: 'blob', timeout: 600000 }),
+  rows:           (step, params) => api.get(`/sz1/rows/${step}`, { params, timeout: 120000 }),
+  distinct:       (kind, params) => api.get(`/sz1/distinct/${kind}`, { params, timeout: 120000 }),
+  exportBuilt:    (step, params) => api.get(`/sz1/export/${step}`, { params, responseType: 'blob', timeout: 900000 }),
+  runPage:        ()        => api.get('/sz1/run', { timeout: 120000 }),
+  validateStores: (text, stock_basis) => api.post('/sz1/stores/validate', { text, stock_basis }, { timeout: 120000 }),
+  parseStores:    (fd)      => api.post('/sz1/stores/parse', fd, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  runPreview:     (body)    => api.post('/sz1/run/preview', body, { timeout: 600000 }),
+  // What-if: the run body + variants [{key, cross_rdc, protect_other, one_source}]. Writes nothing.
+  simulate:       (body, signal) => api.post('/sz1/run/simulate', body, { timeout: 600000, signal }),
+  // body: codes, mode, weight_mj, sequence, stock_basis, cross_rdc, protect_other, one_source, note
+  startRun:       (body)    => api.post('/sz1/run', { protect_other: true, one_source: true, ...body }, { timeout: 120000 }),
+  runSession:     (id)      => api.get(`/sz1/run/${id}`),
+  cancelRun:      (id)      => api.post(`/sz1/run/${id}/cancel`),
+  sessions:       (limit)   => api.get('/sz1/sessions', { params: { limit: limit || 50 } }),
+  sessionLines:   (id, params) => api.get(`/sz1/sessions/${id}/lines`, { params, timeout: 120000 }),
+  exportSession:  (id, only) => api.get(`/sz1/sessions/${id}/export`, { params: { only }, responseType: 'blob', timeout: 900000 }),
+  deleteSession:  (id)      => api.delete(`/sz1/sessions/${id}`, { params: { confirm: 'DELETE' }, timeout: 300000 }),
+  // Parked → Approved (ARS_PEND_ALC) lifecycle. recheck is read-only; approve/revert need ACT_1SZ_APPROVE.
+  recheck:        (id)      => api.get(`/sz1/sessions/${id}/recheck`, { timeout: 120000 }),
+  approve:        (id)      => api.post(`/sz1/sessions/${id}/approve`, null, { timeout: 300000 }),
+  revert:         (id)      => api.post(`/sz1/sessions/${id}/revert`, null, { timeout: 300000 }),
+  discard:        (id)      => api.post(`/sz1/sessions/${id}/discard`),
+  // Re-runs the same stores and options on the stock that is left; returns {session_id} — poll it like a run.
+  refit:          (id)      => api.post(`/sz1/sessions/${id}/refit`, null, { timeout: 300000 }),
+  removeStores:   (id, stores) => api.post(`/sz1/sessions/${id}/remove-stores`, { stores }),
+  sessionPend:    (id)      => api.get(`/sz1/sessions/${id}/pend`),
+}
+
 /** Save a blob response as a file, using the server's file name. */
 export function saveBlob(res, fallback) {
   const cd = res.headers?.['content-disposition'] || ''
