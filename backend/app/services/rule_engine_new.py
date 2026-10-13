@@ -44,7 +44,7 @@ RULE_R09_TBL_TRIVIAL      = True   # Unified headroom check for ALL OPT_TYPEs
 # for one round but short of its I_ROD rounds still enters the waterfall. This
 # is the module-level kill switch; the per-run override arrives as the
 # use_irod_eligibility argument and must match the listing Part 6.6 gate.
-RULE_R05_USE_IROD         = False
+RULE_R05_USE_IROD         = True
 
 ENABLE_FOCUS_TIERING      = True
 ENABLE_STORE_BROKEN       = True   # MJ_REQ_REM < factor × ACS_D → skip store in opt_type
