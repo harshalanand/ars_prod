@@ -3,7 +3,8 @@
  * Shows aging, mode/source breakdown, per-RDC, BDC-unconfirmed, and filterable detail.
  * Actions: Generate BDC (download Excel), trigger MSA patch.
  */
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { pendAlcAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 import { RefreshCw, BarChart2, Download, AlertTriangle, ChevronDown, ChevronRight, AlertOctagon } from 'lucide-react'
@@ -146,6 +147,14 @@ const TH = ({ children, right }) => (
 )
 
 export default function PendAlcRecoPage() {
+  // Deep link: /pend-alc/reco?session=<SESSION_ID>[&source=<ALLOC_MODE>][&closed=open|closed|all]
+  // pre-fills the filters below (the grid fetches on its own when they change).
+  // A session link shows open AND closed rows unless `closed` says otherwise.
+  // No query string → the page behaves exactly as before.
+  const [searchParams] = useSearchParams()
+  const qSession = (searchParams.get('session') || '').trim()
+  const qSource  = (searchParams.get('source') || '').trim().toUpperCase()
+  const qClosed  = searchParams.get('closed') || ''
   const [recoSummary, setRecoSummary] = useState(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [sessions, setSessions] = useState([])
@@ -163,11 +172,20 @@ export default function PendAlcRecoPage() {
   const [fDateTo,   setFDateTo]   = useState('')
   const [fRdc,      setFRdc]      = useState('')
   const [fMajCat,   setFMajCat]   = useState('')
-  const [fMode,     setFMode]     = useState('')
+  const [fMode,     setFMode]     = useState(qSource)
   // Typed pend filter — '' | FRESH | GRT | LEGACY (rows with no ALLOC_TYPE).
   const [fAllocType, setFAllocType] = useState('')
-  const [fClosed,   setFClosed]   = useState('open') // 'open' | 'closed' | 'all'
-  const [fSession,  setFSession]  = useState('')
+  const [fClosed,   setFClosed]   = useState(() => (                // 'open' | 'closed' | 'all'
+    ['open', 'closed', 'all'].includes(qClosed) ? qClosed : qSession ? 'all' : 'open'))
+  const [fSession,  setFSession]  = useState(qSession)
+  // Follow a new deep link while the page is already open (e.g. a second
+  // "Open in Pend ALC" click). Only acts when the query string carries a value.
+  useEffect(() => {
+    if (!qSession) return
+    setFSession(qSession)
+    setFClosed(['open', 'closed', 'all'].includes(qClosed) ? qClosed : 'all')
+  }, [qSession, qClosed])
+  useEffect(() => { if (qSource) setFMode(qSource) }, [qSource])
   // Tile-driven filters — set by clicking a status / aging tile. Empty
   // strings mean "no tile filter active". The status filter accepts CSV
   // of BDC_HISTORY.STATUS values (incl. 'NEVER_SENT' for rows that never
@@ -1380,6 +1398,8 @@ export default function PendAlcRecoPage() {
             <option value="">All Modes</option>
             <option value="AUTO">AUTO</option>
             <option value="MANUAL">MANUAL</option>
+            <option value="1SZ">1SZ</option>
+            {fMode && !['AUTO', 'MANUAL', '1SZ'].includes(fMode) && <option value={fMode}>{fMode}</option>}
           </select>
           <select value={fAllocType} onChange={e => setFAllocType(e.target.value)} style={inp}>
             <option value="">All Types</option>
@@ -1431,7 +1451,7 @@ export default function PendAlcRecoPage() {
           { key:'clr', label:'CLR', sortable:true,
             render:r => <span style={{color:C.textSub}}>{r.clr || '—'}</span> },
           { key:'alloc_mode', label:'MODE', sortable:true, filterType:'multi',
-            filterOptions:['AUTO','MANUAL','RL','TBL','NL'],
+            filterOptions:['AUTO','MANUAL','RL','TBL','NL','1SZ'],
             render:r => <ModeBadge value={r.alloc_mode}/> },
           { key:'alloc_type', label:'TYPE', sortable:true,
             render:r => r.alloc_type

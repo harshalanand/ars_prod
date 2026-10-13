@@ -35,7 +35,7 @@ silently distorts every allocation that reads it.
 | Source | Grain | Role |
 |---|---|---|
 | `Master_ALC_INPUT_CO_MAJ_CAT` | MAJ_CAT | Company-level category params (base layer). |
-| `Master_ALC_INPUT_ST_MAJ_CAT` | ST_CD, MAJ_CAT | Store-level overrides (overlay). |
+| `Master_ALC_INPUT_ST_MAJ_CAT` | ST_CD, MAJ_CAT | Store-level overrides (overlay). The **only** source of `DISP_Q` (display) and CM/NM sale (`SAL_PD`) — the CO table has neither. |
 | `Master_ALC_INPUT_ST_MASTER` | ST_CD | INT_DAYS, PRD_DAYS, SL_CVR; store universe. |
 | `Master_ALC_INPUT_CO_ART` / `Master_ALC_INPUT_ST_ART` | article | Article-level params (mirror cascade). |
 | `MASTER_GEN_ART_SALE` | ST_CD, GEN_ART | CM/NM sale quantities; in-place SAL_PD. |
@@ -78,6 +78,31 @@ silently distorts every allocation that reads it.
 - **`STK_TTL` is clamped ≥ 0 at article grain** inside the pivot CTE, before
   rollup, so `SUM(STK_TTL)` reconciles across grids regardless of grouping.
   Individual SLOC columns keep their raw signed sums.
+- **Row universe — company level (Business Rule `GRID_ROW_SCOPE`, 2026-10-12).**
+  A non-pivot grid row exists for a store × key when (a) the store holds
+  stock / pending of it (`ET_STORE_STOCK` + `ARS_PEND_ALC` pivot), or (b) the
+  key is in the S5 universe, inserted with stock 0:
+  - `COMPANY` (default) — every `Master_ALC_INPUT_ST_MASTER` store
+    (`ST_STATUS` OLD/NEW/UPC) × every DISTINCT key in the latest
+    `ARS_MSA_TOTAL` at **any** RDC. A DW01 store gets a row for a category
+    only DH24 holds.
+  - `RDC` — `ARS_MSA_TOTAL ⋈ ST_MASTER ON RDC`: only keys the store's **own**
+    RDC carries (behaviour until 2026-10-12).
+  The key is the grid's full hierarchy (`MAJ_CAT`, plus `MERGE_RNG_SEG` /
+  `RNG_SEG` / `FAB` / `CLR` / … for merge and sec-cap grids), so every
+  non-pivot grid shares one universe; a Run All pins the value once for all
+  grids. Pivot-only grids (`MJ_GEN_ART`, `MJ_VAR_ART`, `MJ_SZ`) are stock-only
+  in both modes. The universe is DISTINCT stores × DISTINCT keys and S5 inserts
+  only keys with no grid row, so it can never duplicate a row (step 8 also
+  dedupes on the PK). The `LISTING=1` filter still runs afterwards.
+- **A universe row is not a budget.** S5 rows go through the same lookups as
+  stock rows: `DISP_Q`, `SAL_PD`, `ACS_D`, `ALC_D` from `ARS_CALC_ST_MAJ_CAT`,
+  whose `DISP_Q` and CM/NM sale come **only** from the store master
+  `Master_ALC_INPUT_ST_MAJ_CAT` (`Master_ALC_INPUT_CO_MAJ_CAT` has no
+  `DISP_Q`). A store with no display maintained for the category gets
+  `DISP_Q 0 → MBQ 0, OPT_CNT 0`, and listing marks its options `NO_DISPLAY`
+  (`MJ_DISP_Q = 0`), so it receives nothing until the display master is
+  maintained.
 
 ### Formulas
 
@@ -157,6 +182,12 @@ Validate before committing grid results:
   MSA-row injection (`_insert_missing_msa_rows`) — verify the `pivot_only` flag
   before running post-lookups so `(GEN_ART='NA', CLR='NA')` placeholders don't
   pollute consumers.
+- **Row universe** — the S5 universe is resolved from `GRID_ROW_SCOPE`
+  (`_grid_row_scope`; inactive / missing / unknown value → `COMPANY`) and is
+  logged per grid as `post-pivot synthetic rows (GRID_ROW_SCOPE=…)`. Read-only
+  check before a build: `_missing_rows_cte(...)` + `SELECT COUNT(*) FROM
+  Missing` gives the rows S5 would add; under `RDC` it must be 0 against a
+  grid last built under `RDC`.
 
 ### Key columns
 
@@ -187,3 +218,4 @@ Validate before committing grid results:
 - **2026-07-08 (from code)** — Sec-cap growth matrix (`ARS_SEC_CAP_GROWTH_MATRIX`) is off by default; when enabled it replaces the flat `sec_cap_pct` per grain with a cont%-banded growth%. Bands must be contiguous with exactly one open-ended last row and every growth ≥ 100 (relaxes, never tightens); a stored growth < 100 is clamped to 100 on load.
 - **2026-07-18 — Rounding precision.** `SAL_PD` is now `ROUND(…, 2)` at all four write sites in `grid_calculations.py` (`_step_sal_pd` MAJ_CAT, `_step_art_sal_pd` fallback + main, `_step_master_sale_sal_pd`). Contribution percentages `STOCK_CONT%` / `SALE_CONT%` / `INITIAL AUTO CONT%` (and the final `CONT`) are `ROUND(…, 4)` — set in `contrib.py` `_compute` (the KPI display columns stay at 2 dp); the Stage B CONT fallback in `rule_engine_new.py` already rounded to 4. Values only; no formula/logic change.
 - **2026-07-18 — Data dictionary.** `ARS_DATA_DICTIONARY` seed audited + topped up (SAL_PD, ALC_D, DISP_Q, MBQ, OPT_CNT, growth degrees, I_ROD, STK_TTL, MSA_FNL_Q, ELIG_FLAG, RL_HOLD_QTY, VAR_COUNT/VAR_FNL_COUNT, AGE, MAX_DAILY_SALE, OPT_MBQ_WH/OPT_REQ_WH, ART_EXCESS, ST_RANK/W_SCORE, ALLOC_TYPE, OPT_PRIORITY_RANK, MJ_REQ_REM, ALLOC_REMARKS, FROM_HOLD, contribution %). `_ensure_table` now idempotently inserts missing seed columns (no wipe). New `GET /data-dictionary/export` → .xlsx, with an **Export** button on the Data Dictionary page.
+- **2026-10-12 — Grid rows at COMPANY level (Business Rule `GRID_ROW_SCOPE`).** Owner ask: "grid row to be generated company level, not based on RDC availability". Until today S5 (`_insert_missing_msa_rows`) built its universe as `ARS_MSA_TOTAL ⋈ Master_ALC_INPUT_ST_MASTER ON SM.RDC = MSA.RDC`, so a store got a non-stock row only for categories its **own** RDC carried — 2,777 listed store × category pairs in 1SZ scope (303 stores, 38 categories; 2,711 DW01 + 66 DH24), e.g. HA13 Ziro (DW01) × YGW_SKEEVY (DH24-only), had no `ARS_GRID_MJ` row. Now `GRID_ROW_SCOPE` (module Grid Builder, choice `COMPANY|RDC`, seeded Active = `COMPANY`; inactive / missing → `COMPANY`) selects the universe; `COMPANY` = DISTINCT stores × DISTINCT keys of ANY RDC. Applies to every non-pivot grid, Run All pins it once per run, takes effect from the next grid build. Read-only measurement against the 2026-10-12 13:09 build (MSA seq 398): `RDC` reproduces today exactly (0 missing rows in all 9 grids); `COMPANY` adds MJ +10,921 · MERGE_RNG_SEG +20,007 · RNG_SEG +41,557 · FIT +37,086 · M_YARN_02 +41,716 · WEAVE_2 +87,412 · FAB +138,705 · CLR +650,002 · M_VND_CD +213,102 (≈ 1.24 M rows, +13 %), no duplicate keys. Of the 10,921 new MJ rows only **342** have a display (`DISP_Q > 0`, MBQ 27,092 pcs; 153 / 4,450 pcs in the 1SZ subset), 678 have `SAL_PD > 0`, 545 (10 categories) are not in the calc masters at all. All 47 new YGW_SKEEVY rows (incl. HA13) are `DISP_Q 0 / SAL_PD 0 / MBQ 0` (ACS_D 22, ALC_D 5). Why it matters: a row is not a budget — to receive stock the store × category also needs `DISP_Q` in `Master_ALC_INPUT_ST_MAJ_CAT`; without it listing blocks the options `NO_DISPLAY`.

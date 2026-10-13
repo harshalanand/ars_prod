@@ -88,6 +88,10 @@ SEED: List[tuple] = [
      "In the sequential per-OPT walk, an option is skipped when the remaining MAJ_CAT requirement is below this factor × OPT_MBQ.",
      "Engine constant 0.5 is used. Not wired yet.",
      "number", "0.5", 0.1, 1.0, None, 0, 1),
+    ("Grid Builder", "GRID_ROW_SCOPE", "Grid row universe — company vs own RDC",
+     "Which store × category rows every non-pivot grid (MJ, MJ_MERGE_RNG_SEG, MJ_RNG_SEG, MJ_FIT, MJ_FAB, MJ_CLR, MJ_M_VND_CD, … — Primary and Secondary alike) carries on top of the rows a store's own stock produces. COMPANY: a store gets a row for every MAJ_CAT (and sub-key) the company carries in ARS_MSA_TOTAL at ANY RDC. RDC: only the categories its own RDC carries (behaviour before 2026-10-12). Display, sale and MBQ fill is unchanged: a new row takes DISP_Q / SAL_PD from ARS_CALC_ST_MAJ_CAT (store display master Master_ALC_INPUT_ST_MAJ_CAT); without a maintained display it stays DISP_Q 0 / MBQ 0 and receives no stock. Takes effect from the next grid build (Run All / Generate full pipeline).",
+     "COMPANY is used (the code default since 2026-10-12). To return to own-RDC rows, keep the rule Active and set the value to RDC.",
+     "choice", "COMPANY", None, None, "COMPANY,RDC", 1, 1),
     ("Listing & Alloc", "GRD_SEC_CAP_DEFAULT", "Default sec-cap % when grid blank",
      "Secondary-grid cap percentage used when a participating grid has no sec_cap_pct maintained.",
      "Hardcoded 130% is used. Not wired yet.",
@@ -205,6 +209,26 @@ ALGO: Dict[str, str] = {
         "(remaining budget too small to make a meaningful display).\n\n"
         "Example (factor 0.5): req_rem 4, next OPT_MBQ 10 → 4 < 5 → skipped;\n"
         "req_rem 6 → 6 >= 5 → OPT is allowed to ship."
+    ),
+    "GRID_ROW_SCOPE": (
+        "Grid build, step S5 (synthetic rows, non-pivot grids only), after the\n"
+        "stock pivot has produced a row for every store × key the store STOCKS:\n"
+        "  COMPANY → universe = every ST_MASTER store (ST_STATUS OLD/NEW/UPC)\n"
+        "            × every DISTINCT key in the latest ARS_MSA_TOTAL, any RDC\n"
+        "  RDC     → universe = ARS_MSA_TOTAL joined to ST_MASTER ON RDC, so a\n"
+        "            store only sees keys its own RDC carries\n"
+        "Universe rows with no grid row at the full key are inserted with\n"
+        "stock 0, then the normal LISTING=1 filter, CONT lookup and MBQ /\n"
+        "OPT_CNT maths run on them exactly as on stock rows. A Run All pins the\n"
+        "value once so all grids of a run share one universe.\n"
+        "MBQ needs DISP_Q > 0 (no fixture ⇒ MBQ 0) and listing blocks options\n"
+        "with MJ_DISP_Q = 0 (NO_DISPLAY), so a new row ships stock only when the\n"
+        "store has a display maintained in Master_ALC_INPUT_ST_MAJ_CAT.\n\n"
+        "Example: HA13 (Ziro, RDC DW01) × YGW_SKEEVY — only DH24 holds stock.\n"
+        "RDC: no ARS_GRID_MJ row. COMPANY: row created (stock 0, ACS_D 22,\n"
+        "ALC_D 5) with DISP_Q 0 / MBQ 0 until a display is maintained for it.\n"
+        "Measured 2026-10-12: +10,921 ARS_GRID_MJ rows (303 stores, 107 cats);\n"
+        "342 of them have a maintained display and get MBQ > 0."
     ),
     "GRD_SEC_CAP_DEFAULT": (
         "Sec-cap pre-gate per participating grid:\n"

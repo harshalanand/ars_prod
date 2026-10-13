@@ -1,7 +1,7 @@
 ---
 title: Listing
 tags: [ars, listing, allocation]
-updated: 2026-07-17
+updated: 2026-10-12
 ---
 
 # Listing
@@ -14,13 +14,13 @@ Stage 4 of the [[Pipeline Overview|pipeline]] — the staging + hand-off layer b
 ## Session model
 - **`ARS_LISTING_SESSIONS`** — one header per `/generate`. `SESSION_ID` = timestamp string, also the `batch_id`. `start_session` attaches a per-session loguru sink (`logs/listing_sessions/<sid>.log`); `end_session` is cancel-safe; `kill_session` does cooperative-cancel + SQL SPID KILL. `PARKED_STATUS` ∈ PARKED / SKIPPED_ERROR / SKIPPED_EMPTY / PARKED_PARTIAL.
 - Data tables are **dropped+recreated every run** — hence the concurrency guard.
-- **working → parked → approved:** live `*_WORKING` tables → Part 8.4 snapshots to `*_PARKED` (tagged by session) → [[Review and Approve|Approve]] promotes to `*_HISTORY`.
+- **working → parked → approved:** live `*_WORKING` tables → Part 8.4 snapshots to `*_PARKED` (tagged by session; ARS_LISTING itself is skipped while audit-all is ON, see Gotchas) → [[Review and Approve|Approve]] promotes to `*_HISTORY`.
 
 ## Build parts (inside `_generate_listing_impl`)
 | Part | What it does |
 |------|--------------|
 | 1 | Grid data (existing stock) → `IS_NEW=0` into `ARS_LISTING` |
-| 2 | MSA-missing options → `IS_NEW=1` |
+| 2 | MSA-missing options → `IS_NEW=1`, **pre-filtered by run pool** (keep only pool FNL_Q>0 OR a live hold; see Gotchas) |
 | 3.5–3.5c | ACS_D + ALC_D, LISTING flag, I_ROD, CLR_MIN/MAX, FOCUS caps, AUTO_GEN_ART_SALE, AGE |
 | **3.54** | `RL_HOLD_QTY` from `ARS_NL_TBL_HOLD_TRACKING` (prior-run hold, pool-scoped) — **must precede 3.6** |
 | 3.55 | `MSA_FNL_Q` (typed by `alloc_type`), `VAR_COUNT`/`VAR_FNL_COUNT` |
@@ -64,6 +64,8 @@ Stage 4 of the [[Pipeline Overview|pipeline]] — the staging + hand-off layer b
 - `allocation_mode` hard-400 for anything but `per_opt`. E-01 pool pre-check (400 if MSA has no rows of the requested `alloc_type`).
 - `allow_multi_parked` **request field is ignored** — authoritative value from AppSettings.
 - Background thread reconstructs `GenerateRequest` from a dict; `parallel_workers` clamped 2–8.
+- **Part 2 pool pre-filter (2026-10-12, 88567ef):** `_msa_pool_filter` (one variable, applied to both the diagnostic and the INSERT) keeps an MSA option only if pool FNL_Q>0 OR a live prior-run hold. The hold is an EXISTS against the ledger mirroring Part 3.54 (RL_HOLD_QTY is not set until 3.54). Strict SUBSET of Part 6.6 `gate_stock` and Stage A `R04`, which stay in place. Outer MSA columns in that EXISTS MUST be table-qualified, or they bind to the hold table and self-match. Reduction is volatile (-96.7% on 10-10, -13.9% on 10-12); the invariant is "0 dropped options with a live hold". Hold rescue is inert while the ledger has 0 open holds. Motivation: a 5h CXSYNC_PORT hang over 38.8M rows. → [[project_listing_pool_prefilter]].
+- **Park skip under audit-all (2026-10-09, 3a17859):** with `LST_AUDIT_ALL_TO_WORKING` ON, ARS_LISTING is not snapshotted to `*_PARKED` / `*_HISTORY` (it duplicated `ARS_LISTING_WORKING_HISTORY`). EXCESS and report readers take the snapshot if it holds the session, else the working archive. Legacy-table TRUNCATE on PROD still awaits approval. → [[project_listing_park_skip_audit_on]].
 - **`listing_allocator.py` is DELETED** — the manual/KB E1–E7 "allocator" section is stale; that logic is now in [[Rule Engine (per_opt)]].
 
 ## Cross-links

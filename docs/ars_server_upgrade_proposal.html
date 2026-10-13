@@ -1,0 +1,144 @@
+<title>ARS Server Upgrade Proposal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a single-column spec-sheet memo — decision up top, evidence strip, option table, line-item costs, then recommendation + next steps side by side. */
+:root{
+  --bg:#F6F7F9; --paper:#FFFFFF; --fg:#18202A; --muted:#5A6573; --line:#DDE2E9;
+  --accent:#1D5A9E; --accent-soft:#E7EEF7;
+  --risk:#B3261E; --risk-soft:#FBEAEA; --ok:#1E7B4E; --ok-soft:#E6F3EC; --warn:#8A5A00; --warn-soft:#FBF1DD;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",Arial,sans-serif;
+  --f-body:"IBM Plex Sans","Segoe UI",Roboto,Arial,sans-serif;
+  --f-mono:"IBM Plex Mono",Consolas,"Courier New",monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0F141A; --paper:#161D25; --fg:#E6EAF0; --muted:#9AA5B3; --line:#2A3440;
+  --accent:#7FB0E8; --accent-soft:#1B2A3B;
+  --risk:#F2918A; --risk-soft:#3A1E1D; --ok:#7CCFA2; --ok-soft:#16302A; --warn:#E9C06B; --warn-soft:#352A14; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0F141A; --paper:#161D25; --fg:#E6EAF0; --muted:#9AA5B3; --line:#2A3440;
+  --accent:#7FB0E8; --accent-soft:#1B2A3B;
+  --risk:#F2918A; --risk-soft:#3A1E1D; --ok:#7CCFA2; --ok-soft:#16302A; --warn:#E9C06B; --warn-soft:#352A14; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 var(--f-body);padding-inline:16px;padding-block:24px 40px}
+.sheet{max-width:900px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:28px clamp(16px,4vw,40px);display:grid;gap:22px}
+.eyebrow{font:500 11px/1 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+h1{font:600 clamp(24px,4vw,32px)/1.15 var(--f-display);margin:6px 0 4px;text-wrap:balance}
+h2{font:600 15px/1.2 var(--f-display);letter-spacing:.04em;text-transform:uppercase;margin:0 0 10px;color:var(--fg)}
+.meta{color:var(--muted);font-size:13px}
+.ask{background:var(--accent-soft);border-left:3px solid var(--accent);padding:12px 16px;border-radius:0 4px 4px 0}
+.ask b{font-weight:600}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.fact{border:1px solid var(--line);border-radius:4px;padding:10px 12px;display:grid;gap:2px}
+.fact .v{font:500 20px/1.2 var(--f-mono);font-variant-numeric:tabular-nums}
+.fact .k{font-size:12px;color:var(--muted)}
+.fact.bad .v{color:var(--risk)} .fact.good .v{color:var(--ok)}
+ul.tight{margin:8px 0 0;padding-left:18px;display:grid;gap:3px}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:4px}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:13px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{font:600 12px/1.3 var(--f-body);color:var(--muted);background:var(--bg);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+tr.total td{font-weight:600;background:var(--bg)}
+tr.alt td{color:var(--muted);font-size:12.5px}
+.spec{font-family:var(--f-mono);font-size:12px;color:var(--muted)}
+.pill{display:inline-block;font:600 11px/1 var(--f-body);padding:4px 7px;border-radius:999px;white-space:nowrap}
+.pill.rec{background:var(--ok-soft);color:var(--ok)} .pill.alt{background:var(--accent-soft);color:var(--accent)} .pill.tmp{background:var(--warn-soft);color:var(--warn)}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
+.two > div{min-width:0}
+ol{margin:0;padding-left:20px;display:grid;gap:5px}
+.note{font-size:12px;color:var(--muted);border-top:1px solid var(--line);padding-top:12px}
+.note p{margin:0 0 4px}
+.big{font:600 18px/1.3 var(--f-display)}
+</style>
+
+<main class="sheet">
+  <header>
+    <div class="eyebrow">Infrastructure proposal · ARS Auto Replenishment</div>
+    <h1>ARS Server Upgrade Proposal</h1>
+    <div class="meta">V2 Retail · 9 October 2026 · Prepared by the ARS team (Santosh Kumar)</div>
+  </header>
+
+  <section class="ask">
+    <b>Decision needed:</b> approve a licensed SQL Server for ARS, plus either an upgrade of our existing app server so it also hosts the database, or new server hardware. The ARS database now runs on a desktop PC that is out of memory, has a slow disk, and uses a SQL Server edition that is not licensed for production use.
+  </section>
+
+  <section>
+    <h2>Where we are today</h2>
+    <div class="facts">
+      <div class="fact bad"><span class="v">31 GB</span><span class="k">RAM on the DB PC. SQL uses 29 GB, Windows has 0 GB free.</span></div>
+      <div class="fact bad"><span class="v">60 ms</span><span class="k">Average disk write time. Healthy is under 5 ms.</span></div>
+      <div class="fact bad"><span class="v">1.7 TB/day</span><span class="k">Written to a desktop SSD. Wear-out risk within about 2 years.</span></div>
+      <div class="fact good"><span class="v">7%</span><span class="k">Average CPU use. The processor is not the problem.</span></div>
+    </div>
+    <ul class="tight">
+      <li>The database (1 TB) is over 30× larger than the memory available to cache it, so reports and listing runs read from a slow disk.</li>
+      <li><b>Compliance:</b> SQL Server 2022 <i>Developer Edition</i> is free only for development and testing, and is never patched. The PC runs Windows 10 21H1, which no longer gets security updates.</li>
+      <li><b>Data safety:</b> the last full backup of the main database (Rep_Data) was taken on 11 Sep 2026.</li>
+      <li><b>Existing app server:</b> ARS already runs on a Lenovo server (LENOVO-SRV, 192.168.150.249). If it has spare memory slots and drive bays, it can be upgraded to host the database too, which avoids buying new servers. Its capacity check is in progress.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Options and tentative cost</h2>
+    <div class="tbl"><table>
+      <thead><tr><th>Option</th><th>Configuration</th><th class="num">Hardware</th><th class="num">Software</th><th class="num">Total*</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pill rec">C · Preferred, if eligible</span><br>Upgrade the existing app server to host the DB too</td>
+          <td>LENOVO-SRV upgraded to <span class="spec">256–384 GB ECC · 4×3.84 TB SSD RAID 10 + 2×1.6 TB SSD mirror</span><br>Needs at least 24 cores, free memory slots and 6+ free drive bays.</td>
+          <td class="num">₹12–20 L</td><td class="num">₹28–38 L</td><td class="num">₹40–58 L</td></tr>
+        <tr><td><span class="pill alt">A · Best new build</span><br>Separate DB and app servers</td>
+          <td>DB: <span class="spec">16 cores · 256 GB ECC · 4×3.84 TB NVMe RAID 10 + 2×1.6 TB NVMe</span><br>App: <span class="spec">16–24 cores · 128 GB ECC · 2×1.92 TB NVMe</span></td>
+          <td class="num">₹27–39 L</td><td class="num">₹30–38 L</td><td class="num">₹57–77 L</td></tr>
+        <tr><td><span class="pill alt">B · Lower-cost new build</span><br>One new server, 2 virtual machines</td>
+          <td><span class="spec">32 cores · 512 GB ECC · 8 enterprise NVMe drives in 3 groups</span><br>DB VM 16 cores / 256 GB · App VM 12–14 cores / 192 GB</td>
+          <td class="num">₹25–35 L</td><td class="num">₹30–38 L</td><td class="num">₹55–73 L</td></tr>
+        <tr><td><span class="pill tmp">Stopgap only</span><br>Upgrade the current PC</td>
+          <td><span class="spec">128 GB RAM · 2 enterprise NVMe drives</span><br>Still no ECC, RAID or dual power. Buys 6–12 months.</td>
+          <td class="num">₹1.5–2.5 L</td><td class="num">₹7–35 L</td><td class="num">₹9–38 L</td></tr>
+      </tbody>
+    </table></div>
+    <p class="meta" style="margin:8px 0 0">*Hardware for A, B and C includes a backup NAS and online UPS (₹3–5 L). Software = Windows Server Standard + SQL Server Standard for 16 cores. <b>A SQL licence is needed in every option, including doing nothing,</b> because the current edition is not licensed for production.</p>
+  </section>
+
+  <section>
+    <h2>Cost breakdown (₹ lakh, excl. GST)</h2>
+    <div class="tbl"><table>
+      <thead><tr><th>Item</th><th class="num">C · Existing</th><th class="num">A · Separate</th><th class="num">B · Single</th></tr></thead>
+      <tbody>
+        <tr><td>Upgrade existing server: memory to 256–384 GB ECC, enterprise SSDs, RAID controller if needed</td><td class="num">9–15</td><td class="num">–</td><td class="num">–</td></tr>
+        <tr><td>New DB server hardware, 5-year onsite warranty</td><td class="num">–</td><td class="num">16–22</td><td class="num" rowspan="2">22–30</td></tr>
+        <tr><td>New app server hardware, 5-year onsite warranty</td><td class="num">existing</td><td class="num">8–12</td></tr>
+        <tr><td>Windows Server 2025 Standard (all physical cores)</td><td class="num">0–2.6</td><td class="num">2.0–2.6</td><td class="num">2.0–2.6</td></tr>
+        <tr><td>SQL Server Standard, 16-core licence</td><td class="num">28–35</td><td class="num">28–35</td><td class="num">28–35</td></tr>
+        <tr><td>Backup NAS (2×16 TB) + online UPS</td><td class="num">3–5</td><td class="num">3–5</td><td class="num">3–5</td></tr>
+        <tr class="total"><td>Total (per-core SQL licence)</td><td class="num">40–58</td><td class="num">57–77</td><td class="num">55–73</td></tr>
+        <tr class="alt"><td>Total if SQL is bought as Server + CAL (about 40 users or fewer, SQL ≈ ₹7–10 L)</td><td class="num">19–33</td><td class="num">36–52</td><td class="num">34–48</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="two">
+    <div>
+      <h2>Recommendation</h2>
+      <p class="big" style="margin:0 0 6px">Option C if the existing server qualifies, otherwise option A.</p>
+      <p style="margin:0 0 6px">Upgrading the existing app server saves about ₹15–20 L compared with new hardware, because it reuses the server we already own. It qualifies if it has at least 24 cores, can take 256 GB or more of ECC memory, has 6 or more free drive bays, and is under warranty or can be extended. Running the app and database on one machine needs firm memory limits for each, and good offsite backups, since one fault takes both down.</p>
+      <p style="margin:0">If it doesn't qualify, buy option A. It costs only ₹2–4 L more than B, and keeps the app and database apart. All options are sized for about 3 years at 2× today's load.</p>
+    </div>
+    <div>
+      <h2>Next steps</h2>
+      <ol>
+        <li>This week: run the capacity check on the existing app server (a read-only script, about 1 minute).</li>
+        <li>If it qualifies, get a Lenovo quote for the memory and SSD upgrade. If not, get quotes for option A or B (ThinkSystem SR650 V3 / SR665 V3 or similar).</li>
+        <li>Get SQL Server Standard quotes from a Microsoft licensing partner, per-core and Server + CAL. The per-core price depends on the final server's core count.</li>
+        <li>This week, at no cost: take a full compressed backup, cap SQL's memory, and turn on backup compression.</li>
+        <li>Migrate over one weekend, compressing the large history tables during the move. The current DB PC then becomes the dev/test database, where the free edition is allowed.</li>
+      </ol>
+    </div>
+  </section>
+
+  <footer class="note">
+    <p><b>Basis:</b> read-only measurements of the production DB server HOPC866 over 84 days of uptime (16 Jul – 8 Oct 2026).</p>
+    <p><b>Cost assumptions:</b> indicative only, excluding 18% GST. Based on list prices at 1 USD ≈ ₹88. Server memory and SSD prices have been volatile through 2025–26, so confirm with quotes. SQL Server 2022 Standard uses at most 128 GB of memory for cached data; SQL Server 2025 Standard is expected to raise this to 256 GB (confirm with your licensing partner). Server + CAL licensing needs one CAL for each person who uses ARS or Power BI reports built on this database. Option C assumes the existing server has 16 cores and spare slots and bays; per-core SQL licensing covers every physical core, so each 2 extra cores adds about ₹3.5–4.4 L, unless SQL runs in a virtual machine.</p>
+  </footer>
+</main>

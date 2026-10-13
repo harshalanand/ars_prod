@@ -73,6 +73,42 @@ def _engine():
     return get_data_engine()
 
 
+# Operations whose preview/revert needs a permission beyond a login.
+# APPROVE_1SZ (a 1SZ ALC session approved into the ledger) is reverted with the
+# same authority that approved it — ACT_1SZ_APPROVE, as on
+# POST /sz1/sessions/{id}/approve|revert. Other op types: login only (unchanged).
+_OP_REVERT_PERMISSION = {"APPROVE_1SZ": "ACT_1SZ_APPROVE"}
+
+
+def _require_op_revert_permission(op_id: int, current_user: User) -> None:
+    """403 if the operation's OP_TYPE needs a permission the user lacks.
+
+    Same rule as security.dependencies.RequirePermissions (SUPER_ADMIN passes),
+    applied imperatively because the required permission depends on the row.
+    A missing operation is left to the downstream call (it returns 404/400).
+    """
+    if "SUPER_ADMIN" in set(getattr(current_user, "role_codes", None) or []):
+        return
+    with _engine().connect() as conn:
+        row = conn.execute(
+            text(f"SELECT OP_TYPE FROM dbo.{OPERATIONS_TABLE} WHERE OP_ID = :id"),
+            {"id": op_id},
+        ).fetchone()
+    if not row:
+        return
+    op_type = str(row[0] or "").strip().upper()
+    perm = _OP_REVERT_PERMISSION.get(op_type)
+    if not perm:
+        return
+    if perm not in (getattr(current_user, "permissions", None) or set()):
+        raise HTTPException(
+            403,
+            f"Operation #{op_id} is a 1SZ ALC approval ({op_type}); reverting it "
+            f"requires the {perm} permission (same as approving a 1SZ session). "
+            f"Ask an administrator to grant it, or revert from 1SZ ALC → Sessions.",
+        )
+
+
 def _norm_alloc_type_field(v):
     """Pydantic normalizer for row-level alloc_type: None/'' → None,
     'fresh'/' GRT ' → 'FRESH'/'GRT', anything else → ValueError (422)."""
@@ -1952,6 +1988,7 @@ def pend_alc_operations_revert_async(
     """Async variant of /operations/{op_id}/revert. Returns {job_id} immediately."""
     if not confirm:
         raise HTTPException(400, "confirm=true is required to revert")
+    _require_op_revert_permission(op_id, current_user)
     note = (body.note if body else None)
     label = f"Revert op #{op_id}"
     job_id = _new_job("revert", label=label)
@@ -2603,6 +2640,7 @@ def pend_alc_operations_preview(
     current_user: User = Depends(get_current_user),
 ):
     """Dry-run: returns what would be reverted + any safety blockers."""
+    _require_op_revert_permission(op_id, current_user)
     try:
         with _engine().connect() as conn:
             res = preview_revert(conn, op_id)
@@ -2629,6 +2667,7 @@ def pend_alc_operations_revert(
     """Apply the reverse of an operation. Requires `confirm=true`."""
     if not confirm:
         raise HTTPException(400, "confirm=true is required to revert")
+    _require_op_revert_permission(op_id, current_user)
     try:
         note = (body.note if body else None)
         with _engine().connect() as conn:

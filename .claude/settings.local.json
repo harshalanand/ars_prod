@@ -883,7 +883,22 @@
       "Bash(awk 'NR>=2120 && NR<=2135 && /^def |^    def /' backend/app/services/rule_engine_pandas.py)",
       "PowerShell(Get-CimInstance Win32_Process -Filter \"ProcessId=21096 or ProcessId=804 or ProcessId=31560 or ProcessId=41008 or ProcessId=15900\" | Select-Object ProcessId, @{n='Cmd';e={$_.CommandLine}}, @{n='Started';e={$_.CreationDate}} | Format-List)",
       "PowerShell(Get-CimInstance Win32_Process -Filter \"ProcessId=47144\" | Select-Object ProcessId, @{n='Cmd';e={$_.CommandLine}}, @{n='Started';e={$_.CreationDate}} | Format-List)",
-      "Bash(curl -s -m 25 -X POST http://127.0.0.1:8080/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"superadmin\",\"password\":\"Admin@12345\"}')"
+      "Bash(curl -s -m 25 -X POST http://127.0.0.1:8080/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"superadmin\",\"password\":\"Admin@12345\"}')",
+      "mcp__claude-in-chrome__tabs_context_mcp",
+      "mcp__claude-in-chrome__browser_batch",
+      "mcp__claude-in-chrome__navigate",
+      "mcp__claude-in-chrome__computer",
+      "PowerShell(w32tm /stripchart /computer:192.168.150.249 /samples:3 /dataonly; \"local UTC: \" + \\(Get-Date\\).ToUniversalTime\\(\\).ToString\\(\"u\"\\))",
+      "Bash(cd \"/c/Users/santosh.kumar3/.claude/projects/D--PROJECTS-ars-v3/memory\" && echo \"=== v3 MEMORY.md ===\" && cat MEMORY.md && echo \"\" && echo \"=== work-in-main-checkout.md ===\" && cat work-in-main-checkout.md)",
+      "Bash(echo \"--- build exit: $? ---\")",
+      "Bash(echo \"vite exit: $?\")",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Select-Object ProcessId,ExecutablePath,@{n='cmd';e={$_.CommandLine.Substring\\(0,[math]::Min\\(140,$_.CommandLine.Length\\)\\)}} | Format-List | Out-String -Width 250)",
+      "PowerShell($e=$null; [System.Management.Automation.Language.Parser]::ParseFile\\('D:\\\\PROJECTS\\\\ars_v3\\\\docs\\\\server_review\\\\server_inventory.ps1',[ref]$null,[ref]$e\\) | Out-Null; if\\($e\\){$e}else{\"parse OK\"})",
+      "Bash(curl -s -m 20 http://localhost:8080/openapi.json)",
+      "Bash(curl -s -m 60 http://localhost:8080/health)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 280 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 500 python scripts/verify_pool_prefilter.py FRESH)",
+      "Bash(ls /c/Users/SANTOS~1.KUM/AppData/Local/Temp/claude/D--PROJECTS-ars-v3/24e47683-a875-405e-be69-f56d520d6730/scratchpad/ 2>/dev/null | head -40)"
     ],
     "additionalDirectories": [
       "D:\\projects\\ars_prod",

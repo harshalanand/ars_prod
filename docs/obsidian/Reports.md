@@ -18,6 +18,8 @@ Catalogue of hand-built analytics reports — ad-hoc queries and stored procs th
 | Grid Report (All-RDC) | `dbo.ALLRDC_usp_ars_grid_report` · `backend/sql/ALLRDC_usp_ars_grid_report.sql` | Per-RDC variant: national pool view + 18 RDC-specific columns (ALC_Q via SRC_RDC, supply via RDC, hold via RDC) |
 | MSA Master | `dbo.usp_ars_msa_master` · `backend/sql/usp_ars_msa_master.sql` | Opening-vs-closing MSA reconciliation; multi-level rollup + ordered steps |
 | MSA Master (All-RDC) | `dbo.ALLRDC_usp_ars_msa_master` · `backend/sql/ALLRDC_usp_ars_msa_master.sql` | Per-RDC variant: fixes 39% under-count in base via SRC_RDC (source RDC, not store RDC) |
+| Alloc Report (All-RDC) | `dbo.ALLRDC_USP_VAR_ART_ALC_RPT` · `backend/sql/ALLRDC_usp_var_art_alc_rpt.sql` | VAR_ART allocation report netted on the all-RDC MSA pool (no RDC join); 2,202 negative EXTRA_MSA_QTY rows in base → 0 |
+| Park Temp (All-RDC) | `dbo.ALLRDC_USP_PARK_TEMP` · `backend/sql/ALLRDC_usp_park_temp.sql` | Parking temp report netted on the all-RDC pool; 7,636 negative EXTRA_MSA_QTY rows in base → 0; RDC is descriptive only |
 | Fresh Lorry | `dbo.usp_ars_fresh_lorry` · `backend/sql/usp_ars_fresh_lorry.sql` | Fresh pool dispatch with per-option HOLD/RELEASE verdict (TBL <30% size coverage → HOLD) |
 | Alloc Batch Summary | `dbo.usp_ars_alloc_batch_summary` · `backend/sql/usp_ars_alloc_batch_summary.sql` | Batch summary at (DIV, SUB_DIV, STATUS, MAJ_CAT): shipped quantity, MSA available, store-level unmet requirement |
 
@@ -25,7 +27,7 @@ Catalogue of hand-built analytics reports — ad-hoc queries and stored procs th
 
 ## Grid Report — `dbo.usp_ars_grid_report`
 
-A parameterized analytics report over the grid tables. Source: `backend/sql/usp_ars_grid_report.sql` (built & live-validated on `HOPC866`, 2026-07-18). Enriches a grid table with store, product, listing, MSA, allocation and hold context in one wide result set. Related: [[Grid Builder]] · [[Pending Allocation and Hold]] · [[MSA Stock Calculation]] · [[Data Model]].
+A parameterized analytics report over the grid tables. Source: `backend/sql/usp_ars_grid_report.sql` (built & live-validated on `HOPC866`, 2026-07-18). Enriches a grid table with store, product, listing, MSA, allocation and hold context in one wide result set. **2026-10-09:** the default session (`MAX(SESSION_ID)`) is read from `ARS_LISTING_WORKING_HISTORY`, because `ARS_LISTING_HISTORY` is no longer written while `LST_AUDIT_ALL_TO_WORKING` is ON ([[project_listing_park_skip_audit_on]]). Related: [[Grid Builder]] · [[Pending Allocation and Hold]] · [[MSA Stock Calculation]] · [[Data Model]].
 
 ### Parameters
 | Param | Default | Meaning |
@@ -103,9 +105,27 @@ Some categories are `[A-Z]-`-prefixed in grid/MSA/listing (`B-M_TEES_HS`) but ne
 
 ---
 
+## Alloc Report (All-RDC) — `dbo.ALLRDC_USP_VAR_ART_ALC_RPT`
+
+All-RDC variant of `USP_VAR_ART_ALC_RPT`. Source: `backend/sql/ALLRDC_usp_var_art_alc_rpt.sql` (commit 123f2e6, branch `feat/central-rdc-pool`, deployed to HOPC866 & ARSDBPRO). Base file untouched.
+
+- **Why:** base joins MSA pool and consumption on RDC (`a.RDC = b.RDC`). Each store's consumption is charged to its own RDC while cross-RDC supply is routine, so netting hits the wrong pool: 2,202 negative `EXTRA_MSA_QTY` rows in base, 0 in this variant.
+- **Change:** `cte_msa_stk` has no RDC; main join is `MAJ_CAT` + `VAR_ART = ARTICLE_NUMBER`. RDC stays as a descriptive column.
+- **Validation:** 36,925 rows / 36 cols on both; 7.5s base vs 7.1s ALLRDC.
+- **Read with care:** `SUM(OP_MSA_QTY)` roughly doubles (2.82M to 5.15M) because every row sees the national pool. Expected.
+
+## Park Temp (All-RDC) — `dbo.ALLRDC_USP_PARK_TEMP`
+
+All-RDC variant of `USP_PARK_TEMP`. Source: `backend/sql/ALLRDC_usp_park_temp.sql` (commit 123f2e6). Consumption side reads `ARS_LISTING_WORKING_HISTORY`, which has NO SRC_RDC column, so the all-RDC roll-up is the only correct option.
+
+- **Changed:** MSA_QTY CTE (grouping, join, outer GROUP BY) drops RDC. ALLOC_AGG windows ALC_TTL / HOLD_TTL / FROM_HOLD_TTL partition by MAJ_CAT, GEN_ART_NUMBER, CLR.
+- **Unchanged:** per-store ALLOC_Q_MACHINE and HOLD_QTY (keyed on WERKS), and the MAJ_CAT / MERGE_RNG_SEG / RNG_SEG / MVGR-1 / FIT groups.
+- **Validation:** 313,283 rows / 101 cols on both; 66.2s base vs 69.0s ALLRDC. Negative `EXTRA_MSA_QTY` rows 7,636 to 0. `SUM(OP_MSA_QTY)` 21.25M to 41.21M (expected, as above).
+- Related: Grid Report (All-RDC) and MSA Master (All-RDC) below · [[2026-10-10]]
+
 ## Grid Report (All-RDC) — `dbo.ALLRDC_usp_ars_grid_report`
 
-Per-RDC variant of the base Grid Report. Source: `backend/sql/ALLRDC_usp_ars_grid_report.sql` (deployed 2026-10-06, both `HOPC866` & `ARSDBPRO`, sha 1511a9e585080afd). **Use this when you need to see what stock is available FROM each RDC, and how much was actually allocated FROM each source.**
+Per-RDC variant of the base Grid Report. Source: `backend/sql/ALLRDC_usp_ars_grid_report.sql` (deployed 2026-10-06, both `HOPC866` & `ARSDBPRO`, sha 1511a9e585080afd). **Use this when you need to see what stock is available FROM each RDC, and how much was actually allocated FROM each source.** Default session (`MAX(SESSION_ID)`) read from `ARS_LISTING_WORKING_HISTORY` as of 2026-10-09.
 
 Related: [[Grid Report — dbo.usp_ars_grid_report]] · [[Fresh-GRT Allocation]] · [[Data Model]] · [[project_rdc_store_vs_src]].
 
@@ -160,7 +180,7 @@ Strip `/* */` and `--` comments first. Header comments mentioning a formula name
 
 ## MSA Master — `dbo.usp_ars_msa_master`
 
-Opening → allocation-movement → closing reconciliation of MSA, rolled up to any grain. Source: `backend/sql/usp_ars_msa_master.sql` (built & live-validated on `HOPC866`, 2026-07-23). Related: [[MSA Stock Calculation]] · [[Fresh-GRT Allocation]] · [[Data Model]].
+Opening → allocation-movement → closing reconciliation of MSA, rolled up to any grain. Source: `backend/sql/usp_ars_msa_master.sql` (built & live-validated on `HOPC866`, 2026-07-23). Default session read from `ARS_LISTING_WORKING_HISTORY` as of 2026-10-09. Related: [[MSA Stock Calculation]] · [[Fresh-GRT Allocation]] · [[Data Model]].
 
 ### Parameters
 | Param | Default | Meaning |
@@ -209,7 +229,7 @@ In the Report Generation hub, `@Level` shows a **multi-select dropdown** (chips,
 
 ## MSA Master (All-RDC) — `dbo.ALLRDC_usp_ars_msa_master`
 
-Per-RDC opening → allocation-movement → closing reconciliation. Corrects a **39% under-count** in the base `usp_ars_msa_master` caused by cross-RDC supply. Source: `backend/sql/ALLRDC_usp_ars_msa_master.sql` (deployed 2026-10-06, both HOPC866 & ARSDBPRO, sha 68e35d1fe7002500). **This proc is only correct on PROD**; on DEV it degrades gracefully to the base logic (the split table does not exist there). Related: [[MSA Master|usp_ars_msa_master]] · [[RDC store vs src]] · [[Fresh-GRT Allocation]] · [[Data Model]].
+Per-RDC opening → allocation-movement → closing reconciliation. Corrects a **39% under-count** in the base `usp_ars_msa_master` caused by cross-RDC supply. Source: `backend/sql/ALLRDC_usp_ars_msa_master.sql` (deployed 2026-10-06, both HOPC866 & ARSDBPRO, sha 68e35d1fe7002500). **This proc is only correct on PROD**; on DEV it degrades gracefully to the base logic (the split table does not exist there). Default session read from `ARS_LISTING_WORKING_HISTORY` as of 2026-10-09. Related: [[MSA Master|usp_ars_msa_master]] · [[RDC store vs src]] · [[Fresh-GRT Allocation]] · [[Data Model]].
 
 ### The Under-Count Problem
 

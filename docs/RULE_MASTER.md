@@ -161,6 +161,7 @@ breach ⇒ block the OPT row at the main-pass pre-gate
 | Orphan column removal goes through `POST /grid-builder/hierarchy/compact` | Explicit admin action; default `dry_run=true`. Includes `MERGE_<X>` orphans when parent `X` is gone |
 | **No** `DBCC SHRINKFILE` after Run-All | Routine shrink fragments indexes; file regrows next run anyway |
 | S5 `_insert_missing_msa_rows` skipped when `grid.pivot_only=1` | Article-grain grids would only get `(NA,NA,NA)` placeholders polluting downstream |
+| S5 row universe = Business Rule `GRID_ROW_SCOPE` (module Grid Builder): **COMPANY** (default, 2026-10-12) = every ST_MASTER store × every key in `ARS_MSA_TOTAL` at ANY RDC; **RDC** = only keys the store's own RDC carries | Owner 2026-10-12: "grid row to be generated company level, not based on RDC availability". One universe for every non-pivot grid (MJ, merge, sec-cap); Run-All pins the value once. New rows still need `DISP_Q > 0` (Master_ALC_INPUT_ST_MAJ_CAT) to get MBQ / ship |
 | `bootstrap_msa_pend_sync` at end of Run-All is **kept** | Cheap safety net; prevents PEND/FNL_Q drift after heavy rebuild |
 
 ---

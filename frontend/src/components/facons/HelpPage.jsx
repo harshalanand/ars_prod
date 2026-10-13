@@ -3,7 +3,8 @@ import { BookOpen, Bookmark } from 'lucide-react'
 import { C } from '@/theme/colors'
 
 // Simple, plain-language Help page: a bookmark rail + BRD/FSD sections.
-// content = { title, tag, intro, sections: [{ id, emoji, title, lead, bullets?, rows? }] }
+// content = { title, tag, intro, sections: [{ id, emoji, title, lead, content?, bullets?, rows? }] }
+//   content: any React node (a diagram, a flowchart) shown under the lead
 //   bullets: string[] (supports **bold**)      rows: [[term, description], …]
 function rich(t) {
   return String(t || '').split(/(\*\*[^*]+\*\*)/g).map((s, i) =>
@@ -65,6 +66,7 @@ export default function HelpPage({ title, tag, intro, sections = [] }) {
                   {s.lead && <p style={{ fontSize: 13, color: C.textSub, margin: '4px 0 0', maxWidth: '72ch', lineHeight: 1.55 }}>{rich(s.lead)}</p>}
                 </div>
               </div>
+              {s.content && <div style={{ marginTop: 14 }}>{s.content}</div>}
               {s.bullets && (
                 <ul className="mt-3 flex flex-col gap-2" style={{ listStyle: 'none', margin: '12px 0 0', padding: 0 }}>
                   {s.bullets.map((b, i) => (

@@ -108,6 +108,13 @@ const B2BRunPage             = lazy(() => import('@/pages/b2b/B2BRunPage'))
 const B2BSessionsPage        = lazy(() => import('@/pages/b2b/B2BSessionsPage'))
 const B2BGapPage             = lazy(() => import('@/pages/b2b/B2BGapPage'))
 const B2BExtractPage         = lazy(() => import('@/pages/b2b/B2BExtractPage'))
+const Sz1OverviewPage        = lazy(() => import('@/pages/sz1/Sz1OverviewPage'))
+const Sz1PreparePage         = lazy(() => import('@/pages/sz1/Sz1PreparePage'))
+const Sz1PrepareLegacy       = lazy(() => import('@/pages/sz1/Sz1PreparePage').then(m => ({ default: m.Sz1PrepareLegacy })))
+const Sz1SettingsPage        = lazy(() => import('@/pages/sz1/Sz1SettingsPage'))
+const Sz1RunPage             = lazy(() => import('@/pages/sz1/Sz1RunPage'))
+const Sz1SessionsPage        = lazy(() => import('@/pages/sz1/Sz1SessionsPage'))
+const Sz1HelpPage            = lazy(() => import('@/pages/sz1/Sz1HelpPage'))
 
 function PageLoader() {
   return (
@@ -279,6 +286,18 @@ export default function App() {
         <Route path="bin-alloc/requirement" element={<Navigate to="/bin-alloc/upload" replace />} />
         <Route path="bin-alloc/results"     element={<Navigate to="/bin-alloc/sessions" replace />} />
         <Route path="bin-alloc/log"         element={<Navigate to="/bin-alloc/sessions" replace />} />
+        {/* 1SZ ALC — size allocation of broken-size RDC stock (sz1_alloc.md).
+            Overview · Prepare (tabs supply | demand | gap) · Plan a run · Sessions · Settings · Help.
+            The old /base, /req, /gap URLs open the matching Prepare tab. */}
+        <Route path="sz1-alloc"             element={<ErrorBoundary><Sz1OverviewPage /></ErrorBoundary>} />
+        <Route path="sz1-alloc/prepare"     element={<ErrorBoundary><Sz1PreparePage /></ErrorBoundary>} />
+        <Route path="sz1-alloc/base"        element={<ErrorBoundary><Sz1PrepareLegacy key="supply" tab="supply" /></ErrorBoundary>} />
+        <Route path="sz1-alloc/req"         element={<ErrorBoundary><Sz1PrepareLegacy key="demand" tab="demand" /></ErrorBoundary>} />
+        <Route path="sz1-alloc/gap"         element={<ErrorBoundary><Sz1PrepareLegacy key="gap" tab="gap" /></ErrorBoundary>} />
+        <Route path="sz1-alloc/run"         element={<ErrorBoundary><Sz1RunPage /></ErrorBoundary>} />
+        <Route path="sz1-alloc/sessions"    element={<ErrorBoundary><Sz1SessionsPage /></ErrorBoundary>} />
+        <Route path="sz1-alloc/settings"    element={<ErrorBoundary><Sz1SettingsPage /></ErrorBoundary>} />
+        <Route path="sz1-alloc/help"        element={<ErrorBoundary><Sz1HelpPage /></ErrorBoundary>} />
         {/* Pending Allocation Lifecycle */}
         <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />

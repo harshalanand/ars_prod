@@ -592,6 +592,182 @@ def _resolve_template(template: str, hier_cols: List[str]) -> str:
 _get_col_type_sql = get_col_type_sql  # shared helper
 
 
+# ── Grid row universe scope (Business Rule GRID_ROW_SCOPE) ────────────────
+# Which store × MAJ_CAT (× sub-key) rows the synthetic-row injection (S5)
+# adds on top of the rows the store's own stock produces:
+#   COMPANY — every store gets every key the COMPANY carries in
+#             ARS_MSA_TOTAL at ANY RDC (owner ask 2026-10-12: "grid row to be
+#             generated company level, not based on RDC availability").
+#   RDC     — only keys the store's OWN RDC carries (pre-2026-10-12).
+# Inactive / missing / unknown rule value → COMPANY (the code default).
+GRID_ROW_SCOPE_RULE = "GRID_ROW_SCOPE"
+GRID_ROW_SCOPES = ("COMPANY", "RDC")
+GRID_ROW_SCOPE_DEFAULT = "COMPANY"
+
+
+def _normalise_row_scope(value: Any) -> str:
+    v = str(value or "").strip().upper()
+    return v if v in GRID_ROW_SCOPES else GRID_ROW_SCOPE_DEFAULT
+
+
+def _grid_row_scope(grid: Optional[dict] = None) -> str:
+    """Resolve the row-universe scope for a grid build.
+
+    A Run-All pins the scope ONCE on every grid dict (key `_row_scope`) so all
+    grids of one run share the same universe even if the rule is flipped
+    mid-run; a single-grid run reads the rule directly (30 s rule cache).
+    """
+    pinned = (grid or {}).get("_row_scope")
+    if pinned:
+        return _normalise_row_scope(pinned)
+    try:
+        from app.services.business_rules import rule_value
+        return _normalise_row_scope(
+            rule_value(GRID_ROW_SCOPE_RULE, GRID_ROW_SCOPE_DEFAULT)
+        )
+    except Exception as e:  # rules table unreachable → code default
+        logger.warning(f"{GRID_ROW_SCOPE_RULE} read failed, using "
+                       f"{GRID_ROW_SCOPE_DEFAULT}: {e}")
+        return GRID_ROW_SCOPE_DEFAULT
+
+
+_ROW_SCOPE_ST_STATUSES = "('OLD','NEW','UPC')"
+
+
+def _msa_universe_sql(
+    hier_cols: List[str],
+    numeric_hier: Set[str],
+    mp_cols_upper: dict,
+    merge_case_cache: dict,
+    scope: str,
+) -> Optional[str]:
+    """SELECT producing the intended-dispatch universe at the grid's FULL
+    hier_cols grain (one row per key — never duplicated), or None when the
+    grid lacks WERKS / MAJ_CAT.
+
+    RDC     : ARS_MSA_TOTAL ⋈ Master_ALC_INPUT_ST_MASTER ON RDC — a store only
+              sees keys its own RDC carries (byte-identical to pre-2026-10-12).
+    COMPANY : DISTINCT stores × DISTINCT MSA keys of ANY RDC — a store sees
+              every key the company carries. Both sides are DISTINCT, so the
+              cross product is unique per (store, key) by construction.
+    Store filter in both: ST_STATUS IN (OLD, NEW, UPC). The LISTING=1 filter
+    is applied later by _apply_post_lookups (same as stock rows).
+    """
+    upper_hier = {c.upper() for c in hier_cols}
+    if 'WERKS' not in upper_hier or 'MAJ_CAT' not in upper_hier:
+        return None
+
+    _msa_native = {"MAJ_CAT", "GEN_ART_NUMBER", "CLR", "ARTICLE_NUMBER"}
+    key_exprs: List[tuple] = []   # (col, expr over MSA / MP3) for non-WERKS cols
+    for col in hier_cols:
+        cu = col.upper()
+        default = "0" if cu in numeric_hier else "'NA'"
+        if cu == "WERKS":
+            continue
+        if cu in ("ARTICLE_NUMBER", "MATNR"):
+            expr = f"ISNULL(TRY_CAST(MSA.[ARTICLE_NUMBER] AS BIGINT), {default})"
+        elif cu in _msa_native:
+            src = f"MSA.[{cu}]"
+            if cu in numeric_hier:
+                expr = f"ISNULL(TRY_CAST({src} AS BIGINT), {default})"
+            else:
+                expr = f"ISNULL({src}, {default})"
+        elif cu in merge_case_cache:
+            # MERGE_<col> derived from MP3 via the same CASE used by the main
+            # build — guarantees Universe and grid agree on derived values.
+            expr_mp3 = (merge_case_cache[cu]
+                        .replace("[MP].", "[MP3].")
+                        .replace("MP.", "MP3."))
+            expr = f"ISNULL({expr_mp3}, {default})"
+        elif cu in mp_cols_upper:
+            actual = mp_cols_upper[cu]
+            expr = f"ISNULL(MP3.[{actual}], {default})"
+        else:
+            expr = default
+        key_exprs.append((col, expr))
+
+    msa_from = """dbo.ARS_MSA_TOTAL MSA WITH (NOLOCK)
+    {sm_join}LEFT JOIN dbo.vw_master_product MP3 WITH (NOLOCK)
+        ON TRY_CAST(MSA.ARTICLE_NUMBER AS BIGINT) = MP3.ARTICLE_NUMBER
+    WHERE MSA.sequence_id = (SELECT MAX(sequence_id) FROM dbo.ARS_MSA_TOTAL)"""
+
+    if _normalise_row_scope(scope) == "RDC":
+        expr_by_col = dict(key_exprs)
+        parts = []
+        for col in hier_cols:
+            if col.upper() == "WERKS":
+                parts.append(f"SM.[ST_CD] AS [{col}]")
+            else:
+                parts.append(f"{expr_by_col[col]} AS [{col}]")
+        sm_join = (f"INNER JOIN dbo.Master_ALC_INPUT_ST_MASTER SM WITH (NOLOCK)\n"
+                   f"        ON SM.RDC = MSA.RDC\n"
+                   f"       AND UPPER(SM.ST_STATUS) IN {_ROW_SCOPE_ST_STATUSES}\n    ")
+        return (f"SELECT DISTINCT\n        {', '.join(parts)}\n    FROM "
+                + msa_from.format(sm_join=sm_join))
+
+    # COMPANY
+    key_sel = ", ".join(f"{e} AS [{c}]" for c, e in key_exprs)
+    outer = []
+    for col in hier_cols:
+        if col.upper() == "WERKS":
+            outer.append(f"ST.[ST_CD] AS [{col}]")
+        else:
+            outer.append(f"K.[{col}]")
+    return f"""SELECT {', '.join(outer)}
+    FROM (
+        SELECT DISTINCT SM.[ST_CD]
+        FROM dbo.Master_ALC_INPUT_ST_MASTER SM WITH (NOLOCK)
+        WHERE SM.[ST_CD] IS NOT NULL
+          AND UPPER(SM.ST_STATUS) IN {_ROW_SCOPE_ST_STATUSES}
+    ) ST
+    CROSS JOIN (
+        SELECT DISTINCT {key_sel}
+        FROM {msa_from.format(sm_join='')}
+    ) K"""
+
+
+def _missing_rows_cte(
+    out_table: str,
+    hier_cols: List[str],
+    numeric_hier: Set[str],
+    mp_cols_upper: dict,
+    merge_case_cache: dict,
+    scope: str,
+) -> Optional[str]:
+    """`;WITH Universe AS (...), Missing AS (...)` — `Missing` holds the
+    hier-key tuples S5 would inject (universe rows with no grid row at the
+    full key). The caller appends its own statement: S5 appends an INSERT,
+    read-only diagnostics append `SELECT COUNT(*) FROM Missing`."""
+    universe = _msa_universe_sql(hier_cols, numeric_hier, mp_cols_upper,
+                                 merge_case_cache, scope)
+    if universe is None:
+        return None
+    # NOT EXISTS at FULL hier_cols grain — every column of the grid's
+    # composite key is compared. ISNULL on the grid side handles rows whose
+    # hier values are still NULL at this stage (NULL→default fill happens
+    # later in step 8); the Universe side already has ISNULL'd defaults baked
+    # into its SELECT.
+    not_exists_parts = []
+    for col in hier_cols:
+        cu = col.upper()
+        default = "0" if cu in numeric_hier else "'NA'"
+        not_exists_parts.append(f"ISNULL(G.[{col}], {default}) = U.[{col}]")
+    hier_cols_u = ", ".join(f"U.[{c}]" for c in hier_cols)
+    return f"""
+;WITH Universe AS (
+    {universe}
+),
+Missing AS (
+    SELECT {hier_cols_u}
+    FROM Universe U
+    WHERE NOT EXISTS (
+        SELECT 1 FROM [{out_table}] G WITH (NOLOCK)
+        WHERE {' AND '.join(not_exists_parts)}
+    )
+)
+"""
+
+
 def _insert_missing_msa_rows(
     conn,
     out_table: str,
@@ -600,13 +776,18 @@ def _insert_missing_msa_rows(
     numeric_hier: Set[str],
     mp_cols_upper: dict,
     merge_case_cache: dict,
+    scope: str = GRID_ROW_SCOPE_DEFAULT,
 ) -> int:
     """
     Post-pivot synthetic-row injection.
 
     For every (hier_cols) tuple that exists in the intended-dispatch universe
-    (ARS_MSA_TOTAL × Master_ALC_INPUT_ST_MASTER, joined by RDC) but is absent
-    from the just-built grid, insert one row with SLOC cols = 0 and STK_TTL=0.
+    but is absent from the just-built grid, insert one row with SLOC cols = 0
+    and STK_TTL=0. The universe depends on `scope` (Business Rule
+    GRID_ROW_SCOPE, see _msa_universe_sql):
+      COMPANY (default since 2026-10-12) — Master_ALC_INPUT_ST_MASTER stores ×
+              every key of ARS_MSA_TOTAL at ANY RDC;
+      RDC     — ARS_MSA_TOTAL × Master_ALC_INPUT_ST_MASTER joined by RDC.
 
     Covers three scenarios uniformly:
       (a) new MAJ_CAT — warehouse has stock, no in-store stock yet
@@ -637,44 +818,12 @@ def _insert_missing_msa_rows(
     if not (msa_exists and stm_exists):
         return 0
 
-    # Universe is built by joining MSA (RDC-keyed) to ST_MASTER (WERKS=ST_CD,
-    # RDC) — both keys must be in the grid's hier for the result to be useful.
-    upper_hier = {c.upper() for c in hier_cols}
-    if 'WERKS' not in upper_hier or 'MAJ_CAT' not in upper_hier:
+    # Both WERKS and MAJ_CAT must be in the grid's hier for the universe to
+    # be meaningful (the CTE builder returns None otherwise).
+    cte = _missing_rows_cte(out_table, hier_cols, numeric_hier,
+                            mp_cols_upper, merge_case_cache, scope)
+    if cte is None:
         return 0
-
-    _msa_native = {"MAJ_CAT", "GEN_ART_NUMBER", "CLR", "ARTICLE_NUMBER"}
-    hier_select_parts = []
-    for col in hier_cols:
-        cu = col.upper()
-        default = "0" if cu in numeric_hier else "'NA'"
-        if cu == "WERKS":
-            hier_select_parts.append(f"SM.[ST_CD] AS [{col}]")
-        elif cu in ("ARTICLE_NUMBER", "MATNR"):
-            hier_select_parts.append(
-                f"ISNULL(TRY_CAST(MSA.[ARTICLE_NUMBER] AS BIGINT), {default}) AS [{col}]"
-            )
-        elif cu in _msa_native:
-            src = f"MSA.[{cu}]"
-            if cu in numeric_hier:
-                hier_select_parts.append(
-                    f"ISNULL(TRY_CAST({src} AS BIGINT), {default}) AS [{col}]"
-                )
-            else:
-                hier_select_parts.append(f"ISNULL({src}, {default}) AS [{col}]")
-        elif cu in merge_case_cache:
-            # MERGE_<col> derived from MP3 via the same CASE used by the main
-            # build — guarantees Universe and grid agree on derived values.
-            expr_mp3 = (merge_case_cache[cu]
-                        .replace("[MP].", "[MP3].")
-                        .replace("MP.", "MP3."))
-            hier_select_parts.append(f"ISNULL({expr_mp3}, {default}) AS [{col}]")
-        elif cu in mp_cols_upper:
-            actual = mp_cols_upper[cu]
-            hier_select_parts.append(f"ISNULL(MP3.[{actual}], {default}) AS [{col}]")
-        else:
-            hier_select_parts.append(f"{default} AS [{col}]")
-    msa_hier_select = ", ".join(hier_select_parts)
 
     hier_cols_sql = ", ".join(f"[{c}]" for c in hier_cols)
     sloc_cols_sql = ", ".join(f"[{s}]" for s in slocs) if slocs else ""
@@ -687,37 +836,10 @@ def _insert_missing_msa_rows(
         insert_cols = f"{hier_cols_sql}, [STK_TTL]"
         select_cols = f"{hier_cols_sql}, CAST(0 AS FLOAT)"
 
-    # NOT EXISTS at FULL hier_cols grain — every column of the grid's
-    # composite key is compared. ISNULL on the grid side handles rows whose
-    # hier values are still NULL at this stage (NULL→default fill happens
-    # later in step 8); the Universe side already has ISNULL'd defaults baked
-    # into msa_hier_select.
-    not_exists_parts = []
-    for col in hier_cols:
-        cu = col.upper()
-        default = "0" if cu in numeric_hier else "'NA'"
-        not_exists_parts.append(f"ISNULL(G.[{col}], {default}) = U.[{col}]")
-    not_exists_clause = " AND ".join(not_exists_parts)
-
-    insert_sql = f"""
-;WITH Universe AS (
-    SELECT DISTINCT
-        {msa_hier_select}
-    FROM dbo.ARS_MSA_TOTAL MSA WITH (NOLOCK)
-    INNER JOIN dbo.Master_ALC_INPUT_ST_MASTER SM WITH (NOLOCK)
-        ON SM.RDC = MSA.RDC
-       AND UPPER(SM.ST_STATUS) IN ('OLD','NEW','UPC')
-    LEFT JOIN dbo.vw_master_product MP3 WITH (NOLOCK)
-        ON TRY_CAST(MSA.ARTICLE_NUMBER AS BIGINT) = MP3.ARTICLE_NUMBER
-    WHERE MSA.sequence_id = (SELECT MAX(sequence_id) FROM dbo.ARS_MSA_TOTAL)
-)
+    insert_sql = f"""{cte}
 INSERT INTO [{out_table}] ({insert_cols})
 SELECT {select_cols}
-FROM Universe U
-WHERE NOT EXISTS (
-    SELECT 1 FROM [{out_table}] G WITH (NOLOCK)
-    WHERE {not_exists_clause}
-)
+FROM Missing
 """
 
     result = conn.execute(text(insert_sql))
@@ -1495,13 +1617,17 @@ GROUP BY {hier_cols_sql};
                 logger.warning(f"[grid {grid.get('id')}] could not drop {stage_table}: {e}")
 
         # ── 5.5. Post-pivot synthetic-row injection ─────────────────────
-        # Fill (WERKS, MAJ_CAT) pairs that exist in the intended-dispatch
-        # universe (ARS_MSA_TOTAL × Master_ALC_INPUT_ST_MASTER) but are
-        # missing from the just-built grid because ET_STORE_STOCK had no
-        # rows for them yet. Handles new-MAJ_CAT and new-store cases in one
-        # pass. Cheap because NOT EXISTS hits the grid table, not the
-        # 100M-row stock table. Runs BEFORE post-lookups so LISTING / CONT
-        # / MBQ / OPT_CNT calculations apply to synthetic rows identically.
+        # Fill (WERKS, MAJ_CAT[, sub-key]) tuples that exist in the
+        # intended-dispatch universe but are missing from the just-built
+        # grid because ET_STORE_STOCK had no rows for them yet. Universe per
+        # Business Rule GRID_ROW_SCOPE (default COMPANY since 2026-10-12):
+        #   COMPANY — every ST_MASTER store × every key ARS_MSA_TOTAL carries
+        #             at ANY RDC;
+        #   RDC     — only keys the store's own RDC carries (old behaviour).
+        # Handles new-MAJ_CAT and new-store cases in one pass. Cheap because
+        # NOT EXISTS hits the grid table, not the 100M-row stock table. Runs
+        # BEFORE post-lookups so LISTING / CONT / MBQ / OPT_CNT calculations
+        # apply to synthetic rows identically.
         #
         # Skipped for pivot_only grids: ARS_MSA_TOTAL is at MAJ_CAT grain,
         # so it can't produce meaningful article-grain rows for
@@ -1515,16 +1641,18 @@ GROUP BY {hier_cols_sql};
         else:
             try:
                 t_syn = time.time()
+                row_scope = _grid_row_scope(grid)
                 synthetic_n = _insert_missing_msa_rows(
                     conn, out_table, hier_cols, slocs,
                     numeric_hier, mp_cols_upper, _merge_case_cache,
+                    scope=row_scope,
                 )
-                if synthetic_n:
-                    logger.info(
-                        f"[grid {grid.get('id')}] post-pivot synthetic rows: "
-                        f"{synthetic_n} added in {time.time() - t_syn:.1f}s "
-                        f"(MSA × ST_MASTER for missing (WERKS, MAJ_CAT) pairs)"
-                    )
+                logger.info(
+                    f"[grid {grid.get('id')}] post-pivot synthetic rows "
+                    f"(GRID_ROW_SCOPE={row_scope}): {synthetic_n} added in "
+                    f"{time.time() - t_syn:.1f}s (MSA × ST_MASTER for "
+                    f"missing (WERKS, MAJ_CAT[, sub-key]) tuples)"
+                )
             except Exception as e:
                 logger.warning(
                     f"[grid {grid.get('id')}] synthetic-row INSERT skipped: {e}"
@@ -1998,6 +2126,13 @@ def _do_run_all_background(active_grids: List[dict], workers: int) -> None:
         logger.info(f"Calc table built once for {len(active_grids)} grids (took {calc_duration}s)")
         with _run_all_lock:
             _run_all_state["calc_duration"] = calc_duration
+
+        # Pin the row-universe scope ONCE for the whole run so every grid
+        # (MJ, merge/sec-cap grids) shares the same store × MAJ_CAT universe
+        # even if GRID_ROW_SCOPE is flipped while the run is in flight.
+        row_scope = _grid_row_scope()
+        active_grids = [dict(g, _row_scope=row_scope) for g in active_grids]
+        logger.info(f"Run All: GRID_ROW_SCOPE={row_scope} for {len(active_grids)} grids")
 
         # Parallel grid run
         results: List[dict] = []

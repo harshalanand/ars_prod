@@ -1108,6 +1108,8 @@ def preview_revert(conn, op_id: int) -> Dict:
         errors = _check_hold_clear_revert(conn, op)
     elif op["op_type"] == "HOLD_REVISE":
         errors = _check_hold_revise_revert(conn, op)
+    elif op["op_type"] == "APPROVE_1SZ":
+        errors = _check_approve_1sz_revert(conn, op)
     else:
         errors = [f"Unknown op_type: {op['op_type']}"]
 
@@ -1151,6 +1153,8 @@ def revert_operation(
         errors = _check_hold_clear_revert(conn, op)
     elif op["op_type"] == "HOLD_REVISE":
         errors = _check_hold_revise_revert(conn, op)
+    elif op["op_type"] == "APPROVE_1SZ":
+        errors = _check_approve_1sz_revert(conn, op)
     else:
         return {"success": False, "error": f"Unknown op_type: {op['op_type']}"}
     if errors:
@@ -1172,6 +1176,8 @@ def revert_operation(
         result = _revert_hold_clear(conn, payload)
     elif op["op_type"] == "HOLD_REVISE":
         result = _revert_hold_revise(conn, payload)
+    elif op["op_type"] == "APPROVE_1SZ":
+        result = _revert_approve_1sz(conn, payload, reverted_by=reverted_by, op_id=op_id)
 
     # Stamp the audit fields on the op row
     conn.execute(text(f"""
@@ -1669,6 +1675,80 @@ def _revert_approve(conn, payload: Dict) -> Dict:
         f"[revert] APPROVE session={session_id}: "
         f"deleted {result['pend_alc_rows_deleted']} pend rows, "
         f"demoted {result.get('demoted_by_table')}"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# APPROVE_1SZ — a 1SZ ALC session approved into the ledger
+# (sz1_approve_service.approve). SESSION_ID = '1SZ-<1SZ session id>',
+# SOURCE / ALLOC_MODE = '1SZ'. Its revert touches ONLY the ledger, MSA / grid
+# and the 1SZ session: there is no listing hold tracking or listing history
+# behind a 1SZ approval, so none of _revert_approve's steps 3-4 apply.
+# ---------------------------------------------------------------------------
+def _check_approve_1sz_revert(conn, op: Dict) -> List[str]:
+    """Same gate as APPROVE: refused once any of its rows has BDC_QTY > 0 or
+    DO_QTY > 0. Also refused when the 1SZ session is no longer APPROVED."""
+    errors = _check_approve_revert(conn, op)
+    sz1_sid = op["payload"].get("sz1_session_id")
+    if sz1_sid:
+        st = conn.execute(text(
+            "SELECT STATUS FROM ARS_SZ1_SESSION WHERE SESSION_ID = :s"
+        ), {"s": sz1_sid}).scalar()
+        if st is not None and st != "APPROVED":
+            errors.append(f"1SZ session {sz1_sid} is {st}, not APPROVED.")
+    return errors
+
+
+def _revert_approve_1sz(conn, payload: Dict, reverted_by: Optional[str] = None,
+                        op_id: Optional[int] = None) -> Dict:
+    """Undo a 1SZ approval in ONE transaction (revert_operation commits it):
+      1. lock the 1SZ session; re-check no row was BDC'd / DO'd (U-locked);
+      2. -1 MSA / grid delta from the session's PEND rows;
+      3. DELETE those PEND rows;
+      4. 1SZ session back to PARKED + 1SZ balances re-applied.
+    Raises instead of swallowing, so a failure rolls everything back."""
+    from app.services import sz1_approve_service as A
+    session_id = payload.get("session_id")
+    if not session_id or not str(session_id).startswith(A.PEND_PREFIX):
+        raise ValueError(f"APPROVE_1SZ payload has no 1SZ session id: {session_id!r}")
+    sz1_sid = payload.get("sz1_session_id") or str(session_id)[len(A.PEND_PREFIX):]
+
+    A.lock_session(conn, sz1_sid)
+    bad = conn.execute(text(f"""
+        SELECT COUNT(*) FROM {PEND_ALC_TABLE} WITH (UPDLOCK, HOLDLOCK)
+         WHERE SESSION_ID = :sid AND (BDC_QTY > 0 OR DO_QTY > 0)
+    """), {"sid": session_id}).scalar() or 0
+    if bad:
+        raise ValueError(f"{bad} row(s) of {session_id} were BDC'd or DO'd meanwhile; revert refused.")
+
+    result: Dict = {"_skip_post_bootstrap": True}     # the scoped delta is exact
+    delta = apply_pend_alc_delta(A.NoCommit(conn), sign=-1, from_session_id=session_id)
+    if delta.get("error"):
+        raise RuntimeError(f"APPROVE_1SZ -1 delta failed: {delta['error']}")
+    A.assert_txn_alive(conn)
+    result["msa_delta"] = delta
+
+    res = conn.execute(text(
+        f"DELETE FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid"
+    ), {"sid": session_id})
+    result["pend_alc_rows_deleted"] = int(res.rowcount or 0)
+
+    result["sz1"] = A.reopen_after_revert(conn, sz1_sid, session_id, reverted_by, op_id)
+
+    # Any other still-active APPROVE_1SZ op for the same key goes with it.
+    sib = conn.execute(text(f"""
+        UPDATE {OPERATIONS_TABLE}
+           SET REVERTED_AT = GETDATE(), REVERTED_BY = ISNULL(REVERTED_BY, 'system'),
+               REVERT_NOTE = ISNULL(REVERT_NOTE, 'auto-cleared: sibling APPROVE_1SZ reverted')
+         WHERE OP_TYPE = 'APPROVE_1SZ' AND OP_KEY = :sid AND REVERTED_AT IS NULL
+           AND OP_ID <> ISNULL(:op, -1)
+    """), {"sid": session_id, "op": op_id})
+    result["sibling_ops_cleared"] = int(sib.rowcount or 0)
+    A.assert_txn_alive(conn)
+    logger.info(
+        f"[revert] APPROVE_1SZ {session_id}: deleted "
+        f"{result['pend_alc_rows_deleted']} pend rows; 1SZ {sz1_sid} re-parked"
     )
     return result
 
