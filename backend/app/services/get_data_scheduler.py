@@ -7,7 +7,11 @@ seconds one thread
   2. atomically claims DUE jobs — NEXT_RUN_AT <= now (advanced to the next IST
      slot in the same UPDATE) or RETRY_AT <= now — so with 4 uvicorn workers a
      job still fires once,
-  3. starts each claimed job as an AUTO run.
+  3. starts each claimed job as an AUTO run,
+  4. checks "When the source changes" jobs whose check is due (claimed the
+     same way on NEXT_CHECK_AT) and starts the ones get_data_watch.decide()
+     clears. Their daily safety run is a NEXT_RUN_AT slot (step 2), skipped
+     when the job loaded in the last 23 hours.
 
 Every run executes on its own thread; at most `max_parallel` load at once, the
 rest wait (their heartbeat keeps them alive while queued). A job whose previous
@@ -25,7 +29,9 @@ from sqlalchemy import text
 
 from app.database.session import get_data_engine
 from app.services import get_data_sync_service as svc
+from app.services import get_data_watch as gw
 from app.services.get_data_schema import ensure_tables, JOB_TABLE
+from app.services.get_data_snowflake import sf_message
 
 
 class GetDataScheduler:
@@ -106,31 +112,88 @@ class GetDataScheduler:
     def _tick(self) -> None:
         self._last_tick = datetime.utcnow()
         svc.reconcile_stale()
-        for job_id, name, attempt in self._claim_due():
+        for job_id, name, attempt, trigger in self._claim_due():
+            by = "scheduler"
+            if trigger == "on_change" and attempt == 1:
+                # The daily safety run of an on-change job: only if nothing loaded lately.
+                go, why = gw.safety_due(gw.last_ok_start(job_id), svc._now())
+                if not go:
+                    logger.info(f"[get-data-sched] job {job_id} '{name}': {why}")
+                    continue
+                by = "safety run"
             try:
-                run_id = svc.start_run(job_id, "AUTO", "scheduler", attempt=attempt)
+                run_id = svc.start_run(job_id, "AUTO", by, attempt=attempt)
             except svc.AlreadyRunning as e:
                 svc.record_skipped(job_id, name, f"Skipped — {e}")
                 continue
             except Exception as e:
                 logger.error(f"[get-data-sched] could not start job {job_id}: {e}")
                 continue
-            logger.info(f"[get-data-sched] job {job_id} '{name}' → run {run_id} (attempt {attempt})")
+            logger.info(f"[get-data-sched] job {job_id} '{name}' → run {run_id} (attempt {attempt}, {by})")
             self.submit(run_id)
+        self._check_changes()
 
-    def _claim_due(self) -> List[Tuple[int, str, int]]:
+    # ── When the source changes ─────────────────────────────────────────────
+    def _check_changes(self) -> None:
+        """One Snowflake round trip for every watched job whose check is due
+        (metadata only — no warehouse), then run or record why it waits."""
+        jobs = gw.claim_checks()
+        if not jobs:
+            return
+        tables = sorted({t for j in jobs for t in (j["cfg"].get("tables") or [])})
+        try:
+            toks, errs, sf_now = gw.poll(tables)
+        except Exception as e:
+            msg = f"Couldn't check Snowflake: {sf_message(e)[:300]}"
+            logger.warning(f"[get-data-sched] change check failed: {msg}")
+            for j in jobs:
+                gw.save_check(int(j["JOB_ID"]), "error", msg)
+            return
+        now = svc._now()
+        for j in jobs:
+            try:
+                self._check_one(j, toks, errs, sf_now, now)
+            except Exception as e:
+                logger.warning(f"[get-data-sched] change check of job {j['JOB_ID']} failed: {e}")
+                gw.save_check(int(j["JOB_ID"]), "error", f"Check failed: {e}"[:400])
+
+    def _check_one(self, j: Dict[str, Any], toks, errs, sf_now: datetime, now: datetime) -> None:
+        jid, cfg = int(j["JOB_ID"]), j["cfg"]
+        tok, table, err = gw.job_token(cfg.get("tables") or [], toks, errs)
+        if tok is None:
+            gw.save_check(jid, "error", err or "No tables to watch")
+            return
+        change_at = gw.token_time(tok)
+        fire, state, msg, init = gw.decide(
+            cfg, token=str(tok), change_at=change_at, change_table=table,
+            synced_token=j["SYNCED_TOKEN"], last_ok_start=j["LAST_OK_START"],
+            last_run_start=j["LAST_RUN_START"], running=j["LOCK_RUN_ID"] is not None,
+            now=now, sf_now=sf_now)
+        if fire:
+            try:
+                run_id = svc.start_run(jid, "AUTO", gw.trigger_label(table, change_at))
+                self.submit(run_id)
+                msg = msg.replace(gw.STARTING_LEAD, f"Run #{run_id} started")
+                logger.info(f"[get-data-sched] job {jid} '{j['JOB_NAME']}': {msg}")
+            except svc.AlreadyRunning:
+                state, msg = "running", msg.replace(gw.STARTING_LEAD, gw.RUNNING_LEAD)
+        gw.save_check(jid, state, msg, token=str(tok), change_at=change_at,
+                      change_table=table, synced_init=init)
+
+    def _claim_due(self) -> List[Tuple[int, str, int, str]]:
         eng = get_data_engine()
         with eng.connect() as c:
             due = c.execute(text(f"""
                 SELECT JOB_ID, JOB_NAME, TRIGGER_TYPE, SCHEDULE_CONFIG,
-                       CASE WHEN TRIGGER_TYPE='schedule' AND NEXT_RUN_AT <= SYSUTCDATETIME()
+                       CASE WHEN TRIGGER_TYPE IN ('schedule', 'on_change')
+                                 AND NEXT_RUN_AT <= SYSUTCDATETIME()
                             THEN 1 ELSE 0 END AS SCHED_DUE
                 FROM {JOB_TABLE}
                 WHERE ENABLED = 1
-                  AND ((TRIGGER_TYPE = 'schedule' AND NEXT_RUN_AT <= SYSUTCDATETIME())
+                  AND ((TRIGGER_TYPE IN ('schedule', 'on_change') AND NEXT_RUN_AT <= SYSUTCDATETIME())
                        OR RETRY_AT <= SYSUTCDATETIME())
             """)).mappings().fetchall()
-        claimed: List[Tuple[int, str, int]] = []
+        claimed: List[Tuple[int, str, int, str]] = []
         for j in due:
             jid = int(j["JOB_ID"])
             with eng.begin() as c:
@@ -139,7 +202,7 @@ class GetDataScheduler:
                         cfg = json.loads(j["SCHEDULE_CONFIG"] or "{}")
                     except Exception:
                         cfg = {}
-                    nxt = svc.next_run_utc("schedule", cfg)
+                    nxt = svc.next_run_utc(j["TRIGGER_TYPE"], cfg)
                     # OUTPUT, not rowcount: rowcount reads -1 on a pooled
                     # connection left with SET NOCOUNT ON, which would silently
                     # advance NEXT_RUN_AT without ever running the job.
@@ -157,7 +220,7 @@ class GetDataScheduler:
                     """), {"id": jid}).fetchone()
                     attempt = 2
             if got:
-                claimed.append((jid, j["JOB_NAME"], attempt))
+                claimed.append((jid, j["JOB_NAME"], attempt, j["TRIGGER_TYPE"]))
         return claimed
 
 

@@ -10,7 +10,8 @@ no way to tell whether a table is today's or last week's.
 Get Data is the one place that brings outside data **into** local SQL:
 
 - define the data once (a Snowflake view),
-- copy it into a local table **daily on a schedule** or **on demand**,
+- copy it into a local table **daily on a schedule**, **when the source changes**, or
+  **on demand**,
 - keep a **history of every run** — automatic or manual, who ran it, and how many
   rows came across — so a planner can trust the table before using it.
 
@@ -24,7 +25,7 @@ and SAP (phase 4, absorbs SAP → Data Pulls) plug into the same jobs and histor
 |---|---|---|
 | Overview | `/get-data/overview` | Sources, today's runs (auto · manual · success · failed · rows), next scheduled runs, failures in the last 7 days, 7-day table. |
 | Snowflake Views | `/get-data/snowflake/views` | Write a SELECT → Validate → Preview 100 rows → Create view. Browse every schema read-only. |
-| Sync Jobs | `/get-data/snowflake/jobs` | Source → local table, load mode, IST schedule, retry, Run now / Full reload, **Stop** (■, while a run is live), live progress. |
+| Sync Jobs | `/get-data/snowflake/jobs` | Source → local table, load mode, trigger (IST schedule · **when the source changes** · manual), retry, Run now / Full reload, **Stop** (■, while a run is live), live progress, change-watch status. |
 | Run History | `/get-data/runs` | Every run with AUTO/MANUAL, run by, Snowflake rows, rows loaded, time, status, details, Excel export; Stop on a running row. |
 | Excel · DataV2 · SAP | `/get-data/excel` … | Placeholders describing the later phases. |
 | Help | `/get-data/help` | Plain-language guide. |
@@ -196,6 +197,49 @@ watermark, so the next incremental run loads everything.
 - Run now returns at once with the run id; the page polls for progress (step, rows
   loaded of Snowflake rows).
 
+### When the source changes (trigger `on_change`)
+A job can run when its Snowflake data changes instead of at fixed times
+(`get_data_watch.py`, driven by the scheduler tick).
+- **What is watched** — tables, not the view. Asked about a view, Snowflake missed
+  changes in tables behind nested views (2026-10-14: `V_ARS_STORE_STK_DATA` answered 11:26
+  while `DIM_PRODUCT_V2` under it changed 11:33). The form's **Find tables** lists every
+  table behind the source (`GET_OBJECT_REFERENCES`, nested views walked) with its last
+  change; a table source, or a view over one table, is ticked automatically. Tick only the
+  table(s) whose change should reload the job: a busy table (e.g. `MARA`, `GRC_LIVE_HR`)
+  would reload it all day. Tables can also be added by name. 1–50 tables.
+- **The check** — every `check_every_min` (default 5, 1–60) one Snowflake call reads
+  `SYSTEM$LAST_CHANGE_COMMIT_TIME` for every due job's tables plus `SYSDATE()`. It is
+  metadata only: query history shows **no warehouse** for it, so polling costs no warehouse
+  credits. (Find tables does use the warehouse for a few seconds, so it runs only when
+  the form asks.) The newest change over the job's tables is its **change token**
+  (`GD_JOB.CHANGE_TOKEN / CHANGE_AT / CHANGE_TABLE`). Checks are claimed on
+  `NEXT_CHECK_AT` with a guarded UPDATE, so one worker checks each job per interval.
+- **It runs when all hold**: the token differs from `SYNCED_TOKEN` (what the last
+  successful run loaded) · the tables have been quiet for `quiet_min` (default 10, 0–240;
+  measured on Snowflake's clock, since the change times are Snowflake's — so a half-done
+  upstream truncate-and-reload isn't copied) · now is inside the IST window
+  (`window_start–window_end`, default 06:00–22:00; empty = any time; an overnight window
+  like 22:00–06:00 belongs to the day it opens) on a ticked weekday · the last run started
+  ≥ `min_gap_min` ago (default 60, 0–1440) · no run is going. A change outside the window
+  waits for it to open. Several changes in a row become one run.
+- **SYNCED_TOKEN** — the run reads the token **before** its data query and stores it on
+  success, so a change made during a run triggers another one after the gap. Manual runs
+  count too. A failed run leaves the change pending (retry setting still applies).
+  If a job has no SYNCED_TOKEN yet (new trigger, or the table list changed) and its last
+  successful run started ≥ 15 min after the change, that run is taken as having loaded it.
+- **Any unreadable watched table blocks the job** (status `error`, no run): a token taken
+  over fewer tables could look like a change.
+- **Safety run** (optional, default on, 09:00): stored as `SCHEDULE_CONFIG` / `NEXT_RUN_AT`
+  (daily, or weekly on the ticked weekdays) and claimed like a schedule. At that time the
+  job runs **unless it loaded successfully in the last 23 hours** — insurance against a
+  missed change. Not limited by the window. Run by `safety run`.
+- **Status** (`CHECK_STATE` / `CHECK_MESSAGE`, shown under the trigger in the jobs list,
+  state first): `up_to_date` · `waiting_quiet` · `waiting_window` · `waiting_gap` ·
+  `running` · `started` · `error` · `pending` (just saved). A change-triggered run is
+  AUTO with `TRIGGERED_BY` = `change · <table> <IST time>`.
+- Editing a job re-checks it on the next tick; changing its table list, source or local
+  table clears the stored tokens.
+
 ### Run history (`GD_RUN`)
 One row per run: `RUN_TYPE` AUTO | MANUAL, `TRIGGERED_BY` (user or `scheduler`),
 `ATTEMPT`, `FULL_RELOAD`, `STATUS` running | success | failed | skipped | stopped, `STEP`,
@@ -221,8 +265,8 @@ Filters: IST date range, job, trigger, status. Summary: auto, manual, rows loade
 `GET overview` · `GET snowflake/status|schemas|objects|columns|views|views/{name}` ·
 `POST snowflake/validate|preview|views` · `DELETE snowflake/views/{name}` ·
 `GET|POST jobs` · `POST jobs/test` · `GET|PUT|DELETE jobs/{id}` · `POST jobs/{id}/enable` ·
-`POST jobs/{id}/run?full_reload=` · `GET runs` · `GET runs/{id}` · `POST runs/{id}/stop` ·
-`GET scheduler/status`.
+`POST jobs/{id}/run?full_reload=` · `GET jobs/watch-candidates?source=` · `GET runs` ·
+`GET runs/{id}` · `POST runs/{id}/stop` · `GET scheduler/status`.
 
 ### Depends on
 - Settings → Snowflake (the single app-wide connection, `snowflake_config_service`),
@@ -305,3 +349,11 @@ Filters: IST date range, job, trigger, status. Summary: auto, manual, rows loade
   worker, so it works across uvicorn workers; it cancels the Snowflake query (verified:
   `SYSTEM$WAIT(60)` ended with 000604 three seconds after the cancel), kills bcp, drops the stage, and never
   touches the live table. After the apply step begins, the run finishes instead.
+- 2026-10-14 · "When the source changes" trigger, with a daily safety run. Watches base
+  tables (not the view — nested views hid changes), polls `SYSTEM$LAST_CHANGE_COMMIT_TIME`
+  (no warehouse, verified in query history), and runs only after the tables are quiet,
+  inside the window, and past the minimum gap. Motivation, from that day's change times:
+  the 07:00 ST_MJ_DAY_WISE_CONT run went before its table changed at 07:49, and the
+  `cont` job's daily 08:35 run couldn't pick up its 13 Oct 14:03 change until the next morning.
+  The decision is one pure function (`get_data_watch.decide`); an example day of eight
+  changes gives runs at 06:00, 08:05, 09:05, 13:20 and 06:00 next day.

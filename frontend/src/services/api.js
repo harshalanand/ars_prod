@@ -842,6 +842,7 @@ export const getDataAPI = _gdChecked({
   listJobs:   ()              => api.get('/get-data/jobs', _GD),
   getJob:     (id)            => api.get(`/get-data/jobs/${id}`, _GD),
   testJob:    (body)          => api.post('/get-data/jobs/test', body, _GD_SF),
+  watchCandidates: (source)   => api.get('/get-data/jobs/watch-candidates', { ..._GD_SF, params: { source } }),
   createJob:  (body)          => api.post('/get-data/jobs', body, _GD),
   updateJob:  (id, body)      => api.put(`/get-data/jobs/${id}`, body, _GD),
   enableJob:  (id, enabled)   => api.post(`/get-data/jobs/${id}/enable`, {}, { ..._GD, params: { enabled } }),

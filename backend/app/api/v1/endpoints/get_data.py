@@ -4,7 +4,7 @@ Get Data API  (prefix /get-data)
 Brings data INTO local SQL (Rep_data) from outside sources. Phase 1 = Snowflake:
   • /get-data/overview             — module dashboard
   • /get-data/snowflake/*          — status, browse, validate, preview, views
-  • /get-data/jobs                 — sync-job CRUD, test, Run now
+  • /get-data/jobs                 — sync-job CRUD, test, Run now, tables to watch
   • /get-data/runs                 — run history (AUTO / MANUAL, row counts), Stop
 
 Manage (create views, edit jobs) = SUPER_ADMIN / ADMIN or GET_DATA_MANAGE.
@@ -21,6 +21,7 @@ from app.schemas.common import APIResponse
 from app.security.dependencies import get_current_user
 from app.services import get_data_snowflake as gsf
 from app.services import get_data_sync_service as svc
+from app.services import get_data_watch as gw
 from app.services.get_data_scheduler import get_data_scheduler
 from app.services.get_data_snowflake import GetDataError
 from app.services.snowflake_config_service import SnowflakeError
@@ -99,6 +100,7 @@ class JobReq(BaseModel):
     loader: Optional[str] = "bulk"          # bulk (default) | classic
     allow_empty: Optional[bool] = False     # let a 0-row result empty a filled table
     column_map: Optional[Any] = None        # [{source, name, load}] — rename / skip columns
+    watch_config: Optional[Any] = None      # trigger_type on_change: {tables, check_every_min, ...}
 
 
 class JobTestReq(BaseModel):
@@ -224,6 +226,18 @@ def list_jobs(current_user: User = Depends(get_current_user)):
                            data={"items": items, "total": len(items)})
     except Exception as e:
         _fail(e, "list jobs")
+
+
+@router.get("/jobs/watch-candidates", response_model=APIResponse)
+def watch_candidates(source: str, current_user: User = Depends(get_current_user)):
+    """The tables behind a source (nested views walked), each with its last
+    change in Snowflake — what a "When the source changes" job can watch."""
+    _require_run(current_user)
+    try:
+        res = gw.watch_candidates(source)
+        return APIResponse(success=True, message=f"{len(res['tables'])} table(s)", data=res)
+    except Exception as e:
+        _fail(e, "find tables to watch")
 
 
 @router.get("/jobs/{job_id}", response_model=APIResponse)

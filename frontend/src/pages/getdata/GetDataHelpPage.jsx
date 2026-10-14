@@ -4,7 +4,7 @@ import HelpPage from '@/components/facons/HelpPage'
 const SECTIONS = [
   {
     id: 'what', emoji: '📥', title: 'What Get Data does',
-    lead: 'It brings data **into** local SQL (Rep_data) from outside sources, on a schedule or on demand, and records every run.',
+    lead: 'It brings data **into** local SQL (Rep_data) from outside sources, on a schedule, when the source changes, or on demand, and records every run.',
     bullets: [
       'Phase 1 is **Snowflake**: create a view, then a sync job copies it into a local **GD_SF_** table.',
       'Excel, DataV2 and SAP follow in later phases, into the same jobs and history.',
@@ -40,9 +40,23 @@ const SECTIONS = [
     ],
   },
   {
+    id: 'onchange', emoji: '⚡', title: 'When the source changes',
+    lead: 'Instead of fixed times, a job can run when its Snowflake tables change — but only when it is sensible to.',
+    rows: [
+      ['Watch these tables', '**Find tables** lists every table behind the source with its last change. Tick only the table(s) whose change should reload the job — a table that changes all day would reload it all day.'],
+      ['Check every', 'How often ARS asks Snowflake (default 5 minutes). Asking costs no warehouse time.'],
+      ['Wait until quiet', 'Runs only after the tables stop changing for this long (default 10 minutes), so a half-finished upstream reload is never copied. Several changes in a row become one run.'],
+      ['Only between', 'The hours (and weekdays) a change may start a run, e.g. 06:00–22:00. A change outside them waits for the window to open.'],
+      ['At most once every', 'The minimum gap between runs (default 1 hour).'],
+      ['Safety run', 'Optional daily time when the job loads anyway — unless it already loaded in the last 23 hours. Insurance in case a change is missed.'],
+      ['Status line', 'Under the trigger in Sync Jobs: up to date, waiting for quiet, waiting for the window, next run allowed at …, or an error (a watched table can’t be read — nothing runs until it is fixed).'],
+    ],
+  },
+  {
     id: 'history', emoji: '🕘', title: 'Reading the run history',
     rows: [
-      ['AUTO / MANUAL', 'AUTO = started by the schedule (or its retry). MANUAL = Run now, with the user’s name.'],
+      ['AUTO / MANUAL', 'AUTO = started by the schedule, its retry, a source change (“change · TABLE time”) or a safety run. MANUAL = Run now, with the user’s name.'],
+      ['Stop', 'The ■ button on a running job ends the run within seconds and leaves the local table as it was. Turning a job off (power button) only stops future runs.'],
       ['Snowflake rows vs rows loaded', 'They must be equal. If not, the run fails with “Count mismatch” and the table is not changed.'],
       ['Skipped', 'A scheduled run found the previous run of the same job still going, so it did not start a second one.'],
       ['Retry', 'A failed scheduled run is retried once after the delay set on the job (default 15 minutes).'],

@@ -2,8 +2,9 @@
 Get Data — sync jobs, the run engine, and run history.
 
 A sync job copies one Snowflake view or table into a local GD_SF_* table in
-Rep_data, manually or on a schedule (times in IST). Every run is recorded in
-GD_RUN as AUTO or MANUAL with the Snowflake row count and the rows loaded.
+Rep_data, manually, on a schedule (times in IST), or when its source changes
+(get_data_watch). Every run is recorded in GD_RUN as AUTO or MANUAL with the
+Snowflake row count and the rows loaded.
 
 One run:
   1. read the source's columns and map Snowflake types to SQL Server types
@@ -42,6 +43,7 @@ from sqlalchemy import text
 from app.database.session import get_data_engine
 from app.services import get_data_bulk as gdb
 from app.services import get_data_snowflake as gsf
+from app.services import get_data_watch as gw
 from app.services.get_data_schema import ensure_tables, JOB_TABLE, RUN_TABLE
 from app.services.get_data_snowflake import GetDataError
 from app.services.report_scheduler_service import compute_next_run
@@ -50,7 +52,7 @@ IST = timedelta(hours=5, minutes=30)
 TARGET_PREFIX = "GD_SF_"
 VALID_MODES = ("replace", "incremental", "append")
 VALID_LOADERS = ("bulk", "classic")
-VALID_TRIGGERS = ("manual", "schedule")
+VALID_TRIGGERS = ("manual", "schedule", "on_change")
 VALID_FREQ = ("daily", "weekly", "monthly", "every_n_hours")
 FETCH_BATCH = 20000
 LOCK_STALE_MIN = 10
@@ -89,7 +91,7 @@ def _iso(v: Any) -> Any:
 
 def _row(r) -> Dict[str, Any]:
     d = {k: _iso(v) for k, v in dict(r).items()}
-    for jk in ("KEY_COLS", "SCHEDULE_CONFIG", "COLUMN_MAP", "APPLIED_COLUMN_MAP"):
+    for jk in ("KEY_COLS", "SCHEDULE_CONFIG", "COLUMN_MAP", "APPLIED_COLUMN_MAP", "WATCH_CONFIG"):
         if isinstance(d.get(jk), str) and d[jk]:
             try:
                 d[jk] = json.loads(d[jk])
@@ -123,8 +125,9 @@ def sanitize_target(name: Any) -> str:
 def next_run_utc(trigger: str, cfg: Optional[Dict[str, Any]],
                  now_utc: Optional[datetime] = None) -> Optional[datetime]:
     """Schedule times are IST wall-clock; NEXT_RUN_AT is stored in UTC.
-    IST has no daylight saving, so a fixed +05:30 is exact."""
-    if trigger != "schedule" or not isinstance(cfg, dict):
+    IST has no daylight saving, so a fixed +05:30 is exact. For an on_change
+    job the schedule is its daily safety run."""
+    if trigger not in ("schedule", "on_change") or not isinstance(cfg, dict):
         return None
     now_ist = (now_utc or _now()) + IST
     nxt = compute_next_run(cfg, now=now_ist)
@@ -187,6 +190,8 @@ _JOB_COLS = """j.JOB_ID, j.JOB_NAME, j.DESCRIPTION, j.SOURCE_TYPE, j.SOURCE_OBJE
     j.RETRY_AT, j.LOCK_RUN_ID, j.LOCK_HEARTBEAT, j.LAST_RUN_ID, j.LAST_RUN_AT,
     j.LAST_STATUS, j.LAST_ROWS, j.LAST_MESSAGE, j.CREATED_BY, j.CREATED_AT,
     j.UPDATED_BY, j.UPDATED_AT,
+    j.WATCH_CONFIG, j.NEXT_CHECK_AT, j.CHANGE_TOKEN, j.CHANGE_AT, j.CHANGE_TABLE, j.SYNCED_TOKEN,
+    j.CHECKED_AT, j.CHECK_STATE, j.CHECK_MESSAGE,
     r.STEP AS RUN_STEP, r.SOURCE_ROWS AS RUN_SOURCE_ROWS, r.ROWS_LOADED AS RUN_ROWS_LOADED,
     r.STARTED_AT AS RUN_STARTED_AT, r.RUN_TYPE AS RUN_RUN_TYPE,
     r.STOP_REQUESTED_AT AS RUN_STOP_REQUESTED_AT, r.STOP_REQUESTED_BY AS RUN_STOP_REQUESTED_BY"""
@@ -219,6 +224,7 @@ def get_job(job_id: int, raw: bool = False) -> Optional[Dict[str, Any]]:
         d["SCHEDULE_CONFIG"] = json.loads(d["SCHEDULE_CONFIG"]) if d.get("SCHEDULE_CONFIG") else None
         d["COLUMN_MAP"] = json.loads(d["COLUMN_MAP"]) if d.get("COLUMN_MAP") else None
         d["APPLIED_COLUMN_MAP"] = json.loads(d["APPLIED_COLUMN_MAP"]) if d.get("APPLIED_COLUMN_MAP") else None
+        d["WATCH_CONFIG"] = json.loads(d["WATCH_CONFIG"]) if d.get("WATCH_CONFIG") else None
         return d
     return _row(r)
 
@@ -242,8 +248,12 @@ def _clean_payload(p: Dict[str, Any], job_id: Optional[int]) -> Dict[str, Any]:
         wm = None
     trig = str(p.get("trigger_type") or "manual").lower()
     if trig not in VALID_TRIGGERS:
-        raise GetDataError("Trigger must be manual or schedule.")
-    sched = _validate_schedule(p.get("schedule_config")) if trig == "schedule" else None
+        raise GetDataError("Trigger must be manual, schedule or on_change.")
+    watch = gw.clean_watch_config(p.get("watch_config")) if trig == "on_change" else None
+    if trig == "schedule":
+        sched = _validate_schedule(p.get("schedule_config"))
+    else:
+        sched = gw.safety_schedule(watch) if watch else None   # on_change: the safety run
     delay = int(p.get("retry_delay_min") or 15)
     if not 5 <= delay <= 240:
         raise GetDataError("Retry delay must be between 5 and 240 minutes.")
@@ -271,6 +281,7 @@ def _clean_payload(p: Dict[str, Any], job_id: Optional[int]) -> Dict[str, Any]:
         "next": next_run_utc(trig, sched) if enabled else None,
         "loader": loader, "allow_empty": 1 if p.get("allow_empty") else 0,
         "cmap": json.dumps(cmap) if cmap else None,
+        "watch": json.dumps(watch) if watch else None,
     }
 
 
@@ -359,11 +370,11 @@ def create_job(p: Dict[str, Any], user: str) -> Dict[str, Any]:
         new_id = c.execute(text(f"""
             INSERT INTO {JOB_TABLE} (JOB_NAME, DESCRIPTION, SOURCE_TYPE, SOURCE_OBJECT,
                 TARGET_TABLE, LOAD_MODE, LOADER_PREF, ALLOW_EMPTY, COLUMN_MAP, KEY_COLS,
-                WATERMARK_COL, TRIGGER_TYPE, SCHEDULE_CONFIG, RETRY_ON_FAIL, RETRY_DELAY_MIN,
-                ENABLED, NEXT_RUN_AT, CREATED_BY, UPDATED_BY)
+                WATERMARK_COL, TRIGGER_TYPE, SCHEDULE_CONFIG, WATCH_CONFIG, RETRY_ON_FAIL,
+                RETRY_DELAY_MIN, ENABLED, NEXT_RUN_AT, CREATED_BY, UPDATED_BY)
             OUTPUT INSERTED.JOB_ID
             VALUES (:name, :desc, 'SNOWFLAKE', :src, :tgt, :mode, :loader, :allow_empty, :cmap,
-                :keys, :wm, :trig, :sched, :retry, :delay, :en, :next, :user, :user)
+                :keys, :wm, :trig, :sched, :watch, :retry, :delay, :en, :next, :user, :user)
         """), v).scalar()
     logger.info(f"[get-data] job {new_id} '{v['name']}' created by {user}")
     return get_job(int(new_id))
@@ -378,7 +389,16 @@ def update_job(job_id: int, p: Dict[str, Any], user: str) -> Dict[str, Any]:
     # stored watermark — the next incremental run starts with a full load.
     reset_wm = (v["src"] != cur["SOURCE_OBJECT"] or v["tgt"] != cur["TARGET_TABLE"]
                 or v["mode"] != cur["LOAD_MODE"] or v["wm"] != cur["WATERMARK_COL"])
-    v.update({"id": job_id, "user": user, "reset": 1 if reset_wm else 0})
+    # The change token is the newest change over the watched tables, so a
+    # different table list (or a new source / target) makes the stored tokens
+    # meaningless. They start over; the first check re-seeds SYNCED_TOKEN from
+    # the last successful run when that run clearly came after the change.
+    old_tables = sorted((cur.get("WATCH_CONFIG") or {}).get("tables") or [])
+    new_tables = sorted((json.loads(v["watch"]) if v["watch"] else {}).get("tables") or [])
+    reset_change = (old_tables != new_tables or v["src"] != cur["SOURCE_OBJECT"]
+                    or v["tgt"] != cur["TARGET_TABLE"])
+    v.update({"id": job_id, "user": user, "reset": 1 if reset_wm else 0,
+              "reset_chg": 1 if reset_change else 0})
     with get_data_engine().begin() as c:
         c.execute(text(f"""
             UPDATE {JOB_TABLE} SET JOB_NAME=:name, DESCRIPTION=:desc, SOURCE_OBJECT=:src,
@@ -389,6 +409,13 @@ def update_job(job_id: int, p: Dict[str, Any], user: str) -> Dict[str, Any]:
                 TRIGGER_TYPE=:trig, SCHEDULE_CONFIG=:sched, RETRY_ON_FAIL=:retry,
                 RETRY_DELAY_MIN=:delay, ENABLED=:en, NEXT_RUN_AT=:next,
                 RETRY_AT = CASE WHEN :en = 1 THEN RETRY_AT ELSE NULL END,
+                WATCH_CONFIG=:watch, NEXT_CHECK_AT=NULL,
+                CHANGE_TOKEN = CASE WHEN :reset_chg = 1 THEN NULL ELSE CHANGE_TOKEN END,
+                CHANGE_AT = CASE WHEN :reset_chg = 1 THEN NULL ELSE CHANGE_AT END,
+                CHANGE_TABLE = CASE WHEN :reset_chg = 1 THEN NULL ELSE CHANGE_TABLE END,
+                SYNCED_TOKEN = CASE WHEN :reset_chg = 1 THEN NULL ELSE SYNCED_TOKEN END,
+                CHECK_STATE = CASE WHEN :trig = 'on_change' THEN 'pending' ELSE NULL END,
+                CHECK_MESSAGE = CASE WHEN :trig = 'on_change' THEN 'Checking soon' ELSE NULL END,
                 UPDATED_BY=:user, UPDATED_AT=SYSUTCDATETIME()
             WHERE JOB_ID=:id
         """), v)
@@ -404,6 +431,7 @@ def set_enabled(job_id: int, enabled: bool, user: str) -> Dict[str, Any]:
         c.execute(text(f"""
             UPDATE {JOB_TABLE} SET ENABLED=:en, NEXT_RUN_AT=:nr,
                 RETRY_AT = CASE WHEN :en = 1 THEN RETRY_AT ELSE NULL END,
+                NEXT_CHECK_AT = NULL,
                 UPDATED_BY=:u, UPDATED_AT=SYSUTCDATETIME()
             WHERE JOB_ID=:id
         """), {"en": 1 if enabled else 0, "nr": nxt, "u": user, "id": job_id})
@@ -1261,6 +1289,20 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
             where, params = f" WHERE {gsf.qcol(wm_sf)} >= %s", (wm_from,)
         stats["WATERMARK_FROM"] = wm_from
 
+        # On-change jobs: the change token is read BEFORE the data query, so it
+        # never claims more than the query saw; a change after it shows as a new
+        # token and triggers another run. Saved as SYNCED_TOKEN on success.
+        watch = job.get("WATCH_CONFIG") if job.get("TRIGGER_TYPE") == "on_change" else None
+        if watch and watch.get("tables"):
+            try:
+                toks, errs = gw.read_tokens(cur, watch["tables"])
+                tok, _, err = gw.job_token(watch["tables"], toks, errs)
+                stats["SOURCE_TOKEN"] = str(tok) if tok is not None else None
+                if err:
+                    logger.warning(f"[get-data] run {run_id}: change token not read — {err}")
+            except Exception as e:
+                logger.warning(f"[get-data] run {run_id}: change token not read — {e}")
+
         # ONE pass over the source: the data query runs first, and the profile
         # (widths, ASCII-only, unsafe characters, checksums) reads that query's
         # stored result, so a heavy view is computed once, not twice.
@@ -1461,6 +1503,7 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
                         f"{run['TARGET_TABLE']}, so the run was finished.")
 
     new_wm = stats.pop("NEW_WATERMARK", None)
+    source_token = stats.pop("SOURCE_TOKEN", None)
     with get_data_engine().begin() as c:
         c.execute(text(f"""
             UPDATE {RUN_TABLE} SET STATUS=:st, STEP=NULL, COMPLETED_AT=SYSUTCDATETIME(),
@@ -1484,11 +1527,15 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
                                        ELSE WATERMARK_VALUE END,
                 RETRY_AT = CASE WHEN :st = 'success' THEN NULL ELSE COALESCE(:retry, RETRY_AT) END,
                 APPLIED_COLUMN_MAP = CASE WHEN :st = 'success' AND :acm IS NOT NULL THEN :acm
-                                          ELSE APPLIED_COLUMN_MAP END
+                                          ELSE APPLIED_COLUMN_MAP END,
+                SYNCED_TOKEN = CASE WHEN :st = 'success' AND :tok IS NOT NULL THEN :tok
+                                    ELSE SYNCED_TOKEN END,
+                -- an on-change job is re-checked on the next tick, so its status is current
+                NEXT_CHECK_AT = CASE WHEN TRIGGER_TYPE = 'on_change' THEN NULL ELSE NEXT_CHECK_AT END
             WHERE JOB_ID=:jid
         """), {"st": status, "rows": stats.get("ROWS_LOADED") if status == "success" else None,
                "m": message[:1000], "wm": new_wm, "retry": retry_at,
-               "acm": stats.get("APPLIED_COLUMN_MAP"), "jid": job_id})
+               "acm": stats.get("APPLIED_COLUMN_MAP"), "tok": source_token, "jid": job_id})
         c.execute(text(f"""
             UPDATE {JOB_TABLE} SET LOCK_RUN_ID=NULL, LOCK_HEARTBEAT=NULL
             WHERE JOB_ID=:jid AND LOCK_RUN_ID=:rid

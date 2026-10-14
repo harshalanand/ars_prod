@@ -127,6 +127,22 @@ def ensure_tables(force: bool = False) -> None:
                 ALTER TABLE dbo.{JOB_TABLE} ADD ALLOW_EMPTY BIT NOT NULL
                     CONSTRAINT DF_{JOB_TABLE}_ALLOW_EMPTY DEFAULT 0
             """))
+            # Self-heal (2026-10-14): "When the source changes" trigger. WATCH_CONFIG
+            # = the user's settings (JSON); the rest is the change watcher's state.
+            # Tokens are Snowflake SYSTEM$LAST_CHANGE_COMMIT_TIME values (ns, as text).
+            for col, ddl in (("WATCH_CONFIG", "NVARCHAR(MAX) NULL"),
+                             ("NEXT_CHECK_AT", "DATETIME2(0) NULL"),
+                             ("CHANGE_TOKEN", "NVARCHAR(40) NULL"),
+                             ("CHANGE_AT", "DATETIME2(0) NULL"),
+                             ("CHANGE_TABLE", "NVARCHAR(400) NULL"),
+                             ("SYNCED_TOKEN", "NVARCHAR(40) NULL"),
+                             ("CHECKED_AT", "DATETIME2(0) NULL"),
+                             ("CHECK_STATE", "NVARCHAR(20) NULL"),
+                             ("CHECK_MESSAGE", "NVARCHAR(400) NULL")):
+                c.execute(text(f"""
+                    IF COL_LENGTH('dbo.{JOB_TABLE}', '{col}') IS NULL
+                    ALTER TABLE dbo.{JOB_TABLE} ADD {col} {ddl}
+                """))
             c.execute(text(f"""
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_{JOB_TABLE}_due')
                 CREATE INDEX IX_{JOB_TABLE}_due

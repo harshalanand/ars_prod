@@ -45,7 +45,18 @@ export const MODE_LABEL = { replace: 'Full replace', incremental: 'Incremental',
 
 const WD = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
+// "06:00–22:00 · Mon–Sat" for an on-change job's settings.
+export function watchWindowText(w) {
+  if (!w) return ''
+  const win = w.window_start && w.window_end ? `${w.window_start}–${w.window_end}` : 'any time'
+  const wds = w.weekdays || [0, 1, 2, 3, 4, 5, 6]
+  if (wds.length === 7) return win
+  const contiguous = wds.every((d, i) => i === 0 || d === wds[i - 1] + 1)
+  return `${win} · ${contiguous && wds.length > 2 ? `${WD[wds[0]]}–${WD[wds[wds.length - 1]]}` : wds.map(d => WD[d]).join(', ')}`
+}
+
 export function scheduleText(job) {
+  if (job?.TRIGGER_TYPE === 'on_change') return `On change · ${watchWindowText(job.WATCH_CONFIG)}`
   if (!job || job.TRIGGER_TYPE !== 'schedule' || !job.SCHEDULE_CONFIG) return 'Manual only'
   const c = job.SCHEDULE_CONFIG
   const times = (c.times || []).join(', ')
