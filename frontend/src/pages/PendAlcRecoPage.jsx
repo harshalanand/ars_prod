@@ -355,13 +355,14 @@ export default function PendAlcRecoPage() {
 
   // The DataGrid component drives its own pagination/sort/per-column filter
   // and calls this fetcher whenever any of those change. The top-bar filters
-  // (date range, RDC, etc.) are merged in here and changes bump `refreshKey`
-  // so the grid re-fetches.
+  // (date range, SRC RDC, etc.) are merged in here and changes bump `refreshKey`
+  // so the grid re-fetches. The page-level RDC box (fRdc) is the DISPATCH
+  // warehouse → sent as `src_rdc` (on /reco `rdc` means the store's own RDC).
   const fetchReco = useCallback(async (gridParams) => {
     const params = { ...gridParams }
     if (fDateFrom) params.date_from  = fDateFrom
     if (fDateTo)   params.date_to    = fDateTo
-    if (fRdc)      params.rdc        = fRdc
+    if (fRdc)      params.src_rdc    = fRdc
     if (fMajCat)   params.maj_cat    = fMajCat
     if (fMode)     params.alloc_mode = fMode
     if (fAllocType) params.alloc_type = fAllocType
@@ -447,7 +448,7 @@ export default function PendAlcRecoPage() {
       const params = {}
       if (fDateFrom) params.date_from  = fDateFrom
       if (fDateTo)   params.date_to    = fDateTo
-      if (fRdc)      params.rdc        = fRdc
+      if (fRdc)      params.src_rdc    = fRdc
       if (fMajCat)   params.maj_cat    = fMajCat
       if (fMode)     params.alloc_mode = fMode
       if (fAllocType) params.alloc_type = fAllocType
@@ -483,7 +484,7 @@ export default function PendAlcRecoPage() {
       const params = {}
       if (fDateFrom) params.date_from  = fDateFrom
       if (fDateTo)   params.date_to    = fDateTo
-      if (fRdc)      params.rdc        = fRdc
+      if (fRdc)      params.src_rdc    = fRdc
       if (fMajCat)   params.maj_cat    = fMajCat
       if (fMode)     params.alloc_mode = fMode
       if (fSession)  params.session_id = fSession
@@ -599,7 +600,7 @@ export default function PendAlcRecoPage() {
       document.body.removeChild(a); URL.revokeObjectURL(url)
 
       setBdcJobResult(finalJob.result || null)
-      toast.success(`BDC ready — ${finalJob.result?.rdc_count || 0} RDC file(s), `
+      toast.success(`BDC ready — ${finalJob.result?.rdc_count || 0} SRC RDC file(s), `
         + `${(finalJob.result?.row_count || 0).toLocaleString()} rows`)
       loadSummary(); loadSessions(); setGridBumpKey(k => k + 1)
     } catch (e) {
@@ -644,7 +645,7 @@ export default function PendAlcRecoPage() {
         <BarChart2 size={16} color={C.primary}/>
         <div style={{ fontSize: 13, fontWeight: 800, color: C.text }}>PEND_ALC Reconciliation</div>
         <div style={{ fontSize: 10, color: C.textMuted, marginLeft: 4 }}>
-          RDC = source warehouse · ST_CD = destination store · Aging · BDC tracking · MSA sync
+          SRC_RDC = dispatch warehouse · RDC = store's own warehouse · ST_CD = destination store · Aging · BDC tracking · MSA sync
         </div>
         <div style={{ flex: 1 }}/>
         <button style={_btn()}
@@ -783,7 +784,7 @@ export default function PendAlcRecoPage() {
                       ✓ Job complete — ZIP downloaded
                     </div>
                     <div>Allocation: <b>{bdcJobResult.allocation_no}</b></div>
-                    <div>RDCs: <b>{bdcJobResult.rdc_count}</b> file(s)</div>
+                    <div>SRC RDCs: <b>{bdcJobResult.rdc_count}</b> file(s)</div>
                     <div>Rows: <b>{(bdcJobResult.row_count || 0).toLocaleString()}</b></div>
                     <div>Units: <b>{(bdcJobResult.total_qty || 0).toLocaleString()}</b></div>
                   </div>
@@ -918,18 +919,19 @@ export default function PendAlcRecoPage() {
           )}
         </div>
 
-        {/* By RDC */}
+        {/* By SRC RDC — reco-summary `by_rdc` is grouped by the DISPATCH
+            warehouse (row key stays `rdc`). */}
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
           <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`,
                         fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: '.05em' }}>
-            BY RDC (open rows)
+            BY SRC RDC (dispatch, open rows)
           </div>
           {summaryLoading ? (
             <div style={{ padding: 20, textAlign: 'center', color: C.textMuted }}>Loading…</div>
           ) : (
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead><tr style={{ background: C.bg }}>
-                <TH>RDC</TH><TH right>ALLOC</TH><TH right>BDC</TH>
+                <TH>SRC RDC</TH><TH right>ALLOC</TH><TH right>BDC</TH>
                 <TH right>DO</TH><TH right>PEND</TH>
                 <TH right>PEND BDC</TH>
                 <TH right>ROWS</TH>
@@ -1108,7 +1110,7 @@ export default function PendAlcRecoPage() {
             {/* Action row */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
               <div style={{ fontSize: 9, color: C.textMuted }}>
-                Honours page-level RDC filter{dcRule ? <> · filtered to <b>{dcRule}</b></> : null}
+                Honours page-level SRC RDC filter{dcRule ? <> · filtered to <b>{dcRule}</b></> : null}
               </div>
               <div style={{ flex: 1 }}/>
               <button style={_btn()} onClick={loadDispatchGap} disabled={dcLoading}>
@@ -1139,7 +1141,7 @@ export default function PendAlcRecoPage() {
                             border: `1px solid ${C.border}`, borderRadius: 4 }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
                   <thead><tr style={{ background: C.bg, position: 'sticky', top: 0 }}>
-                    {['RDC', 'STORE', 'GEN_ART', 'CLR', 'MAJ_CAT', 'DIV', 'PEND', 'BLOCKED BY'].map((h, i) => (
+                    {['SRC RDC', 'STORE RDC', 'STORE', 'GEN_ART', 'CLR', 'MAJ_CAT', 'DIV', 'PEND', 'BLOCKED BY'].map((h, i) => (
                       <th key={i} style={{ padding: '7px 10px',
                                 textAlign: h === 'PEND' ? 'right' : 'left',
                                 fontSize: 9, fontWeight: 700, color: C.textSub,
@@ -1150,7 +1152,8 @@ export default function PendAlcRecoPage() {
                   <tbody>
                     {dcDetailFiltered.slice(0, 500).map((r, i) => (
                       <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
-                        <td style={{ padding: '5px 10px' }}>{r.rdc}</td>
+                        <td style={{ padding: '5px 10px', fontWeight: 600 }}>{r.src_rdc ?? r.rdc}</td>
+                        <td style={{ padding: '5px 10px', color: C.textSub }}>{r.rdc || '—'}</td>
                         <td style={{ padding: '5px 10px' }}>{r.st_cd}</td>
                         <td style={{ padding: '5px 10px', fontFamily: 'monospace' }}>{r.gen_art_number}</td>
                         <td style={{ padding: '5px 10px' }}>{r.clr}</td>
@@ -1246,7 +1249,7 @@ export default function PendAlcRecoPage() {
             {/* Action row */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
               <div style={{ fontSize: 9, color: C.textMuted }}>
-                Honours page-level RDC / MAJ_CAT filters · sorted by{' '}
+                Honours page-level SRC RDC / MAJ_CAT filters · sorted by{' '}
                 <b>{gapSortBy.toUpperCase()}</b> {gapSortDir}
               </div>
               <div style={{ flex: 1 }}/>
@@ -1282,7 +1285,7 @@ export default function PendAlcRecoPage() {
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
                     <thead><tr style={{ background: C.bg, position: 'sticky', top: 0 }}>
                       {[
-                        ['rdc',            'RDC',         false],
+                        ['rdc',            'SRC RDC',     false],   // MSA (dispatch) warehouse
                         ['article_number', 'ARTICLE',     false],
                         ['maj_cat',        'MAJ_CAT',     false],
                         [null,             'CLR',         false],
@@ -1391,7 +1394,8 @@ export default function PendAlcRecoPage() {
               style={{ ...inp, fontSize: 9 }}/>
           </div>
           <input value={fRdc} onChange={e => setFRdc(e.target.value)}
-            placeholder="RDC…" style={{ ...inp, width: 80 }}/>
+            placeholder="SRC RDC…" title="Dispatch warehouse (SRC_RDC)"
+            style={{ ...inp, width: 80 }}/>
           <input value={fMajCat} onChange={e => setFMajCat(e.target.value)}
             placeholder="MAJ_CAT…" style={{ ...inp, width: 100 }}/>
           <select value={fMode} onChange={e => setFMode(e.target.value)} style={inp}>
@@ -1439,7 +1443,10 @@ export default function PendAlcRecoPage() {
         compact
         emptyText="No rows match the current filters."
         columns={[
-          { key:'rdc', label:'RDC', sortable:true, filterType:'multi',
+          { key:'src_rdc', label:'SRC RDC', sortable:true, filterType:'multi',
+            filterOptions:['DH24','DH26','DW01'],
+            render:r => <span style={{fontWeight:600}}>{r.src_rdc}</span> },
+          { key:'rdc', label:'STORE RDC', sortable:true, filterType:'multi',
             filterOptions:['DH24','DH26','DW01'],
             render:r => <span style={{fontWeight:600}}>{r.rdc}</span> },
           { key:'st_cd', label:'ST_CD', sortable:true, filterType:'text',

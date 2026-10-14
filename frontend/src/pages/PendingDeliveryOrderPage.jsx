@@ -38,6 +38,8 @@ const C = {
   bg: '#f8fafc', card: '#ffffff',
 }
 
+// `rdc` in the row state = the DISPATCH warehouse (the SAP DO's warehouse,
+// matched against ARS_PEND_ALC.SRC_RDC). Sent to the backend as `src_rdc`.
 const EMPTY_ROW = {
   rdc: '', st_cd: '', article_number: '',
   do_qty: '', do_number: '', allocation_number: '', alloc_type: '',
@@ -47,7 +49,11 @@ function parseCsv(text) {
   const lines = text.trim().split('\n')
   if (lines.length < 2) return []
   const hdr = lines[0].split(',').map(h => h.trim().toLowerCase())
-  const rdcIdx   = hdr.findIndex(h => ['rdc','source warehouse','source wh','warehouse','wh','vendor'].includes(h))
+  // Dispatch warehouse. Explicit SRC_RDC names win over the generic ones, so
+  // a file carrying both SRC_RDC and RDC (store RDC) reads the dispatch WH.
+  const srcIdx   = hdr.findIndex(h => ['src_rdc','src rdc','srcrdc','dispatch rdc','dispatch_rdc','dispatch wh','dispatch_wh'].includes(h))
+  const rdcIdx   = srcIdx >= 0 ? srcIdx
+                 : hdr.findIndex(h => ['rdc','source warehouse','source wh','warehouse','wh','vendor'].includes(h))
   const stIdx    = hdr.findIndex(h => ['st_cd','st code','store','store code','dest store','destination store','receiving store','werks'].includes(h))
   const artIdx   = hdr.findIndex(h => ['article_number','material no','material','matnr'].includes(h))
   const qtyIdx   = hdr.findIndex(h => ['do_qty','do qty','qty','quantity'].includes(h))
@@ -159,7 +165,7 @@ export default function PendingDeliveryOrderPage() {
     reader.onload = ev => {
       const parsed = parseCsv(ev.target.result)
       if (!parsed) {
-        toast.error('CSV must have columns: RDC (or "Receiving Store"), Article_Number (or "Material No"), DO_QTY')
+        toast.error('CSV must have columns: SRC_RDC (dispatch WH — or RDC / "Source Warehouse" / Vendor), Article_Number (or "Material No"), DO_QTY')
         return
       }
       if (parsed.length === 0) {
@@ -182,7 +188,8 @@ export default function PendingDeliveryOrderPage() {
   }
 
   const buildPayload = (r) => ({
-    rdc:            r.rdc.trim(),
+    src_rdc:        r.rdc.trim(),          // dispatch warehouse
+    rdc:            r.rdc.trim(),          // same value — older backends read `rdc`
     article_number: r.article_number.trim(),
     do_qty:         parseFloat(r.do_qty),
     ...(r.st_cd?.trim()             ? { st_cd:             r.st_cd.trim() }             : {}),
@@ -201,7 +208,7 @@ export default function PendingDeliveryOrderPage() {
       return !isNaN(q) && q >= 0
     })
     if (!valid.length) {
-      toast.error('No valid rows to submit (check RDC, Article Number, and DO QTY ≥ 0)')
+      toast.error('No valid rows to submit (check SRC RDC, Article Number, and DO QTY ≥ 0)')
       return
     }
     // FS-12: non-FIFO deduction must name a target session (backend 400s too).
@@ -344,7 +351,7 @@ export default function PendingDeliveryOrderPage() {
             IMPORT FROM CSV
           </div>
           <div style={{ fontSize: 9, color: C.textMuted }}>
-            Required: RDC, Article_Number, DO_QTY — optional: ST_CD (dest store), DO_Number, Allocation_Number (links DO back to its BDC), Alloc_Type (FRESH/GRT — scopes the deduction to matching typed pend rows)
+            Required: SRC_RDC (dispatch WH; RDC also accepted), Article_Number, DO_QTY — optional: ST_CD (dest store), DO_Number, Allocation_Number (links DO back to its BDC), Alloc_Type (FRESH/GRT — scopes the deduction to matching typed pend rows)
           </div>
         </div>
         <div style={{ fontSize: 9, color: C.amber, marginTop: 4,
@@ -362,7 +369,7 @@ export default function PendingDeliveryOrderPage() {
           </button>
           <button onClick={() => {
             const csv = '﻿'
-              + 'RDC,ST_CD,Article_Number,DO_QTY,DO_Number,Allocation_Number,Alloc_Type\n'
+              + 'SRC_RDC,ST_CD,Article_Number,DO_QTY,DO_Number,Allocation_Number,Alloc_Type\n'
               + 'DW01,S001,1000000001,50,DO-2026-001,2526-001,FRESH\n'
               + 'DW01,S002,1000000001,30,DO-2026-001,2526-001,GRT\n'
               + 'DW02,S003,1000000002,120,DO-2026-002,2526-002,\n'
@@ -455,7 +462,7 @@ export default function PendingDeliveryOrderPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead>
                 <tr style={{ background: C.bg }}>
-                  {['RDC','ST_CD','Article','DO Qty','DO Number','Alloc No','Type'].map(h => (
+                  {['SRC RDC','ST_CD','Article','DO Qty','DO Number','Alloc No','Type'].map(h => (
                     <th key={h} style={{ padding: '5px 8px', textAlign: 'left',
                                           fontSize: 9, fontWeight: 700, color: C.textSub,
                                           letterSpacing: '.05em',
@@ -551,7 +558,7 @@ export default function PendingDeliveryOrderPage() {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ background: C.bg }}>
-              {['RDC (Source WH)', 'ST_CD (Dest Store)', 'Article Number (VAR_ART)', 'DO Qty', 'DO Number (optional)', 'Allocation No. (optional)', 'Type (optional)', ''].map((h, i) => (
+              {['SRC RDC (Dispatch WH)', 'ST_CD (Dest Store)', 'Article Number (VAR_ART)', 'DO Qty', 'DO Number (optional)', 'Allocation No. (optional)', 'Type (optional)', ''].map((h, i) => (
                 <th key={i} style={{ padding: '6px 8px', textAlign: 'left', fontSize: 9,
                                      fontWeight: 700, color: C.textSub, letterSpacing: '.05em',
                                      borderBottom: `1px solid ${C.border}` }}>
@@ -675,7 +682,7 @@ export default function PendingDeliveryOrderPage() {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
             <thead>
               <tr style={{ background: C.bg }}>
-                {['RDC','ARTICLE','MAJ_CAT','ALLOC','DO QTY','PEND','STATUS','LAST DO'].map(h => (
+                {['SRC RDC','STORE RDC','ST_CD','ARTICLE','MAJ_CAT','ALLOC','DO QTY','PEND','STATUS','LAST DO'].map(h => (
                   <th key={h} style={{ padding: '6px 10px', textAlign: 'left', fontSize: 9,
                                        fontWeight: 700, color: C.textSub, letterSpacing: '.05em',
                                        borderBottom: `1px solid ${C.border}` }}>{h}</th>
@@ -686,7 +693,9 @@ export default function PendingDeliveryOrderPage() {
               {history.map((r, i) => (
                 <tr key={i} style={{ borderBottom: `1px solid ${C.border}`,
                                      background: r.is_closed ? '#f0fdf4' : (i % 2 === 0 ? '#fff' : C.bg) }}>
-                  <td style={{ padding: '5px 10px' }}>{r.rdc}</td>
+                  <td style={{ padding: '5px 10px', fontWeight: 600 }}>{r.src_rdc || '—'}</td>
+                  <td style={{ padding: '5px 10px', color: C.textSub }}>{r.rdc || '—'}</td>
+                  <td style={{ padding: '5px 10px' }}>{r.st_cd || '—'}</td>
                   <td style={{ padding: '5px 10px', fontFamily: 'monospace', fontSize: 9 }}>
                     {r.article_number}
                   </td>

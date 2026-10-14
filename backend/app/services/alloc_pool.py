@@ -156,20 +156,24 @@ def pend_agg_sql(grain: str) -> str:
            "- ISNULL(TRY_CAST(P.[DO_QTY] AS FLOAT), 0))")
     where = (f"ISNULL(P.[IS_CLOSED], 0) = 0 AND {qty} > 0 "
              f"AND {_typed_match('P')}")
+    # The pool a pending row draws on is its DISPATCH warehouse (SRC_RDC),
+    # not the store's own RDC — same expression as
+    # pend_alc_service.src_rdc_sql('P').
+    p_src = "COALESCE(NULLIF(P.[SRC_RDC], ''), P.[RDC])"
     if grain == "var":
         keys = (
-            "LTRIM(RTRIM(CAST(P.[RDC] AS NVARCHAR(50)))) AS RDC_KEY, "
+            f"LTRIM(RTRIM(CAST({p_src} AS NVARCHAR(50)))) AS RDC_KEY, "
             "LTRIM(RTRIM(CAST(P.[ARTICLE_NUMBER] AS NVARCHAR(30)))) AS ART_KEY"
         )
-        group = ("LTRIM(RTRIM(CAST(P.[RDC] AS NVARCHAR(50)))), "
+        group = (f"LTRIM(RTRIM(CAST({p_src} AS NVARCHAR(50)))), "
                  "LTRIM(RTRIM(CAST(P.[ARTICLE_NUMBER] AS NVARCHAR(30))))")
     elif grain == "gen":
         keys = (
-            "LTRIM(RTRIM(CAST(P.[RDC] AS NVARCHAR(50)))) AS RDC_KEY, "
+            f"LTRIM(RTRIM(CAST({p_src} AS NVARCHAR(50)))) AS RDC_KEY, "
             "TRY_CAST(TRY_CAST(P.[GEN_ART_NUMBER] AS FLOAT) AS BIGINT) AS GEN_KEY, "
             "LTRIM(RTRIM(CAST(ISNULL(P.[CLR], '') AS NVARCHAR(200)))) AS CLR_KEY"
         )
-        group = ("LTRIM(RTRIM(CAST(P.[RDC] AS NVARCHAR(50)))), "
+        group = (f"LTRIM(RTRIM(CAST({p_src} AS NVARCHAR(50)))), "
                  "TRY_CAST(TRY_CAST(P.[GEN_ART_NUMBER] AS FLOAT) AS BIGINT), "
                  "LTRIM(RTRIM(CAST(ISNULL(P.[CLR], '') AS NVARCHAR(200))))")
     else:
@@ -189,14 +193,12 @@ def hold_agg_sql(grain: str, st_master_table: str = DEFAULT_ST_MASTER) -> str:
     grain 'gen' → (RDC_KEY, GEN_KEY, CLR_KEY, HOLD_T)
     Bind param: :pool_alloc_type
     """
-    # This expression was always the right shape: prefer the hold row's own
-    # warehouse, fall back to the store master. Since 2026-10-03 H.RDC IS the
-    # sourcing warehouse — the one physically reserving the piece, written at
-    # Approve from the split rows — so the brief SRC_RDC detour in front of it
-    # is gone. msa_service._hold_src_expr now resolves identically, which ends
-    # the disagreement where that loader went straight to the store master and
-    # this one did not (234,285 of 234,285 open rows on 2026-09-22).
-    rdc = "COALESCE(NULLIF(H.[RDC], ''), SM.[RDC])"
+    # The reserving warehouse: the hold's SRC_RDC (2026-10-14), then its RDC
+    # (rows that predate SRC_RDC held the reserving warehouse there), then
+    # the store master. Identical to msa_service._hold_src_expr and
+    # pend_alc_service.hold_src_rdc_sql, so no two readers can disagree
+    # (they did on 234,285 of 234,285 open rows on 2026-09-22).
+    rdc = "COALESCE(NULLIF(H.[SRC_RDC], ''), NULLIF(H.[RDC], ''), SM.[RDC])"
     where = ("ISNULL(H.[IS_CLOSED], 0) = 0 AND ISNULL(H.[HOLD_REM], 0) > 0 "
              f"AND {_typed_match('H')}")
     if grain == "var":

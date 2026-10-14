@@ -24,6 +24,7 @@ const C = {
   bg: '#f8fafc', card: '#ffffff',
 }
 
+// `rdc` in the row state = the DISPATCH warehouse (sent as `src_rdc`).
 const EMPTY_ROW = { rdc: '', st_cd: '', article_number: '', reason: '' }
 
 /* FastAPI `detail` is not always a string — the blank-ST_CD guard on
@@ -53,7 +54,9 @@ function parseCsv(text) {
                      .replace(/_+/g, '_')
   const hdr = lines[0].split(',').map(norm)
   const idx = (...names) => hdr.findIndex(h => names.includes(h))
-  const rdcIdx = idx('rdc', 'source_warehouse', 'warehouse', 'wh')
+  // Dispatch warehouse — SRC_RDC (preferred) or the older RDC column.
+  const srcIdx = idx('src_rdc', 'srcrdc', 'dispatch_rdc', 'dispatch_wh')
+  const rdcIdx = srcIdx >= 0 ? srcIdx : idx('rdc', 'source_warehouse', 'warehouse', 'wh')
   const stIdx  = idx('st_cd', 'st_code', 'store', 'store_code', 'werks')
   const artIdx = idx('article_number', 'article', 'material_no', 'material', 'matnr', 'var_art')
   const remIdx = idx('reason', 'remark', 'remarks', 'note', 'notes', 'comment')
@@ -92,7 +95,7 @@ export default function AdhocClosePage() {
 
   const downloadTemplate = () => {
     const csv =
-      'RDC,ST_CD,ARTICLE_NUMBER,REASON\n' +
+      'SRC_RDC,ST_CD,ARTICLE_NUMBER,REASON\n' +
       'DH24,,1110112278002,No MSA stock — bot mis-allocated\n' +
       'DH24,V001,1110112278002,\n' +
       'DH24,V002,1110112278003,Article delisted at store\n'
@@ -124,7 +127,7 @@ export default function AdhocClosePage() {
     reader.onload = (ev) => {
       const parsed = parseCsv(String(ev.target?.result || ''))
       if (parsed === null) {
-        toast.error('CSV missing required columns: RDC, ARTICLE_NUMBER')
+        toast.error('CSV missing required columns: SRC_RDC (or RDC), ARTICLE_NUMBER')
         setFile(null); if (fileRef.current) fileRef.current.value = ''
         return
       }
@@ -135,10 +138,10 @@ export default function AdhocClosePage() {
 
   const submitRows = async () => {
     if (validRows.length === 0) {
-      toast.error('Add at least one row with RDC + ARTICLE_NUMBER')
+      toast.error('Add at least one row with SRC RDC + ARTICLE_NUMBER')
       return
     }
-    // Blank ST_CD = close EVERY store for that (RDC, ARTICLE). The backend
+    // Blank ST_CD = close EVERY store for that (SRC_RDC, ARTICLE). The backend
     // refuses such rows unless confirm_close_all_stores is set, so ask for
     // that consent here and pass the flag — without it the request always
     // 400s and the feature simply cannot be used store-wildcard.
@@ -151,10 +154,10 @@ export default function AdhocClosePage() {
     )) return
     if (wildcardRows.length && !confirm(
       `⚠ ${wildcardRows.length} row(s) have a BLANK store code (ST_CD).\n\n` +
-      `Those will close the article across ALL stores for the given RDC, ` +
+      `Those will close the article across ALL stores for the given SRC RDC, ` +
       `not just one store:\n` +
       wildcardRows.slice(0, 10)
-        .map(r => `   • RDC ${r.rdc.trim()} · article ${r.article_number.trim()}`)
+        .map(r => `   • SRC RDC ${r.rdc.trim()} · article ${r.article_number.trim()}`)
         .join('\n') +
       (wildcardRows.length > 10 ? `\n   … and ${wildcardRows.length - 10} more` : '') +
       `\n\nContinue?`
@@ -166,7 +169,8 @@ export default function AdhocClosePage() {
         reason: globalReason.trim() || null,
         confirm_close_all_stores: wildcardRows.length > 0,
         rows: validRows.map(r => ({
-          rdc:            r.rdc.trim(),
+          src_rdc:        r.rdc.trim(),        // dispatch warehouse
+          rdc:            r.rdc.trim(),        // same value — older backends read `rdc`
           article_number: r.article_number.trim(),
           ...(r.st_cd?.trim()  ? { st_cd:  r.st_cd.trim() }  : {}),
           ...(r.reason?.trim() ? { reason: r.reason.trim() } : {}),
@@ -202,13 +206,13 @@ export default function AdhocClosePage() {
       : null
     if (wildcardCount && !confirm(
       `⚠ ${wildcardCount} row(s) in ${file.name} have a BLANK store code (ST_CD).\n\n` +
-      `Those close the article across ALL stores for the given RDC, ` +
+      `Those close the article across ALL stores for the given SRC RDC, ` +
       `not just one store.\n\nContinue?`
     )) return
     if (wildcardCount === null && !confirm(
       `Store codes in ${file.name} could not be previewed.\n\n` +
       `Any row with a blank ST_CD will close the article across ALL stores ` +
-      `for its RDC. Continue?`
+      `for its SRC RDC. Continue?`
     )) return
 
     setSubmitting(true); setResult(null)
@@ -293,7 +297,7 @@ export default function AdhocClosePage() {
           </div>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
             <thead><tr style={{ background: C.bg }}>
-              <th style={th}>RDC*</th>
+              <th style={th}>SRC RDC* <span style={{ color: C.textMuted, fontWeight: 400 }}>(dispatch)</span></th>
               <th style={th}>ST_CD <span style={{ color: C.textMuted, fontWeight: 400 }}>(blank = all stores)</span></th>
               <th style={th}>ARTICLE*</th>
               <th style={th}>REASON <span style={{ color: C.textMuted, fontWeight: 400 }}>(per-row override)</span></th>
@@ -344,7 +348,7 @@ export default function AdhocClosePage() {
           <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
             <div style={{ fontSize: 10, color: C.textSub }}>
               CSV or Excel with columns: <code style={{ background: C.bg, padding: '0 4px', borderRadius: 3 }}>
-              RDC, ARTICLE_NUMBER</code><br/>
+              SRC_RDC (or RDC), ARTICLE_NUMBER</code><br/>
               Optional: <code style={{ background: C.bg, padding: '0 4px', borderRadius: 3 }}>ST_CD, REASON</code>
             </div>
             <input

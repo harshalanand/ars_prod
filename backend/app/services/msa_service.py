@@ -39,37 +39,45 @@ def _df_to_native_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
+def _has_col(db, table: str, col: str) -> bool:
+    try:
+        return bool(db.execute(text(
+            "SELECT CASE WHEN COL_LENGTH(:t, :c) IS NULL THEN 0 ELSE 1 END"
+        ), {"t": f"dbo.{table}", "c": col}).scalar())
+    except Exception:
+        return False
+
+
 def _hold_src_expr(db, hold_table: str, rdc_col: str) -> str:
     """SQL expression for the warehouse a hold is PHYSICALLY reserved at.
 
     MSA deducts open holds from FNL_Q per warehouse, so this must name the
-    warehouse that is actually holding the pieces. Since 2026-10-03
-    ARS_NL_TBL_HOLD_TRACKING.RDC carries exactly that — the sourcing
-    warehouse, written at Approve from the split rows — so the hold row
-    answers for itself.
+    warehouse that is actually holding the pieces. Since 2026-10-14 the hold
+    ledger carries RDC = the store's own warehouse and SRC_RDC = the
+    reserving one (same contract as ARS_PEND_ALC).
 
     Resolution order, first non-blank wins:
-        1. H.RDC      — the reserving warehouse
-        2. S.<rdc>    — the store master, for legacy rows with a blank RDC
+        1. H.SRC_RDC  — the reserving warehouse
+        2. H.RDC      — rows written before SRC_RDC existed held the
+                        reserving warehouse here (2026-10-05 contract)
+        3. S.<rdc>    — the store master, for legacy rows with neither
 
-    This also closes a long-standing split brain. `alloc_pool._typed_hold_sql`
-    already preferred the hold row's own RDC while this loader ignored it and
-    went to the store master, so the two disagreed for any store re-tagged
-    after its hold was created — measured 2026-09-22 at 234,285 of 234,285
-    open hold rows (346,258 pcs, 412 stores). Both now resolve to
-    COALESCE(NULLIF(H.RDC,''), store master) and cannot drift apart.
-
-    Safe to change now because every one of those 2.75 M hold rows is CLOSED
-    (0 open as of 2026-10-03), so no existing deduction moves; the earlier
-    objection to touching this was the 234 k open rows, and they are gone.
-
-    A short hold still names one warehouse: BR-RDC-12 forbids splitting a
-    hold, so the tracker's PK (WERKS, VAR_ART, SZ, ALLOC_TYPE) holds.
+    Identical to pend_alc_service.hold_src_rdc_sql, so the MSA build and the
+    approve-time re-sync cannot resolve a hold to different warehouses.
     """
-    # `db` and `hold_table` are no longer needed — the probe for a SRC_RDC
-    # column went with it — but the signature is kept so the two call sites
-    # stay unchanged.
+    if _has_col(db, hold_table, "SRC_RDC"):
+        return f"COALESCE(NULLIF(H.[SRC_RDC],''), NULLIF(H.[RDC],''), S.[{rdc_col}])"
     return f"COALESCE(NULLIF(H.[RDC],''), S.[{rdc_col}])"
+
+
+def _pend_src_expr(db) -> str:
+    """SQL expression for an ARS_PEND_ALC row's dispatch warehouse — the MSA
+    pool its PEND_QTY is deducted from. Same as pend_alc_service.src_rdc_sql():
+    SRC_RDC, falling back to RDC for rows written before SRC_RDC existed (on
+    those, RDC held the dispatch warehouse)."""
+    if _has_col(db, "ARS_PEND_ALC", "SRC_RDC"):
+        return "COALESCE(NULLIF([SRC_RDC], ''), [RDC])"
+    return "[RDC]"
 
 
 class MSAService:
@@ -102,17 +110,19 @@ class MSAService:
         """Load open pending allocations from ARS_PEND_ALC.
 
         Returns DataFrame with columns RDC, ARTICLE_NUMBER, ARS_PEND — the
-        approved-but-not-yet-DO'd quantities from the ARS system. These are
-        added to the legacy MASTER_ALC_PEND deduction in Step 6 to prevent
-        double-allocation of warehouse stock before SAP issues a Delivery Order.
+        approved-but-not-yet-DO'd quantities from the ARS system, keyed on the
+        DISPATCH warehouse (SRC_RDC) so each one is deducted from the pool
+        that will actually ship it. ARS_PEND_ALC.RDC is the store's own
+        warehouse and must never be used here.
         """
         try:
-            result = self.db.execute(text("""
-                SELECT RDC, ARTICLE_NUMBER,
+            src = _pend_src_expr(self.db)
+            result = self.db.execute(text(f"""
+                SELECT {src} AS RDC, ARTICLE_NUMBER,
                        SUM(PEND_QTY) AS ARS_PEND
                 FROM ARS_PEND_ALC WITH (NOLOCK)
                 WHERE IS_CLOSED = 0 AND PEND_QTY > 0
-                GROUP BY RDC, ARTICLE_NUMBER
+                GROUP BY {src}, ARTICLE_NUMBER
             """))
             rows = result.fetchall()
             if not rows:
@@ -222,6 +232,7 @@ class MSAService:
 
         grain 'var' → (RDC, ARTICLE_NUMBER, ALLOC_TYPE, TYPED_VAL)
         grain 'gen' → (RDC, GEN_ART_NUMBER, CLR, ALLOC_TYPE, TYPED_VAL)
+        RDC here is the row's dispatch warehouse (SRC_RDC).
         """
         cols = (["RDC", "ARTICLE_NUMBER", "ALLOC_TYPE", "TYPED_VAL"]
                 if grain == "var"
@@ -232,11 +243,14 @@ class MSAService:
                "- ISNULL(TRY_CAST(DO_QTY AS FLOAT),0))")
         where = f"ISNULL(IS_CLOSED,0) = 0 AND {qty} > 0"
         try:
+            # Dispatch warehouse (SRC_RDC) — this is the loader that sets the
+            # PEND_QTY finally stored, so it must agree with Step 7.
+            src = _pend_src_expr(self.db)
             if grain == "var":
-                keys = ("LTRIM(RTRIM(CAST(RDC AS NVARCHAR(50)))), "
+                keys = (f"LTRIM(RTRIM(CAST({src} AS NVARCHAR(50)))), "
                         "LTRIM(RTRIM(CAST(ARTICLE_NUMBER AS NVARCHAR(30))))")
             else:
-                keys = ("LTRIM(RTRIM(CAST(RDC AS NVARCHAR(50)))), "
+                keys = (f"LTRIM(RTRIM(CAST({src} AS NVARCHAR(50)))), "
                         "LTRIM(RTRIM(CAST(GEN_ART_NUMBER AS NVARCHAR(50)))), "
                         "LTRIM(RTRIM(CAST(ISNULL(CLR,'') AS NVARCHAR(200))))")
             sql = (f"SELECT {keys}, {fold} AS ALLOC_TYPE, "
@@ -254,9 +268,10 @@ class MSAService:
     def _load_typed_hold(self, grain: str) -> pd.DataFrame:
         """Open ARS_NL_TBL_HOLD_TRACKING HOLD_REM, summed per type.
 
-        RDC resolves via the store master (ST_CD = WERKS), mirroring
-        _load_open_holds so typed holds land on the same warehouse grain as
-        the untyped Step 8 merge. ALLOC_TYPE folds ''/NULL/unknown → FRESH.
+        RDC resolves through _hold_src_expr (the hold's SRC_RDC, then its
+        RDC, then the store master), mirroring _load_open_holds so typed holds
+        land on the same warehouse as the untyped Step 8 merge.
+        ALLOC_TYPE folds ''/NULL/unknown → FRESH.
 
         grain 'var' → (RDC, ARTICLE_NUMBER, ALLOC_TYPE, TYPED_VAL)
         grain 'gen' → (RDC, GEN_ART_NUMBER, CLR, ALLOC_TYPE, TYPED_VAL)
@@ -507,12 +522,11 @@ class MSAService:
              If `slocs` is empty or None, all SLOCs participate. STK_Q magnitude
              is irrelevant — any positive stock qualifies the GEN_ART.
           B. Pend universe — products with any open ARS_PEND_ALC row (IS_CLOSED=0,
-             PEND_QTY > 0). RDC and GEN_ART_NUMBER are read directly from the
-             pending row.
+             PEND_QTY > 0), at the row's dispatch warehouse (SRC_RDC).
           C. Hold universe — products with any open ARS_NL_TBL_HOLD_TRACKING
-             row (IS_CLOSED=0, HOLD_REM > 0). WERKS is mapped to RDC via the
-             store master; VAR_ART is mapped to GEN_ART_NUMBER via
-             vw_master_product.
+             row (IS_CLOSED=0, HOLD_REM > 0), at the hold's reserving
+             warehouse (_hold_src_expr); VAR_ART is mapped to GEN_ART_NUMBER
+             via vw_master_product.
 
         The result drives the Step 6 backfill so that every (RDC, GEN_ART) with
         any real signal (stock-in-scope, PEND, or HOLD) has all its master
@@ -553,11 +567,12 @@ class MSAService:
             except Exception as e:
                 logger.warning(f"[universe] source A (stock) failed: {e}")
 
-        # --- Source B: open PEND ------------------------------------------
+        # --- Source B: open PEND (at the dispatch warehouse) ---------------
         try:
-            df_b = pd.read_sql(text("""
+            src = _pend_src_expr(self.db)
+            df_b = pd.read_sql(text(f"""
                 SELECT DISTINCT
-                    CAST(RDC AS NVARCHAR(50))            AS RDC,
+                    CAST({src} AS NVARCHAR(50))          AS RDC,
                     CAST(GEN_ART_NUMBER AS NVARCHAR(50)) AS GEN_ART_NUMBER
                 FROM ARS_PEND_ALC WITH (NOLOCK)
                 WHERE IS_CLOSED = 0
@@ -569,14 +584,19 @@ class MSAService:
         except Exception as e:
             logger.warning(f"[universe] source B (pend) failed: {e}")
 
-        # --- Source C: open HOLD (WERKS->RDC, VAR_ART->GEN via master) ---
+        # --- Source C: open HOLD (at the reserving warehouse, VAR_ART->GEN) -
+        # Same warehouse resolution as Steps 8 / 12 (_hold_src_expr). Until
+        # 2026-10-14 this read the store master's RDC, so a hold reserved at
+        # another warehouse seeded its placeholder rows at the wrong one.
         try:
-            df_c = pd.read_sql(text("""
+            hold_rdc = _hold_src_expr(self.db, self.hold_table, "RDC").replace(
+                "S.[RDC]", "SM.[RDC]")
+            df_c = pd.read_sql(text(f"""
                 SELECT DISTINCT
-                    CAST(SM.RDC AS NVARCHAR(50))            AS RDC,
+                    CAST({hold_rdc} AS NVARCHAR(50))        AS RDC,
                     CAST(MP.GEN_ART_NUMBER AS NVARCHAR(50)) AS GEN_ART_NUMBER
                 FROM ARS_NL_TBL_HOLD_TRACKING H WITH (NOLOCK)
-                INNER JOIN Master_ALC_INPUT_ST_MASTER SM
+                LEFT JOIN Master_ALC_INPUT_ST_MASTER SM
                     ON SM.ST_CD = H.WERKS
                 INNER JOIN vw_master_product MP
                     ON CAST(MP.ARTICLE_NUMBER AS NVARCHAR(30))
@@ -1608,7 +1628,7 @@ class MSAService:
 
             # ============ STEP 7: MERGE ARS_PEND_ALC → PEND_QTY ============
             # Stamp PEND onto every row (existing + universe-backfilled)
-            # by joining ARS_PEND_ALC on (RDC, ARTICLE_NUMBER). Every
+            # by joining ARS_PEND_ALC on (SRC_RDC, ARTICLE_NUMBER). Every
             # open pending obligation now has a row to land on, so
             # SUM(TOTAL.PEND_QTY) reconciles to SUM(ARS_PEND_ALC.PEND_QTY).
             ars_pend_loaded = False
@@ -1986,48 +2006,3 @@ class MSAService:
         """Validate column name for SQL injection prevention"""
         import re
         return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", column))
-
-    def _get_pending_allocation(self, msa_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Get pending allocations and aggregate by ARTICLE_NUMBER
-        
-        Args:
-            msa_df: The MSA pivot table
-        
-        Returns:
-            DataFrame with ARTICLE_NUMBER and PEND_QTY columns
-        """
-        try:
-            if "ARTICLE_NUMBER" not in msa_df.columns:
-                return pd.DataFrame()
-
-            # Check if pending table exists
-            sql = f"""SELECT TOP 1 * FROM {self.pending_table}"""
-            try:
-                pend_df = pd.read_sql(text(sql), self.db.bind)
-                if pend_df.empty:
-                    logger.info("No pending allocations found")
-                    return pd.DataFrame()
-            except Exception as e:
-                logger.warning(f"Pending table not found or empty: {e}")
-                return pd.DataFrame()
-
-            # Load all pending data
-            sql = f"""SELECT * FROM {self.pending_table}"""
-            pend_df = pd.read_sql(text(sql), self.db.bind)
-
-            if "QTY" in pend_df.columns:
-                pend_df["QTY"] = pd.to_numeric(pend_df["QTY"], errors="coerce").fillna(0)
-
-                # Aggregate by ARTICLE_NUMBER
-                if "ARTICLE_NUMBER" in pend_df.columns:
-                    pend_agg = pend_df.groupby("ARTICLE_NUMBER")["QTY"].sum().reset_index()
-                    pend_agg.rename(columns={"QTY": "PEND_QTY"}, inplace=True)
-                    logger.info(f"Aggregated {len(pend_agg)} pending allocation records")
-                    return pend_agg
-
-            return pd.DataFrame()
-
-        except Exception as e:
-            logger.warning(f"Error getting pending allocations: {e}")
-            return pd.DataFrame()

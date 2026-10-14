@@ -19,8 +19,8 @@
 
 ## Three input sources
 - `VW_ET_MSA_STK_WITH_MASTER` — stock per `(date, ST_CD, SLOC, ARTICLE_NUMBER, …)`. Step 1 filters by `SLOC IN (selected_slocs)` and `SEG IN ('APP','GM')`.
-- `ARS_PEND_ALC` — open pending (`IS_CLOSED=0`, `PEND_QTY>0`). One row per `(RDC, ARTICLE_NUMBER)`.
-- `ARS_NL_TBL_HOLD_TRACKING` — open holds (`IS_CLOSED=0`, `HOLD_REM>0`). Mapped WERKS→RDC via `Master_ALC_INPUT_ST_MASTER`, VAR_ART→GEN_ART via `vw_master_product`.
+- `ARS_PEND_ALC` — open pending (`IS_CLOSED=0`, `PEND_QTY>0`). Aggregated per `(dispatch warehouse, ARTICLE_NUMBER)`, dispatch warehouse = `COALESCE(NULLIF(SRC_RDC,''), RDC)` (2026-10-14; the ledger's `RDC` is the store's own warehouse and is never the deduction key).
+- `ARS_NL_TBL_HOLD_TRACKING` — open holds (`IS_CLOSED=0`, `HOLD_REM>0`). Warehouse = `COALESCE(NULLIF(SRC_RDC,''), NULLIF(RDC,''), Master_ALC_INPUT_ST_MASTER.RDC)` (`_hold_src_expr`, 2026-10-14), VAR_ART→GEN_ART via `vw_master_product`.
 - `vw_master_product` — master catalogue. Slow VIEW; `_load_master_variants` uses temp-table JOIN with retry on transient connect-drop (10054/10053/08S01).
 
 ## 11-step MSA flow (universe-anchored, June 2026)
@@ -33,13 +33,14 @@
 6. **Universe backfill** — `_load_universe(slocs, date)` returns the
    union of (RDC, GEN_ART_NUMBER) keys from:
      A. stock in the **selected SLOCs only**
-     B. open `ARS_PEND_ALC` rows
-     C. open `ARS_NL_TBL_HOLD_TRACKING` rows
+     B. open `ARS_PEND_ALC` rows, at their `SRC_RDC` (fallback `RDC`)
+     C. open `ARS_NL_TBL_HOLD_TRACKING` rows, at the hold's `SRC_RDC`
+        (fallback `RDC` → store master; used the store master's RDC until 2026-10-14)
    For each (RDC, GEN_ART) in the universe, every VAR_ART from
    `vw_master_product` is inserted into `msa_pivot` as a zero-stock
    placeholder if missing. Guarantees PEND/HOLD always land on a row.
-7. merge `ARS_PEND_ALC` → `PEND_QTY` on (RDC, ARTICLE_NUMBER)
-8. merge `ARS_NL_TBL_HOLD_TRACKING` → `HOLD_QTY` (via WERKS → RDC)
+7. merge `ARS_PEND_ALC` → `PEND_QTY` (`_load_ars_pending`) on (RDC = pending `SRC_RDC`, ARTICLE_NUMBER); Step 12 `_load_typed_pend` sets the final stored typed `PEND_QTY` on the same key
+8. merge `ARS_NL_TBL_HOLD_TRACKING` → `HOLD_QTY` at the hold's `SRC_RDC` (`_hold_src_expr`; typed in Step 12 by `_load_typed_hold`)
 9. `FNL_Q = max(STK − PEND − HOLD, 0)`
 10. threshold (relaxed): keep groups where
     `sum(FNL_Q) + sum(PEND_QTY) + sum(HOLD_QTY) > threshold`
@@ -65,7 +66,7 @@ After every MSA Generate:
 
 ## Five validation checks (run after every MSA Generate)
 1. **TOTAL ↔ PEND_ALC**: `SUM(TOTAL.PEND_QTY) ≈ SUM(ARS_PEND_ALC.PEND_QTY WHERE IS_CLOSED=0)`. Catches PEND rows with no matching MSA variant.
-2. **TOTAL ↔ HOLD_TRACKING**: `SUM(TOTAL.HOLD_QTY) ≈ SUM(ARS_NL_TBL_HOLD_TRACKING.HOLD_REM WHERE IS_CLOSED=0)` (with WERKS→RDC mapping). Catches hold rows that don't land.
+2. **TOTAL ↔ HOLD_TRACKING**: `SUM(TOTAL.HOLD_QTY) ≈ SUM(ARS_NL_TBL_HOLD_TRACKING.HOLD_REM WHERE IS_CLOSED=0)` (per warehouse: by the hold's `SRC_RDC`, fallback `RDC` → store master). Catches hold rows that don't land.
 3. **TOTAL ↔ source view**: `SUM(TOTAL.STK_QTY) ≈ SUM(VW_ET_MSA_STK_WITH_MASTER.STK_Q WHERE SLOC IN selected AND SEG IN ('APP','GM'))` for the run date. Catches a regression in pivot or filter.
 4. **VAR_ART ⊂ TOTAL**: per passing `(RDC, MAJ_CAT, GEN_ART_NUMBER, CLR)` group, `COUNT(DISTINCT VAR_ART.ARTICLE_NUMBER) == COUNT(DISTINCT TOTAL.ARTICLE_NUMBER)`. Catches a passing group losing articles (e.g. if anyone adds article-level filtering to Step 10).
 5. **GEN_ART = rollup(VAR_ART)**: per `(RDC, MAJ_CAT, GEN_ART_NUMBER, CLR)`, `GEN_ART.X == SUM(VAR_ART.X)` for X ∈ {STK_QTY, PEND_QTY, HOLD_QTY, FNL_Q}. Catches the historical GEN_ART grain bug — RDC-collapse during Step 11 aggregation.
@@ -82,10 +83,11 @@ After the universe-anchored build (June 2026), all five should sit at zero delta
 
 ## Diagnostic recipes
 - **Compare sums across the three tables**: `SELECT SUM(STK_QTY), SUM(PEND_QTY), SUM(HOLD_QTY), SUM(FNL_Q) FROM ARS_MSA_TOTAL` (then VAR_ART, GEN_ART). TOTAL.PEND should match `ARS_PEND_ALC` open sum; VAR_ART.PEND < TOTAL.PEND if threshold drops groups; GEN_ART = VAR_ART rollup if RDC grain is intact.
-- **Find the missing article**: `(RDC, ARTICLE_NUMBER)` in `ARS_PEND_ALC` open rows but absent from `ARS_MSA_TOTAL` → it's either a master-product gap or (pre-June-2026) a SLOC scope drop.
+- **Find the missing article**: `(COALESCE(NULLIF(SRC_RDC,''), RDC), ARTICLE_NUMBER)` in `ARS_PEND_ALC` open rows but absent from `ARS_MSA_TOTAL` → it's either a master-product gap or (pre-June-2026) a SLOC scope drop. Never match on the ledger's `RDC` alone — since 2026-10-14 it is the store's own warehouse.
 - **Probe the universe**: `MSAService(session)._load_universe(slocs, date)` returns `(RDC, GEN_ART_NUMBER)` from the three sources. Useful to predict the row-count delta before a fresh Generate.
 
 ## Recorded rules
 <!-- ars_flow appends dated bullets below. One rule per line. -->
 - **2026-07-13 — ATT_TYP gate (00/02 only).** MSA keeps only real sellable SKUs: `ATT_TYP ∈ settings.MSA_ALLOWED_ATT_TYP` (default `['00','02']` = single + variant). Drops `01` generic headers (never allocate a header directly, only its 02 variants) and `11` structured/prepack. Step 6b in `calculate()` via `_load_att_typ_map` (ATT_TYP resolved per ARTICLE_NUMBER from `vw_master_product` — the MSA source view lacks it); the Step-6 backfill loader also filters `ATT_TYP IN (allowlist)`. Runs after Step 6, before PEND/HOLD merges → Grid/Listing/Alloc inherit it. Unmapped→dropped; fail-open. Diagnostic: `SELECT mp.ATT_TYP, COUNT(*) FROM ARS_MSA_VAR_ART v LEFT JOIN MASTER_PRODUCT mp ON CAST(mp.ARTICLE_NUMBER AS NVARCHAR(30))=CAST(v.ARTICLE_NUMBER AS NVARCHAR(30)) WHERE v.SEQUENCE_ID=<seq> GROUP BY mp.ATT_TYP` — should return only 00/02.
 - **2026-07-13 — GRT size-ladder completed per-OPT (Step 12).** Row-per-type expansion (`_expand_frame`) now keeps GRT rows **per-OPT, not per-variant**: if an OPT `(RDC,MAJ_CAT,GEN_ART_NUMBER,CLR)` has GRT signal at any size, keep its whole GRT size-ladder (zero sizes as placeholders — GRT coverage/CONT denominator), mirroring the always-on FRESH ladder. Pure-FRESH OPTs still emit no GRT rows; each pool completed independently. Fixes fragmented GRT pools (e.g. GRT stock only in 2XL surfaced a 1-size GRT ladder → wrong CONT/SZ_MBQ on GRT allocation). Only active when both pools are generated (FRESH-only MSA unchanged). Diagnostic: for GRT-participating OPTs, `COUNT(DISTINCT SZ WHERE ALLOC_TYPE='GRT') == COUNT(DISTINCT SZ WHERE ALLOC_TYPE='FRESH')` must hold per colour.
+- **2026-10-14 — PEND/HOLD deducted at the ledgers' `SRC_RDC`** (branch `for_merge`, not yet deployed/migrated). Pending key `COALESCE(NULLIF(SRC_RDC,''), RDC)` in Step 7 / Step 12 / universe B; hold key `COALESCE(NULLIF(SRC_RDC,''), NULLIF(RDC,''), store master)` in Step 8 / Step 12 / universe C. Approve/revert delta, `bootstrap_msa_pend_sync`, `bootstrap_msa_hold_sync` (session scope now by ARTICLE across all warehouses) and `alloc_pool.pend_agg_sql`/`hold_agg_sql` use the same keys. `_get_pending_allocation` removed. Why: MSA had debited the store's warehouse instead of the one that ships (session `20261003_130926_698`: 7,653 of 12,730 pcs wrong). Open: `ALLRDC_usp_ars_msa_master` `alloc_fh` still attributes FROM_HOLD by store RDC. Full rule: manual `msa.md`. see also: pend_alc.md, hold.md

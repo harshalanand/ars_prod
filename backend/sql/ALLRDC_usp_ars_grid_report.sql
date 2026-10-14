@@ -181,15 +181,22 @@ pdim AS (
       @rdcAlc = STRING_AGG(CAST(
           N', SUM(CASE WHEN {a}SRC_RDC = N''' + RDC + N''' THEN ISNULL({a}SHIP_QTY, 0) ELSE 0 END) AS '
           + QUOTENAME(RDC + N'_ALCQ') AS NVARCHAR(MAX)), N'') WITHIN GROUP (ORDER BY RDC),
-      -- HOLD movement splits on RDC (the holding RDC), NOT SRC_RDC.
+      -- HOLD movement splits on the HOLDING warehouse. (2026-10-14) A new hold
+      -- is reserved at the line's SRC_RDC (one warehouse — a hold is never
+      -- split), so HADD reads ARS_ALLOC_HISTORY.SRC_RDC unless it is 'MULTI'
+      -- or blank. FROM_HOLD_QTY is drawn from the store's EXISTING hold, whose
+      -- warehouse ARS_ALLOC_HISTORY does not carry, so HCONS stays on the
+      -- line's RDC (the store's own warehouse).
       @rdcHmov = STRING_AGG(CAST(
-          N', SUM(CASE WHEN {a}RDC = N''' + RDC + N''' THEN ISNULL({a}HOLD_QTY, 0) ELSE 0 END) AS '
+          N', SUM(CASE WHEN COALESCE(NULLIF(NULLIF({a}SRC_RDC, N''''), N''MULTI''), {a}RDC) = N''' + RDC + N''' THEN ISNULL({a}HOLD_QTY, 0) ELSE 0 END) AS '
           + QUOTENAME(RDC + N'_HADD')
           + N', SUM(CASE WHEN {a}RDC = N''' + RDC + N''' THEN ISNULL({a}FROM_HOLD_QTY, 0) ELSE 0 END) AS '
           + QUOTENAME(RDC + N'_HCONS') AS NVARCHAR(MAX)), N'') WITHIN GROUP (ORDER BY RDC),
-      -- HOLD remaining splits on RDC too (ARS_NL_TBL_HOLD_TRACKING.RDC)
+      -- HOLD remaining splits on the holding warehouse: the tracker's SRC_RDC
+      -- (2026-10-14), falling back to its RDC for rows that predate SRC_RDC
+      -- (on those RDC held the reserving warehouse).
       @rdcHold = STRING_AGG(CAST(
-          N', SUM(CASE WHEN {a}RDC = N''' + RDC + N''' THEN ISNULL({a}HOLD_REM, 0) ELSE 0 END) AS '
+          N', SUM(CASE WHEN COALESCE(NULLIF({a}SRC_RDC, N''''), {a}RDC) = N''' + RDC + N''' THEN ISNULL({a}HOLD_REM, 0) ELSE 0 END) AS '
           + QUOTENAME(RDC + N'_HCLOSE') AS NVARCHAR(MAX)), N'') WITHIN GROUP (ORDER BY RDC),
       @rdcAlcOut = STRING_AGG(CAST(
             N',
@@ -375,8 +382,8 @@ WHERE 1 = 1' + @where;
     GROUP BY a.WERKS, a.MAJ_CAT, pd.DIMV
 )' END;
 
-    -- HOLD remaining per RDC (holding RDC, not SRC_RDC). 391 of 421 stores
-    -- hold stock at BOTH RDCs, so this split is real, not a copy + a zero.
+    -- HOLD remaining per holding warehouse (tracker SRC_RDC, else RDC). 391 of
+    -- 421 stores hold stock at BOTH RDCs, so this split is real, not a copy + a zero.
     DECLARE @holdRCTE NVARCHAR(MAX) = CASE WHEN @DimCol IS NULL THEN
         N'hold_r AS (
     SELECT WERKS, MAJ_CAT' + REPLACE(@rdcHold, N'{a}', N'') + N'

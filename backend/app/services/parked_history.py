@@ -45,11 +45,11 @@ from sqlalchemy import text
 from app.database.session import get_data_engine
 from app.services.pend_alc_service import (
     write_pend_alc,
-    adjust_msa_after_pend_insert,
     apply_pend_alc_delta_by_session,
     bootstrap_msa_hold_sync,
     log_operation,
     OPERATIONS_TABLE,
+    _table_exists,
 )
 
 
@@ -843,11 +843,11 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                               AND A.[OPT_TYPE] IN ('RL','TBC','TBL','NL')
                         )
                         INSERT INTO [{_HOLD_SNAPSHOT_TABLE}]
-                            (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                            (SESSION_ID, WERKS, RDC, SRC_RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
                              VAR_ART, SZ, OPT_STATUS, LISTED_DATE,
                              HOLD_QTY_INITIAL, HOLD_REM,
                              LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ALLOC_TYPE)
-                        SELECT :sid, H.WERKS, H.RDC, H.MAJ_CAT, H.GEN_ART_NUMBER, H.CLR,
+                        SELECT :sid, H.WERKS, H.RDC, H.SRC_RDC, H.MAJ_CAT, H.GEN_ART_NUMBER, H.CLR,
                                H.VAR_ART, H.SZ, H.OPT_STATUS, H.LISTED_DATE,
                                H.HOLD_QTY_INITIAL, H.HOLD_REM,
                                H.LAST_UPDATED, H.IS_CLOSED, H.CLOSED_DATE,
@@ -1508,8 +1508,16 @@ def _ensure_hold_snapshot_tables(conn) -> None:
         )
         ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}] ADD [RDC] NVARCHAR(20) NULL
     """))
-    # (2026-10-03) The snapshot mirrors the tracking table, whose RDC is now
-    # the SOURCING warehouse. The short-lived SRC_RDC column is gone from both.
+    # (2026-10-14) The snapshot mirrors the tracking table: RDC = the store's
+    # own warehouse, SRC_RDC = the warehouse reserving the hold.
+    conn.execute(text(f"""
+        IF COL_LENGTH('dbo.{_HOLD_SNAPSHOT_TABLE}', 'SRC_RDC') IS NULL
+            ALTER TABLE [{_HOLD_SNAPSHOT_TABLE}] ADD [SRC_RDC] NVARCHAR(20) NULL
+    """))
+    conn.execute(text("""
+        IF COL_LENGTH('dbo.ARS_NL_TBL_HOLD_TRACKING', 'SRC_RDC') IS NULL
+            ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING] ADD [SRC_RDC] NVARCHAR(20) NULL
+    """))
     # Idempotent ALTER for older deployments without the typed-pool column
     # (Fresh/GRT approve chain, Jul 2026). '' = legacy/untyped row.
     conn.execute(text(f"""
@@ -1555,12 +1563,13 @@ def snapshot_hold_tracking(session_id: str) -> None:
             # Snapshot all current rows.
             res = conn.execute(text(f"""
                 INSERT INTO [{_HOLD_SNAPSHOT_TABLE}]
-                    (SESSION_ID, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
-                     OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL, HOLD_REM,
-                     LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ALLOC_TYPE)
-                SELECT :sid, WERKS, RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
-                       OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL, HOLD_REM,
-                       LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ISNULL(ALLOC_TYPE, '')
+                    (SESSION_ID, WERKS, RDC, SRC_RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                     VAR_ART, SZ, OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL,
+                     HOLD_REM, LAST_UPDATED, IS_CLOSED, CLOSED_DATE, ALLOC_TYPE)
+                SELECT :sid, WERKS, RDC, SRC_RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                       VAR_ART, SZ, OPT_STATUS, LISTED_DATE, HOLD_QTY_INITIAL,
+                       HOLD_REM, LAST_UPDATED, IS_CLOSED, CLOSED_DATE,
+                       ISNULL(ALLOC_TYPE, '')
                 FROM [ARS_NL_TBL_HOLD_TRACKING]
             """), {"sid": session_id})
             row_count = int(res.rowcount or 0)
@@ -1588,7 +1597,7 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
 
     Step A: RL/TBC alloc rows consumed existing hold → decrement HOLD_REM.
     Step B: TBL alloc rows created new hold → MERGE (insert / accumulate /
-            re-open) and stamp RDC from the store master.
+            re-open); RDC = the store's warehouse, SRC_RDC = the reserving one.
 
     Returns: {step_a_rows, step_b_rows, error}.
     """
@@ -1708,56 +1717,60 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
         """))
         result["step_a_rows"] = int(r_a1.rowcount or 0) + int(r_a2.rowcount or 0)
 
-        # Carry the sourcing warehouse into the hold ledger's RDC, where the
-        # split rows exist to say what it is. A database without the split
-        # table falls through to the store master and behaves as before.
-        #
-        # Reads the HISTORY copy, not the working table: this runs inside
-        # approve_parked AFTER the promote step, so the session's split rows
-        # have already moved to ARS_ALLOC_RDC_SPLIT_HISTORY. The working table
-        # holds whatever run happened last, which need not be this session.
-        _hold_has_src = bool(conn.execute(text(
-            "SELECT CASE WHEN OBJECT_ID('dbo.ARS_ALLOC_RDC_SPLIT_HISTORY','U') "
-            "IS NULL THEN 0 ELSE 1 END"
-        )).scalar())
-        # Only split rows that actually carry a hold identify the reserving
-        # warehouse. BR-RDC-12 means there is at most one per store-size.
-        _hold_src_join = ("""
-                LEFT JOIN [ARS_ALLOC_RDC_SPLIT_HISTORY] SPL
-                    ON  SPL.[SESSION_ID] = A.[SESSION_ID]
-                    AND SPL.[WERKS]      = A.[WERKS]
-                    AND SPL.[VAR_ART]    = TRY_CAST(A.[VAR_ART] AS BIGINT)
-                    AND SPL.[SZ]         = A.[SZ]
-                    AND ISNULL(SPL.[HOLD_QTY],0) > 0""" if _hold_has_src else "")
-
         # STEP B — TBL created a new warehouse hold.
         #
-        # RDC is the warehouse PHYSICALLY RESERVING the hold (2026-10-03), to
-        # match ARS_PEND_ALC.RDC: a hold is a claim on warehouse stock, so it
-        # must name the warehouse that actually owes the pieces. It used to be
-        # the STORE's warehouse from the store master, which is wrong the
-        # moment a hold is reserved at the other warehouse — MSA would then
-        # deduct from a pool that is not holding anything.
-        #
-        # It cannot be read from ARS_ALLOC_HISTORY — a split line's SRC_RDC
-        # there is the literal 'MULTI' — so it comes from the split rows.
+        # RDC     = the store's own warehouse (store master).
+        # SRC_RDC = the warehouse PHYSICALLY RESERVING the hold — what MSA
+        #           deducts HOLD_QTY from. Resolved like write_pend_alc:
+        #           split rows that carry the hold (history, else the parked
+        #           copy), then ARS_ALLOC_HISTORY.SRC_RDC unless 'MULTI', then
+        #           the RDC the run allocated from, then the store master.
         # BR-RDC-12 guarantees a hold is never split, so MAX() over the split
-        # rows that carry a hold yields exactly one warehouse per
-        # (WERKS, VAR_ART, SZ) and the hold table's primary key still holds.
-        #
-        # Own/Cross sessions have no split rows, so the COALESCE falls through
-        # to the store master and the value is byte-identical to before.
-        #
-        # On MATCHED the incoming RDC wins (ISNULL(R.RDC, T.RDC)) rather than
-        # the stored one: a revert → re-approve must be able to correct a tag
-        # written before this change, and R.RDC is NULL only when the session
-        # supplies nothing at all.
+        # rows that carry a hold yields one warehouse per (WERKS, VAR_ART, SZ)
+        # and the tracker's primary key still holds.
+        split_parts = []
+        has_split_hist = _table_exists(conn, "ARS_ALLOC_RDC_SPLIT_HISTORY")
+        if has_split_hist:
+            split_parts.append(
+                "SELECT [WERKS], [VAR_ART], [SZ], [SRC_RDC], [HOLD_QTY] "
+                "FROM [ARS_ALLOC_RDC_SPLIT_HISTORY] WHERE [SESSION_ID] = :sid")
+        if _table_exists(conn, "ARS_ALLOC_RDC_SPLIT_PARKED"):
+            guard = (" AND NOT EXISTS (SELECT 1 FROM [ARS_ALLOC_RDC_SPLIT_HISTORY] X "
+                     "WHERE X.[SESSION_ID] = :sid)") if has_split_hist else ""
+            split_parts.append(
+                "SELECT [WERKS], [VAR_ART], [SZ], [SRC_RDC], [HOLD_QTY] "
+                f"FROM [ARS_ALLOC_RDC_SPLIT_PARKED] WHERE [SESSION_ID] = :sid{guard}")
+        hold_src_join = ""
+        if split_parts:
+            hold_src_join = f"""
+                LEFT JOIN ({' UNION ALL '.join(split_parts)}) SPL
+                    ON  SPL.[WERKS]   = A.[WERKS]
+                    AND SPL.[VAR_ART] = TRY_CAST(A.[VAR_ART] AS BIGINT)
+                    AND SPL.[SZ]      = A.[SZ]
+                    AND ISNULL(SPL.[HOLD_QTY],0) > 0"""
+        has_hist_src = bool(conn.execute(text(
+            "SELECT CASE WHEN COL_LENGTH('dbo.ARS_ALLOC_HISTORY','SRC_RDC') "
+            "IS NULL THEN 0 ELSE 1 END")).scalar())
+        src_parts = []
+        if split_parts:
+            src_parts.append("MAX(NULLIF(SPL.[SRC_RDC],''))")
+        if has_hist_src:
+            src_parts.append("MAX(NULLIF(NULLIF(A.[SRC_RDC],''),'MULTI'))")
+        src_parts += ["MAX(NULLIF(A.[RDC],''))", "MAX(SM.[RDC])"]
+        src_expr = f"COALESCE({', '.join(src_parts)})"
+
+        # On MATCHED, a hold that is still open keeps the warehouse it is
+        # reserved at: one tracker row can name only one warehouse, and its
+        # existing pieces are physically there. A closed row being re-opened
+        # takes this session's warehouse. Right-hand T.* values in SET are the
+        # pre-update ones, so rows written before SRC_RDC existed (warehouse
+        # in RDC) keep that warehouse as their SRC_RDC.
         r_b = conn.execute(text(f"""
             MERGE [ARS_NL_TBL_HOLD_TRACKING] AS T
             USING (
                 SELECT A.[WERKS],
-                       {"COALESCE(MAX(NULLIF(SPL.[SRC_RDC],'')), MAX(SM.[RDC]))"
-                        if _hold_has_src else "MAX(SM.[RDC])"} AS RDC,
+                       COALESCE(MAX(SM.[RDC]), MAX(NULLIF(A.[RDC],'')), A.[WERKS]) AS RDC,
+                       {src_expr} AS SRC_RDC,
                        A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
                        TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
                        A.[SZ],
@@ -1766,7 +1779,7 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                 FROM [ARS_ALLOC_HISTORY] A
                 LEFT JOIN [Master_ALC_INPUT_ST_MASTER] SM
                     ON SM.[ST_CD] = A.[WERKS]
-                {_hold_src_join}
+                {hold_src_join}
                 WHERE A.[SESSION_ID] = :sid
                   AND A.[OPT_TYPE] = 'TBL'
                   AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
@@ -1780,6 +1793,12 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
             WHEN MATCHED THEN
                 UPDATE SET
                     T.[RDC] = ISNULL(R.[RDC], T.[RDC]),
+                    T.[SRC_RDC] = CASE
+                        WHEN T.[IS_CLOSED] = 0 AND ISNULL(T.[HOLD_REM], 0) > 0
+                             AND COALESCE(NULLIF(T.[SRC_RDC],''), NULLIF(T.[RDC],'')) IS NOT NULL
+                        THEN COALESCE(NULLIF(T.[SRC_RDC],''), T.[RDC])
+                        ELSE R.[SRC_RDC]
+                    END,
                     T.[HOLD_QTY_INITIAL] = CASE
                         WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
                         ELSE T.[HOLD_QTY_INITIAL] + R.hold_qty
@@ -1793,14 +1812,14 @@ def _apply_hold_tracking_from_history(conn, session_id: str) -> Dict[str, Any]:
                     T.[LAST_UPDATED]     = GETDATE()
             WHEN NOT MATCHED THEN
                 INSERT (
-                    [WERKS], [RDC],
+                    [WERKS], [RDC], [SRC_RDC],
                     [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
                     [VAR_ART], [SZ], [OPT_STATUS],
                     [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM],
                     [LAST_UPDATED], [IS_CLOSED], [ALLOC_TYPE]
                 )
                 VALUES (
-                    R.[WERKS], R.[RDC],
+                    R.[WERKS], R.[RDC], R.[SRC_RDC],
                     R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
                     R.[VAR_ART], R.[SZ], 'TBL',
                     GETDATE(), R.hold_qty, R.hold_qty,
@@ -1883,6 +1902,7 @@ def _revert_hold_tracking(conn, session_id: str) -> Dict[str, Any]:
         r_upd = conn.execute(text(f"""
             UPDATE T SET
                 T.[RDC]              = S.[RDC],
+                T.[SRC_RDC]          = S.[SRC_RDC],
                 T.[MAJ_CAT]          = S.[MAJ_CAT],
                 T.[GEN_ART_NUMBER]   = S.[GEN_ART_NUMBER],
                 T.[CLR]              = S.[CLR],

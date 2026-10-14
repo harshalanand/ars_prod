@@ -27,7 +27,7 @@ from typing import List, Literal, Optional
 import pandas as pd
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import text
 from loguru import logger
 
@@ -35,7 +35,6 @@ from app.database.session import get_data_engine
 from app.security.dependencies import get_current_user
 from app.models.rbac import User
 from app.services.pend_alc_service import (
-    adjust_msa_after_pend_insert,
     apply_adhoc_close,
     apply_pend_alc_delta,
     apply_do_deductions,
@@ -59,6 +58,7 @@ from app.services.pend_alc_service import (
     update_bdc_history_with_do,
     upsert_schedules,
     write_manual_pend_alc,
+    src_rdc_sql,
     BDC_HISTORY_TABLE,
     OPERATIONS_TABLE,
     PEND_ALC_TABLE,
@@ -67,6 +67,14 @@ from app.services.pend_alc_service import (
 )
 
 router = APIRouter(prefix="/pend-alc", tags=["Pending Allocation"])
+
+# RDC vs SRC_RDC (2026-10-14). On ARS_PEND_ALC and ARS_BDC_HISTORY, RDC is
+# the store's own warehouse and SRC_RDC the dispatch warehouse (BDC VENDOR,
+# DO match key, MSA pool). Everything that matches pending to BDC history,
+# groups a BDC file or filters "by warehouse" for dispatch uses these.
+_P_SRC = src_rdc_sql("P")          # aliased P
+_H_SRC = src_rdc_sql("H")          # aliased H
+_T_SRC = src_rdc_sql()             # unaliased ARS_PEND_ALC
 
 
 def _engine():
@@ -138,14 +146,14 @@ def _alloc_type_pred(alloc_type: Optional[str], params: dict,
     raise HTTPException(400, "alloc_type filter must be FRESH, GRT, or LEGACY")
 
 
-# Excludes (RDC, ST_CD, ARTICLE) combos that already have an open BDC
+# Excludes (SRC_RDC, ST_CD, ARTICLE) combos that already have an open BDC
 # awaiting DO. A partial DO transitions the prior history row to
 # CLOSED_PARTIAL (see apply_do_deductions), so it no longer matches here —
 # the residual ALLOC_QTY-DO_QTY is free to flow into the next BDC.
 _NO_OPEN_BDC_PREDICATE = (
     f"NOT EXISTS ("
     f"  SELECT 1 FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)"
-    f"  WHERE h.RDC = {PEND_ALC_TABLE}.RDC"
+    f"  WHERE {src_rdc_sql('h')} = {src_rdc_sql(PEND_ALC_TABLE)}"
     f"    AND ISNULL(h.ST_CD,'') = ISNULL({PEND_ALC_TABLE}.ST_CD,'')"
     f"    AND h.ARTICLE_NUMBER = {PEND_ALC_TABLE}.ARTICLE_NUMBER"
     f"    AND h.STATUS = 'OPEN'"
@@ -377,11 +385,11 @@ def pend_alc_sessions(current_user: User = Depends(get_current_user)):
                 -- residual that belongs to an older overlapping session.
                 stamped_keys AS (
                     SELECT P.SESSION_ID,
-                           P.RDC, ISNULL(P.ST_CD,'') AS ST_CD, P.ARTICLE_NUMBER
+                           {_P_SRC} AS RDC, ISNULL(P.ST_CD,'') AS ST_CD, P.ARTICLE_NUMBER
                     FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                     WHERE P.IS_CLOSED = 0
                       AND ISNULL(P.BDC_QTY, 0) > 0
-                    GROUP BY P.SESSION_ID, P.RDC, ISNULL(P.ST_CD,''),
+                    GROUP BY P.SESSION_ID, {_P_SRC}, ISNULL(P.ST_CD,''),
                              P.ARTICLE_NUMBER
                 ),
                 key_session_count AS (
@@ -402,7 +410,7 @@ def pend_alc_sessions(current_user: User = Depends(get_current_user)):
                            SUM((H.BDC_QTY - H.DO_RECEIVED) * 1.0 / k.n) AS qty
                     FROM {BDC_HISTORY_TABLE} H WITH (NOLOCK)
                     JOIN session_keys sk
-                      ON sk.RDC = H.RDC
+                      ON sk.RDC = {_H_SRC}
                      AND sk.ST_CD = ISNULL(H.ST_CD,'')
                      AND sk.ARTICLE_NUMBER = H.ARTICLE_NUMBER
                     JOIN key_session_count k
@@ -447,6 +455,7 @@ _DETAIL_SORTABLE = {
     "id":             "P.ID",
     "session_id":     "P.SESSION_ID",
     "rdc":            "P.RDC",
+    "src_rdc":        _P_SRC,
     "st_cd":          "P.ST_CD",
     "article_number": "P.ARTICLE_NUMBER",
     "maj_cat":        "P.MAJ_CAT",
@@ -482,8 +491,13 @@ def pend_alc_detail(
     # Sort
     sort_by:      Optional[str]  = Query(None),
     sort_dir:     str            = Query("desc", pattern="^(asc|desc)$"),
-    # Per-column multi-value filters
+    # Per-column multi-value filters. `rdc` / `src_rdc` are the keys the
+    # DataGrid column filters send (it posts each column under its own key);
+    # f_rdc / f_src_rdc are the older names — both are accepted.
     f_rdc:        Optional[str] = Query(None),
+    f_src_rdc:    Optional[str] = Query(None),
+    rdc:          Optional[str] = Query(None, description="store RDC, CSV"),
+    src_rdc:      Optional[str] = Query(None, description="dispatch RDC, CSV"),
     f_st_cd:      Optional[str] = Query(None),
     f_maj_cat:    Optional[str] = Query(None),
     f_alloc_mode: Optional[str] = Query(None),
@@ -493,7 +507,7 @@ def pend_alc_detail(
     current_user: User = Depends(get_current_user),
 ):
     """Row-level ARS_PEND_ALC data, paged + sortable + filterable, joined
-    with the latest BDC history row per (RDC, ST_CD, ARTICLE)."""
+    with the latest BDC history row per (SRC_RDC, ST_CD, ARTICLE)."""
     try:
         filters: List[str] = ["1=1"]
         params: dict = {}
@@ -518,7 +532,8 @@ def pend_alc_detail(
             filters.append(f"{col} IN ({phs})")
             for i, v in enumerate(vals):
                 params[f"{prefix}{i}"] = v
-        _multi("P.RDC",                 f_rdc,        "frdc")
+        _multi("P.RDC",                 f_rdc or rdc,         "frdc")
+        _multi(_P_SRC,                  f_src_rdc or src_rdc, "fsrcr")
         _multi("ISNULL(P.ST_CD,'')",    f_st_cd,      "fst")
         _multi("P.MAJ_CAT",             f_maj_cat,    "fmc")
         _multi("P.ALLOC_MODE",          f_alloc_mode, "fam")
@@ -551,7 +566,7 @@ def pend_alc_detail(
         OUTER APPLY (
             SELECT TOP 1 H.ALLOCATION_NUMBER, H.STATUS, H.DO_RECEIVED, H.BDC_DATE
             FROM {BDC_HISTORY_TABLE} H
-            WHERE H.RDC = P.RDC
+            WHERE {_H_SRC} = {_P_SRC}
               AND ISNULL(H.ST_CD,'') = ISNULL(P.ST_CD,'')
               AND H.ARTICLE_NUMBER = P.ARTICLE_NUMBER
             ORDER BY H.BDC_DATE DESC, H.ID DESC
@@ -581,7 +596,7 @@ def pend_alc_detail(
                     P.APPROVED_AT, P.LAST_BDC_AT, P.DO_NUMBER, P.DO_UPLOADED_AT,
                     P.LAST_DO_AT, P.IS_CLOSED, P.REMARKS,
                     B.ALLOCATION_NUMBER, B.STATUS, B.DO_RECEIVED, B.BDC_DATE,
-                    P.ALLOC_TYPE
+                    P.ALLOC_TYPE, {_P_SRC} AS SRC_RDC
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 {bdc_join}
                 {where}
@@ -626,6 +641,7 @@ def pend_alc_detail(
                     "do_received":    float(r[23] or 0) if r[23] is not None else None,
                     "bdc_date":       r[24].isoformat() if r[24] else None,
                     "alloc_type":     r[25] or None,
+                    "src_rdc":        r[26],
                 }
                 for r in rows
             ],
@@ -652,7 +668,8 @@ def pend_alc_do_history(
                 SELECT TOP (:lim)
                     SESSION_ID, RDC, ARTICLE_NUMBER, MAJ_CAT, ALLOC_MODE, SOURCE,
                     ALLOC_QTY, BDC_QTY, DO_QTY, PEND_QTY,
-                    IS_CLOSED, DO_NUMBER, DO_UPLOADED_AT, LAST_DO_AT
+                    IS_CLOSED, DO_NUMBER, DO_UPLOADED_AT, LAST_DO_AT,
+                    {_T_SRC} AS SRC_RDC, ST_CD
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
                 WHERE LAST_DO_AT IS NOT NULL
                 ORDER BY LAST_DO_AT DESC
@@ -675,6 +692,8 @@ def pend_alc_do_history(
                     "do_number":      r[11],
                     "do_uploaded_at": r[12].isoformat() if r[12] else None,
                     "last_do_at":     r[13].isoformat() if r[13] else None,
+                    "src_rdc":        r[14],
+                    "st_cd":          r[15],
                 }
                 for r in rows
             ],
@@ -687,7 +706,10 @@ def pend_alc_do_history(
 # POST /pend-alc/do-update
 # ---------------------------------------------------------------------------
 class DoUpdateRow(BaseModel):
-    rdc:               str
+    # The SAP DO's warehouse = the DISPATCH warehouse, matched against each
+    # pending row's SRC_RDC. Sent as `src_rdc`; `rdc` is the older name.
+    rdc:               Optional[str] = None
+    src_rdc:           Optional[str] = None
     article_number:    str
     do_qty:            float
     # Optional — when provided, apply_do_deductions resolves the BDC's
@@ -706,6 +728,14 @@ class DoUpdateRow(BaseModel):
     @classmethod
     def _v_alloc_type(cls, v):
         return _norm_alloc_type_field(v)
+
+    @model_validator(mode="after")
+    def _v_dispatch_rdc(self):
+        wh = (self.src_rdc or self.rdc or "").strip()
+        if not wh:
+            raise ValueError("src_rdc (dispatch warehouse) is required")
+        self.src_rdc = self.rdc = wh
+        return self
 
 
 class DoUpdateRequest(BaseModel):
@@ -768,7 +798,7 @@ def pend_alc_do_update(
         # single-shot callers get a fresh UUID — same behavior as before.
         session_id = body.session_id or _uuid.uuid4().hex[:12]
         rows = [
-            {"rdc": r.rdc, "article_number": r.article_number,
+            {"rdc": r.src_rdc, "article_number": r.article_number,
              "do_qty": r.do_qty, "do_number": r.do_number,
              "st_cd": r.st_cd,
              "allocation_number": r.allocation_number,
@@ -864,13 +894,14 @@ def pend_alc_bdc_preview(
     current_user: User = Depends(get_current_user),
 ):
     """Preview open PEND rows that would be included in the next BDC file.
-    Groups by RDC × ST_CD × ARTICLE × MAJ_CAT and returns PEND_QTY
-    (what will be sent to SAP)."""
+    Groups by SRC_RDC (the file's VENDOR) × ST_CD × ARTICLE × MAJ_CAT and
+    returns PEND_QTY (what will be sent to SAP). `rdc` filters the dispatch
+    warehouse."""
     try:
         filters, params = ["IS_CLOSED = 0", "PEND_QTY > 0",
                            _NO_OPEN_BDC_PREDICATE], {}
         if rdc:
-            filters.append("RDC = :rdc"); params["rdc"] = rdc
+            filters.append(f"{_T_SRC} = :rdc"); params["rdc"] = rdc
         if maj_cat:
             filters.append("MAJ_CAT = :mc"); params["mc"] = maj_cat
         where = "WHERE " + " AND ".join(filters)
@@ -883,7 +914,7 @@ def pend_alc_bdc_preview(
                 f" AND NOT {m}" for _, _, m in _existing_dispatch_controls(conn)
             )
             rows = conn.execute(text(f"""
-                SELECT RDC,
+                SELECT {_T_SRC}                   AS SRC_RDC,
                        ISNULL(ST_CD,'')           AS ST_CD,
                        ARTICLE_NUMBER, MAJ_CAT,
                        ISNULL(GEN_ART_NUMBER,'') AS GEN_ART_NUMBER,
@@ -893,12 +924,13 @@ def pend_alc_bdc_preview(
                        SUM(DO_QTY)                AS do_qty,
                        SUM(PEND_QTY)              AS pend_qty,
                        MAX(LAST_BDC_AT)           AS last_bdc_at,
-                       COUNT(DISTINCT SESSION_ID) AS session_count
+                       COUNT(DISTINCT SESSION_ID) AS session_count,
+                       MAX(RDC)                   AS STORE_RDC
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
                 {where}{_dispatch_and}
-                GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT,
+                GROUP BY {_T_SRC}, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT,
                          ISNULL(GEN_ART_NUMBER,''), ISNULL(CLR,'')
-                ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
+                ORDER BY 1, ST_CD, MAJ_CAT, ARTICLE_NUMBER
             """), params).fetchall()
 
         return {
@@ -907,7 +939,8 @@ def pend_alc_bdc_preview(
             "total_pend_qty": sum(float(r[9] or 0) for r in rows),
             "data": [
                 {
-                    "rdc":            r[0],
+                    "src_rdc":        r[0],
+                    "rdc":            r[12],
                     "st_cd":          r[1],
                     "article_number": r[2],
                     "maj_cat":        r[3],
@@ -933,9 +966,10 @@ def pend_alc_bdc_preview(
 def _dispatch_gap_query(conn, rdc: Optional[str]):
     """Open pending lines that Generate BDC will SKIP due to a control table.
 
-    Tags each held (RDC, ST_CD, GEN_ART, CLR, MAJ_CAT) group with which
+    Tags each held (SRC_RDC, ST_CD, GEN_ART, CLR, MAJ_CAT) group with which
     rule(s) matched. Returns (detail, summary, total_held_qty). Held stock
-    stays pending — this is the visibility for it.
+    stays pending — this is the visibility for it. `rdc` filters the
+    dispatch warehouse.
     """
     controls = _existing_dispatch_controls(conn)
     if not controls:
@@ -943,7 +977,7 @@ def _dispatch_gap_query(conn, rdc: Optional[str]):
     params: dict = {}
     base = ["IS_CLOSED = 0", "PEND_QTY > 0", _NO_OPEN_BDC_PREDICATE]
     if rdc:
-        base.append("RDC = :rdc"); params["rdc"] = rdc
+        base.append(f"{_T_SRC} = :rdc"); params["rdc"] = rdc
     where = "WHERE " + " AND ".join(base)
     rules = [rule for _, rule, _ in controls]
     # Row-level flags in the CTE (no grouping → correlated EXISTS is legal),
@@ -954,7 +988,8 @@ def _dispatch_gap_query(conn, rdc: Optional[str]):
     any_flag  = " OR ".join(f"f_{rule} = 1" for rule in rules)
     sql = f"""
         WITH tagged AS (
-            SELECT RDC,
+            SELECT {_T_SRC}                  AS SRC_RDC,
+                   RDC                       AS STORE_RDC,
                    ISNULL(ST_CD,'')          AS ST_CD,
                    ISNULL(GEN_ART_NUMBER,'') AS GEN_ART_NUMBER,
                    ISNULL(CLR,'')            AS CLR,
@@ -963,15 +998,16 @@ def _dispatch_gap_query(conn, rdc: Optional[str]):
             FROM {PEND_ALC_TABLE} WITH (NOLOCK)
             {where}
         )
-        SELECT RDC, ST_CD, GEN_ART_NUMBER, CLR, MAJ_CAT,
+        SELECT SRC_RDC, ST_CD, GEN_ART_NUMBER, CLR, MAJ_CAT,
                (SELECT TOP 1 DIV FROM ARS_MSA_GEN_ART g WITH (NOLOCK)
                   WHERE g.MAJ_CAT = tagged.MAJ_CAT) AS DIV,
                SUM(PEND_QTY) AS PEND_QTY,
-               {out_flags}
+               {out_flags},
+               MAX(STORE_RDC) AS STORE_RDC
         FROM tagged
         WHERE {any_flag}
-        GROUP BY RDC, ST_CD, GEN_ART_NUMBER, CLR, MAJ_CAT
-        ORDER BY RDC, ST_CD, MAJ_CAT
+        GROUP BY SRC_RDC, ST_CD, GEN_ART_NUMBER, CLR, MAJ_CAT
+        ORDER BY SRC_RDC, ST_CD, MAJ_CAT
     """
     rows = conn.execute(text(sql), params).fetchall()
     detail = []
@@ -982,7 +1018,8 @@ def _dispatch_gap_query(conn, rdc: Optional[str]):
         flags = {rules[i]: int(row[7 + i] or 0) for i in range(len(rules))}
         blocked = [r for r in rules if flags[r]]
         detail.append({
-            "rdc": row[0], "st_cd": row[1], "gen_art_number": row[2],
+            "src_rdc": row[0], "rdc": row[7 + len(rules)],
+            "st_cd": row[1], "gen_art_number": row[2],
             "clr": row[3], "maj_cat": row[4], "div": row[5],
             "pend_qty": pq, "blocked_by": blocked,
         })
@@ -1019,10 +1056,11 @@ def pend_alc_dispatch_gap_export(
     try:
         with _engine().connect() as conn:
             detail, _, _ = _dispatch_gap_query(conn, rdc)
-        cols = ["RDC", "STORE", "GEN_ART_NUMBER", "CLR", "MAJ_CAT", "DIV",
-                "PEND_QTY", "BLOCKED_BY"]
+        cols = ["SRC_RDC", "RDC", "STORE", "GEN_ART_NUMBER", "CLR", "MAJ_CAT",
+                "DIV", "PEND_QTY", "BLOCKED_BY"]
         df = pd.DataFrame([{
-            "RDC": d["rdc"], "STORE": d["st_cd"], "GEN_ART_NUMBER": d["gen_art_number"],
+            "SRC_RDC": d["src_rdc"], "RDC": d["rdc"],
+            "STORE": d["st_cd"], "GEN_ART_NUMBER": d["gen_art_number"],
             "CLR": d["clr"], "MAJ_CAT": d["maj_cat"], "DIV": d["div"],
             "PEND_QTY": d["pend_qty"], "BLOCKED_BY": ", ".join(d["blocked_by"]),
         } for d in detail], columns=cols)
@@ -1098,10 +1136,11 @@ def pend_alc_bdc_generate(
             file_date_str = datetime.date.today().strftime("%Y-%m-%d")
         today_str = file_date_str
 
+        # `rdc` = the dispatch warehouse (the file's VENDOR).
         filters, params = ["IS_CLOSED = 0", "PEND_QTY > 0",
                            _NO_OPEN_BDC_PREDICATE], {}
         if rdc:
-            filters.append("RDC = :rdc"); params["rdc"] = rdc
+            filters.append(f"{_T_SRC} = :rdc"); params["rdc"] = rdc
         if maj_cat:
             filters.append("MAJ_CAT = :mc"); params["mc"] = maj_cat
         if store_filter:
@@ -1125,25 +1164,25 @@ def pend_alc_bdc_generate(
                 f" AND NOT {m}" for _, _, m in _existing_dispatch_controls(conn)
             )
             rows = conn.execute(text(f"""
-                SELECT RDC,
+                SELECT {_T_SRC}                  AS SRC_RDC,
                        ISNULL(ST_CD,'')          AS ST_CD,
                        ARTICLE_NUMBER,
                        MAJ_CAT,
                        SUM(PEND_QTY)             AS PEND_QTY
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
                 {where}{_dispatch_and}
-                GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
+                GROUP BY {_T_SRC}, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
                 HAVING SUM(PEND_QTY) > 0
-                ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
+                ORDER BY 1, ST_CD, MAJ_CAT, ARTICLE_NUMBER
             """), params).fetchall()
 
         if not rows:
             raise HTTPException(404, "No open pending rows found for BDC")
         _t_read = _t.perf_counter()
 
-        # Group rows by RDC — one allocation number + one history batch +
-        # one operations-log entry per (FY, RDC). Each RDC's BDC is
-        # independently revertable.
+        # Group rows by dispatch warehouse (SRC_RDC = VENDOR) — one
+        # allocation number + one history batch + one operations-log entry
+        # per (FY, SRC_RDC). Each warehouse's BDC is independently revertable.
         rows_by_rdc: dict = {}
         for r in rows:
             rdc_key = str(r[0] or "").strip() or "UNKNOWN"
@@ -1473,8 +1512,8 @@ def _bdc_run_job(job_id: str, params: dict, store_filter, file_date_str: str,
                     progress="reading rows")
 
         filters = ["IS_CLOSED = 0", "PEND_QTY > 0", _NO_OPEN_BDC_PREDICATE]
-        if params.get("rdc"):
-            filters.append("RDC = :rdc")
+        if params.get("rdc"):                      # dispatch warehouse
+            filters.append(f"{_T_SRC} = :rdc")
         if params.get("maj_cat"):
             filters.append("MAJ_CAT = :mc")
         if store_filter:
@@ -1498,16 +1537,16 @@ def _bdc_run_job(job_id: str, params: dict, store_filter, file_date_str: str,
                 f" AND NOT {m}" for _, _, m in _existing_dispatch_controls(conn)
             )
             rows = conn.execute(text(f"""
-                SELECT RDC,
+                SELECT {_T_SRC}                  AS SRC_RDC,
                        ISNULL(ST_CD,'')          AS ST_CD,
                        ARTICLE_NUMBER,
                        MAJ_CAT,
                        SUM(PEND_QTY)             AS PEND_QTY
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
                 {where}{_dispatch_and}
-                GROUP BY RDC, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
+                GROUP BY {_T_SRC}, ISNULL(ST_CD,''), ARTICLE_NUMBER, MAJ_CAT
                 HAVING SUM(PEND_QTY) > 0
-                ORDER BY RDC, ST_CD, MAJ_CAT, ARTICLE_NUMBER
+                ORDER BY 1, ST_CD, MAJ_CAT, ARTICLE_NUMBER
             """), sql_params).fetchall()
 
         if not rows:
@@ -1920,7 +1959,7 @@ def pend_alc_do_update_async(
     import uuid as _uu
     session_id = body.session_id or _uu.uuid4().hex[:12]
     rows = [
-        {"rdc": r.rdc, "article_number": r.article_number,
+        {"rdc": r.src_rdc, "article_number": r.article_number,
          "do_qty": r.do_qty, "do_number": r.do_number,
          "st_cd": r.st_cd, "allocation_number": r.allocation_number,
          "alloc_type": r.alloc_type}
@@ -2242,11 +2281,13 @@ def pend_alc_bdc_history(
 ):
     """Audit trail of every BDC ever generated, with how much SAP confirmed.
 
-    Each row = one (RDC, ST_CD, ARTICLE) line in one BDC file.
+    Each row = one (SRC_RDC, ST_CD, ARTICLE) line in one BDC file.
+    SRC_RDC      = dispatch warehouse (the file's VENDOR) — `rdc` filters it
+    RDC          = the receiving store's own warehouse
     BDC_QTY      = qty asked for in that BDC
     DO_RECEIVED  = qty SAP returned via DO
     STATUS:
-      OPEN            — no DO yet, blocks the same (RDC, ST_CD, ART) from re-BDC
+      OPEN            — no DO yet, blocks the same (SRC_RDC, ST_CD, ART) from re-BDC
       CLOSED_PARTIAL  — DO arrived short of BDC; row is terminal, residual
                         ALLOC_QTY - DO_QTY is free for the next BDC
       CONFIRMED       — DO fully covered BDC; terminal
@@ -2261,8 +2302,8 @@ def pend_alc_bdc_history(
         params: dict = {"lim": limit}
         if allocation_no:
             filters.append("ALLOCATION_NUMBER = :alloc"); params["alloc"] = allocation_no
-        if rdc:
-            filters.append("RDC = :rdc"); params["rdc"] = rdc
+        if rdc:                                    # dispatch warehouse
+            filters.append(f"{_T_SRC} = :rdc"); params["rdc"] = rdc
         if st_cd:
             filters.append("ISNULL(ST_CD,'') = :st"); params["st"] = st_cd
         if article:
@@ -2290,7 +2331,8 @@ def pend_alc_bdc_history(
                     RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
                     BDC_QTY, DO_RECEIVED,
                     (BDC_QTY - DO_RECEIVED) AS SHORT_QTY,
-                    STATUS, LAST_DO_AT, CREATED_BY
+                    STATUS, LAST_DO_AT, CREATED_BY,
+                    {_T_SRC} AS SRC_RDC
                 FROM {BDC_HISTORY_TABLE} WITH (NOLOCK)
                 {where}
                 ORDER BY BDC_DATE DESC, ID DESC
@@ -2314,6 +2356,7 @@ def pend_alc_bdc_history(
                     "status":            r[10],
                     "last_do_at":        r[11].isoformat() if r[11] else None,
                     "created_by":        r[12],
+                    "src_rdc":           r[13],
                 }
                 for r in rows
             ],
@@ -2349,8 +2392,8 @@ def pend_alc_bdc_history_allocations(
             filters.append("BDC_DATE >= :df"); params["df"] = date_from
         if date_to:
             filters.append("BDC_DATE < DATEADD(day, 1, :dt)"); params["dt"] = date_to
-        if rdc:
-            filters.append("RDC = :rdc"); params["rdc"] = rdc
+        if rdc:                                    # dispatch warehouse
+            filters.append(f"{_T_SRC} = :rdc"); params["rdc"] = rdc
         where = "WHERE " + " AND ".join(filters)
 
         with _engine().connect() as conn:
@@ -2417,11 +2460,11 @@ def pend_alc_bdc_history_redownload(
         with _engine().connect() as conn:
             rows = conn.execute(text(f"""
                 SELECT BDC_DATE, ALLOCATION_NUMBER,
-                       RDC, ISNULL(ST_CD,'') AS ST_CD,
+                       {_T_SRC} AS SRC_RDC, ISNULL(ST_CD,'') AS ST_CD,
                        ARTICLE_NUMBER, BDC_QTY
                 FROM {BDC_HISTORY_TABLE} WITH (NOLOCK)
                 WHERE ALLOCATION_NUMBER = :a
-                ORDER BY RDC, ST_CD, ARTICLE_NUMBER, ID
+                ORDER BY 3, ST_CD, ARTICLE_NUMBER, ID
             """), {"a": allocation_number}).fetchall()
 
         if not rows:
@@ -2511,9 +2554,9 @@ def pend_alc_bdc_history_export(
     as an Excel file. Default Open BDC Report view: status=OPEN.
 
     Excel columns:
-      ID, BDC_DATE, ALLOCATION_NUMBER, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
-      BDC_QTY, DO_RECEIVED, SHORT_QTY, STATUS, LAST_DO_AT, CREATED_BY,
-      DAYS_OPEN
+      ID, BDC_DATE, ALLOCATION_NUMBER, SRC_RDC (dispatch / VENDOR), RDC
+      (store's own), ST_CD, ARTICLE_NUMBER, MAJ_CAT, BDC_QTY, DO_RECEIVED,
+      SHORT_QTY, STATUS, LAST_DO_AT, CREATED_BY, DAYS_OPEN
     """
     try:
         filters = ["1=1"]
@@ -2522,8 +2565,8 @@ def pend_alc_bdc_history_export(
             filters.append("STATUS = :stat"); params["stat"] = status.upper()
         if allocation_no:
             filters.append("ALLOCATION_NUMBER = :a"); params["a"] = allocation_no
-        if rdc:
-            filters.append("RDC = :rdc"); params["rdc"] = rdc
+        if rdc:                                    # dispatch warehouse
+            filters.append(f"{_T_SRC} = :rdc"); params["rdc"] = rdc
         if st_cd:
             filters.append("ISNULL(ST_CD,'') = :st"); params["st"] = st_cd
         if article:
@@ -2542,7 +2585,8 @@ def pend_alc_bdc_history_export(
                        BDC_QTY, DO_RECEIVED,
                        (BDC_QTY - DO_RECEIVED) AS SHORT_QTY,
                        STATUS, LAST_DO_AT, CREATED_BY,
-                       DATEDIFF(day, BDC_DATE, GETDATE()) AS DAYS_OPEN
+                       DATEDIFF(day, BDC_DATE, GETDATE()) AS DAYS_OPEN,
+                       {_T_SRC} AS SRC_RDC
                 FROM {BDC_HISTORY_TABLE} WITH (NOLOCK)
                 {where}
                 ORDER BY BDC_DATE DESC, ID DESC
@@ -2552,7 +2596,7 @@ def pend_alc_bdc_history_export(
         buf = io.StringIO()
         w = _csv.writer(buf, lineterminator="\n")
         w.writerow([
-            "ID", "BDC_DATE", "ALLOCATION_NUMBER", "RDC", "ST_CD",
+            "ID", "BDC_DATE", "ALLOCATION_NUMBER", "SRC_RDC", "RDC", "ST_CD",
             "ARTICLE_NUMBER", "MAJ_CAT", "BDC_QTY", "DO_RECEIVED",
             "SHORT_QTY", "STATUS", "LAST_DO_AT", "CREATED_BY", "DAYS_OPEN",
         ])
@@ -2560,7 +2604,7 @@ def pend_alc_bdc_history_export(
             w.writerow([
                 int(r[0]),
                 r[1].strftime("%Y-%m-%d") if r[1] else "",
-                r[2], r[3], r[4], r[5], r[6] or "",
+                r[2], r[14], r[3], r[4], r[5], r[6] or "",
                 float(r[7] or 0), float(r[8] or 0), float(r[9] or 0),
                 r[10] or "",
                 r[11].strftime("%Y-%m-%d %H:%M") if r[11] else "",
@@ -2800,7 +2844,11 @@ def pend_alc_operations_backfill_approve_qty(
 # POST /pend-alc/manual-upload
 # ---------------------------------------------------------------------------
 class ManualRow(BaseModel):
-    rdc:            str
+    # The warehouse the qty is dispatched FROM → ARS_PEND_ALC.SRC_RDC. Sent
+    # as `src_rdc`; `rdc` is the older name. The ledger's RDC is set to the
+    # store's own warehouse from the store master (by st_cd).
+    rdc:            Optional[str] = None
+    src_rdc:        Optional[str] = None
     article_number: str
     alloc_qty:      float
     st_cd:          Optional[str] = None
@@ -2817,6 +2865,14 @@ class ManualRow(BaseModel):
     @classmethod
     def _v_alloc_type(cls, v):
         return _norm_alloc_type_field(v)
+
+    @model_validator(mode="after")
+    def _v_dispatch_rdc(self):
+        wh = (self.src_rdc or self.rdc or "").strip()
+        if not wh:
+            raise ValueError("src_rdc (dispatch warehouse) is required")
+        self.src_rdc = self.rdc = wh
+        return self
 
 
 class ManualUploadRequest(BaseModel):
@@ -2842,7 +2898,7 @@ def pend_alc_manual_upload(
     """Insert manually-allocated rows (SOURCE=MANUAL) into ARS_PEND_ALC.
 
     Apply +1 delta to ARS_MSA_TOTAL/GEN_ART/VAR_ART and every active
-    ARS_GRID_MJ* table for the affected (RDC, ARTICLE_NUMBER) keys —
+    ARS_GRID_MJ* table for the affected (SRC_RDC, ARTICLE_NUMBER) keys —
     PEND_QTY goes up, FNL_Q goes down, GRID.PEND_ALC goes up. Same
     treatment whether rows came from the manual entry table or a bulk
     CSV upload.
@@ -2862,8 +2918,8 @@ def pend_alc_manual_upload(
             for r in rows:
                 if not r.get("alloc_type"):
                     r["alloc_type"] = body.default_alloc_type
-        article_rdc_pairs = [
-            {"rdc": r["rdc"], "article_number": r["article_number"]}
+        article_rdc_pairs = [                       # rdc = dispatch WH
+            {"rdc": r["src_rdc"], "article_number": r["article_number"]}
             for r in rows
         ]
         from app.services.pend_alc_service import log_operation_upsert
@@ -2918,10 +2974,21 @@ def pend_alc_manual_upload(
 # POST /pend-alc/close-rows  — adhoc cancel
 # ---------------------------------------------------------------------------
 class CloseRow(BaseModel):
-    rdc:            str
+    # Dispatch warehouse (SRC_RDC) of the pending rows to close. `rdc` is the
+    # older name for the same value.
+    rdc:            Optional[str] = None
+    src_rdc:        Optional[str] = None
     article_number: str
     st_cd:          Optional[str] = None
     reason:         Optional[str] = None
+
+    @model_validator(mode="after")
+    def _v_dispatch_rdc(self):
+        wh = (self.src_rdc or self.rdc or "").strip()
+        if not wh:
+            raise ValueError("src_rdc (dispatch warehouse) is required")
+        self.src_rdc = self.rdc = wh
+        return self
 
 
 class CloseRowsRequest(BaseModel):
@@ -2958,7 +3025,7 @@ def pend_alc_close_rows(
     for r in body.rows:
         per_row_reason = (r.reason or body.reason or "").strip()
         rows.append({
-            "rdc":            r.rdc,
+            "rdc":            r.src_rdc,
             "st_cd":          r.st_cd,
             "article_number": r.article_number,
             "reason":         per_row_reason,
@@ -3039,14 +3106,15 @@ def pend_alc_close_rows(
 
 @router.post("/close-rows-file")
 async def pend_alc_close_rows_file(
-    file: UploadFile = File(..., description="CSV/Excel with RDC, ARTICLE_NUMBER, [ST_CD], [REASON]"),
+    file: UploadFile = File(..., description="CSV/Excel with SRC_RDC (or RDC), ARTICLE_NUMBER, [ST_CD], [REASON]"),
     reason: Optional[str] = None,
     confirm_close_all_stores: bool = False,
     current_user: User = Depends(get_current_user),
 ):
     """Bulk adhoc-close from a CSV / Excel file.
 
-    Required columns:  RDC, ARTICLE_NUMBER
+    Required columns:  SRC_RDC (dispatch warehouse; `RDC` accepted as the
+                       older name), ARTICLE_NUMBER
     Optional columns:  ST_CD, REASON
     Top-level `reason` query param applies to rows that don't carry their own.
 
@@ -3072,12 +3140,13 @@ async def pend_alc_close_rows_file(
         df = df.fillna("")
         # Normalise column names (uppercase, strip)
         df.columns = [str(c).strip().upper() for c in df.columns]
-        if "RDC" not in df.columns or "ARTICLE_NUMBER" not in df.columns:
-            raise HTTPException(400, "Missing required columns: RDC, ARTICLE_NUMBER")
+        wh_col = "SRC_RDC" if "SRC_RDC" in df.columns else "RDC"
+        if wh_col not in df.columns or "ARTICLE_NUMBER" not in df.columns:
+            raise HTTPException(400, "Missing required columns: SRC_RDC, ARTICLE_NUMBER")
         global_reason = (reason or "").strip()
         rows = []
         for _, row in df.iterrows():
-            rdc = str(row.get("RDC") or "").strip()
+            rdc = str(row.get(wh_col) or "").strip()
             art = str(row.get("ARTICLE_NUMBER") or "").strip().split(".")[0]
             if not rdc or not art:
                 continue
@@ -3167,6 +3236,7 @@ _RECO_SORTABLE = {
     "id":              "P.ID",
     "session_id":      "P.SESSION_ID",
     "rdc":             "P.RDC",
+    "src_rdc":         _P_SRC,
     "st_cd":           "P.ST_CD",
     "article_number":  "P.ARTICLE_NUMBER",
     "maj_cat":         "P.MAJ_CAT",
@@ -3200,7 +3270,11 @@ def _parse_csv_filter(s: Optional[str]) -> List[str]:
 def pend_alc_reco(
     date_from:   Optional[str]  = Query(None),
     date_to:     Optional[str]  = Query(None),
+    # rdc = the store's own warehouse, src_rdc = the dispatch warehouse;
+    # both accept CSV ('DH24,DW01') because the DataGrid column filters send
+    # them under these keys.
     rdc:         Optional[str]  = Query(None),
+    src_rdc:     Optional[str]  = Query(None),
     maj_cat:     Optional[str]  = Query(None),
     alloc_mode:  Optional[str]  = Query(None),
     source:      Optional[str]  = Query(None),
@@ -3217,6 +3291,7 @@ def pend_alc_reco(
     sort_dir:    str            = Query("desc", pattern="^(asc|desc)$"),
     # Per-column multi-value filters (CSV: 'DH24,DW01')
     f_rdc:        Optional[str] = Query(None),
+    f_src_rdc:    Optional[str] = Query(None),
     f_st_cd:      Optional[str] = Query(None),
     f_maj_cat:    Optional[str] = Query(None),
     f_alloc_mode: Optional[str] = Query(None),
@@ -3231,7 +3306,7 @@ def pend_alc_reco(
     """Paged reco view with sort, per-column filter, and BDC history join.
 
     Each row is enriched with the latest open BDC's ALLOCATION_NUMBER, STATUS,
-    and DO_RECEIVED. If no BDC exists for the (RDC, ST_CD, ARTICLE) those
+    and DO_RECEIVED. If no BDC exists for the (SRC_RDC, ST_CD, ARTICLE) those
     columns are null and BDC_STATUS reads 'NEVER_SENT'.
     """
     try:
@@ -3242,8 +3317,6 @@ def pend_alc_reco(
             filters.append("P.APPROVED_AT >= :df"); params["df"] = date_from
         if date_to:
             filters.append("P.APPROVED_AT < DATEADD(day,1,:dt)"); params["dt"] = date_to
-        if rdc:
-            filters.append("P.RDC = :rdc"); params["rdc"] = rdc
         if maj_cat:
             filters.append("P.MAJ_CAT = :mc"); params["mc"] = maj_cat
         if alloc_mode:
@@ -3266,7 +3339,8 @@ def pend_alc_reco(
             filters.append(f"{col} IN ({placeholders})")
             for i, v in enumerate(vals):
                 params[f"{prefix}{i}"] = v
-        _multi("P.RDC",         f_rdc,        "frdc")
+        _multi("P.RDC",         f_rdc or rdc,         "frdc")
+        _multi(_P_SRC,          f_src_rdc or src_rdc, "fsrcr")
         _multi("ISNULL(P.ST_CD,'')", f_st_cd,  "fst")
         _multi("P.MAJ_CAT",     f_maj_cat,    "fmc")
         _multi("P.ALLOC_MODE",  f_alloc_mode, "fam")
@@ -3318,7 +3392,7 @@ def pend_alc_reco(
         OUTER APPLY (
             SELECT TOP 1 H.ALLOCATION_NUMBER, H.STATUS, H.DO_RECEIVED, H.BDC_DATE
             FROM {BDC_HISTORY_TABLE} H
-            WHERE H.RDC = P.RDC
+            WHERE {_H_SRC} = {_P_SRC}
               AND ISNULL(H.ST_CD,'') = ISNULL(P.ST_CD,'')
               AND H.ARTICLE_NUMBER = P.ARTICLE_NUMBER
             ORDER BY H.BDC_DATE DESC, H.ID DESC
@@ -3362,7 +3436,8 @@ def pend_alc_reco(
                     B.STATUS            AS BDC_STATUS,
                     B.DO_RECEIVED       AS BDC_DO_RECEIVED,
                     B.BDC_DATE          AS BDC_DATE,
-                    P.ALLOC_TYPE        AS ALLOC_TYPE
+                    P.ALLOC_TYPE        AS ALLOC_TYPE,
+                    {_P_SRC}            AS SRC_RDC
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 {bdc_join}
                 {where}
@@ -3409,6 +3484,7 @@ def pend_alc_reco(
                     "do_received":     float(r[25] or 0) if r[25] is not None else None,
                     "bdc_date":        r[26].isoformat() if r[26] else None,
                     "alloc_type":      r[27] or None,
+                    "src_rdc":         r[28],
                 }
                 for r in rows
             ],
@@ -3428,7 +3504,8 @@ def pend_alc_reco(
 def pend_alc_reco_export(
     date_from:    Optional[str]  = Query(None),
     date_to:      Optional[str]  = Query(None),
-    rdc:          Optional[str]  = Query(None),
+    rdc:          Optional[str]  = Query(None),      # store RDC, CSV
+    src_rdc:      Optional[str]  = Query(None),      # dispatch RDC, CSV
     maj_cat:      Optional[str]  = Query(None),
     alloc_mode:   Optional[str]  = Query(None),
     source:       Optional[str]  = Query(None),
@@ -3437,6 +3514,7 @@ def pend_alc_reco_export(
     closed:       Optional[bool] = Query(None),
     session_id:   Optional[str]  = Query(None),
     f_rdc:        Optional[str]  = Query(None),
+    f_src_rdc:    Optional[str]  = Query(None),
     f_st_cd:      Optional[str]  = Query(None),
     f_maj_cat:    Optional[str]  = Query(None),
     f_alloc_mode: Optional[str]  = Query(None),
@@ -3458,7 +3536,6 @@ def pend_alc_reco_export(
         params: dict = {"lim": limit}
         if date_from:  filters.append("P.APPROVED_AT >= :df");                params["df"]  = date_from
         if date_to:    filters.append("P.APPROVED_AT < DATEADD(day,1,:dt)");  params["dt"]  = date_to
-        if rdc:        filters.append("P.RDC = :rdc");                        params["rdc"] = rdc
         if maj_cat:    filters.append("P.MAJ_CAT = :mc");                     params["mc"]  = maj_cat
         if alloc_mode: filters.append("P.ALLOC_MODE = :am");                  params["am"]  = alloc_mode
         if source:     filters.append("P.SOURCE = :src");                     params["src"] = source
@@ -3477,7 +3554,8 @@ def pend_alc_reco_export(
             filters.append(f"{col} IN ({phs})")
             for i, v in enumerate(vals):
                 params[f"{prefix}{i}"] = v
-        _multi("P.RDC",                 f_rdc,        "frdc")
+        _multi("P.RDC",                 f_rdc or rdc,         "frdc")
+        _multi(_P_SRC,                  f_src_rdc or src_rdc, "fsrcr")
         _multi("ISNULL(P.ST_CD,'')",    f_st_cd,      "fst")
         _multi("P.MAJ_CAT",             f_maj_cat,    "fmc")
         _multi("P.ALLOC_MODE",          f_alloc_mode, "fam")
@@ -3520,7 +3598,7 @@ def pend_alc_reco_export(
         OUTER APPLY (
             SELECT TOP 1 H.ALLOCATION_NUMBER, H.STATUS, H.DO_RECEIVED, H.BDC_DATE
             FROM {BDC_HISTORY_TABLE} H
-            WHERE H.RDC = P.RDC
+            WHERE {_H_SRC} = {_P_SRC}
               AND ISNULL(H.ST_CD,'') = ISNULL(P.ST_CD,'')
               AND H.ARTICLE_NUMBER = P.ARTICLE_NUMBER
             ORDER BY H.BDC_DATE DESC, H.ID DESC
@@ -3544,7 +3622,8 @@ def pend_alc_reco_export(
                     ISNULL(B.STATUS, 'NEVER_SENT') AS BDC_STATUS,
                     B.DO_RECEIVED AS BDC_DO_RECVD,
                     B.BDC_DATE,
-                    P.ALLOC_TYPE
+                    P.ALLOC_TYPE,
+                    {_P_SRC} AS SRC_RDC
                 FROM {PEND_ALC_TABLE} P
                 {bdc_join}
                 {where}
@@ -3559,7 +3638,7 @@ def pend_alc_reco_export(
         buf = io.StringIO()
         w = _csv.writer(buf, lineterminator="\n")
         w.writerow([
-            "RDC", "ST_CD", "ARTICLE_NUMBER", "MAJ_CAT", "GEN_ART_NUMBER", "CLR",
+            "SRC_RDC", "RDC", "ST_CD", "ARTICLE_NUMBER", "MAJ_CAT", "GEN_ART_NUMBER", "CLR",
             "ALLOC_MODE", "SOURCE",
             "ALLOC_QTY", "BDC_QTY", "DO_QTY", "PEND_QTY", "BDC_UNCONFIRMED",
             "APPROVED_AT", "LAST_BDC_AT", "DO_NUMBER", "DO_UPLOADED_AT",
@@ -3569,7 +3648,7 @@ def pend_alc_reco_export(
         ])
         for r in rows:
             w.writerow([
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                r[25], r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
                 float(r[8] or 0), float(r[9] or 0), float(r[10] or 0),
                 float(r[11] or 0), float(r[12] or 0),
                 r[13].strftime("%Y-%m-%d %H:%M") if r[13] else "",
@@ -3619,7 +3698,10 @@ def pend_alc_reco_summary(
         None, description="FRESH | GRT | LEGACY (NULL/'' rows)"),
     current_user: User = Depends(get_current_user),
 ):
-    """Aggregated reco tiles: by mode, source, aging band, RDC and type."""
+    """Aggregated reco tiles: by mode, source, aging band, RDC and type.
+
+    `by_rdc` groups by the DISPATCH warehouse (SRC_RDC) — what each warehouse
+    still has to ship; `by_store_rdc` groups by the receiving store's own."""
     # Computed before the try so a bad filter surfaces as 400, not 500.
     at_params: dict = {}
     at_pred = _alloc_type_pred(alloc_type, at_params)
@@ -3632,7 +3714,7 @@ def pend_alc_reco_summary(
 
             by_mode = conn.execute(text(f"""
                 ;WITH open_keys AS (
-                    SELECT DISTINCT h.RDC,
+                    SELECT DISTINCT {src_rdc_sql('h')} AS RDC,
                            ISNULL(h.ST_CD,'') AS ST_CD,
                            h.ARTICLE_NUMBER
                     FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)
@@ -3661,7 +3743,7 @@ def pend_alc_reco_summary(
                        COUNT(*)      AS rows
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 LEFT JOIN open_keys ok
-                  ON  ok.RDC = P.RDC
+                  ON  ok.RDC = {_P_SRC}
                  AND ok.ST_CD = ISNULL(P.ST_CD,'')
                  AND ok.ARTICLE_NUMBER = P.ARTICLE_NUMBER
                 WHERE P.IS_CLOSED = 0{p_and}
@@ -3693,13 +3775,13 @@ def pend_alc_reco_summary(
 
             by_rdc = conn.execute(text(f"""
                 ;WITH open_keys AS (
-                    SELECT DISTINCT h.RDC,
+                    SELECT DISTINCT {src_rdc_sql('h')} AS RDC,
                            ISNULL(h.ST_CD,'') AS ST_CD,
                            h.ARTICLE_NUMBER
                     FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)
                     WHERE h.STATUS = 'OPEN'
                 )
-                SELECT P.RDC,
+                SELECT {_P_SRC} AS SRC_RDC,
                        SUM(P.ALLOC_QTY) AS alloc_qty,
                        SUM(P.BDC_QTY)  AS bdc_qty,
                        SUM(P.DO_QTY)   AS do_qty,
@@ -3711,9 +3793,17 @@ def pend_alc_reco_summary(
                        COUNT(*)      AS rows
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 LEFT JOIN open_keys ok
-                  ON  ok.RDC = P.RDC
+                  ON  ok.RDC = {_P_SRC}
                  AND ok.ST_CD = ISNULL(P.ST_CD,'')
                  AND ok.ARTICLE_NUMBER = P.ARTICLE_NUMBER
+                WHERE P.IS_CLOSED = 0{p_and}
+                GROUP BY {_P_SRC}
+                ORDER BY SUM(P.PEND_QTY) DESC
+            """), at_params).fetchall()
+
+            by_store_rdc = conn.execute(text(f"""
+                SELECT P.RDC, SUM(P.ALLOC_QTY), SUM(P.PEND_QTY), COUNT(*)
+                FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
                 WHERE P.IS_CLOSED = 0{p_and}
                 GROUP BY P.RDC
                 ORDER BY SUM(P.PEND_QTY) DESC
@@ -3781,12 +3871,12 @@ def pend_alc_reco_summary(
                     WHERE P.IS_CLOSED = 0 AND P.PEND_QTY > 0{p_and}
                       AND NOT EXISTS (
                           SELECT 1 FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)
-                          WHERE h.RDC = P.RDC
+                          WHERE {src_rdc_sql('h')} = {_P_SRC}
                             AND ISNULL(h.ST_CD,'') = ISNULL(P.ST_CD,'')
                             AND h.ARTICLE_NUMBER = P.ARTICLE_NUMBER
                             AND h.STATUS = 'OPEN'
                       )
-                    GROUP BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                    GROUP BY {_P_SRC}, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
                     HAVING SUM(P.PEND_QTY) > 0
                 ) x
             """), at_params).fetchone()
@@ -3806,7 +3896,7 @@ def pend_alc_reco_summary(
                   AND P.BDC_QTY > P.DO_QTY
                   AND EXISTS (
                       SELECT 1 FROM {BDC_HISTORY_TABLE} h WITH (NOLOCK)
-                      WHERE h.RDC = P.RDC
+                      WHERE {src_rdc_sql('h')} = {_P_SRC}
                         AND ISNULL(h.ST_CD,'') = ISNULL(P.ST_CD,'')
                         AND h.ARTICLE_NUMBER = P.ARTICLE_NUMBER
                         AND h.STATUS = 'OPEN'
@@ -3839,13 +3929,20 @@ def pend_alc_reco_summary(
                      "pend_qty": float(r[2] or 0), "alloc_qty": float(r[3] or 0)}
                     for r in by_aging
                 ],
+                # Keyed `rdc` for the existing UI; the value is the
+                # dispatch warehouse (SRC_RDC).
                 "by_rdc": [
-                    {"rdc": r[0], "alloc_qty": float(r[1] or 0),
+                    {"rdc": r[0], "src_rdc": r[0], "alloc_qty": float(r[1] or 0),
                      "bdc_qty": float(r[2] or 0), "do_qty": float(r[3] or 0),
                      "pend_qty": float(r[4] or 0),
                      "pending_bdc_qty": float(r[5] or 0),
                      "rows": int(r[6] or 0)}
                     for r in by_rdc
+                ],
+                "by_store_rdc": [
+                    {"rdc": r[0], "alloc_qty": float(r[1] or 0),
+                     "pend_qty": float(r[2] or 0), "rows": int(r[3] or 0)}
+                    for r in by_store_rdc
                 ],
                 "by_alloc_type": [
                     {"alloc_type": r[0], "alloc_qty": float(r[1] or 0),
@@ -3902,7 +3999,9 @@ def pend_alc_reco_summary(
 #                                          missing or too small to cover it.
 # GET /pend-alc/pend-vs-msa-gap-export   — same data, CSV download.
 #
-# Returns one row per (RDC, ARTICLE_NUMBER) where:
+# Returns one row per (SRC_RDC, ARTICLE_NUMBER) — the MSA pool the pending
+# is deducted from; the row key is still called RDC, as on ARS_MSA_TOTAL —
+# where:
 #   * the article has open PEND_QTY > 0 in ARS_PEND_ALC, AND
 #   * either MSA_TOTAL has no row for that (RDC, ARTICLE) — "NO_MSA", or
 #     STK_QTY - HOLD_QTY < PEND_QTY (un-clamped — FNL_Q is floored at 0 and
@@ -3941,7 +4040,7 @@ def _pend_vs_msa_gap_query(art_col: Optional[str], rdc_filter: bool, maj_cat_fil
                            status_filter: Optional[str], has_hold: bool = True,
                            has_fnl: bool = True, has_msa_pend: bool = True) -> str:
     pend_filters = ["IS_CLOSED = 0", "PEND_QTY > 0"]
-    if rdc_filter:     pend_filters.append("RDC = :rdc")
+    if rdc_filter:     pend_filters.append(f"{_T_SRC} = :rdc")   # dispatch WH
     if maj_cat_filter: pend_filters.append("MAJ_CAT = :mc")
     pend_where = " AND ".join(pend_filters)
 
@@ -3978,7 +4077,7 @@ def _pend_vs_msa_gap_query(art_col: Optional[str], rdc_filter: bool, maj_cat_fil
 
     return f"""
         ;WITH pend_agg AS (
-            SELECT RDC, ARTICLE_NUMBER,
+            SELECT {_T_SRC} AS RDC, ARTICLE_NUMBER,
                    MAX(MAJ_CAT)        AS MAJ_CAT,
                    MAX(GEN_ART_NUMBER) AS GEN_ART_NUMBER,
                    MAX(CLR)            AS CLR,
@@ -3986,7 +4085,7 @@ def _pend_vs_msa_gap_query(art_col: Optional[str], rdc_filter: bool, maj_cat_fil
                    COUNT(*)            AS PEND_ROWS
             FROM {PEND_ALC_TABLE} WITH (NOLOCK)
             WHERE {pend_where}
-            GROUP BY RDC, ARTICLE_NUMBER
+            GROUP BY {_T_SRC}, ARTICLE_NUMBER
         ), {msa_cte}
         SELECT p.RDC, p.ARTICLE_NUMBER, p.MAJ_CAT,
                p.GEN_ART_NUMBER, p.CLR,
@@ -4068,7 +4167,14 @@ def pend_vs_msa_gap(
                 f"INTO {tmp}\n        FROM pend_agg p\n        LEFT JOIN msa m",
                 1,
             )
-            conn.execute(text(into_sql), params)
+            # A PARAMETERISED SELECT ... INTO #tmp runs under sp_prepexec and
+            # its #temp table is dropped when that inner scope exits, so the
+            # next statement fails with "Invalid object name '#gap_…'" — which
+            # is why this report broke whenever an RDC / MAJ_CAT filter was
+            # set. Inline the two filter values as escaped literals instead.
+            for k, v in params.items():
+                into_sql = into_sql.replace(f":{k}", "N'" + str(v).replace("'", "''") + "'")
+            conn.execute(text(into_sql))
 
             summary_row = conn.execute(text(f"""
                 SELECT
@@ -4174,7 +4280,10 @@ def pend_vs_msa_gap_export(
                 f"INTO {tmp}\n        FROM pend_agg p\n        LEFT JOIN msa m",
                 1,
             )
-            conn.execute(text(into_sql), params)
+            # Same sp_prepexec #temp-scope fix as /pend-vs-msa-gap.
+            for k, v in params.items():
+                into_sql = into_sql.replace(f":{k}", "N'" + str(v).replace("'", "''") + "'")
+            conn.execute(text(into_sql))
             rows = conn.execute(text(f"""
                 SELECT * FROM {tmp}
                 ORDER BY GAP DESC, RDC, ARTICLE_NUMBER

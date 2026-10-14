@@ -4004,6 +4004,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 CREATE TABLE [ARS_NL_TBL_HOLD_TRACKING] (
                     [WERKS]           NVARCHAR(50)  NOT NULL,
                     [RDC]             NVARCHAR(20)  NULL,
+                    [SRC_RDC]         NVARCHAR(20)  NULL,
                     [MAJ_CAT]         NVARCHAR(200) NULL,
                     [GEN_ART_NUMBER]  BIGINT        NULL,
                     [CLR]             NVARCHAR(200) NULL,
@@ -4036,12 +4037,18 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
-            # (2026-10-03) ARS_NL_TBL_HOLD_TRACKING.RDC is now the SOURCING
-            # warehouse — the one physically reserving the hold — written at
-            # Approve from the split rows. The short-lived SRC_RDC column that
-            # used to be added here is gone: it duplicated what RDC should
-            # always have held, and leaving RDC as the store's warehouse made
-            # MSA deduct the hold from a pool that was not holding anything.
+            # (2026-10-14) RDC = the store's own warehouse; SRC_RDC = the
+            # warehouse physically reserving the hold, written at Approve
+            # (parked_history._apply_hold_tracking_from_history) and read by
+            # every MSA hold deduction. Nullable: rows that predate it held
+            # the reserving warehouse in RDC and resolve through the fallback.
+            try:
+                _run(ac, """
+                    IF COL_LENGTH('dbo.ARS_NL_TBL_HOLD_TRACKING', 'SRC_RDC') IS NULL
+                    ALTER TABLE [ARS_NL_TBL_HOLD_TRACKING] ADD [SRC_RDC] NVARCHAR(20) NULL
+                """)
+            except Exception:
+                pass
 
             # Add ALLOC_TYPE if the table predates the Fresh/GRT change
             # (FS-DB-03 / FS-10 item 1 — mirrors the RDC guard above).
@@ -4063,14 +4070,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
-            # Backfill RDC on any rows still blank by joining the store master.
-            # Idempotent — only touches rows where RDC IS NULL or ''.
-            #
-            # That predicate is now the whole guard: a centrally-sourced hold
-            # already carries its reserving warehouse in RDC, so it is
-            # non-blank and this UPDATE cannot reach it. The separate
-            # SRC_RDC IS NULL clause that used to protect such rows went with
-            # the column.
+            # Backfill RDC (the store's own warehouse) on any rows still blank
+            # by joining the store master. Idempotent — only touches rows
+            # where RDC IS NULL or ''. Never touches SRC_RDC.
             try:
                 _run(ac, f"""
                     IF EXISTS (SELECT 1 FROM sys.columns

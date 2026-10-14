@@ -16,14 +16,18 @@ from app.models.rbac import User
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
-_ALLOWED_COLS = {'SESSION_ID','RDC','ST_CD','MATNR','QTY','MAJ_CAT',
+_ALLOWED_COLS = {'SESSION_ID','RDC','SRC_RDC','ST_CD','MATNR','QTY','MAJ_CAT',
                  'GEN_ART_NUMBER','CLR','ALLOC_MODE','SOURCE',
                  'BDC_QTY','DO_QTY','PEND_QTY','DO_NUMBER','IS_CLOSED'}
 
+# RDC = the store's own warehouse; SRC_RDC = the dispatch warehouse (rows
+# written before 2026-10-14 carry it in RDC — same fallback as
+# pend_alc_service.src_rdc_sql).
 _BASE_SQL = """
     SELECT
         PA.SESSION_ID,
         PA.RDC,
+        COALESCE(NULLIF(PA.SRC_RDC, ''), PA.RDC) AS SRC_RDC,
         PA.ST_CD,
         PA.ARTICLE_NUMBER       AS MATNR,
         PA.ALLOC_QTY            AS QTY,

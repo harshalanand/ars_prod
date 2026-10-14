@@ -9,7 +9,7 @@ import { Download, RefreshCw, Table2, Search, X, Filter, Eye, EyeOff } from 'luc
 import { C } from '@/theme/colors'
 
 // Default visible columns (ARS_PEND_ALC table only — no master product join)
-const DEFAULT_VISIBLE = ['RDC','ST_CD','MATNR','QTY','MAJ_CAT','GEN_ART_NUMBER','CLR','ALLOC_MODE','PEND_QTY']
+const DEFAULT_VISIBLE = ['RDC','SRC_RDC','ST_CD','MATNR','QTY','MAJ_CAT','GEN_ART_NUMBER','CLR','ALLOC_MODE','PEND_QTY']
 
 export default function PendAlcReportPage() {
   const [data, setData] = useState(null)

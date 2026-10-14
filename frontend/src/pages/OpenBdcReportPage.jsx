@@ -5,7 +5,8 @@
  * to SAP, no DO received yet — what's in flight).
  *
  * Features:
- *   - Filter by status, allocation_no, RDC, ST_CD, ARTICLE, date range
+ *   - Filter by status, allocation_no, SRC RDC (dispatch WH — the endpoint's
+ *     `rdc` param), ST_CD, ARTICLE, date range
  *   - Per-allocation "Re-download SAP file" button (the original 9-col Excel)
  *   - "Export current view to Excel" — full BDC history rows with DAYS_OPEN
  *
@@ -235,7 +236,8 @@ export default function OpenBdcReportPage() {
         <input value={allocNo} onChange={e => setAllocNo(e.target.value)}
           placeholder="Allocation #" style={{ ...inp, width: 130 }}/>
         <input value={rdc}     onChange={e => setRdc(e.target.value)}
-          placeholder="RDC"     style={{ ...inp, width: 80 }}/>
+          placeholder="SRC RDC" title="Dispatch warehouse (SRC_RDC)"
+          style={{ ...inp, width: 80 }}/>
         <input value={stCd}    onChange={e => setStCd(e.target.value)}
           placeholder="ST_CD"   style={{ ...inp, width: 80 }}/>
         <input value={article} onChange={e => setArticle(e.target.value)}
@@ -308,7 +310,8 @@ export default function OpenBdcReportPage() {
               <thead><tr style={{ background: C.bg, position: 'sticky', top: 0, zIndex: 1 }}>
                 <TH>BDC DATE</TH>
                 <TH>ALLOCATION #</TH>
-                <TH>RDC</TH>
+                <TH>SRC RDC</TH>
+                <TH>STORE RDC</TH>
                 <TH>ST_CD</TH>
                 <TH>ARTICLE</TH>
                 <TH>MAJ_CAT</TH>
@@ -330,7 +333,8 @@ export default function OpenBdcReportPage() {
                                             background: i % 2 === 0 ? '#fff' : C.bg }}>
                       <td style={td}>{fmtDt(r.bdc_date)}</td>
                       <td style={{ ...td, fontFamily: 'monospace', fontSize: 9 }}>{r.allocation_number}</td>
-                      <td style={{ ...td, fontWeight: 600 }}>{r.rdc}</td>
+                      <td style={{ ...td, fontWeight: 600 }}>{r.src_rdc ?? r.rdc}</td>
+                      <td style={{ ...td, color: C.textSub }}>{r.rdc || '—'}</td>
                       <td style={td}>{r.st_cd || '—'}</td>
                       <td style={{ ...td, fontFamily: 'monospace', fontSize: 9 }}>{r.article_number}</td>
                       <td style={td}>{r.maj_cat || '—'}</td>

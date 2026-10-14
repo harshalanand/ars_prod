@@ -8,15 +8,20 @@ Lifecycle:
     Manual upload          → write_manual_pend_alc  → PENDING rows (SOURCE=MANUAL)
     BDC scheduled export   → stamp_bdc_qty          → BDC_QTY updated per row
     SAP DO upload back     → apply_do_deductions    → DO_QTY incremented; IS_CLOSED=1 when fully covered
-    After PEND_ALC INSERTs → adjust_msa_after_pend_insert  → MSA FNL_Q/PEND_QTY refreshed for the affected keys
-                              (called from manual upload + approve_parked. NOT called after DO updates —
-                              STK_QTY in MSA is daily-snapshot only, refreshed by next full MSA run.)
+    After PEND_ALC INSERTs → apply_pend_alc_delta(+1)  → MSA FNL_Q/PEND_QTY adjusted by SRC_RDC
+                              (approve + manual upload. NOT after DO updates — STK_QTY in MSA is a
+                              daily snapshot, refreshed by the next full MSA run.)
     MSA run                → _load_ars_pending      → PEND_QTY deducted from available stock
 
-Table grain: (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)
-  — one row per approved-session × source-warehouse × destination-store × variant-article × alloc-mode
-  RDC   = source warehouse (where stock ships from); used by MSA for FNL_Q deduction
-  ST_CD = destination store (WERKS in ARS_ALLOC_HISTORY); stored for traceability
+Table grain: (SESSION_ID, SRC_RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)
+  — one row per approved-session × dispatch-warehouse × destination-store × variant-article × alloc-mode
+  RDC     = the destination store's own warehouse (Master_ALC_INPUT_ST_MASTER.RDC
+            for ST_CD); descriptive only
+  SRC_RDC = the warehouse the qty is dispatched FROM. MSA deduction, BDC
+            VENDOR / allocation number, the open-BDC lock, DO matching and
+            adhoc close all key on it — always via src_rdc_sql()
+  ST_CD   = destination store (WERKS in ARS_ALLOC_HISTORY)
+ARS_BDC_HISTORY carries the same RDC / SRC_RDC pair.
 
 PEND_QTY = ALLOC_QTY − DO_QTY  (persisted computed column)
 BDC_QTY  = cumulative qty included in BDC files sent to SAP (audit only, not used by MSA)
@@ -65,12 +70,30 @@ def prewarm_pend_alc_tables(engine) -> None:
 
 PEND_ALC_TABLE = "ARS_PEND_ALC"
 
+
+# ── RDC vs SRC_RDC (2026-10-14) ──────────────────────────────────────────
+# RDC is the store's own warehouse; SRC_RDC is the warehouse that ships.
+# Every query that matches, groups or deducts by warehouse goes through this
+# expression, on ARS_PEND_ALC and ARS_BDC_HISTORY alike, so no reader can
+# drift onto the store's warehouse again (that drift is what put 7,653 of
+# 12,730 pcs of session 20261003_130926_698 on the wrong pool).
+#
+# The fallback covers rows written before SRC_RDC existed, or by a server
+# still running the old code: on those rows RDC held the dispatch warehouse
+# (the 2026-10-05 contract), so falling back to it is exact.
+def src_rdc_sql(alias: Optional[str] = None) -> str:
+    """SQL for a row's dispatch warehouse. `alias` is a table alias or name."""
+    p = f"{alias}." if alias else ""
+    return f"COALESCE(NULLIF({p}[SRC_RDC], ''), {p}[RDC])"
+
+
 _DDL = f"""
 IF OBJECT_ID('dbo.{PEND_ALC_TABLE}','U') IS NULL
 CREATE TABLE dbo.{PEND_ALC_TABLE} (
     ID             BIGINT IDENTITY(1,1),
     SESSION_ID     NVARCHAR(50)   NOT NULL,
     RDC            NVARCHAR(20)   NOT NULL,
+    SRC_RDC        NVARCHAR(20)   NULL,
     ST_CD          NVARCHAR(20)   NULL,
     ARTICLE_NUMBER NVARCHAR(30)   NOT NULL,
     MAJ_CAT        NVARCHAR(50)   NULL,
@@ -110,11 +133,23 @@ _INDEXES = [
     ("IX_ARS_PEND_ALC_bdc_lookup",
      f"ON dbo.{PEND_ALC_TABLE} (IS_CLOSED, RDC, ST_CD, ARTICLE_NUMBER) "
      f"INCLUDE (PEND_QTY, BDC_QTY, MAJ_CAT, LAST_BDC_AT)"),
+    # Open-row index for the SRC_RDC readers (MSA sums, BDC generate, DO
+    # FIFO). They filter IS_CLOSED = 0 and read src_rdc_sql(), so the seek is
+    # on IS_CLOSED and every column they touch is included. Built by
+    # scripts/041_src_rdc_concept.py on large tables; listed here so a fresh
+    # install gets it too.
+    ("IX_ARS_PEND_ALC_open_src",
+     f"ON dbo.{PEND_ALC_TABLE} (IS_CLOSED, SRC_RDC, ST_CD, ARTICLE_NUMBER) "
+     f"INCLUDE (RDC, ALLOC_QTY, DO_QTY, PEND_QTY, BDC_QTY, MAJ_CAT, "
+     f"GEN_ART_NUMBER, CLR, ALLOC_TYPE, LAST_BDC_AT, APPROVED_AT)"),
 ]
 
 # ---------------------------------------------------------------------------
 # ARS_BDC_HISTORY — audit trail of every BDC generation event
-# Each row = one (RDC, ST_CD, ARTICLE) line within a BDC file send.
+# Each row = one (SRC_RDC, ST_CD, ARTICLE) line within a BDC file send.
+# SRC_RDC is the dispatch warehouse (the file's VENDOR); RDC is the receiving
+# store's own warehouse. Rows written before 2026-10-14 have SRC_RDC NULL and
+# RDC = VENDOR, which src_rdc_sql() resolves correctly.
 # Tracks: qty sent, allocation no, qty received via DO, current status.
 # Used to answer "show me every BDC ever sent for this store/article and
 # how much SAP confirmed".
@@ -128,6 +163,7 @@ CREATE TABLE dbo.{BDC_HISTORY_TABLE} (
     BDC_DATE          DATETIME       NOT NULL DEFAULT GETDATE(),
     ALLOCATION_NUMBER NVARCHAR(50)   NOT NULL,
     RDC               NVARCHAR(20)   NOT NULL,
+    SRC_RDC           NVARCHAR(20)   NULL,
     ST_CD             NVARCHAR(20)   NULL,
     ARTICLE_NUMBER    NVARCHAR(30)   NOT NULL,
     MAJ_CAT           NVARCHAR(50)   NULL,
@@ -147,6 +183,12 @@ _BDC_HISTORY_INDEXES = [
      f"ON dbo.{BDC_HISTORY_TABLE} (RDC, ST_CD, ARTICLE_NUMBER)"),
     ("IX_ARS_BDC_HISTORY_status",
      f"ON dbo.{BDC_HISTORY_TABLE} (STATUS, BDC_DATE)"),
+    # The pend↔history matches compare src_rdc_sql() on both sides, which
+    # cannot seek on a leading RDC; this one seeks on store + article and
+    # resolves the warehouse from the included columns.
+    ("IX_ARS_BDC_HISTORY_store_art",
+     f"ON dbo.{BDC_HISTORY_TABLE} (ARTICLE_NUMBER, ST_CD) "
+     f"INCLUDE (SRC_RDC, RDC, STATUS, BDC_QTY, DO_RECEIVED, BDC_DATE)"),
 ]
 
 
@@ -155,6 +197,12 @@ def ensure_bdc_history_table(conn) -> None:
     if _TABLES_PREWARMED:
         return  # hot-path skip — startup already verified the schema
     conn.execute(text(_BDC_HISTORY_DDL))
+    # SRC_RDC on tables that predate 2026-10-14. Nullable, so the ALTER is
+    # metadata-only; scripts/041_src_rdc_concept.py backfills it.
+    conn.execute(text(f"""
+        IF COL_LENGTH('dbo.{BDC_HISTORY_TABLE}', 'SRC_RDC') IS NULL
+            ALTER TABLE dbo.{BDC_HISTORY_TABLE} ADD [SRC_RDC] NVARCHAR(20) NULL
+    """))
     for idx_name, idx_def in _BDC_HISTORY_INDEXES:
         conn.execute(text(f"""
             IF NOT EXISTS (
@@ -467,8 +515,8 @@ def backfill_bdc_operations(conn, dry_run: bool = True) -> Dict:
     for (alloc_no,) in missing:
         # 1) History rows in one shot
         h_rows = conn.execute(text(f"""
-            SELECT ID, RDC, ISNULL(ST_CD,'') AS ST_CD, ARTICLE_NUMBER,
-                   BDC_QTY, BDC_DATE, CREATED_BY, DO_RECEIVED
+            SELECT ID, {src_rdc_sql()} AS SRC_RDC, ISNULL(ST_CD,'') AS ST_CD,
+                   ARTICLE_NUMBER, BDC_QTY, BDC_DATE, CREATED_BY, DO_RECEIVED
             FROM {BDC_HISTORY_TABLE}
             WHERE ALLOCATION_NUMBER = :a
         """), {"a": alloc_no}).fetchall()
@@ -500,7 +548,7 @@ def backfill_bdc_operations(conn, dry_run: bool = True) -> Dict:
             SELECT P.ID, P.BDC_QTY
             FROM {PEND_ALC_TABLE} P
             JOIN {tmp} k
-              ON P.RDC = k.rdc
+              ON {src_rdc_sql('P')} = k.rdc
              AND P.ARTICLE_NUMBER = k.art
              AND ISNULL(P.ST_CD,'') = k.st_cd
             WHERE P.BDC_QTY > 0
@@ -620,8 +668,8 @@ def recover_bdc_history_from_active_ops(conn, dry_run: bool = True) -> Dict:
         tmp = _bulk_load_ids(conn, pend_ids)
         try:
             live = conn.execute(text(f"""
-                SELECT P.RDC, ISNULL(P.ST_CD,'') AS ST_CD, P.ARTICLE_NUMBER,
-                       P.MAJ_CAT, P.BDC_QTY
+                SELECT {src_rdc_sql('P')} AS SRC_RDC, ISNULL(P.ST_CD,'') AS ST_CD,
+                       P.ARTICLE_NUMBER, P.MAJ_CAT, P.BDC_QTY
                 FROM {PEND_ALC_TABLE} P
                 JOIN {tmp} t ON t.id = P.ID
                 WHERE P.BDC_QTY > 0
@@ -659,9 +707,10 @@ def recover_bdc_history_from_active_ops(conn, dry_run: bool = True) -> Dict:
 
         conn.execute(text(f"""
             INSERT INTO {BDC_HISTORY_TABLE}
-                (ALLOCATION_NUMBER, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
+                (ALLOCATION_NUMBER, RDC, SRC_RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
                  BDC_QTY, DO_RECEIVED, STATUS, CREATED_BY)
-            VALUES (:alloc, :rdc, :st_cd, :art, :mc, :qty, 0, 'OPEN', :by)
+            SELECT :alloc, {store_rdc_sql(conn, ':st_cd', ':rdc')}, :rdc,
+                   :st_cd, :art, :mc, :qty, 0, 'OPEN', :by
         """), rebuild_payload)
         conn.commit()
 
@@ -755,7 +804,7 @@ def close_orphan_open_bdc_history(conn, dry_run: bool = True) -> Dict:
         # join every OPEN history row to that aggregate.
         conn.execute(text(f"""
             ;WITH agg AS (
-                SELECT P.RDC,
+                SELECT {src_rdc_sql('P')}                       AS SRC_RDC,
                        ISNULL(P.ST_CD,'')                       AS ST_CD,
                        P.ARTICLE_NUMBER,
                        SUM(CASE WHEN P.IS_CLOSED=0 THEN 1   ELSE 0   END) AS has_open,
@@ -766,7 +815,7 @@ def close_orphan_open_bdc_history(conn, dry_run: bool = True) -> Dict:
                        SUM(ISNULL(P.DO_QTY,0))                                             AS sum_do_all,
                        MAX(CASE WHEN P.REMARKS LIKE 'ADHOC:%' THEN 1 ELSE 0 END)           AS had_adhoc
                 FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
-                GROUP BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                GROUP BY {src_rdc_sql('P')}, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
             )
             INSERT INTO {tmp} (history_id, old_status, new_status,
                                has_open, sum_alloc_open, sum_bdc_open, sum_do_open,
@@ -775,7 +824,7 @@ def close_orphan_open_bdc_history(conn, dry_run: bool = True) -> Dict:
                    H.STATUS,
                    CASE
                        -- No live PEND_ALC at all → CANCELLED (history orphan).
-                       WHEN agg.RDC IS NULL THEN 'CANCELLED'
+                       WHEN agg.SRC_RDC IS NULL THEN 'CANCELLED'
                        -- All matching PEND_ALC closed.
                        WHEN ISNULL(agg.has_open, 0) = 0 THEN
                            CASE
@@ -799,7 +848,7 @@ def close_orphan_open_bdc_history(conn, dry_run: bool = True) -> Dict:
                    ISNULL(agg.had_adhoc, 0)
             FROM {BDC_HISTORY_TABLE} H WITH (NOLOCK)
             LEFT JOIN agg
-              ON agg.RDC = H.RDC
+              ON agg.SRC_RDC = {src_rdc_sql('H')}
              AND agg.ST_CD = ISNULL(H.ST_CD,'')
              AND agg.ARTICLE_NUMBER = H.ARTICLE_NUMBER
             WHERE H.STATUS = 'OPEN'
@@ -1537,7 +1586,9 @@ def _revert_manual(conn, payload: Dict) -> Dict:
 
     try:
         # Read the rows BEFORE deleting so we can apply the -1 delta against
-        # the same grain (RDC, ST_CD, ARTICLE, MAJ_CAT, GEN_ART, CLR, qty).
+        # the same grain the +1 used: dispatch warehouse, store, article,
+        # MAJ_CAT, GEN_ART, CLR, qty AND alloc_type — without the type a GRT
+        # row was reverted against the FRESH MSA row.
         rows_to_revert = [
             {
                 "rdc":            r[0],
@@ -1548,10 +1599,12 @@ def _revert_manual(conn, payload: Dict) -> Dict:
                 "clr":            r[5],
                 "alloc_qty":      float(r[6] or 0),
                 "do_qty":         float(r[7] or 0),
+                "alloc_type":     r[8],
             }
             for r in conn.execute(text(f"""
-                SELECT RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                       ALLOC_QTY, ISNULL(DO_QTY, 0)
+                SELECT {src_rdc_sql()}, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
+                       GEN_ART_NUMBER, CLR, ALLOC_QTY, ISNULL(DO_QTY, 0),
+                       ALLOC_TYPE
                 FROM {PEND_ALC_TABLE}
                 WHERE {where_sql}
             """), where_params).fetchall()
@@ -2233,15 +2286,17 @@ def list_schedule_audit(
 # All non-computed columns that must exist; order matters for NOT NULL + DEFAULT
 _ENSURE_COLS = [
     ("SESSION_ID",     "NVARCHAR(50)   NOT NULL DEFAULT ''"),
-    # RDC is the SOURCING warehouse — the one that physically ships, and the
-    # one MSA deducts PEND_QTY from. Under Own/Cross that is the store's own
-    # warehouse; under All RDCs it comes from the split rows. A separate
-    # SRC_RDC column existed briefly (2026-09-21 to 2026-10-03) and was
-    # removed: it duplicated what RDC was always documented to hold, and
-    # leaving RDC as the store's warehouse put the deduction on the wrong
-    # pool. The store's warehouse stays derivable from ST_CD via the store
-    # master, so nothing is lost.
+    # RDC     = the store's own warehouse (store master, by ST_CD).
+    # SRC_RDC = the dispatch warehouse; MSA, BDC and DO key on it through
+    #           src_rdc_sql(). Nullable so adding it to a 22M-row table is a
+    #           metadata-only change; rows that predate it are backfilled by
+    #           scripts/041_src_rdc_concept.py and resolve through the
+    #           fallback in the meantime.
+    # History: SRC_RDC first existed 2026-09-21 → 2026-10-03, written but
+    # never read, so MSA kept deducting the store's warehouse; 8274ede then
+    # made RDC mean the dispatch warehouse instead. Reversed 2026-10-14.
     ("RDC",            "NVARCHAR(20)   NOT NULL DEFAULT ''"),
+    ("SRC_RDC",        "NVARCHAR(20)   NULL"),
     ("ST_CD",          "NVARCHAR(20)   NULL"),
     ("ARTICLE_NUMBER", "NVARCHAR(30)   NOT NULL DEFAULT ''"),
     ("MAJ_CAT",        "NVARCHAR(50)   NULL"),
@@ -2352,10 +2407,10 @@ _ST_MASTER = "Master_ALC_INPUT_ST_MASTER"
 
 
 def _probe_rdc_col(conn) -> Optional[str]:
-    """Return the source-RDC column name on the store master, or None.
+    """Return the RDC column name on the store master, or None.
 
-    The store master maps destination stores (ST_CD / WERKS) to their source
-    warehouse (RDC).  The column name varies by deployment.
+    The store master maps a store (ST_CD / WERKS) to its own warehouse (RDC).
+    The column name varies by deployment.
     """
     for candidate in ("RDC", "WAREHOUSE", "HUB", "WH_CD"):
         found = conn.execute(text(
@@ -2367,174 +2422,187 @@ def _probe_rdc_col(conn) -> Optional[str]:
     return None
 
 
+_STORE_RDC_COL: Dict[str, Optional[str]] = {}
+
+
+def store_rdc_sql(conn, st_cd_expr: str, fallback_expr: str) -> str:
+    """SQL for the store's own warehouse (the RDC column on every ledger):
+    the store master's RDC for `st_cd_expr`, else `fallback_expr`."""
+    if "col" not in _STORE_RDC_COL:
+        _STORE_RDC_COL["col"] = _probe_rdc_col(conn)
+    col = _STORE_RDC_COL["col"]
+    if not col:
+        return fallback_expr
+    return (f"COALESCE((SELECT TOP 1 SMX.[{col}] FROM [{_ST_MASTER}] SMX "
+            f"WHERE SMX.[ST_CD] = {st_cd_expr}), {fallback_expr})")
+
+
+def _table_exists(conn, name: str) -> bool:
+    return bool(conn.execute(text(
+        f"SELECT CASE WHEN OBJECT_ID('dbo.{name}','U') IS NULL THEN 0 ELSE 1 END"
+    )).scalar())
+
+
 def write_pend_alc(conn, session_id: str) -> int:
     """Insert approved ALLOC_QTY into ARS_PEND_ALC at grain
-    (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE).
+    (SESSION_ID, SRC_RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE).
 
-    WERKS in ARS_ALLOC_HISTORY is the DESTINATION store (ST_CD).  We join
-    with the store master to resolve the SOURCE warehouse (RDC).  Both are
-    stored so that:
-      - ST_CD lets users see which destination store received the allocation.
-      - RDC is used by MSA to aggregate PEND_QTY per source warehouse.
+    WERKS in ARS_ALLOC_HISTORY is the destination store (ST_CD).
+      - RDC     = that store's own warehouse, from the store master.
+      - SRC_RDC = the warehouse the line ships from — what MSA deducts and
+                  what the BDC names as VENDOR. Resolved per line, first hit:
+          1. ARS_ALLOC_RDC_SPLIT_HISTORY rows for the session (All RDCs);
+          2. ARS_ALLOC_RDC_SPLIT_PARKED rows, when the session has none in
+             history — an approve that never promoted the split triple
+             (session 20261010_163031_450: 7,892 open rows / 40,890 pcs
+             landed on the store's warehouse that way);
+          3. ARS_ALLOC_HISTORY.SRC_RDC when it names one warehouse ('MULTI'
+             means split and is only resolvable from the split rows);
+          4. the RDC the run allocated from (ARS_ALLOC_HISTORY.RDC) — Own and
+             Cross runs consume the store's own warehouse pool, so this is
+             exact for them; then the store master; then WERKS.
+    A split line yields one row per source warehouse, which is why SRC_RDC is
+    part of the GROUP BY and the NOT EXISTS guard. Split rows are joined on
+    (WERKS, MAJ_CAT, VAR_ART) so an article listed under two MAJ_CATs cannot
+    receive the other category's quantity.
 
-    One row is written per (SESSION, RDC, ST_CD, ARTICLE, ALLOC_MODE).
-    Falls back to using WERKS as RDC if no store master RDC column is found.
-    Idempotent via NOT EXISTS guard on (SESSION, RDC, ST_CD, ARTICLE, MODE).
-    Returns count of rows inserted.
+    Idempotent via the NOT EXISTS guard. Returns count of rows inserted.
     """
     ensure_pend_alc_table(conn)
 
-    # Probe whether ARS_LISTING_WORKING_HISTORY exists
-    has_lwh = conn.execute(text(
-        "SELECT CASE WHEN OBJECT_ID('dbo.ARS_LISTING_WORKING_HISTORY','U') IS NULL "
-        "THEN 0 ELSE 1 END"
-    )).scalar() or 0
-
-    # ── RDC = the SOURCING warehouse (2026-10-03) ─────────────────────────
-    #
-    # This restores the contract documented at the top of this module:
-    #   RDC = source warehouse (where stock ships from); used by MSA for
-    #         FNL_Q deduction
-    #
-    # It used to be filled from the STORE master, i.e. the store's own
-    # warehouse. Under Own and Cross-to-own those are the same warehouse so
-    # nobody noticed, but under All RDCs they diverge and the deduction lands
-    # on the wrong pool. Measured on approved session 20261003_130926_698:
-    # DH24 shipped 9,699 but was debited 2,046 while DW01 shipped 3,031 and
-    # was debited 10,684 — 7,653 of 12,730 pcs (60 %) against the wrong
-    # warehouse, so DH24 advertised stock it had already promised away.
-    #
-    # The store's warehouse is NOT lost: it stays derivable from ST_CD via
-    # the store master, which is where it came from. The sourcing warehouse
-    # is knowable only from the split rows, so that is what we persist.
-    #
-    # The source cannot come from ARS_ALLOC_HISTORY — a split line's SRC_RDC
-    # there is the literal 'MULTI', which is not a warehouse. Only the split
-    # rows can say the line was DH24 2 + DW01 4, so we aggregate them to
-    # (WERKS, VAR_ART, SRC_RDC); pend is at article grain, so sizes roll up.
-    #
-    # A split line therefore yields TWO pend rows — and because RDC now holds
-    # the source, they differ in RDC and are separated by the existing
-    # GROUP BY and NOT EXISTS guard on their own. The SRC_RDC column and its
-    # extra group/guard fragments are gone; RDC alone does the work, exactly
-    # as the table grain (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)
-    # always said it would.
-    #
-    # Own / Cross: the split table holds no rows for the session, the LEFT
-    # JOIN yields NULL, ISNULL falls back to the store master, and every
-    # expression below reduces to exactly what it produced before.
-    _has_split = bool(conn.execute(text(
-        "SELECT CASE WHEN OBJECT_ID('dbo.ARS_ALLOC_RDC_SPLIT_HISTORY','U') "
+    has_lwh = _table_exists(conn, "ARS_LISTING_WORKING_HISTORY")
+    has_hist_src = bool(conn.execute(text(
+        "SELECT CASE WHEN COL_LENGTH('dbo.ARS_ALLOC_HISTORY','SRC_RDC') "
         "IS NULL THEN 0 ELSE 1 END"
     )).scalar())
 
-    if _has_split:
-        src_join = """
-                LEFT JOIN (
-                    SELECT [SESSION_ID], [WERKS], [VAR_ART], [SRC_RDC],
-                           SUM(ISNULL([SHIP_QTY],0)) AS SRC_QTY
-                    FROM   [ARS_ALLOC_RDC_SPLIT_HISTORY]
-                    GROUP  BY [SESSION_ID], [WERKS], [VAR_ART], [SRC_RDC]
-                ) SPL
-                    ON  SPL.[SESSION_ID] = H.[SESSION_ID]
-                    AND SPL.[WERKS]      = H.[WERKS]
-                    AND SPL.[VAR_ART]    = H.[VAR_ART]"""
+    # Split rows: history first; the parked copy only when history has none
+    # for this session.
+    split_parts = []
+    has_split_hist = _table_exists(conn, "ARS_ALLOC_RDC_SPLIT_HISTORY")
+    if has_split_hist:
+        split_parts.append(
+            "SELECT [WERKS], [MAJ_CAT], [VAR_ART], [SRC_RDC], [SHIP_QTY] "
+            "FROM [ARS_ALLOC_RDC_SPLIT_HISTORY] WHERE [SESSION_ID] = :sid")
+    if _table_exists(conn, "ARS_ALLOC_RDC_SPLIT_PARKED"):
+        guard = (" AND NOT EXISTS (SELECT 1 FROM [ARS_ALLOC_RDC_SPLIT_HISTORY] X "
+                 "WHERE X.[SESSION_ID] = :sid)") if has_split_hist else ""
+        split_parts.append(
+            "SELECT [WERKS], [MAJ_CAT], [VAR_ART], [SRC_RDC], [SHIP_QTY] "
+            f"FROM [ARS_ALLOC_RDC_SPLIT_PARKED] WHERE [SESSION_ID] = :sid{guard}")
+    if split_parts:
+        src_join = f"""
+            LEFT JOIN (
+                SELECT S.[WERKS], ISNULL(S.[MAJ_CAT],'') AS MAJ_CAT,
+                       CAST(S.[VAR_ART] AS NVARCHAR(30)) AS VAR_ART,
+                       S.[SRC_RDC], SUM(ISNULL(S.[SHIP_QTY],0)) AS SRC_QTY
+                FROM ({' UNION ALL '.join(split_parts)}) S
+                WHERE NULLIF(S.[SRC_RDC],'') IS NOT NULL
+                GROUP BY S.[WERKS], ISNULL(S.[MAJ_CAT],''),
+                         CAST(S.[VAR_ART] AS NVARCHAR(30)), S.[SRC_RDC]
+                HAVING SUM(ISNULL(S.[SHIP_QTY],0)) > 0
+            ) SPL
+                ON  SPL.[WERKS]   = H.[WERKS]
+                AND SPL.[MAJ_CAT] = ISNULL(H.[MAJ_CAT],'')
+                AND SPL.[VAR_ART] = CAST(H.[VAR_ART] AS NVARCHAR(30))"""
         # The LEFT JOIN multiplies the history row once per source, so the
-        # per-source quantity must come from the split row; SUM(ALLOC_QTY)
-        # would count the whole line again for each warehouse.
+        # per-source quantity must come from the split row.
         qty_expr = ("ISNULL(MAX(SPL.SRC_QTY), "
                     "SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0)))")
-        # NULLIF guards a blank tag; COALESCE (not ISNULL — T-SQL's ISNULL
-        # takes exactly two arguments) walks source -> store master -> WERKS.
-        _src_first = "NULLIF(SPL.[SRC_RDC],''), "
+        spl_first = "NULLIF(SPL.[SRC_RDC],''), "
     else:
         src_join = ""
         qty_expr = "SUM(ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0))"
-        _src_first = ""
+        spl_first = ""
 
-    # Store master supplies the fallback for Own / Cross and for any line the
-    # split pass did not tag.
+    hist_src = "NULLIF(NULLIF(H.[SRC_RDC],''),'MULTI'), " if has_hist_src else ""
     rdc_col = _probe_rdc_col(conn)
     if rdc_col:
-        rdc_expr = f"COALESCE({_src_first}M.[{rdc_col}], H.[WERKS])"
-        st_join  = f"LEFT JOIN [{_ST_MASTER}] M ON M.[ST_CD] = H.[WERKS]"
-        logger.info(
-            f"[pend_alc] write_pend_alc: RDC = sourcing warehouse "
-            f"(split rows, falling back to {_ST_MASTER}.{rdc_col})"
-        )
+        st_join = f"LEFT JOIN [{_ST_MASTER}] M ON M.[ST_CD] = H.[WERKS]"
+        master = f"M.[{rdc_col}], "
     else:
-        rdc_expr = f"COALESCE({_src_first}H.[WERKS])" if _src_first else "H.[WERKS]"
-        st_join  = ""
-        logger.warning("[pend_alc] write_pend_alc: store master RDC col not found — "
-                       "WERKS stored as RDC (MSA deduction may be inaccurate)")
-
+        st_join = ""
+        master = ""
+        logger.warning("[pend_alc] write_pend_alc: store master RDC col not "
+                       "found — RDC falls back to the run's RDC / WERKS")
+    # COALESCE, not ISNULL: T-SQL's ISNULL takes exactly two arguments.
+    src_expr = (f"COALESCE({spl_first}{hist_src}NULLIF(H.[RDC],''), "
+                f"{master}H.[WERKS])")
+    store_expr = f"COALESCE({master}NULLIF(H.[RDC],''), H.[WERKS])"
 
     if has_lwh:
-        sql = f"""
-            INSERT INTO {PEND_ALC_TABLE}
-                (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
-            SELECT :sid, src.RDC, src.ST_CD, src.VAR_ART, src.MAJ_CAT,
-                   src.GEN_ART_NUMBER, src.CLR, src.ALLOC_QTY, src.ALLOC_MODE, 'AUTO',
-                   src.ALLOC_TYPE
-            FROM (
-                SELECT {rdc_expr}                         AS RDC,
-                       H.[WERKS]                          AS ST_CD,
-                       H.[VAR_ART],
-                       H.[MAJ_CAT]                        AS MAJ_CAT,
-                       H.[GEN_ART_NUMBER],
-                       MAX(H.[CLR])                       AS CLR,
-                       {qty_expr}                         AS ALLOC_QTY,
-                       ISNULL(MAX(W.[OPT_TYPE]), 'AUTO')  AS ALLOC_MODE,
-                       MAX(H.[ALLOC_TYPE])                AS ALLOC_TYPE
-                FROM [ARS_ALLOC_HISTORY] H
-                {st_join}{src_join}
-                LEFT JOIN [ARS_LISTING_WORKING_HISTORY] W
-                    ON  W.[SESSION_ID]                = H.[SESSION_ID]
-                    AND W.[WERKS]                     = H.[WERKS]
-                    AND ISNULL(W.[MAJ_CAT],'')        = ISNULL(H.[MAJ_CAT],'')
-                    AND ISNULL(W.[GEN_ART_NUMBER],'') = ISNULL(H.[GEN_ART_NUMBER],'')
-                    AND ISNULL(W.[CLR],'')             = ISNULL(H.[CLR],'')
-                WHERE H.[SESSION_ID] = :sid
-                  AND ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0) > 0
-                GROUP BY {rdc_expr}, H.[WERKS], H.[VAR_ART], H.[MAJ_CAT],
-                         H.[GEN_ART_NUMBER], ISNULL(W.[OPT_TYPE], 'AUTO')
-            ) src
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {PEND_ALC_TABLE} P
-                WHERE P.SESSION_ID     = :sid
-                  AND P.RDC            = src.RDC
-                  AND ISNULL(P.ST_CD,'') = ISNULL(src.ST_CD,'')
-                  AND P.ARTICLE_NUMBER = src.VAR_ART
-                  AND P.ALLOC_MODE     = src.ALLOC_MODE
-            )
-        """
+        mode_join = """
+            LEFT JOIN [ARS_LISTING_WORKING_HISTORY] W
+                ON  W.[SESSION_ID]                = H.[SESSION_ID]
+                AND W.[WERKS]                     = H.[WERKS]
+                AND ISNULL(W.[MAJ_CAT],'')        = ISNULL(H.[MAJ_CAT],'')
+                AND ISNULL(W.[GEN_ART_NUMBER],'') = ISNULL(H.[GEN_ART_NUMBER],'')
+                AND ISNULL(W.[CLR],'')             = ISNULL(H.[CLR],'')"""
+        mode_expr = "ISNULL(W.[OPT_TYPE], 'AUTO')"
+        # MAJ_CAT is a real grouping key (2026-07-16): an article/colour listed
+        # under two MAJ_CATs is two pend rows, never a fanned-out one.
+        maj_sel, gen_sel = "H.[MAJ_CAT]", "H.[GEN_ART_NUMBER]"
+        group_tail = f", H.[MAJ_CAT], H.[GEN_ART_NUMBER], {mode_expr}"
     else:
-        # Fallback: no working history — one row per (RDC, ST_CD, ARTICLE),
-        # where RDC is the sourcing warehouse.
-        sql = f"""
-            INSERT INTO {PEND_ALC_TABLE}
-                (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                 ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
-            SELECT :sid,
-                   {rdc_expr}, H.[WERKS], H.[VAR_ART],
-                   MAX(H.[MAJ_CAT]), MAX(H.[GEN_ART_NUMBER]), MAX(H.[CLR]),
-                   {qty_expr},
-                   'AUTO', 'AUTO', MAX(H.[ALLOC_TYPE])
+        # No working history: one row per (SRC_RDC, store, article), mode AUTO.
+        mode_join = ""
+        mode_expr = "'AUTO'"
+        maj_sel, gen_sel = "MAX(H.[MAJ_CAT])", "MAX(H.[GEN_ART_NUMBER])"
+        group_tail = ""
+
+    sql = f"""
+        INSERT INTO {PEND_ALC_TABLE}
+            (SESSION_ID, RDC, SRC_RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
+             GEN_ART_NUMBER, CLR, ALLOC_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE)
+        SELECT :sid, src.RDC, src.SRC_RDC, src.ST_CD, src.VAR_ART, src.MAJ_CAT,
+               src.GEN_ART_NUMBER, src.CLR, src.ALLOC_QTY, src.ALLOC_MODE,
+               'AUTO', src.ALLOC_TYPE
+        FROM (
+            SELECT MAX({store_expr})   AS RDC,
+                   {src_expr}          AS SRC_RDC,
+                   H.[WERKS]           AS ST_CD,
+                   H.[VAR_ART],
+                   {maj_sel}           AS MAJ_CAT,
+                   {gen_sel}           AS GEN_ART_NUMBER,
+                   MAX(H.[CLR])        AS CLR,
+                   {qty_expr}          AS ALLOC_QTY,
+                   {mode_expr}         AS ALLOC_MODE,
+                   MAX(H.[ALLOC_TYPE]) AS ALLOC_TYPE
             FROM [ARS_ALLOC_HISTORY] H
-            {st_join}{src_join}
+            {st_join}{src_join}{mode_join}
             WHERE H.[SESSION_ID] = :sid
               AND ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0) > 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM {PEND_ALC_TABLE} P
-                  WHERE P.SESSION_ID       = :sid
-                    AND P.RDC              = {rdc_expr}
-                    AND ISNULL(P.ST_CD,'') = ISNULL(H.[WERKS],'')
-                    AND P.ARTICLE_NUMBER   = H.[VAR_ART]
-                    AND P.ALLOC_MODE       = 'AUTO'
-              )
-            GROUP BY {rdc_expr}, H.[WERKS], H.[VAR_ART]
-        """
+            GROUP BY {src_expr}, H.[WERKS], H.[VAR_ART]{group_tail}
+        ) src
+        WHERE src.ALLOC_QTY > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM {PEND_ALC_TABLE} P
+            WHERE P.SESSION_ID       = :sid
+              AND {src_rdc_sql('P')} = src.SRC_RDC
+              AND ISNULL(P.ST_CD,'') = ISNULL(src.ST_CD,'')
+              AND P.ARTICLE_NUMBER   = src.VAR_ART
+              AND P.ALLOC_MODE       = src.ALLOC_MODE
+          )
+    """
+
+    # A 'MULTI' line with no split rows cannot be resolved to its warehouses;
+    # it falls back to the run's RDC. Say so loudly — it means the split
+    # snapshot is missing for this session.
+    if has_hist_src:
+        try:
+            unresolved = conn.execute(text(f"""
+                SELECT COUNT(*) FROM [ARS_ALLOC_HISTORY] H{src_join}
+                WHERE H.[SESSION_ID] = :sid AND H.[SRC_RDC] = 'MULTI'
+                  AND ISNULL(TRY_CAST(H.[ALLOC_QTY] AS FLOAT), 0) > 0
+                  {"AND SPL.[SRC_RDC] IS NULL" if split_parts else ""}
+            """), {"sid": session_id}).scalar() or 0
+            if unresolved:
+                logger.warning(
+                    f"[pend_alc] write_pend_alc: {unresolved} MULTI line(s) in "
+                    f"{session_id} have no split rows — SRC_RDC falls back to "
+                    f"the run's RDC for them")
+        except Exception as e:
+            logger.warning(f"[pend_alc] write_pend_alc MULTI check skipped: {e}")
 
     res = conn.execute(text(sql), {"sid": session_id})
     conn.commit()
@@ -2571,6 +2639,11 @@ def write_manual_pend_alc(
 
     Args:
       rows:        list of row dicts (rdc, article_number, alloc_qty, ...).
+                   The uploaded `rdc` (or `src_rdc`) is the DISPATCH
+                   warehouse and is stored as SRC_RDC; RDC is then set to
+                   the store's own warehouse from the store master (it stays
+                   = SRC_RDC when the row has no ST_CD or the store is not in
+                   the master).
                    Optional per-row `alloc_type` ∈ {None,'','FRESH','GRT'}
                    (normalized UPPER/TRIM; None/'' stored as NULL → the MSA
                    delta folds it into the FRESH row; 'FRESH'/'GRT' stored
@@ -2606,11 +2679,16 @@ def write_manual_pend_alc(
         f"SELECT ISNULL(MAX(ID), 0) FROM {PEND_ALC_TABLE} WHERE SESSION_ID = :sid"
     ), {"sid": session_id}).scalar() or 0
 
-    # Build parameter tuples in fixed column order.
+    # Build parameter tuples in fixed column order. RDC is written as the
+    # dispatch warehouse here and re-pointed to the store's warehouse below.
+    def _src(r: Dict) -> str:
+        return str(r.get("src_rdc") or r.get("rdc") or "").strip()
+
     params = [
         (
             session_id,
-            str(r["rdc"]),
+            _src(r),
+            _src(r),
             (str(r.get("st_cd")).strip() if r.get("st_cd") else None) or None,
             str(r["article_number"]),
             r.get("maj_cat") or None,
@@ -2636,9 +2714,10 @@ def write_manual_pend_alc(
 
         sql = (
             f"INSERT INTO {PEND_ALC_TABLE} "
-            "(SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,"
-            " ALLOC_QTY, ALLOC_MODE, SOURCE, REMARKS, ALLOC_TYPE) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 'MANUAL', ?, ?)"
+            "(SESSION_ID, RDC, SRC_RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,"
+            " GEN_ART_NUMBER, CLR, ALLOC_QTY, ALLOC_MODE, SOURCE, REMARKS,"
+            " ALLOC_TYPE) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 'MANUAL', ?, ?)"
         )
 
         # Internal chunk to keep the parameter array manageable in memory and
@@ -2657,6 +2736,19 @@ def write_manual_pend_alc(
             )
     finally:
         cursor.close()
+
+    # RDC = the store's own warehouse for every row whose store is in the
+    # master; rows without a store keep RDC = SRC_RDC.
+    rdc_col = _probe_rdc_col(conn)
+    if rdc_col:
+        conn.execute(text(f"""
+            UPDATE P SET P.RDC = M.[{rdc_col}]
+            FROM {PEND_ALC_TABLE} P
+            JOIN [{_ST_MASTER}] M ON M.[ST_CD] = P.ST_CD
+            WHERE P.SESSION_ID = :sid AND P.ID > :prev
+              AND NULLIF(M.[{rdc_col}], '') IS NOT NULL
+              AND P.RDC <> M.[{rdc_col}]
+        """), {"sid": session_id, "prev": int(prev_max_id)})
 
     conn.commit()
 
@@ -2708,7 +2800,7 @@ def write_manual_pend_alc(
                     "alloc_type":     r[8],
                 }
                 for r in conn.execute(text(f"""
-                    SELECT P.RDC, P.ST_CD, P.ARTICLE_NUMBER, P.MAJ_CAT,
+                    SELECT {src_rdc_sql('P')}, P.ST_CD, P.ARTICLE_NUMBER, P.MAJ_CAT,
                            P.GEN_ART_NUMBER, P.CLR,
                            P.ALLOC_QTY, ISNULL(P.DO_QTY, 0), P.ALLOC_TYPE
                     FROM {PEND_ALC_TABLE} P
@@ -2754,7 +2846,7 @@ def recover_orphan_bdc_stamps(conn, dry_run: bool = True) -> Dict:
     A row is an orphan if:
         BDC_QTY > 0
         AND IS_CLOSED = 0
-        AND no ARS_BDC_HISTORY row exists for (RDC, ST_CD, ARTICLE_NUMBER)
+        AND no ARS_BDC_HISTORY row exists for (SRC_RDC, ST_CD, ARTICLE_NUMBER)
 
     dry_run=True → returns {found, total_qty} without changes.
     dry_run=False → also performs the UPDATE.
@@ -2768,7 +2860,7 @@ def recover_orphan_bdc_stamps(conn, dry_run: bool = True) -> Dict:
         WHERE P.BDC_QTY > 0 AND P.IS_CLOSED = 0
           AND NOT EXISTS (
               SELECT 1 FROM {BDC_HISTORY_TABLE} H
-              WHERE H.RDC = P.RDC
+              WHERE {src_rdc_sql('H')} = {src_rdc_sql('P')}
                 AND ISNULL(H.ST_CD,'') = ISNULL(P.ST_CD,'')
                 AND H.ARTICLE_NUMBER = P.ARTICLE_NUMBER
           )
@@ -2786,7 +2878,7 @@ def recover_orphan_bdc_stamps(conn, dry_run: bool = True) -> Dict:
             WHERE P.BDC_QTY > 0 AND P.IS_CLOSED = 0
               AND NOT EXISTS (
                   SELECT 1 FROM {BDC_HISTORY_TABLE} H
-                  WHERE H.RDC = P.RDC
+                  WHERE {src_rdc_sql('H')} = {src_rdc_sql('P')}
                     AND ISNULL(H.ST_CD,'') = ISNULL(P.ST_CD,'')
                     AND H.ARTICLE_NUMBER = P.ARTICLE_NUMBER
               )
@@ -2803,10 +2895,12 @@ def insert_bdc_history(
     rows: List[Dict],
     created_by: Optional[str] = None,
 ) -> List[int]:
-    """Append one row per (RDC, ST_CD, ARTICLE) line in a BDC file to
+    """Append one row per (SRC_RDC, ST_CD, ARTICLE) line in a BDC file to
     ARS_BDC_HISTORY. Each call = one BDC generation event.
 
-    rows: list of dicts with keys rdc, st_cd, article_number, maj_cat, bdc_qty.
+    rows: list of dicts with keys rdc (or src_rdc) = the DISPATCH warehouse
+    (the file's VENDOR), st_cd, article_number, maj_cat, bdc_qty. SRC_RDC is
+    stored from it; RDC is then set to the receiving store's own warehouse.
     Returns list of inserted IDs (used by the operations log to revert later).
     """
     if not rows:
@@ -2816,7 +2910,7 @@ def insert_bdc_history(
     payload = [
         {
             "alloc": alloc,
-            "rdc":   str(r.get("rdc") or "").strip(),
+            "rdc":   str(r.get("src_rdc") or r.get("rdc") or "").strip(),
             "st_cd": str(r.get("st_cd") or "").strip() or None,
             "art":   str(r.get("article_number") or "").strip(),
             "mc":    (r.get("maj_cat") or None),
@@ -2843,10 +2937,22 @@ def insert_bdc_history(
 
     conn.execute(text(f"""
         INSERT INTO {BDC_HISTORY_TABLE}
-            (ALLOCATION_NUMBER, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
+            (ALLOCATION_NUMBER, RDC, SRC_RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT,
              BDC_QTY, DO_RECEIVED, STATUS, CREATED_BY)
-        VALUES (:alloc, :rdc, :st_cd, :art, :mc, :qty, 0, 'OPEN', :by)
+        VALUES (:alloc, :rdc, :rdc, :st_cd, :art, :mc, :qty, 0, 'OPEN', :by)
     """), payload)
+    # RDC = the receiving store's own warehouse (one set-based UPDATE rather
+    # than a per-row lookup in the INSERT).
+    rdc_col = _probe_rdc_col(conn)
+    if rdc_col:
+        conn.execute(text(f"""
+            UPDATE H SET H.RDC = M.[{rdc_col}]
+            FROM {BDC_HISTORY_TABLE} H
+            JOIN [{_ST_MASTER}] M ON M.[ST_CD] = H.ST_CD
+            WHERE H.ALLOCATION_NUMBER = :a AND H.ID > :prev
+              AND NULLIF(M.[{rdc_col}], '') IS NOT NULL
+              AND H.RDC <> M.[{rdc_col}]
+        """), {"a": alloc, "prev": int(prev_max_id)})
     conn.commit()
 
     ids = conn.execute(text(f"""
@@ -2918,7 +3024,7 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
     cx_global: List[Dict] = []  # global path   (qty = 0, cancel)
 
     for r in do_rows:
-        rdc       = str(r.get("rdc") or "").strip()
+        rdc       = str(r.get("src_rdc") or r.get("rdc") or "").strip()  # dispatch WH
         art       = str(r.get("article_number") or "").strip()
         st_cd     = (str(r.get("st_cd") or "").strip() or "")
         alloc_no  = (str(r.get("allocation_number") or "").strip() or "")
@@ -3013,20 +3119,23 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
         # open history row matches at most one agg row (otherwise an
         # UPDATE..JOIN can drop apply_qty silently when two agg rows hit
         # the same target).
+        # The DO's rdc is the dispatch warehouse, so every pass keys on the
+        # history row's SRC_RDC (src_rdc_sql), never on the store's RDC.
+        h_src = src_rdc_sql("H")
         passes = [
             # (bucket_name, partition_cols, group_cols, join_pred)
             ("alloc",
-             "H.ALLOCATION_NUMBER, H.RDC, H.ARTICLE_NUMBER",
+             f"H.ALLOCATION_NUMBER, {h_src}, H.ARTICLE_NUMBER",
              "rdc, art, alloc_no",
-             "agg.alloc_no = o.ALLOCATION_NUMBER AND agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER"),
+             "agg.alloc_no = o.ALLOCATION_NUMBER AND agg.rdc = o.SRC_KEY AND agg.art = o.ARTICLE_NUMBER"),
             ("store",
-             "H.RDC, ISNULL(H.ST_CD,''), H.ARTICLE_NUMBER",
+             f"{h_src}, ISNULL(H.ST_CD,''), H.ARTICLE_NUMBER",
              "rdc, st_cd, art",
-             "agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER AND agg.st_cd = ISNULL(o.ST_CD,'')"),
+             "agg.rdc = o.SRC_KEY AND agg.art = o.ARTICLE_NUMBER AND agg.st_cd = ISNULL(o.ST_CD,'')"),
             ("global",
-             "H.RDC, H.ARTICLE_NUMBER",
+             f"{h_src}, H.ARTICLE_NUMBER",
              "rdc, art",
-             "agg.rdc = o.RDC AND agg.art = o.ARTICLE_NUMBER"),
+             "agg.rdc = o.SRC_KEY AND agg.art = o.ARTICLE_NUMBER"),
         ]
 
         # Cancellation passes — run BEFORE the FIFO apply passes so that a
@@ -3039,14 +3148,14 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
             ("alloc",
              "rdc, art, alloc_no",
              "agg.alloc_no = H.ALLOCATION_NUMBER "
-             "AND agg.rdc = H.RDC AND agg.art = H.ARTICLE_NUMBER"),
+             f"AND agg.rdc = {h_src} AND agg.art = H.ARTICLE_NUMBER"),
             ("store",
              "rdc, st_cd, art",
-             "agg.rdc = H.RDC AND agg.art = H.ARTICLE_NUMBER "
+             f"agg.rdc = {h_src} AND agg.art = H.ARTICLE_NUMBER "
              "AND agg.st_cd = ISNULL(H.ST_CD,'')"),
             ("global",
              "rdc, art",
-             "agg.rdc = H.RDC AND agg.art = H.ARTICLE_NUMBER"),
+             f"agg.rdc = {h_src} AND agg.art = H.ARTICLE_NUMBER"),
         ]
         for bucket, group_cols, join_pred in cancel_passes:
             sql = f"""
@@ -3087,7 +3196,7 @@ def update_bdc_history_with_do(conn, do_rows: List[Dict]) -> int:
                        H.DO_RECEIVED,
                        H.STATUS,
                        H.LAST_DO_AT,
-                       H.RDC, H.ST_CD, H.ARTICLE_NUMBER, H.ALLOCATION_NUMBER,
+                       {h_src} AS SRC_KEY, H.ST_CD, H.ARTICLE_NUMBER, H.ALLOCATION_NUMBER,
                        (H.BDC_QTY - H.DO_RECEIVED) AS need,
                        SUM(H.BDC_QTY - H.DO_RECEIVED) OVER (
                            PARTITION BY {partition_cols}
@@ -3183,7 +3292,7 @@ def apply_adhoc_close(
     """Adhoc-close PEND_ALC rows for keys whose BDC should be abandoned
     (e.g. bot-generated BDC for an article with no MSA stock).
 
-    For every input (RDC, ST_CD, ARTICLE):
+    For every input (SRC_RDC, ST_CD, ARTICLE):
       - PEND_ALC matching rows with IS_CLOSED=0 → IS_CLOSED=1, REMARKS
         prefixed with `ADHOC: <reason>` so it's visible in reco.
       - Any STATUS='OPEN' rows in BDC_HISTORY for the same key → STATUS=
@@ -3192,7 +3301,8 @@ def apply_adhoc_close(
     Pre-images are captured for both sides so the operation can be reverted
     via the existing operations-log machinery.
 
-    rows: dicts with rdc, article_number, optional st_cd.
+    rows: dicts with rdc (or src_rdc) = the DISPATCH warehouse,
+          article_number, optional st_cd.
     Returns: {touched_pend, touched_history, pend_updates, history_updates}.
     """
     ensure_pend_alc_table(conn)
@@ -3200,7 +3310,7 @@ def apply_adhoc_close(
 
     keys: List[Dict] = []
     for r in rows or []:
-        rdc = str(r.get("rdc") or "").strip()
+        rdc = str(r.get("src_rdc") or r.get("rdc") or "").strip()  # dispatch WH
         art = str(r.get("article_number") or "").strip()
         if not rdc or not art:
             continue
@@ -3242,9 +3352,9 @@ def apply_adhoc_close(
             cur.close()
 
         # Close matching PEND_ALC rows.  An empty st_cd in the input means
-        # "any store for this (RDC, ARTICLE)" — kept symmetric with the
-        # rest of the service so an ops user can clear the whole article
-        # without enumerating every store.
+        # "any store served from this (SRC_RDC, ARTICLE)" — kept symmetric
+        # with the rest of the service so an ops user can clear the whole
+        # article without enumerating every store.
         for r in conn.execute(text(f"""
             UPDATE P
                SET P.IS_CLOSED = 1,
@@ -3255,7 +3365,7 @@ def apply_adhoc_close(
             OUTPUT INSERTED.ID, DELETED.IS_CLOSED, DELETED.REMARKS
             FROM {PEND_ALC_TABLE} P
             JOIN {tmp} u
-              ON P.RDC = u.rdc
+              ON {src_rdc_sql('P')} = u.rdc
              AND P.ARTICLE_NUMBER = u.art
              AND (u.st_cd = '' OR ISNULL(P.ST_CD,'') = u.st_cd)
             WHERE P.IS_CLOSED = 0
@@ -3275,7 +3385,7 @@ def apply_adhoc_close(
             OUTPUT INSERTED.ID, DELETED.STATUS
             FROM {BDC_HISTORY_TABLE} H
             JOIN {tmp} u
-              ON H.RDC = u.rdc
+              ON {src_rdc_sql('H')} = u.rdc
              AND H.ARTICLE_NUMBER = u.art
              AND (u.st_cd = '' OR ISNULL(H.ST_CD,'') = u.st_cd)
             WHERE H.STATUS = 'OPEN'
@@ -3701,9 +3811,10 @@ def stamp_bdc_qty(
     revert time from the live PEND_QTY) — that alone cuts the JSON payload by
     ~25 % when stamping hundreds of thousands of rows.
 
-    article_rdc_pairs: list of dicts with rdc, article_number, optional st_cd.
+    article_rdc_pairs: list of dicts with rdc (= the DISPATCH warehouse, the
+        BDC file's VENDOR), article_number, optional st_cd.
         - If `st_cd` is provided, scoped to that exact destination store row.
-        - If `st_cd` omitted, falls back to (RDC, ARTICLE) matching.
+        - If `st_cd` omitted, falls back to (SRC_RDC, ARTICLE) matching.
     If article_rdc_pairs is None, stamps ALL open rows globally.
 
     store_scoped: pass True when the caller filtered by store (st_cd list
@@ -3749,7 +3860,7 @@ def stamp_bdc_qty(
             OUTPUT INSERTED.ID, DELETED.BDC_QTY, DELETED.LAST_BDC_AT
             FROM {PEND_ALC_TABLE} P
             JOIN {tmp} u
-              ON P.RDC = u.rdc
+              ON {src_rdc_sql('P')} = u.rdc
              AND P.ARTICLE_NUMBER = u.art
              AND {st_pred}
             WHERE P.IS_CLOSED = 0 AND P.PEND_QTY > 0
@@ -3818,6 +3929,8 @@ def apply_do_deductions(conn, rows: List[Dict],
 
     rows: list of dicts with keys rdc, article_number, do_qty.
           Optional: st_cd, do_number, allocation_number, alloc_type.
+          `rdc` (or `src_rdc`) is the DISPATCH warehouse on the SAP DO and
+          is matched against each pend row's SRC_RDC.
 
     Typed scoping (Package 3): a row carrying alloc_type ∈ {FRESH, GRT}
     only drains PEND rows whose *folded* type matches — folded =
@@ -3883,7 +3996,7 @@ def apply_do_deductions(conn, rows: List[Dict],
     for seq, r in enumerate(valid):
         input_rows.append({
             "seq":      seq,
-            "rdc":      str(r["rdc"]).strip(),
+            "rdc":      str(r.get("src_rdc") or r["rdc"]).strip(),  # dispatch WH
             "st_cd":    (str(r.get("st_cd") or "").strip() or ""),
             "art":      str(r["article_number"]).strip(),
             "alloc_no": (str(r.get("allocation_number") or "").strip() or ""),
@@ -3970,7 +4083,7 @@ def apply_do_deductions(conn, rows: List[Dict],
                 SELECT TOP 1 ISNULL(H.ST_CD,'') AS st_cd
                   FROM [{BDC_HISTORY_TABLE}] H
                  WHERE H.ALLOCATION_NUMBER = T.alloc_no
-                   AND H.RDC              = T.rdc
+                   AND {src_rdc_sql('H')} = T.rdc
                    AND H.ARTICLE_NUMBER   = T.art
                  ORDER BY
                     CASE WHEN ISNULL(H.ST_CD,'') = T.st_cd THEN 0 ELSE 1 END,
@@ -4000,6 +4113,9 @@ def apply_do_deductions(conn, rows: List[Dict],
         # today's behaviour on whatever capacity the typed passes left.
         typed_vals  = sorted({r["alloc_type"] for r in input_rows if r["alloc_type"]})
         has_untyped = any(not r["alloc_type"] for r in input_rows)
+        # The DO's rdc is the dispatch warehouse: FIFO partitions, matching,
+        # overflow and the BDC auto-close below all key on the row's SRC_RDC.
+        p_src = src_rdc_sql("P")
         if typed_vals:
             type_buckets = [(t, True) for t in typed_vals]
             if has_untyped:
@@ -4049,16 +4165,16 @@ def apply_do_deductions(conn, rows: List[Dict],
                            P.DO_QTY,
                            (P.ALLOC_QTY - P.DO_QTY) AS need,
                            SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
-                               PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                               PARTITION BY {p_src}, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
                                ORDER BY {sess_order}P.APPROVED_AT, P.ID
                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                            ) AS cum_after,
                            ISNULL(SUM(P.ALLOC_QTY - P.DO_QTY) OVER (
-                               PARTITION BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                               PARTITION BY {p_src}, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
                                ORDER BY {sess_order}P.APPROVED_AT, P.ID
                                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
                            ), 0) AS cum_before,
-                           P.RDC, P.ST_CD, P.ARTICLE_NUMBER
+                           {p_src} AS SRC_KEY, P.ST_CD, P.ARTICLE_NUMBER
                     FROM {PEND_ALC_TABLE} P
                     WHERE P.IS_CLOSED = 0 AND (P.ALLOC_QTY - P.DO_QTY) > 0{sess_filter}{open_type_pred}
                 ),
@@ -4072,7 +4188,7 @@ def apply_do_deductions(conn, rows: List[Dict],
                            END AS apply_qty
                     FROM open_ranked o
                     JOIN agg
-                      ON agg.rdc = o.RDC
+                      ON agg.rdc = o.SRC_KEY
                      AND agg.art = o.ARTICLE_NUMBER
                      AND {join_pred}
                     WHERE {scope_pred}
@@ -4138,13 +4254,13 @@ def apply_do_deductions(conn, rows: List[Dict],
                     -- Group applied qty by the SAME (rdc, st_cd, art) shape as
                     -- input_agg. Empty-st_cd input aggregates ALL stores' applied
                     -- qty into one bucket via the LEFT JOIN below.
-                    SELECT P.RDC                 AS rdc,
+                    SELECT {p_src}               AS rdc,
                            ISNULL(P.ST_CD,'')    AS st_cd,
                            P.ARTICLE_NUMBER      AS art,
                            SUM(o.qty_added)      AS applied_qty
                     FROM {tmp_out} o
                     JOIN {PEND_ALC_TABLE} P ON P.ID = o.pend_alc_id
-                    GROUP BY P.RDC, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
+                    GROUP BY {p_src}, ISNULL(P.ST_CD,''), P.ARTICLE_NUMBER
                 ),
                 joined AS (
                     SELECT i.rdc, i.st_cd, i.art, i.do_qty,
@@ -4201,7 +4317,7 @@ def apply_do_deductions(conn, rows: List[Dict],
             conn.execute(text(f"""
                 ;WITH closed_keys AS (
                     SELECT DISTINCT
-                           P.RDC,
+                           {p_src} AS RDC,
                            ISNULL(P.ST_CD,'') AS ST_CD,
                            P.ARTICLE_NUMBER
                     FROM {PEND_ALC_TABLE} P WITH (NOLOCK)
@@ -4217,7 +4333,7 @@ def apply_do_deductions(conn, rows: List[Dict],
                   INTO {tmp_sync} (history_id, old_status, prev_last_do_at)
                 FROM {BDC_HISTORY_TABLE} H
                 JOIN closed_keys k
-                  ON  k.RDC = H.RDC
+                  ON  k.RDC = {src_rdc_sql('H')}
                  AND k.ST_CD = ISNULL(H.ST_CD,'')
                  AND k.ARTICLE_NUMBER = H.ARTICLE_NUMBER
                 WHERE H.STATUS = 'OPEN'
@@ -4263,194 +4379,6 @@ def apply_do_deductions(conn, rows: List[Dict],
     }
 
 
-def adjust_msa_after_pend_insert(
-    conn,
-    session_id: Optional[str] = None,
-    article_rdc_pairs: Optional[List[Dict]] = None,
-) -> Dict:
-    """Adjust ARS_MSA_TOTAL/GEN_ART/VAR_ART after rows were INSERTED into
-    ARS_PEND_ALC (manual upload, bulk CSV, or approve_parked).
-
-    Called only after PEND_ALC INSERTs — NOT after DO updates. Reason:
-      • A new pending allocation reduces what's freely available in WH, so
-        FNL_Q and PEND_QTY should reflect that immediately.
-      • A DO arrival physically depletes WH stock, but STK_QTY in MSA tables
-        is a daily snapshot and is not refreshed until the next full MSA run.
-        Touching FNL_Q after a DO without refreshing STK_QTY would
-        over-state the available pool — so we leave MSA alone for DO and
-        let the next-day full MSA reconcile.
-
-    Strategy:
-      1. Identify affected (RDC, VAR_ART) keys.
-      2. Recompute PEND_QTY per key from ARS_PEND_ALC (IS_CLOSED=0 sum).
-      3. UPDATE ARS_MSA_TOTAL: FNL_Q = max(STK_QTY - new_PEND - HOLD_QTY, 0).
-         HOLD_QTY is already stored in the table from the last MSA run.
-      4. Roll up FNL_Q to ARS_MSA_GEN_ART and ARS_MSA_VAR_ART.
-
-    Returns dict with updated row counts per table.
-    """
-    result: Dict = {"msa_total": 0, "msa_gen_art": 0, "msa_var_art": 0, "error": None}
-
-    try:
-        # --- Build affected-articles temp table ---
-        tmp = f"#patch_msa_{uuid.uuid4().hex[:8]}"
-        conn.execute(text(
-            f"CREATE TABLE {tmp} ("
-            f"rdc NVARCHAR(20) COLLATE DATABASE_DEFAULT, "
-            f"art NVARCHAR(30) COLLATE DATABASE_DEFAULT)"
-        ))
-
-        if session_id:
-            conn.execute(text(f"""
-                INSERT INTO {tmp} (rdc, art)
-                SELECT DISTINCT RDC, ARTICLE_NUMBER
-                FROM {PEND_ALC_TABLE}
-                WHERE SESSION_ID = :sid
-            """), {"sid": session_id})
-        elif article_rdc_pairs:
-            conn.execute(
-                text(f"INSERT INTO {tmp} VALUES (:r, :a)"),
-                [{"r": str(p["rdc"]), "a": str(p["article_number"])}
-                 for p in article_rdc_pairs]
-            )
-        else:
-            # Patch all open PEND rows
-            conn.execute(text(f"""
-                INSERT INTO {tmp} (rdc, art)
-                SELECT DISTINCT RDC, ARTICLE_NUMBER
-                FROM {PEND_ALC_TABLE} WHERE IS_CLOSED = 0
-            """))
-
-        # --- Check MSA tables exist ---
-        for tbl in ("ARS_MSA_TOTAL", "ARS_MSA_GEN_ART", "ARS_MSA_VAR_ART"):
-            exists = conn.execute(text(
-                f"SELECT CASE WHEN OBJECT_ID('dbo.{tbl}','U') IS NULL THEN 0 ELSE 1 END"
-            )).scalar() or 0
-            if not exists:
-                logger.info(f"[pend_alc] adjust_msa_after_pend_insert: {tbl} not found — skip")
-                conn.execute(text(
-                    f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
-                ))
-                return result
-
-        # --- Probe article column names (vary by deployment) ---
-        def _col(table, *candidates):
-            for c in candidates:
-                found = conn.execute(text(
-                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
-                    "WHERE TABLE_NAME=:t AND COLUMN_NAME=:c"
-                ), {"t": table, "c": c}).scalar() or 0
-                if found:
-                    return c
-            return candidates[0]  # fallback
-
-        # ARS_MSA_TOTAL article col (MSA pivot uses ARTICLE_NUMBER)
-        total_art  = _col("ARS_MSA_TOTAL",   "ARTICLE_NUMBER", "VAR_ART", "ARTICLE")
-        # ARS_MSA_VAR_ART article col
-        var_art_c  = _col("ARS_MSA_VAR_ART", "VAR_ART", "ARTICLE_NUMBER", "ARTICLE")
-
-        has_hold = conn.execute(text("""
-            SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
-             WHERE TABLE_NAME='ARS_MSA_TOTAL' AND COLUMN_NAME='HOLD_QTY'
-        """)).scalar() or 0
-        hold_expr = "ISNULL(T.HOLD_QTY, 0)" if has_hold else "0"
-
-        logger.info(
-            f"[pend_alc] adjust_msa_after_pend_insert: MSA_TOTAL.art={total_art} "
-            f"VAR_ART.art={var_art_c}"
-        )
-
-        # --- 1. Update ARS_MSA_TOTAL ---
-        r1 = conn.execute(text(f"""
-            UPDATE T
-               SET T.PEND_QTY = ISNULL(P.PEND_TOTAL, 0),
-                   T.FNL_Q    = CASE
-                       WHEN T.STK_QTY - ISNULL(P.PEND_TOTAL, 0) - {hold_expr} < 0
-                       THEN 0
-                       ELSE T.STK_QTY - ISNULL(P.PEND_TOTAL, 0) - {hold_expr}
-                   END
-            FROM ARS_MSA_TOTAL T
-            JOIN {tmp} x ON T.RDC = x.rdc AND T.[{total_art}] = x.art
-            LEFT JOIN (
-                SELECT RDC, ARTICLE_NUMBER, SUM(PEND_QTY) AS PEND_TOTAL
-                FROM {PEND_ALC_TABLE} WHERE IS_CLOSED = 0
-                GROUP BY RDC, ARTICLE_NUMBER
-            ) P ON T.RDC = P.RDC AND T.[{total_art}] = P.ARTICLE_NUMBER
-        """))
-        result["msa_total"] = int(r1.rowcount or 0)
-        conn.commit()  # commit TOTAL update independently
-
-        # --- 2. Roll up to ARS_MSA_VAR_ART ---
-        try:
-            r2 = conn.execute(text(f"""
-                UPDATE V
-                   SET V.FNL_Q    = agg.FNL_Q_SUM,
-                       V.PEND_QTY = agg.PEND_SUM
-                FROM ARS_MSA_VAR_ART V
-                JOIN (
-                    SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{total_art}] AS ART_KEY,
-                           SUM(FNL_Q)    AS FNL_Q_SUM,
-                           SUM(PEND_QTY) AS PEND_SUM
-                    FROM ARS_MSA_TOTAL
-                    WHERE [{total_art}] IN (SELECT art FROM {tmp})
-                    GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, [{total_art}]
-                ) agg ON V.RDC = agg.RDC
-                     AND ISNULL(V.MAJ_CAT,'')        = ISNULL(agg.MAJ_CAT,'')
-                     AND ISNULL(V.GEN_ART_NUMBER,'') = ISNULL(agg.GEN_ART_NUMBER,'')
-                     AND ISNULL(V.CLR,'')             = ISNULL(agg.CLR,'')
-                     AND V.[{var_art_c}]              = agg.ART_KEY
-            """))
-            result["msa_var_art"] = int(r2.rowcount or 0)
-            conn.commit()
-        except Exception as e2:
-            logger.warning(f"[pend_alc] adjust_msa_after_pend_insert VAR_ART rollup skipped: {e2}")
-            conn.rollback()
-
-        # --- 3. Roll up to ARS_MSA_GEN_ART ---
-        try:
-            r3 = conn.execute(text(f"""
-                UPDATE G
-                   SET G.FNL_Q    = agg.FNL_Q_SUM,
-                       G.PEND_QTY = agg.PEND_SUM
-                FROM ARS_MSA_GEN_ART G
-                JOIN (
-                    SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                           SUM(FNL_Q)    AS FNL_Q_SUM,
-                           SUM(PEND_QTY) AS PEND_SUM
-                    FROM ARS_MSA_TOTAL
-                    WHERE [{total_art}] IN (SELECT art FROM {tmp})
-                    GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR
-                ) agg ON G.RDC = agg.RDC
-                     AND ISNULL(G.MAJ_CAT,'')        = ISNULL(agg.MAJ_CAT,'')
-                     AND ISNULL(G.GEN_ART_NUMBER,'') = ISNULL(agg.GEN_ART_NUMBER,'')
-                     AND ISNULL(G.CLR,'')             = ISNULL(agg.CLR,'')
-            """))
-            result["msa_gen_art"] = int(r3.rowcount or 0)
-            conn.commit()
-        except Exception as e3:
-            logger.warning(f"[pend_alc] adjust_msa_after_pend_insert GEN_ART rollup skipped: {e3}")
-            conn.rollback()
-
-        try:
-            conn.execute(text(
-                f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}"
-            ))
-            conn.commit()
-        except Exception:
-            pass
-
-        logger.info(
-            f"[pend_alc] adjust_msa_after_pend_insert: total={result['msa_total']} "
-            f"var={result['msa_var_art']} gen={result['msa_gen_art']}"
-        )
-
-    except Exception as e:
-        logger.warning(f"[pend_alc] adjust_msa_after_pend_insert failed (non-fatal): {e}")
-        result["error"] = str(e)
-
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Adhoc hold-clear — release qty from ARS_NL_TBL_HOLD_TRACKING and re-sync
 # MSA HOLD_QTY/FNL_Q so the released qty is immediately allocatable.
@@ -4463,12 +4391,37 @@ def adjust_msa_after_pend_insert(
 HOLD_TRACKING_TABLE = "ARS_NL_TBL_HOLD_TRACKING"
 
 
+def _has_col(conn, table: str, col: str) -> bool:
+    return bool(conn.execute(text(
+        "SELECT CASE WHEN COL_LENGTH(:t, :c) IS NULL THEN 0 ELSE 1 END"
+    ), {"t": f"dbo.{table}", "c": col}).scalar())
+
+
+def hold_src_rdc_sql(alias: Optional[str] = None,
+                     master_rdc: Optional[str] = None) -> str:
+    """SQL for the warehouse a hold is reserved at (MSA deducts HOLD_QTY
+    there). Same contract as src_rdc_sql: RDC is the store's own warehouse,
+    SRC_RDC the reserving one; rows that predate SRC_RDC held the reserving
+    warehouse in RDC (2026-10-05 contract). `master_rdc` is an optional last
+    fallback, e.g. a store-master column for rows with no RDC at all."""
+    p = f"{alias}." if alias else ""
+    parts = [f"NULLIF({p}[SRC_RDC], '')", f"NULLIF({p}[RDC], '')"]
+    if master_rdc:
+        parts.append(master_rdc)
+    return f"COALESCE({', '.join(parts)})"
+
+
 def _ensure_hold_audit_columns(conn) -> None:
     """Idempotent ALTER: add LAST_REMARKS + LAST_UPDATED_BY to the hold
     tracker. Adhoc clear/revise stamp these so the dashboard can show who
     manually touched a row and why — the normal Step A/B flow leaves them
-    NULL.
+    NULL. Also guarantees SRC_RDC, which every hold reader resolves through
+    hold_src_rdc_sql().
     """
+    conn.execute(text(f"""
+        IF COL_LENGTH('dbo.{HOLD_TRACKING_TABLE}', 'SRC_RDC') IS NULL
+            ALTER TABLE [{HOLD_TRACKING_TABLE}] ADD [SRC_RDC] NVARCHAR(20) NULL
+    """))
     conn.execute(text(f"""
         IF NOT EXISTS (
             SELECT 1 FROM sys.columns
@@ -4503,7 +4456,7 @@ def apply_hold_clear(
     tracker (open rows only) for the affected (RDC, ARTICLE) keys and
     recomputes FNL_Q = max(STK_QTY - PEND_QTY - HOLD_QTY, 0). FNL_Q is
     then rolled up to ARS_MSA_VAR_ART / ARS_MSA_GEN_ART using the same
-    SQL shape as adjust_msa_after_pend_insert.
+    SQL shape as apply_pend_alc_delta.
 
     Returns: {touched_hold, hold_updates, msa_total, msa_var_art, msa_gen_art}.
     `hold_updates` is the audit list for the operations log.
@@ -4581,7 +4534,7 @@ def apply_hold_clear(
         # LISTED_DATE — instead of granting each row the full qty.
         updates = conn.execute(text(f"""
             ;WITH ordered AS (
-                SELECT H.WERKS, H.VAR_ART, H.SZ, H.RDC, H.ALLOC_TYPE,
+                SELECT H.WERKS, H.VAR_ART, H.SZ, H.RDC, H.SRC_RDC, H.ALLOC_TYPE,
                        H.HOLD_REM, H.IS_CLOSED, H.CLOSED_DATE,
                        H.LAST_UPDATED, H.LAST_REMARKS, H.LAST_UPDATED_BY,
                        u.release_qty,
@@ -4627,7 +4580,7 @@ def apply_hold_clear(
                    LAST_REMARKS    = :rmk,
                    LAST_UPDATED_BY = :usr
             OUTPUT INSERTED.WERKS, INSERTED.VAR_ART, INSERTED.SZ,
-                   INSERTED.RDC,
+                   {hold_src_rdc_sql('INSERTED')} AS RDC,
                    DELETED.HOLD_REM   AS OLD_HOLD_REM,
                    INSERTED.HOLD_REM  AS NEW_HOLD_REM,
                    DELETED.IS_CLOSED  AS OLD_IS_CLOSED,
@@ -4663,7 +4616,7 @@ def apply_hold_clear(
         )).scalar() or 0
         if msa_exists and result["touched_hold"] > 0:
             # Probe article column name on MSA_TOTAL — same logic as
-            # adjust_msa_after_pend_insert.
+            # apply_pend_alc_delta.
             def _col(*candidates):
                 for c in candidates:
                     found = conn.execute(text(
@@ -4721,12 +4674,12 @@ def apply_hold_clear(
                     JOIN {tmp_keys} x
                       ON T.RDC = x.rdc AND T.[{total_art}] = x.art
                     LEFT JOIN (
-                        SELECT RDC,
+                        SELECT {hold_src_rdc_sql()} AS RDC,
                                CAST(VAR_ART AS NVARCHAR(30)) AS ART_KEY,
                                SUM(HOLD_REM) AS HOLD_TOTAL
                         FROM [{HOLD_TRACKING_TABLE}]
                         WHERE ISNULL(IS_CLOSED, 0) = 0
-                        GROUP BY RDC, CAST(VAR_ART AS NVARCHAR(30))
+                        GROUP BY {hold_src_rdc_sql()}, CAST(VAR_ART AS NVARCHAR(30))
                     ) H ON T.RDC = H.RDC AND T.[{total_art}] = H.ART_KEY
                 """))
                 result["msa_total"] = int(r1.rowcount or 0)
@@ -4913,7 +4866,7 @@ def apply_hold_revise(
         # remaining ties).
         updates = conn.execute(text(f"""
             ;WITH pick AS (
-                SELECT H.WERKS, H.VAR_ART, H.SZ, H.RDC, H.ALLOC_TYPE,
+                SELECT H.WERKS, H.VAR_ART, H.SZ, H.RDC, H.SRC_RDC, H.ALLOC_TYPE,
                        H.HOLD_REM, H.HOLD_QTY_INITIAL, H.IS_CLOSED,
                        H.CLOSED_DATE, H.LAST_UPDATED, H.LAST_REMARKS,
                        H.LAST_UPDATED_BY,
@@ -4948,7 +4901,7 @@ def apply_hold_revise(
                    LAST_REMARKS   = :rmk,
                    LAST_UPDATED_BY = :usr
             OUTPUT INSERTED.WERKS, INSERTED.VAR_ART, INSERTED.SZ,
-                   INSERTED.RDC,
+                   {hold_src_rdc_sql('INSERTED')} AS RDC,
                    DELETED.HOLD_REM         AS OLD_HOLD_REM,
                    INSERTED.HOLD_REM        AS NEW_HOLD_REM,
                    DELETED.HOLD_QTY_INITIAL AS OLD_INITIAL,
@@ -5035,12 +4988,12 @@ def apply_hold_revise(
                     JOIN {tmp_keys} x
                       ON T.RDC = x.rdc AND T.[{total_art}] = x.art
                     LEFT JOIN (
-                        SELECT RDC,
+                        SELECT {hold_src_rdc_sql()} AS RDC,
                                CAST(VAR_ART AS NVARCHAR(30)) AS ART_KEY,
                                SUM(HOLD_REM) AS HOLD_TOTAL
                         FROM [{HOLD_TRACKING_TABLE}]
                         WHERE ISNULL(IS_CLOSED, 0) = 0
-                        GROUP BY RDC, CAST(VAR_ART AS NVARCHAR(30))
+                        GROUP BY {hold_src_rdc_sql()}, CAST(VAR_ART AS NVARCHAR(30))
                     ) H ON T.RDC = H.RDC AND T.[{total_art}] = H.ART_KEY
                 """))
                 result["msa_total"] = int(r1.rowcount or 0)
@@ -5625,8 +5578,10 @@ def apply_pend_alc_delta(
         bottleneck on large reverts (50K+ rows = 30 s saved). Used by
         _revert_approve.
 
-    rows[i] keys: rdc, st_cd, article_number, maj_cat, gen_art_number, clr,
-                  alloc_qty, do_qty (default 0)
+    rows[i] keys: rdc (= the DISPATCH warehouse, i.e. the row's SRC_RDC —
+                  callers read it through src_rdc_sql()), st_cd,
+                  article_number, maj_cat, gen_art_number, clr,
+                  alloc_qty, do_qty (default 0), alloc_type
     Effective qty per row = (alloc_qty - do_qty) * sign
 
     Returns counts of rows updated per target table (best-effort — missing
@@ -5671,7 +5626,7 @@ def apply_pend_alc_delta(
             # session is a no-op (zero rows inserted → all UPDATEs match 0).
             conn.execute(text(f"""
                 INSERT INTO {tmp} (rdc, st_cd, art, maj_cat, gen_art, clr, alloc_type, qty)
-                SELECT RDC,
+                SELECT {src_rdc_sql()},              -- dispatch WH = MSA pool
                        ISNULL(ST_CD, ''),
                        ARTICLE_NUMBER,
                        ISNULL(MAJ_CAT, ''),
@@ -5992,10 +5947,11 @@ def bootstrap_msa_pend_sync(conn) -> Dict:
         # predates the universe-anchored build.
         r1 = conn.execute(text(f"""
             ;WITH P AS (
-                SELECT RDC, ARTICLE_NUMBER{p_sel}, SUM(PEND_QTY) AS qty
+                SELECT {src_rdc_sql()} AS RDC, ARTICLE_NUMBER{p_sel},
+                       SUM(PEND_QTY) AS qty
                 FROM {PEND_ALC_TABLE}
                 WHERE IS_CLOSED = 0
-                GROUP BY RDC, ARTICLE_NUMBER{p_grp}
+                GROUP BY {src_rdc_sql()}, ARTICLE_NUMBER{p_grp}
             )
             UPDATE T
                SET T.PEND_QTY = ISNULL(P.qty, 0),
@@ -6081,9 +6037,9 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
             Pass None to reseed every row (used by msa_result_storage,
             full MSA builds, and the diagnostic script).
 
-    RDC resolution: prefers ARS_NL_TBL_HOLD_TRACKING.RDC if present (added
-    by listing.py Part 8.6 setup). Falls back to a Master_ALC_INPUT_ST_MASTER
-    join for older rows where RDC is still NULL.
+    Warehouse resolution: hold_src_rdc_sql — the hold's SRC_RDC (reserving
+    warehouse), then its RDC (rows that predate SRC_RDC), then the store
+    master for rows with neither.
 
     Call from:
       • approve_parked, after the PEND delta — keeps HOLD in step with the
@@ -6129,23 +6085,24 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
         scope_join = ""
         sql_params: Dict = {}
         if session_id:
-            # Resolve affected (RDC, ARTICLE) keys via the alloc history for
-            # this session, joined through store master to map WERKS→RDC.
+            # Scope by ARTICLE only, across every warehouse. The session's
+            # holds sit at their reserving warehouse (SRC_RDC), which need not
+            # be the store's own — scoping by the store master's RDC (as this
+            # did until 2026-10-14) skipped exactly the cross-warehouse holds.
+            # Re-syncing an article at a warehouse it has no hold in is a
+            # harmless no-op, so the wider scope is safe.
             scope_cte = f"""
                 , ScopedKeys AS (
                     SELECT DISTINCT
-                           SM.RDC AS rdc,
                            CAST(A.[VAR_ART] AS NVARCHAR(30)) AS art
                     FROM [ARS_ALLOC_HISTORY] A
-                    INNER JOIN [Master_ALC_INPUT_ST_MASTER] SM
-                        ON SM.[ST_CD] = A.[WERKS]
                     WHERE A.[SESSION_ID] = :sid
                       AND A.[OPT_TYPE] IN ('RL','TBC','TBL','NL')
                 )
             """
             scope_join = (
                 "INNER JOIN ScopedKeys SK "
-                "ON SK.rdc = T.RDC AND SK.art = T.[{}]".format(msa_total_art)
+                "ON SK.art = T.[{}]".format(msa_total_art)
             )
             sql_params["sid"] = session_id
 
@@ -6156,15 +6113,18 @@ def bootstrap_msa_hold_sync(conn, session_id: Optional[str] = None) -> Dict:
         """)).scalar() or 0) > 0
 
         if has_rdc_col:
+            h_rdc = (hold_src_rdc_sql("H", "SM.RDC")
+                     if _has_col(conn, HOLD_TRACKING_TABLE, "SRC_RDC")
+                     else "COALESCE(NULLIF(H.RDC, ''), SM.RDC)")
             hold_cte_inner = f"""
-                SELECT COALESCE(NULLIF(H.RDC, ''), SM.RDC) AS rdc,
+                SELECT {h_rdc} AS rdc,
                        CAST(H.VAR_ART AS NVARCHAR(30)) AS art{h_sel},
                        SUM(CAST(H.HOLD_REM AS FLOAT)) AS hold_qty
                 FROM ARS_NL_TBL_HOLD_TRACKING H
                 LEFT JOIN Master_ALC_INPUT_ST_MASTER SM ON SM.ST_CD = H.WERKS
                 WHERE ISNULL(H.IS_CLOSED, 0) = 0
                   AND ISNULL(H.HOLD_REM, 0) > 0
-                GROUP BY COALESCE(NULLIF(H.RDC, ''), SM.RDC),
+                GROUP BY {h_rdc},
                          CAST(H.VAR_ART AS NVARCHAR(30)){h_grp}
             """
         else:

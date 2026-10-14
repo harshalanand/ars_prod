@@ -11,6 +11,7 @@
 **Glossary (short form):**
 - **OPT** = one allocation unit = `(WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR)`
 - **WERKS** = store; **RDC** = regional DC (was `ST_CD` pre-rename)
+- **SRC_RDC** = the warehouse stock ships (pend/BDC) or is reserved (hold) from. On `ARS_PEND_ALC`, `ARS_BDC_HISTORY` and `ARS_NL_TBL_HOLD_TRACKING` (since 2026-10-14) `RDC` = the destination store's own warehouse (descriptive only) and every reader keys on `COALESCE(NULLIF(SRC_RDC,''), RDC)`
 - **STK / PEND / HOLD / FNL_Q** = stock / pending alloc / held / final available
 - **MBQ** = Minimum Base Qty (per-size dispatch unit); **MJ_MBQ** = MAJ_CAT roll-up
 - **SZ_MBQ** = size-level MBQ; **I_ROD** = ideal rounds of dispatch
@@ -66,10 +67,10 @@ These apply across MSA / Grid / Listing / Allocation. A run that violates any of
 | 3 | Fill missing dims | Apply column defaults (e.g. `CLR='NA'`) |
 | 4 | SEG filter | Keep `SEG IN ('APP','GM')` |
 | 5 | Pivot by SLOC | Rename `ST_CD → RDC` **immediately after pivot** (must happen before any downstream column lookup — see § 3.5 bug) |
-| 6 | **Universe backfill** | `_load_universe(slocs, date)` returns `(RDC, GEN_ART)` union of: (A) stock in selected SLOCs, (B) open `ARS_PEND_ALC`, (C) open `ARS_NL_TBL_HOLD_TRACKING`. Backfill VAR_ARTs from `vw_master_product` (loader itself only pulls `ATT_TYP IN` allowlist) so every PEND/HOLD has a row. |
+| 6 | **Universe backfill** | `_load_universe(slocs, date)` returns `(RDC, GEN_ART)` union of: (A) stock in selected SLOCs, (B) open `ARS_PEND_ALC` at its `SRC_RDC` (fallback `RDC`), (C) open `ARS_NL_TBL_HOLD_TRACKING` at the hold's `SRC_RDC` (fallback `RDC` → store master; used the store master's RDC until 2026-10-14). Backfill VAR_ARTs from `vw_master_product` (loader itself only pulls `ATT_TYP IN` allowlist) so every PEND/HOLD has a row. |
 | 6b | **ATT_TYP gate (00/02 only)** (2026-07-13) | Keep only articles whose `ATT_TYP` (SAP category, from `vw_master_product` via `_load_att_typ_map`) ∈ `settings.MSA_ALLOWED_ATT_TYP` (default `['00','02']` = single + variant). Drops `01` generic headers (never allocate a header directly — only its 02 variants) and `11` structured/prepack (not individually replenished). Runs after Step 6 (covers stocked + backfilled), before Step 7 (no obligation lands on an excluded article). Unmapped → dropped; fail-open if unresolvable. Fixed config rule; Grid/Listing/Alloc inherit it. |
-| 7 | Merge PEND | `ARS_PEND_ALC` → `PEND_QTY` on `(RDC, ARTICLE_NUMBER)` |
-| 8 | Merge HOLD | `ARS_NL_TBL_HOLD_TRACKING` → `HOLD_QTY` (map `WERKS → RDC`) |
+| 7 | Merge PEND | `ARS_PEND_ALC` → `PEND_QTY` on `(RDC = COALESCE(NULLIF(SRC_RDC,''), RDC), ARTICLE_NUMBER)` — the dispatch warehouse, never the ledger's store `RDC` (`_load_ars_pending`; typed final value Step 12 `_load_typed_pend`) |
+| 8 | Merge HOLD | `ARS_NL_TBL_HOLD_TRACKING` → `HOLD_QTY` at `COALESCE(NULLIF(SRC_RDC,''), NULLIF(RDC,''), store master RDC)` (`_hold_src_expr`; typed Step 12 `_load_typed_hold`) |
 | 9 | Compute `FNL_Q` | `FNL_Q = max(STK − PEND − HOLD, 0)` |
 | 10 | Threshold | Keep groups where `Σ FNL_Q + Σ PEND_QTY + Σ HOLD_QTY > threshold` (admits pend-only / hold-only groups) |
 | 11 | Aggregate to GEN_ART | Group VAR_ART → GEN_ART by `(RDC, MAJ_CAT, GEN_ART_NUMBER, CLR)` |
@@ -84,7 +85,7 @@ Stock contribution stays **SLOC-scoped**. Products with stock only on *non-selec
 | # | Check | Pass condition |
 |---|---|---|
 | R1 | `Σ TOTAL.PEND_QTY == Σ ARS_PEND_ALC.PEND_QTY` for `IS_CLOSED=0` | Δ = 0 |
-| R2 | `Σ TOTAL.HOLD_QTY == Σ ARS_NL_TBL_HOLD_TRACKING.HOLD_REM` for `IS_CLOSED=0` (via WERKS→RDC) | Δ = 0 |
+| R2 | `Σ TOTAL.HOLD_QTY == Σ ARS_NL_TBL_HOLD_TRACKING.HOLD_REM` for `IS_CLOSED=0` (per warehouse: by hold `SRC_RDC`, fallback `RDC` → store master) | Δ = 0 |
 | R3 | `Σ TOTAL.STK_QTY == Σ VW_ET_MSA_STK_WITH_MASTER.STK_Q` for run date, selected SLOCs, `SEG IN ('APP','GM')` | Δ = 0 |
 | R4 | `count(distinct VAR_ART.ARTICLE_NUMBER) == count(distinct TOTAL.ARTICLE_NUMBER)` per passing group | Equal |
 | R5 | Per `(RDC, MAJ_CAT, GEN_ART, CLR)`: `GEN_ART.X == Σ VAR_ART.X` for X ∈ {STK_QTY, PEND_QTY, HOLD_QTY, FNL_Q} | Equal |
@@ -101,13 +102,13 @@ Only path 1 ever inserts rows or touches `STK_QTY`. Paths 2–8 are UPDATE-only 
 | # | Function | Trigger | Writes |
 |---|---|---|---|
 | 1 | `msa_result_storage.store_results` | MSA Generate | TRUNCATE+INSERT all 3 tables; auto-runs paths 7+8 |
-| 2 | `adjust_msa_after_pend_insert` | PEND_ALC INSERT (manual, CSV, approve_parked) | PEND_QTY/FNL_Q for affected `(RDC, ART)` |
-| 3 | `apply_pend_alc_delta(sign=±1)` | PEND_ALC mutation with explicit sign | PEND_QTY/FNL_Q delta in all 3 |
+| 2 | ~~`adjust_msa_after_pend_insert`~~ | **Removed 2026-10-14** (dead code, no callers) | Manual upload uses #3 |
+| 3 | `apply_pend_alc_delta(sign=±1)` | PEND_ALC mutation with explicit sign (manual upload, approve, revert) | PEND_QTY/FNL_Q delta in all 3, keyed on pending `SRC_RDC` |
 | 4 | `apply_pend_alc_delta_by_session` | Approve Parked / session-scoped revert | Same as #3, scoped by SESSION_ID |
-| 5 | `apply_hold_clear` | Hold Dashboard "Clear" | HOLD_QTY/FNL_Q for closed hold rows |
-| 6 | `apply_hold_revise` | Hold Dashboard "Revise" | HOLD_QTY/FNL_Q for revised hold rows |
-| 7 | `bootstrap_msa_pend_sync` | End of #1, post-revert, post-grid-build | Full reseed of PEND_QTY/FNL_Q |
-| 8 | `bootstrap_msa_hold_sync` | End of #1, after `approve_parked` PEND delta | Reseed HOLD_QTY/FNL_Q |
+| 5 | `apply_hold_clear` | Hold Dashboard "Clear" | HOLD_QTY/FNL_Q for closed hold rows, re-synced on hold `SRC_RDC` |
+| 6 | `apply_hold_revise` | Hold Dashboard "Revise" | HOLD_QTY/FNL_Q for revised hold rows, re-synced on hold `SRC_RDC` |
+| 7 | `bootstrap_msa_pend_sync` | End of #1, post-revert, post-grid-build | Full reseed of PEND_QTY/FNL_Q, keyed on `SRC_RDC` |
+| 8 | `bootstrap_msa_hold_sync` | End of #1, after `approve_parked` PEND delta | Reseed HOLD_QTY/FNL_Q keyed on hold `SRC_RDC`; session-scoped re-sync scopes by ARTICLE across all warehouses |
 
 **Invariant for all paths:** `FNL_Q = max(STK_QTY − PEND_QTY − HOLD_QTY, 0)` is recomputed inside every UPDATE. Rollup is always `TOTAL → VAR_ART → GEN_ART`.
 
@@ -276,7 +277,7 @@ split. `Own` and `Cross` can never satisfy the mode test.
 | BR-RDC-08 | A store with a missing/invalid RDC tag still receives its full allocation; only its sourcing preference falls back. |
 | BR-RDC-09 | One SHIPMENT line may be sourced from at most `ALC_RDC_MAX_SPLIT` RDCs (default 2). |
 | BR-RDC-10 | No silent truncation. Any reduced line is stamped in `ALLOC_REMARKS`, rolled up to the option, and counted in the run log and cockpit. |
-| BR-RDC-11 | `RDC` and `SRC_RDC` never mix. Own/Cross use `RDC` and write no `SRC_RDC` and no split rows; `All RDCs` uses `SRC_RDC`. Readers use `ISNULL(SRC_RDC, RDC)`. |
+| BR-RDC-11 | `RDC` and `SRC_RDC` never mix. Own/Cross use `RDC` and write no `SRC_RDC` and no split rows; `All RDCs` uses `SRC_RDC`. Readers use `ISNULL(SRC_RDC, RDC)`. Since 2026-10-14 the ledgers follow the same rule: `ARS_PEND_ALC`, `ARS_BDC_HISTORY` and the hold ledger carry `SRC_RDC` as its own column (split rows → `ARS_ALLOC_HISTORY.SRC_RDC` unless `MULTI` → run RDC) and keep `RDC` = the store's own warehouse; their readers use `COALESCE(NULLIF(SRC_RDC,''), RDC)`. |
 | BR-RDC-12 | **A HOLD is never split.** The hold tracker's PK `(WERKS, VAR_ART, SZ, ALLOC_TYPE)` cannot express two sources. A short hold takes the largest single RDC and is reduced with `RDC_HOLD_SHORT`. Cross-RDC holds remain allowed. |
 | BR-RDC-13 | Central pooling requires `rdc_mode='all'` **AND** `ALC_RDC_CENTRAL_POOL` active. The flag is resolved ONCE at run start (the rules cache has a 30 s TTL) and passed down as an argument. |
 
@@ -381,13 +382,13 @@ A parked OPT must not re-enter active flow with a different `OPT_TYPE` (invarian
 
 | Risk | Where | Effect |
 |---|---|---|
-| `ARS_PEND_ALC` has only PK on `ID` — no unique on `(SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)` | `pend_alc_service.py:16` (docstring claims grain but `write_manual_pend_alc` doesn't enforce) | Duplicate manual rows silently double-count after `apply_pend_alc_delta` aggregates |
-| Manual upload has no required Pydantic validation | `pend_alc.py:2222` | Blank `rdc` / orphan articles get inserted → MSA delta matches 0 rows → MSA stays stale until next bootstrap |
+| `ARS_PEND_ALC` has only PK on `ID` — no unique on `(SESSION_ID, SRC_RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)` | `pend_alc_service.py:16` (docstring claims grain but `write_manual_pend_alc` doesn't enforce) | Duplicate manual rows silently double-count after `apply_pend_alc_delta` aggregates |
+| Manual upload has no required Pydantic validation | `pend_alc.py:2222` | Blank `src_rdc` (old name `rdc`) / orphan articles get inserted → MSA delta matches 0 rows → MSA stays stale until next bootstrap |
 | `apply_adhoc_close` does **not** sync MSA (no `apply_pend_alc_delta(-1)`, no `bootstrap_msa_pend_sync`) | `pend_alc_service.py:2878` | `MSA_TOTAL.PEND_QTY` stays inflated until next full Generate; listings see lower `FNL_Q` than reality |
-| Adhoc close with blank `ST_CD` is "any-store" wildcard | `pend_alc_service.py:2961` | Empty Excel `ST_CD` column closes every open row for `(RDC, ARTICLE)` across all stores |
+| Adhoc close with blank `ST_CD` is "any-store" wildcard | `pend_alc_service.py:2961` | Empty Excel `ST_CD` column closes every open row for `(SRC_RDC, ARTICLE)` across all stores served from that warehouse |
 | `apply_do_deductions` FIFO partition does **not** include `ALLOC_MODE` | `pend_alc_service.py:3371,3376` | RL DO can settle a TBC allocation (and vice versa) — cross-attribution risk |
-| `update_bdc_history_with_do` `do_qty=0` cancellation has wildcard scope | `pend_alc_service.py:2772-2774` | Cancel with only `(rdc, art)` + `do_qty=0` flips every OPEN BDC for that pair |
-| `_check_adhoc_close_revert` gates on `LAST_DO_AT/LAST_BDC_AT` but `apply_adhoc_close` doesn't touch them | `pend_alc_service.py:3011` | Revert always passes; if BDC was re-generated, two OPEN history rows can co-exist for the same `(RDC, ST_CD, ART)` |
+| `update_bdc_history_with_do` `do_qty=0` cancellation has wildcard scope | `pend_alc_service.py:2772-2774` | Cancel with only `(src_rdc, art)` + `do_qty=0` flips every OPEN BDC for that pair |
+| `_check_adhoc_close_revert` gates on `LAST_DO_AT/LAST_BDC_AT` but `apply_adhoc_close` doesn't touch them | `pend_alc_service.py:3011` | Revert always passes; if BDC was re-generated, two OPEN history rows can co-exist for the same `(SRC_RDC, ST_CD, ART)` |
 
 ---
 
@@ -397,7 +398,7 @@ Walk these in order — failure at step `N` makes step `N+1` meaningless.
 
 ### 8.1 MSA layer (read [§ 3.3](#33-reconciliation-guarantees-must-all-hold-after-every-generate))
 - [ ] **R1** `Σ TOTAL.PEND == Σ PEND_ALC (open)`?
-- [ ] **R2** `Σ TOTAL.HOLD == Σ HOLD_TRACKING (open)` (with WERKS→RDC)?
+- [ ] **R2** `Σ TOTAL.HOLD == Σ HOLD_TRACKING (open)` (per warehouse by hold `SRC_RDC`)?
 - [ ] **R3** `Σ TOTAL.STK == Σ stock view` for run date + selected SLOCs + APP/GM?
 - [ ] **R4** Per group, VAR_ART article-count = TOTAL article-count?
 - [ ] **R5** Per `(RDC, MAJ_CAT, GEN_ART, CLR)`, `GEN_ART.X = Σ VAR_ART.X` for X ∈ {STK, PEND, HOLD, FNL_Q}?
@@ -456,19 +457,19 @@ These are points where the implementation, comments, and recorded rules disagree
 
 ### 9.4 Adhoc close + DO cancel — wildcard `ST_CD` semantics are unsafe defaults
 
-**Observation:** § 7.4 — blank `ST_CD` in adhoc close = "any store"; `do_qty=0` with only `(rdc, art)` = "every open BDC". Copy-paste from Excel commonly leaves these blank.
+**Observation:** § 7.4 — blank `ST_CD` in adhoc close = "any store"; `do_qty=0` with only `(src_rdc, art)` = "every open BDC". Copy-paste from Excel commonly leaves these blank.
 
 **Suggested rule:** require explicit `ALL_STORES=true` in the payload to invoke the wildcard. Default blank `ST_CD` to a rejection with a confirmation prompt.
 
 ### 9.5 `ARS_PEND_ALC` grain claim vs reality
 
-**Observation:** § 7.4 — the docstring claims `(SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)` is the grain, but only the PK exists. `write_manual_pend_alc` doesn't enforce it.
+**Observation:** § 7.4 — the docstring claims `(SESSION_ID, SRC_RDC, ST_CD, ARTICLE_NUMBER, ALLOC_MODE)` is the grain (`RDC` before 2026-10-14), but only the PK exists. `write_manual_pend_alc` doesn't enforce it.
 
 **Suggested rule:** either add a unique index that matches the documented grain, or update the docstring. The current mismatch enables duplicate-row double-counting.
 
 ### 9.6 DO FIFO partition ignores `ALLOC_MODE`
 
-**Observation:** § 7.4 — `apply_do_deductions` partitions FIFO by `(RDC, ST_CD, ART)` without `ALLOC_MODE`. An RL DO can consume a TBC PEND row and vice versa.
+**Observation:** § 7.4 — `apply_do_deductions` partitions FIFO by `(SRC_RDC, ST_CD, ART)` without `ALLOC_MODE`. An RL DO can consume a TBC PEND row and vice versa.
 
 **Suggested rule:** include `ALLOC_MODE` in the FIFO partition unless there is a stated reason for cross-attribution. If cross-attribution is intentional, document it as a rule and surface it in reporting (RL vs TBC "actual mode" columns).
 
@@ -491,5 +492,6 @@ These are points where the implementation, comments, and recorded rules disagree
 | Date | Change | By |
 |---|---|---|
 | 2026-06-26 | Initial consolidated rule master created | Santosh (drafted via Claude) |
+| 2026-10-14 | Ledger `RDC` = store's own warehouse, `SRC_RDC` = dispatch/reserving warehouse: glossary, § 3.1 Steps 6–8, § 3.3 R2, § 3.4 write paths (#2 removed), BR-RDC-11, § 7.4 / § 8.1 / § 9 keys | Santosh (drafted via Claude) |
 
 > **How to extend this doc:** add new rules as a sub-bullet under the matching section. For module-specific deep dives, also append to the relevant `.claude/agents/ars_flow_kb/<area>.md` file with a dated bullet. The ars_flow agent reads those KB files on every invocation, so keeping them in sync makes the next debugging session faster.

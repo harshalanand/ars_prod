@@ -2,8 +2,10 @@
  * ManualPendAlcPage — Manual Pending Allocation entry tool
  * Insert allocation rows directly into ARS_PEND_ALC (SOURCE='MANUAL').
  * The backend automatically adjusts ARS_MSA_TOTAL/GEN_ART/VAR_ART for the
- * affected (RDC, ARTICLE) keys: PEND_QTY goes up, FNL_Q goes down — same
- * for both manual entry and bulk CSV upload.
+ * affected (SRC_RDC, ARTICLE) keys: PEND_QTY goes up, FNL_Q goes down — same
+ * for both manual entry and bulk CSV upload. SRC_RDC = the dispatch
+ * warehouse (sent as `src_rdc`); the ledger's RDC (the store's own
+ * warehouse) is filled by the backend from the store master by ST_CD.
  *
  * Two modes:
  *   - manual: small ad-hoc entry (≤ BULK_THRESHOLD rows). Renders editable table.
@@ -26,6 +28,7 @@ const C = {
   bg: '#f8fafc', card: '#ffffff',
 }
 
+// `rdc` in the row state = the DISPATCH warehouse (sent as `src_rdc`).
 const EMPTY_ROW = {
   rdc: '', st_cd: '', article_number: '', alloc_qty: '',
   maj_cat: '', gen_art_number: '', clr: '', alloc_type: '', remarks: '',
@@ -54,7 +57,10 @@ function parseCsv(text) {
                      .replace(/_+/g, '_')
   const hdr = lines[0].split(',').map(norm)
   const idx = (...names) => hdr.findIndex(h => names.includes(h))
-  const rdcIdx  = idx('rdc','source_warehouse','source_wh','warehouse','wh')
+  // Dispatch warehouse — SRC_RDC (preferred) or the older RDC column. SRC_RDC
+  // wins when a file carries both (RDC there would be the store's own WH).
+  const srcIdx  = idx('src_rdc','srcrdc','dispatch_rdc','dispatch_wh')
+  const rdcIdx  = srcIdx >= 0 ? srcIdx : idx('rdc','source_warehouse','source_wh','warehouse','wh')
   const stIdx   = idx('st_cd','st_code','store','store_code','dest_store','destination_store','werks')
   const artIdx  = idx('article_number','article','material_no','material','matnr','var_art')
   const qtyIdx  = idx('alloc_qty','allocation_qty','qty','quantity','alloc')
@@ -108,7 +114,8 @@ function buildPayload(r, defaultAllocType) {
   const at = (r.alloc_type || '').trim().toUpperCase()
   const allocType = ALLOC_TYPES.includes(at) ? at : (defaultAllocType || '')
   return {
-    rdc:            r.rdc.trim(),
+    src_rdc:        r.rdc.trim(),          // dispatch warehouse
+    rdc:            r.rdc.trim(),          // same value — older backends read `rdc`
     article_number: r.article_number.trim(),
     alloc_qty:      parseFloat(r.alloc_qty),
     ...(r.st_cd?.trim()           ? { st_cd:          r.st_cd.trim() }          : {}),
@@ -171,7 +178,7 @@ export default function ManualPendAlcPage() {
     reader.onload = ev => {
       const parsed = parseCsv(ev.target.result)
       if (!parsed) {
-        toast.error('CSV must have columns: RDC, Article_Number, Alloc_Qty (optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER or GEN_ART, CLR, Alloc_Type [FRESH/GRT], Remarks)')
+        toast.error('CSV must have columns: SRC_RDC (or RDC), Article_Number, Alloc_Qty (optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER or GEN_ART, CLR, Alloc_Type [FRESH/GRT], Remarks)')
         return
       }
       if (parsed.length === 0) {
@@ -196,7 +203,7 @@ export default function ManualPendAlcPage() {
 
   const downloadSample = () => {
     const csv = '﻿'
-      + 'RDC,ST_CD,Article_Number,Alloc_Qty,MAJ_CAT,GEN_ART_NUMBER,CLR,Alloc_Type,Remarks\n'
+      + 'SRC_RDC,ST_CD,Article_Number,Alloc_Qty,MAJ_CAT,GEN_ART_NUMBER,CLR,Alloc_Type,Remarks\n'
       + 'DW01,S001,1000000001,50,FOOTWEAR,90000001,RED,FRESH,Manual top-up\n'
       + 'DW01,S002,1000000001,30,FOOTWEAR,90000001,RED,GRT,Manual top-up\n'
       + 'DW02,S003,1000000002,120,APPAREL,90000002,BLUE,,\n'
@@ -217,7 +224,7 @@ export default function ManualPendAlcPage() {
       r => r.rdc && r.article_number && parseFloat(r.alloc_qty) > 0
     )
     if (!valid.length) {
-      toast.error('No valid rows to submit (check RDC, Article Number, and Alloc Qty > 0)')
+      toast.error('No valid rows to submit (check SRC RDC, Article Number, and Alloc Qty > 0)')
       return
     }
     setSubmitting(true)
@@ -320,7 +327,7 @@ export default function ManualPendAlcPage() {
             IMPORT FROM CSV
           </div>
           <div style={{ fontSize: 9, color: C.textMuted }}>
-            Required: RDC, Article_Number, Alloc_Qty — optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER (or GEN_ART), CLR, Alloc_Type (FRESH/GRT), Remarks
+            Required: SRC_RDC (dispatch WH; RDC also accepted), Article_Number, Alloc_Qty — optional: ST_CD, MAJ_CAT, GEN_ART_NUMBER (or GEN_ART), CLR, Alloc_Type (FRESH/GRT), Remarks
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -393,7 +400,7 @@ export default function ManualPendAlcPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
               <thead>
                 <tr style={{ background: C.bg }}>
-                  {['RDC','ST_CD','Article','Qty','MAJ_CAT','GEN_ART','CLR','Type','Remarks'].map(h => (
+                  {['SRC RDC','ST_CD','Article','Qty','MAJ_CAT','GEN_ART','CLR','Type','Remarks'].map(h => (
                     <th key={h} style={{ padding: '5px 8px', textAlign: 'left',
                                           fontSize: 9, fontWeight: 700, color: C.textSub,
                                           letterSpacing: '.05em',
@@ -438,12 +445,17 @@ export default function ManualPendAlcPage() {
       {!bulkMode && (
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
                       padding: 12, marginBottom: 12, overflowX: 'auto' }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub,
-                        letterSpacing: '.05em', marginBottom: 8 }}>ALLOCATION ROWS</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 8 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textSub,
+                          letterSpacing: '.05em' }}>ALLOCATION ROWS</div>
+            <div style={{ fontSize: 9, color: C.textMuted }}>
+              Store RDC is filled from the store master by ST_CD.
+            </div>
+          </div>
           <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 1100 }}>
             <thead>
               <tr style={{ background: C.bg }}>
-                {['RDC', 'ST_CD', 'Article Number', 'Alloc Qty', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'Type', 'Remarks', ''].map((h, i) => (
+                {['SRC RDC (dispatch)', 'ST_CD', 'Article Number', 'Alloc Qty', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'Type', 'Remarks', ''].map((h, i) => (
                   <th key={i} style={{ padding: '6px 8px', textAlign: 'left', fontSize: 9,
                                        fontWeight: 700, color: C.textSub, letterSpacing: '.05em',
                                        borderBottom: `1px solid ${C.border}` }}>

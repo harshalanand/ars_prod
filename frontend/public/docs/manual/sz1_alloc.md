@@ -376,9 +376,10 @@ Run on the stored rows inside the write transaction (`sz1_run_service.check_stor
   failed, any RDC × article needs more than live MSA free stock now, or any store × MAJ_CAT ×
   size needs more than its room now (store stock now and the other parked sessions);
   warns on an older Step 1 / 2 build or a session older than 2 days. Then one transaction:
-  ARS_PEND_ALC rows (SESSION_ID `1SZ-<id>`, SOURCE / ALLOC_MODE `1SZ`, RDC = ship-from
-  SRC_RDC, ALLOC_TYPE from Step 1 — a mixed article split by live FRESH free stock, FRESH
-  first), `apply_pend_alc_delta(+1)` to MSA and the grid, operation `APPROVE_1SZ`, session →
+  ARS_PEND_ALC rows (SESSION_ID `1SZ-<id>`, SOURCE / ALLOC_MODE `1SZ`, SRC_RDC = the line's
+  ship-from SRC_RDC, RDC = the store's own warehouse from the store master, idempotency guard
+  on SRC_RDC, ALLOC_TYPE from Step 1 — a mixed article split by live FRESH free stock, FRESH
+  first), `apply_pend_alc_delta(+1)` to MSA (by SRC_RDC) and the grid, operation `APPROVE_1SZ`, session →
   APPROVED (APPROVED_BY / AT, PEND_SESSION_ID), balances. Any failure rolls all back.
   From then on Pend ALC manages the rows (BDC, DO, reco, adhoc close).
 * **Re-fit** (blocked approve): discard the session and re-run the same stores and options
@@ -440,7 +441,8 @@ SUPER_ADMIN, tick it for other roles in Settings → Roles).
   full-stock wave never re-issues units the first allocated.
 * Park & approve: two parked sessions on the same article never hold the same pieces; a
   blocked approve shows the shortfall and Re-fit; approving a small session writes
-  ARS_PEND_ALC `1SZ-<id>` rows that match its lines, MSA FNL_Q drops by the same units,
+  ARS_PEND_ALC `1SZ-<id>` rows that match its lines (SRC_RDC = the line's SRC_RDC, RDC = the
+  store's own warehouse), MSA FNL_Q drops by the same units at the SRC_RDC,
   BDC preview lists them; revert before BDC restores MSA, deletes the rows and parks it again.
 * Business head signs off one end-to-end wave before go-live.
 
@@ -609,3 +611,12 @@ approved then reverted) as the end-to-end proof; master clean-up of Master_CONT_
   cov_curve, cov_gap, parked / approved sessions, balance_drift. Lists match the check's
   count; first 5,000 rows on screen, full CSV from the server.
   `GET /sz1/readiness/{scope}/items/{key}/rows|export`; items carry `has_rows`.
+* **2026-10-14 — Approve writes SRC_RDC = ship-from, RDC = the store's warehouse.** Pend ALC's
+  ledgers now carry both: `RDC` = the destination store's own warehouse (store master,
+  descriptive only), `SRC_RDC` = the warehouse the qty ships from, read everywhere as
+  `COALESCE(NULLIF(SRC_RDC,''), RDC)` (see pendalc.md). `sz1_approve_service` therefore writes
+  `SRC_RDC` = the 1SZ line's `SRC_RDC` and `RDC` = store master, and its idempotency guard is on
+  `SRC_RDC`. Supersedes "RDC = ship-from" in the 2026-10-12 phase 3 rule above. 1SZ's own tables
+  are unchanged — they already carried RDC = store, SRC_RDC = ship-from — and its free stock reads
+  ARS_MSA_TOTAL, so it inherits MSA's corrected pending deduction (by SRC_RDC). Code on branch
+  `for_merge`, not yet deployed or migrated (`backend/scripts/041_src_rdc_concept.py`).

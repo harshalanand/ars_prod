@@ -6,7 +6,8 @@ Allocation ledger, or is discarded, re-fitted or trimmed.
                             stock and live store room? blocks / warns / totals.
     approve(sid, user)      ONE transaction: re-check → ARS_PEND_ALC rows
                             (SESSION_ID '1SZ-<sid>', SOURCE / ALLOC_MODE '1SZ',
-                            RDC = ship-from SRC_RDC) → +1 MSA / grid delta →
+                            SRC_RDC = ship-from, RDC = store's own warehouse)
+                            → +1 MSA / grid delta →
                             operation APPROVE_1SZ in the Pend ALC log → header
                             APPROVED → balances re-applied. Any error: nothing.
     revert(sid, user)       through Pend ALC's revert dispatcher (op APPROVE_1SZ),
@@ -205,18 +206,25 @@ src AS (
 def insert_sql(msa_has_type: bool) -> str:
     """The approve INSERT. Bind :sid (1SZ id), :psid (pending id), :remark.
     Idempotent: NOT EXISTS on the pending grain, as write_pend_alc does, with
-    ALLOC_TYPE added because a mixed article yields a FRESH and a GRT row."""
+    ALLOC_TYPE added because a mixed article yields a FRESH and a GRT row.
+
+    In the src CTE `RDC` is the 1SZ line's ship-from warehouse. It is written
+    to ARS_PEND_ALC.SRC_RDC (what MSA, BDC and DO key on); the ledger's RDC
+    is the store's own warehouse from the store master (2026-10-14)."""
     return pend_src_cte(msa_has_type) + f"""
 INSERT INTO {PEND_TABLE}
-    (SESSION_ID, RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
+    (SESSION_ID, RDC, SRC_RDC, ST_CD, ARTICLE_NUMBER, MAJ_CAT, GEN_ART_NUMBER, CLR,
      ALLOC_QTY, DO_QTY, ALLOC_MODE, SOURCE, ALLOC_TYPE, REMARKS)
-SELECT :psid, src.RDC, src.ST_CD, src.ARTICLE_NUMBER, src.MAJ_CAT, src.GEN_ART_NUMBER, src.CLR,
+SELECT :psid,
+       COALESCE((SELECT TOP 1 SM.[RDC] FROM [Master_ALC_INPUT_ST_MASTER] SM
+                  WHERE SM.[ST_CD] = src.ST_CD), src.RDC),
+       src.RDC, src.ST_CD, src.ARTICLE_NUMBER, src.MAJ_CAT, src.GEN_ART_NUMBER, src.CLR,
        src.ALLOC_QTY, 0, '{PEND_MODE}', '{PEND_SOURCE}', src.ALLOC_TYPE, :remark
   FROM src
  WHERE NOT EXISTS (
        SELECT 1 FROM {PEND_TABLE} P
         WHERE P.SESSION_ID         = :psid
-          AND P.RDC                = src.RDC
+          AND COALESCE(NULLIF(P.SRC_RDC, ''), P.RDC) = src.RDC
           AND ISNULL(P.ST_CD, '')  = ISNULL(src.ST_CD, '')
           AND P.ARTICLE_NUMBER     = src.ARTICLE_NUMBER
           AND P.ALLOC_MODE         = '{PEND_MODE}'
