@@ -122,7 +122,7 @@ watermark, so the next incremental run loads everything.
      About 96,000 rows/s measured, against 7,800–13,000 for the classic loader.
    - **Classic insert (fallback)** — pyodbc `fast_executemany` in batches of 20,000,
      committing each batch. Used, with the reason written in the run message, when the
-     job is set to Classic, bcp isn't installed (e.g. Azure), `GET_DATA_FAST_LOADER=0`,
+     job is set to Classic, bcp isn't installed on the server running the backend, `GET_DATA_FAST_LOADER=0`,
      no bcp login works, a column is BINARY, or a text value contains the separators
      themselves (0x1E / 0x1F / NUL).
    `GD_RUN.LOADER` records `bulk` or `classic`.
