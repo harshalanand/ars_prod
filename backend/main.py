@@ -322,7 +322,8 @@ import os
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-static_dir = os.path.join(os.path.dirname(__file__), "static")
+# ARS_STATIC_DIR lets a local prod run serve a fresh build (frontend/dist) without overwriting the committed static/.
+static_dir = os.environ.get("ARS_STATIC_DIR") or os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir) and os.path.exists(os.path.join(static_dir, "index.html")):
     # Serve static assets (JS, CSS, images)
     app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")), name="static-assets")
