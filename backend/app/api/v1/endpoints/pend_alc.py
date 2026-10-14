@@ -234,7 +234,13 @@ def pend_alc_summary(
                        SUM(DO_QTY)                                      AS total_do,
                        SUM(PEND_QTY)                                    AS total_pend,
                        SUM(CASE WHEN IS_CLOSED=1 THEN 1 ELSE 0 END)     AS closed_rows,
-                       SUM(CASE WHEN IS_CLOSED=0 THEN 1 ELSE 0 END)     AS open_rows
+                       SUM(CASE WHEN IS_CLOSED=0 THEN 1 ELSE 0 END)     AS open_rows,
+                       -- DO received against BDC-sent qty, capped per row at
+                       -- BDC_QTY (DO on lines never sent in BDC doesn't count)
+                       SUM(CASE WHEN BDC_QTY > 0 THEN
+                                CASE WHEN ISNULL(DO_QTY,0) < BDC_QTY
+                                     THEN ISNULL(DO_QTY,0) ELSE BDC_QTY END
+                                ELSE 0 END)                             AS do_on_bdc
                 FROM {PEND_ALC_TABLE} WITH (NOLOCK)
                 {at_where}
             """), params).fetchone()
@@ -304,8 +310,10 @@ def pend_alc_summary(
                     "total_pend":  float(row[4] or 0),
                     "closed_rows": int(row[5] or 0),
                     "open_rows":   int(row[6] or 0),
-                    "pct_bdc_covered": round(
-                        100 * float(row[3] or 0) / max(float(row[2] or 1), 1), 1
+                    # None when nothing was sent in BDC (the UI hides the line)
+                    "pct_bdc_covered": (
+                        round(100 * float(row[7] or 0) / float(row[2]), 1)
+                        if float(row[2] or 0) > 0 else None
                     ),
                 },
                 "by_mode": [
