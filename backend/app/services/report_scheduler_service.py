@@ -76,9 +76,8 @@ else:  # POSIX: detach from the controlling terminal's session/signal group
 EVENT_LISTING_APPROVED = "listing.approved"
 EVENT_PENDALC_APPROVED = "pendalc.approved"
 EVENT_MSA_COMPLETED = "msa.completed"
-EVENT_AUTOCONT_COMPLETED = "autocont.completed"
 KNOWN_EVENTS = {EVENT_LISTING_APPROVED, EVENT_PENDALC_APPROVED,
-                EVENT_MSA_COMPLETED, EVENT_AUTOCONT_COMPLETED}
+                EVENT_MSA_COMPLETED}
 
 
 # ── Self-healing DDL ────────────────────────────────────────────────────────

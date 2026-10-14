@@ -23,7 +23,6 @@ Reference docs (read these before making non-trivial changes):
 - `backend/app/docs/processes/fallback_archived.md`
 - `backend/app/docs/processes/pend_alc_lifecycle.md`
 - `backend/app/docs/processes/msa_stock_calculation.md`
-- `backend/app/docs/processes/contribution_percentage.md`
 - `backend/app/docs/processes/full_replenishment_cycle.md`
 - `backend/app/docs/processes/ars_pipeline_complete_reference.md`
 
@@ -51,7 +50,7 @@ with SessionLocal() as db:
     rows = db.execute(text("SELECT TOP 100 ... FROM rep_data.dbo.alloc_detail WHERE ...")).fetchall()
 ```
 
-Key tables (rep_data DB): `store_stock`, `store_sales`, `alloc_header`, `alloc_detail`, `retail_gen_article`, `retail_variant_article`, `ARS_MSA_TOTAL`, `ARS_MSA_GEN_ART`, `ARS_MSA_VAR_ART`, `MSA_Calculation_Sequence`, `Cont_presets`, `ARS_CHECKLIST`.
+Key tables (rep_data DB): `store_stock`, `store_sales`, `alloc_header`, `alloc_detail`, `retail_gen_article`, `retail_variant_article`, `ARS_MSA_TOTAL`, `ARS_MSA_GEN_ART`, `ARS_MSA_VAR_ART`, `MSA_Calculation_Sequence`, `ARS_CHECKLIST`.
 
 Key tables (claude DB): `rbac_roles`, `rbac_users`, `rbac_permissions`, `rls_stores`, `audit_log`.
 

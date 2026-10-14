@@ -4,7 +4,7 @@
  * The dynamic replacement for the manual "STORE OPENING DATES *.xlsx" workbook.
  * You upload only ST_CD + proposed opening date + share date; identity is
  * joined live from the store master and metrics (MBQ / stock / SLOC-wise /
- * fill-rate) from the latest TREND_ST row. Date & remark changes are tracked
+ * fill-rate) from ARS_GRID_MJ summed per store. Date & remark changes are tracked
  * as event history — counts, first/last, and delays are all derived.
  * See services/upc_store_track_service.py + manual/upc_tracking.md.
  */

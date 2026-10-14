@@ -1,10 +1,10 @@
 # CLAUDE.md — Instructions for Claude Code + Claude Desktop
 
 ## ARS MANUAL = SOURCE OF TRUTH (read before changing any ARS module)
-The canonical spec for every ARS module lives in **`frontend/public/docs/manual/<module>.md`** — one dossier per module (`msa, grid, merge, listing, review, hold, pendalc, start, dictionary`) with **BRD** (business why), **FSD** (rules, formulas, validation gates), and appendable **Recorded rules**. These same files render in-app at `/manual/*` for humans AND are Claude's memory.
+The canonical spec for every ARS module lives in **`frontend/public/docs/manual/<module>.md`** — one dossier per module (`msa, grid, merge, listing, review, hold, pendalc, start, dictionary`) with **BRD** (business why), **FSD** (rules, formulas, validation gates), and appendable **Recorded rules**. They are Claude's memory and the spec for every change. (The in-app Training Manual viewer at `/manual/*` was removed on 2026-10-14; the dossiers stay.)
 
 - **Before** developing/changing an ARS area, READ its dossier and conform to it. It says how MSA is calculated and why, each column's relevance, how Grid/Listing/Pending-Allocation work, and the "validate first, then create" gates.
-- **After** changing logic, UPDATE that dossier's FSD + `## Recorded rules`, keep `ARS_DATA_DICTIONARY` in sync, and re-run screenshots if the UI changed. See `tools/manual/REFRESH.md`.
+- **After** changing logic, UPDATE that dossier's FSD + `## Recorded rules` and keep `ARS_DATA_DICTIONARY` in sync. See `tools/manual/REFRESH.md`.
 - A PostToolUse hook (`tools/manual/doc_drift_hook.mjs`) reminds which dossier to update when you edit a backend ARS source file.
 - The terse per-area files in `.claude/agents/ars_flow_kb/` and `docs/RULE_MASTER.md` are extracts of these dossiers — keep them consistent, dossiers win.
 
@@ -73,7 +73,7 @@ Nubo: nubo-hub, nubo-ads-dashboard, nubo-ads-bot, nubo-ads-cron, nubo-ads-snapsh
 Claude DB:   rbac_roles, rbac_users, rbac_permissions, rls_stores, audit_log
 Rep_data DB: store_stock, store_sales, alloc_header, alloc_detail, retail_gen_article,
              retail_variant_article, ARS_MSA_TOTAL, ARS_MSA_GEN_ART, ARS_MSA_VAR_ART,
-             MSA_Calculation_Sequence, Cont_presets, ARS_CHECKLIST
+             MSA_Calculation_Sequence, ARS_CHECKLIST
 
 ## MSA ALGORITHM (9 steps in msa_service.py)
 filter SLOC → normalize → fill dims → SEG=[APP,GM] → pivot by SLOC

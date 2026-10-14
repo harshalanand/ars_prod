@@ -575,7 +575,6 @@ def get_events(current_user: User = Depends(get_current_user)):
         "listing.approved": "Listing approve",
         "pendalc.approved": "Pending allocation approve",
         "msa.completed": "MSA calculation",
-        "autocont.completed": "Auto Contrib",
     }
     return APIResponse(success=True, data=[
         {"event": e, "label": labels.get(e, e)} for e in sorted(KNOWN_EVENTS)])

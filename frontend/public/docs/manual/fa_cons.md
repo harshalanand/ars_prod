@@ -332,8 +332,7 @@ Reuse:
 ### E. Cross-cutting revised rules
 
 - **All segments:** the two-segment restriction is hard-coded as
-  `SEG IN ('APP','GM')` at `msa_service.py:498` and `:1241` (and mirrored in
-  `contrib.py:316/318/613/907`, `auto_contrib.py:510`). Relaxing it to all segments
+  `SEG IN ('APP','GM')` at `msa_service.py:498` and `:1241`. Relaxing it to all segments
   is the **single highest-risk change** — it widens the MSA universe and touches
   every downstream calc; it must be gated and validated in isolation, not bundled
   with the FA & CONS scaffold.

@@ -734,76 +734,6 @@ export const lookupArtMasterAPI = {
     }),
 }
 
-// ============== Contribution Percentage v2 ==============
-export const contribAPI = {
-  // Config
-  getGroupingColumns: ()    => api.get('/contrib/config/grouping-columns'),
-  getMonths:          ()    => api.get('/contrib/config/months'),
-  getSsnValues:       ()    => api.get('/contrib/config/ssn-values'),
-  getMajcats:    (gc)       => api.get('/contrib/config/majcats', { params: { grouping_column: gc } }),
-  // Presets
-  listPresets:   ()         => api.get('/contrib/presets'),
-  savePreset:    (data)     => api.post('/contrib/presets', data),
-  deletePreset:  (name)     => api.delete(`/contrib/presets/${encodeURIComponent(name)}`),
-  reorderPresets:(seq)      => api.put('/contrib/presets/reorder', { sequence: seq }),
-  // Mappings
-  listMappings:  ()         => api.get('/contrib/mappings'),
-  saveMapping:   (data)     => api.post('/contrib/mappings', data),
-  deleteMapping: (name)     => api.delete(`/contrib/mappings/${encodeURIComponent(name)}`),
-  // Assignments
-  listAssignments: ()       => api.get('/contrib/assignments'),
-  saveAssignment:  (data)   => api.post('/contrib/assignments', data),
-  deleteAssignment:(id)     => api.delete(`/contrib/assignments/${id}`),
-  // Execute (creates background job)
-  execute: (data)           => api.post('/contrib/execute', data),
-  // Jobs
-  listJobs:    ()           => api.get('/contrib/jobs'),
-  getJob:      (id)         => api.get(`/contrib/jobs/${id}`),
-  cancelJob:   (id)         => api.post(`/contrib/jobs/${id}/cancel`),
-  deleteJob:   (id)         => api.delete(`/contrib/jobs/${id}`),
-  pauseJob:    (id)         => api.post(`/contrib/jobs/${id}/pause`),
-  resumeJob:   (id)         => api.post(`/contrib/jobs/${id}/resume`),
-  downloadJobResult: (id, type) => api.get(`/contrib/jobs/${id}/download/${type}`, { responseType: 'blob', timeout: 600000 }),
-  // Review
-  listTables:    ()         => api.get('/contrib/review/tables'),
-  previewTable:  (name, limit=500, filters={}) => {
-    const params = { limit }
-    Object.entries(filters).forEach(([col, vals]) => { if (vals.length) params[`f_${col}`] = vals.join(',') })
-    return api.get(`/contrib/review/preview/${encodeURIComponent(name)}`, { params })
-  },
-  downloadTable: (name)     => api.get(`/contrib/review/download/${encodeURIComponent(name)}`, { responseType: 'blob', timeout: 600000 }),
-  deleteTable:   (name)     => api.delete(`/contrib/review/tables/${encodeURIComponent(name)}`),
-  // Review Export Jobs (background download)
-  startExport:      (name, filters={})  => api.post(`/contrib/review/export/${encodeURIComponent(name)}`, { filters }),
-  listExports:      ()      => api.get('/contrib/review/exports'),
-  getExport:        (id)    => api.get(`/contrib/review/exports/${id}`),
-  downloadExport:   (id)    => api.get(`/contrib/review/exports/${id}/download`, { responseType: 'blob', timeout: 600000 }),
-  deleteExport:     (id)    => api.delete(`/contrib/review/exports/${id}`),
-}
-
-// ============== Auto Cont % (SQL-direct pipeline) ==============
-// Reuses Cont_presets / Cont_mappings via contribAPI above (those tables are
-// shared with the pandas pipeline). Only compute, jobs, and table I/O are
-// net-new here.
-export const autoContAPI = {
-  status:        ()       => api.get('/auto-cont/status'),
-  // execute now creates a background JOB (returns { job_id }) — no longer
-  // blocks the request. Poll /jobs/{id} for status.
-  execute:       (data)   => api.post('/auto-cont/execute', data),
-  // Jobs
-  listJobs:      ()       => api.get('/auto-cont/jobs'),
-  getJob:        (id)     => api.get(`/auto-cont/jobs/${id}`),
-  cancelJob:     (id)     => api.post(`/auto-cont/jobs/${id}/cancel`),
-  deleteJob:     (id)     => api.delete(`/auto-cont/jobs/${id}`),
-  // Tables
-  listTables:    ()       => api.get('/auto-cont/tables'),
-  preview:       (name, limit=200) =>
-    api.get(`/auto-cont/preview/${encodeURIComponent(name)}`, { params: { limit } }),
-  dropTable:     (name)   => api.delete(`/auto-cont/tables/${encodeURIComponent(name)}`),
-  downloadTable: (name)   => api.get(`/auto-cont/download/${encodeURIComponent(name)}`,
-                                      { responseType: 'blob', timeout: 600000 }),
-}
-
 // ============== Data Checklist ==============
 export const checklistAPI = {
   getItems:         ()           => api.get('/checklist/items'),
@@ -920,22 +850,6 @@ export const getDataAPI = _gdChecked({
   listRuns:   (params)        => api.get('/get-data/runs', { ..._GD, params }),
   getRun:     (id)            => api.get(`/get-data/runs/${id}`, _GD),
 })
-
-// ============== Trends ==============
-export const trendsAPI = {
-  listTables:      ()                    => api.get('/trends/tables'),
-  getSchema:       (name)                => api.get(`/trends/tables/${encodeURIComponent(name)}/schema`),
-  getDistinct:     (name, col)           => api.get(`/trends/tables/${encodeURIComponent(name)}/distinct/${encodeURIComponent(col)}`),
-  uploadPreview:   (formData)            => api.post('/trends/upload/preview', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
-  checkConflicts:  (data)                => api.post('/trends/upload/check-conflicts', data),
-  upload:          (formData, onProgress) => api.post('/trends/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: onProgress, timeout: 300000 }),
-  review:          (data)                => api.post('/trends/review', data),
-  downloadReview:  (name, params)        => api.get(`/trends/review/${encodeURIComponent(name)}/download`, { params, responseType: 'blob', timeout: 600000 }),
-  createTable:     (formData)            => api.post('/trends/create-table', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
-  truncateTable:   (name)                => api.post(`/trends/admin/truncate/${encodeURIComponent(name)}`),
-  dropTable:       (name)                => api.delete(`/trends/admin/drop/${encodeURIComponent(name)}`),
-  alterColumns:    (name, data)          => api.put(`/trends/admin/${encodeURIComponent(name)}/columns`, data),
-}
 
 // ============== Maintenance (superadmin only) ==============
 export const maintenanceAPI = {
@@ -1182,39 +1096,6 @@ export const pendAlcAPI = {
       params, headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 10 * 60 * 1000,
     })
-  },
-}
-
-// ============== Project Tracker ==============
-export const ptAPI = {
-  enums:        ()                       => api.get('/pt/enums'),
-  list:         (params = {})            => api.get('/pt/projects',          { params }),
-  tree:         (params = {})            => api.get('/pt/projects/tree',     { params }),
-  get:          (id)                     => api.get(`/pt/projects/${id}`),
-  create:       (data)                   => api.post('/pt/projects', data),
-  update:       (id, data)               => api.put(`/pt/projects/${id}`, data),
-  archive:      (id)                     => api.delete(`/pt/projects/${id}`),
-  restore:      (id)                     => api.post(`/pt/projects/${id}/restore`),
-  move:         (id, new_parent_id)      => api.post(`/pt/projects/${id}/move`,
-                                                     { new_parent_id }),
-  activity:     (id, limit = 100)        => api.get(`/pt/projects/${id}/activity`,
-                                                    { params: { limit } }),
-  dashboard:    ()                       => api.get('/pt/dashboard'),
-  myTasks:      ()                       => api.get('/pt/my-tasks'),
-  attachments: {
-    list:     (pid)      => api.get(`/pt/projects/${pid}/attachments`),
-    upload:   (pid, file) => {
-      const fd = new FormData()
-      fd.append('file', file)
-      return api.post(`/pt/projects/${pid}/attachments`, fd, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 5 * 60 * 1000,
-      })
-    },
-    downloadUrl: (aid)   => `${API_BASE}/pt/attachments/${aid}/download`,
-    download: (aid)      => api.get(`/pt/attachments/${aid}/download`,
-                                    { responseType: 'blob' }),
-    delete:   (aid)      => api.delete(`/pt/attachments/${aid}`),
   },
 }
 

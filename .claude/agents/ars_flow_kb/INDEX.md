@@ -1,6 +1,6 @@
 # ars_flow knowledge base — index
 
-> **⭐ CANONICAL SOURCE = the ARS Manual dossiers:** `frontend/public/docs/manual/<module>.md` (`msa, grid, merge, listing, review, hold, pendalc`). Those hold the full BRD + FSD (rules, formulas, validation gates) and render in-app at `/manual/*`. **Read the dossier first**; the terse per-area files here are the quick-rules extract. When they disagree, the dossier wins. New rules are appended to the dossier's `## Recorded rules` AND (optionally) mirrored here.
+> **⭐ CANONICAL SOURCE = the ARS Manual dossiers:** `frontend/public/docs/manual/<module>.md` (`msa, grid, merge, listing, review, hold, pendalc`). Those hold the full BRD + FSD (rules, formulas, validation gates). **Read the dossier first**; the terse per-area files here are the quick-rules extract. When they disagree, the dossier wins. New rules are appended to the dossier's `## Recorded rules` AND (optionally) mirrored here.
 
 This directory holds the quick per-area rule extracts. The `ars_flow` subagent reads the relevant file(s) on every invocation and appends new rules as the user states them.
 

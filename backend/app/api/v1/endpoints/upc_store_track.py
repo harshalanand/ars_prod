@@ -4,7 +4,7 @@ UPC Store Tracking API  (prefix /upc-store-track)
 Store-opening lifecycle tracker — the dynamic replacement for the manual
 "STORE OPENING DATES *.xlsx" workbook. Upload only ST_CD + proposed opening
 date + share date; identity is joined from Master_ALC_INPUT_ST_MASTER and
-metrics (MBQ / stock / SLOC-wise / fill-rate) from the latest TREND_ST row.
+metrics (MBQ / stock / SLOC-wise / fill-rate) from ARS_GRID_MJ summed per store.
 Date & remark history is event-based. See services/upc_store_track_service.py.
 """
 from typing import Any, List, Optional

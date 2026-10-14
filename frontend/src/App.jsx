@@ -22,22 +22,6 @@ const RLSPage                = lazy(() => import('@/pages/RLSPage'))
 const TableManagementPage    = lazy(() => import('@/pages/TableManagementPage'))
 const SettingsPage           = lazy(() => import('@/pages/SettingsPage'))
 const MSAStockCalculationPage= lazy(() => import('@/pages/MSAStockCalculationPage'))
-const ContribPresetsPage     = lazy(() => import('@/pages/ContribPresetsPage'))
-const ContribMappingsPage    = lazy(() => import('@/pages/ContribMappingsPage'))
-const ContribExecutePage     = lazy(() => import('@/pages/ContribExecutePage'))
-const ContribReviewPage      = lazy(() => import('@/pages/ContribReviewPage'))
-// Auto Cont % — SQL-direct pipeline (placeholders during rollout, superadmin-only)
-const AutoContPresetsPage    = lazy(() => import('@/pages/AutoContPresetsPage'))
-const AutoContMappingsPage   = lazy(() => import('@/pages/AutoContMappingsPage'))
-const AutoContExecutePage    = lazy(() => import('@/pages/AutoContExecutePage'))
-const AutoContJobsPage       = lazy(() => import('@/pages/AutoContJobsPage'))
-const AutoContReviewPage     = lazy(() => import('@/pages/AutoContReviewPage'))
-// ALC_Fixture — MSA-STK Allocation Engine (blueprint v1.0, superadmin-only during rollout)
-const AlcFixtureTunablesPage  = lazy(() => import('@/pages/AlcFixtureTunablesPage'))
-const AlcFixtureExecutePage   = lazy(() => import('@/pages/AlcFixtureExecutePage'))
-const AlcFixtureReviewPage    = lazy(() => import('@/pages/AlcFixtureReviewPage'))
-const AlcFixtureDashboardPage = lazy(() => import('@/pages/AlcFixtureDashboardPage'))
-const AlcFixtureJobsPage      = lazy(() => import('@/pages/AlcFixtureJobsPage'))
 const JobsDashboardPage      = lazy(() => import('@/pages/JobsDashboardPage'))
 const StoreStockPage         = lazy(() => import('@/pages/StoreStockPage'))
 const GridBuilderPage        = lazy(() => import('@/pages/GridBuilderPage'))
@@ -61,19 +45,8 @@ const ArsDashboardPage       = lazy(() => import('@/pages/ArsDashboardPage'))
 const AlcReviewPage          = lazy(() => import('@/pages/AlcReviewPage'))
 const GapReportPage          = lazy(() => import('@/pages/GapReportPage'))
 const ChecklistPage          = lazy(() => import('@/pages/ChecklistPage'))
-const TrendUploadPage        = lazy(() => import('@/pages/TrendUploadPage'))
-const TrendReviewPage        = lazy(() => import('@/pages/TrendReviewPage'))
-const TrendAdminPage         = lazy(() => import('@/pages/TrendAdminPage'))
-const TrendDashboardPage     = lazy(() => import('@/pages/TrendDashboardPage'))
 const TempDBAdminPage        = lazy(() => import('@/pages/TempDBAdminPage'))
 const DevSyncManagerPage     = lazy(() => import('@/pages/DevSyncManagerPage'))
-// Project Tracker
-const PTDashboardPage        = lazy(() => import('@/pages/pt/PTDashboardPage'))
-const PTProjectsPage         = lazy(() => import('@/pages/pt/PTProjectsPage'))
-const PTProjectDetailPage    = lazy(() => import('@/pages/pt/PTProjectDetailPage'))
-const PTMyTasksPage          = lazy(() => import('@/pages/pt/PTMyTasksPage'))
-const TrainingManualPage     = lazy(() => import('@/pages/TrainingManualPage'))
-const ManualGalleryPage      = lazy(() => import('@/pages/ManualGalleryPage'))
 const DataDictionaryPage     = lazy(() => import('@/pages/DataDictionaryPage'))
 const ReportGenerationPage   = lazy(() => import('@/pages/ReportGenerationPage'))
 const DailyActivityLogPage   = lazy(() => import('@/pages/DailyActivityLogPage'))
@@ -193,23 +166,6 @@ export default function App() {
         <Route path="data-dictionary" element={<ErrorBoundary><DataDictionaryPage /></ErrorBoundary>} />
         {/* Data Preparation */}
         <Route path="msa" element={<ProtectedRoute permission="MSA_VIEW"><MSAStockCalculationPage /></ProtectedRoute>} />
-        <Route path="contribution/presets" element={<ProtectedRoute permission="CONTRIB_PRESETS"><ContribPresetsPage /></ProtectedRoute>} />
-        <Route path="contribution/mappings" element={<ProtectedRoute permission="CONTRIB_MAPPINGS"><ContribMappingsPage /></ProtectedRoute>} />
-        <Route path="contribution/execute" element={<ProtectedRoute permission="CONTRIB_EXECUTE"><ContribExecutePage /></ProtectedRoute>} />
-        <Route path="contribution/review" element={<ProtectedRoute permission="CONTRIB_REVIEW"><ContribReviewPage /></ProtectedRoute>} />
-        {/* Auto Cont % — SQL-direct pipeline (superadmin-only during rollout) */}
-        <Route path="auto-cont/presets"  element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContPresetsPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="auto-cont/mappings" element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContMappingsPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="auto-cont/execute"  element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContExecutePage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="auto-cont/jobs"     element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContJobsPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="auto-cont/review"   element={<ProtectedRoute superadminOnly><ErrorBoundary><AutoContReviewPage /></ErrorBoundary></ProtectedRoute>} />
-        {/* ALC_Fixture — MSA-STK Allocation Engine (superadmin-only during rollout) */}
-        <Route path="alc-fixture"            element={<Navigate to="/alc-fixture/execute" replace />} />
-        <Route path="alc-fixture/tunables"   element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureTunablesPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="alc-fixture/execute"    element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureExecutePage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="alc-fixture/review"     element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureReviewPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="alc-fixture/dashboard"  element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureDashboardPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="alc-fixture/jobs"       element={<ProtectedRoute superadminOnly><ErrorBoundary><AlcFixtureJobsPage /></ErrorBoundary></ProtectedRoute>} />
         <Route path="data-validation/store-sloc" element={<ProtectedRoute permission="STORE_SLOC_VIEW"><StoreStockPage /></ProtectedRoute>} />
         <Route path="data-validation/checklist" element={<ProtectedRoute permission="CHECKLIST_VIEW"><ChecklistPage /></ProtectedRoute>} />
         {/* Data Preparation - Grid Builder */}
@@ -219,23 +175,6 @@ export default function App() {
         <Route path="data-prep/listing" element={<ErrorBoundary><ListingPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/run-params" element={<ErrorBoundary><RunParamsPage /></ErrorBoundary>} />
-        {/* Process docs — in-app explanation of Listing + Allocation pipeline */}
-        <Route path="manual"              element={<Navigate to="/manual/start" replace />} />
-        <Route path="manual/gallery"      element={<ErrorBoundary><ManualGalleryPage /></ErrorBoundary>} />
-        <Route path="manual/:module"      element={<ErrorBoundary><TrainingManualPage /></ErrorBoundary>} />
-        {/* Back-compat: old Process routes → new Manual */}
-        <Route path="process"             element={<Navigate to="/manual/start" replace />} />
-        <Route path="process/:module"     element={<Navigate to="/manual/start" replace />} />
-        {/* Project Tracker */}
-        <Route path="pt"                   element={<ErrorBoundary><PTDashboardPage /></ErrorBoundary>} />
-        <Route path="pt/projects"          element={<ErrorBoundary><PTProjectsPage /></ErrorBoundary>} />
-        <Route path="pt/projects/:id"      element={<ErrorBoundary><PTProjectDetailPage /></ErrorBoundary>} />
-        <Route path="pt/my-tasks"          element={<ErrorBoundary><PTMyTasksPage /></ErrorBoundary>} />
-        {/* Trends */}
-        <Route path="trends/dashboard" element={<ProtectedRoute permission="TRENDS_DASHBOARD"><ErrorBoundary><TrendDashboardPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="trends/upload" element={<ProtectedRoute permission="TRENDS_UPLOAD"><ErrorBoundary><TrendUploadPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="trends/review" element={<ProtectedRoute permission="TRENDS_REVIEW"><ErrorBoundary><TrendReviewPage /></ErrorBoundary></ProtectedRoute>} />
-        <Route path="trends/admin" element={<ErrorBoundary><TrendAdminPage /></ErrorBoundary>} />
         {/* Reports */}
         <Route path="reports/generation" element={<ErrorBoundary><ReportGenerationPage /></ErrorBoundary>} />
         <Route path="reports/pend-alc" element={<PendAlcReportPage />} />

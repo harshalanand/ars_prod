@@ -1,16 +1,19 @@
 ---
 title: Allocation Engine v2 (score-based)
 tags: [ars, allocation, v2, score-based]
-updated: 2026-07-17
+updated: 2026-10-14
 ---
 
 # Allocation Engine v2 (score-based)
 
-A **separate, newer** allocation engine — NOT the live [[Rule Engine (per_opt)|per_opt]] pipeline. It scores each article against each store on weighted attributes and cascades budget by score. In rollout; the UI (ALC_Fixture pages) is superadmin-only. Don't conflate the two engines.
+A **separate, newer** allocation engine — NOT the live [[Rule Engine (per_opt)|per_opt]] pipeline. It scores each article against each store on weighted attributes and cascades budget by score. In rollout. Its UI is `backend/static/allocation.html`. Don't conflate the two engines.
+
+> [!note] Correction (2026-10-14)
+> Earlier versions of this note called the `/alc-fixture/*` pages the v2 UI. That was wrong. ALC_Fixture was a frontend-only placeholder with no backend, and it was removed on 2026-10-14. The v2 engine and its UI were not touched.
 
 - **Router:** `/allocation-engine` (`backend/app/api/v1/endpoints/allocation_engine.py`) + service `backend/app/services/allocation_engine.py`.
 - **Migration:** `scripts/020_allocation_engine_tables.sql` (Rep_Data).
-- **Frontend:** `/alc-fixture/{tunables,execute,review,dashboard,jobs}` (AlcFixture*Page).
+- **Frontend:** `backend/static/allocation.html` (v2 UI). The former `/alc-fixture/*` placeholder pages were removed 2026-10-14.
 
 ## Concept
 Instead of the OPT_TYPE waterfall, an article's fit for a store is a **weighted score** over matching attributes; budget cascades to the highest-scoring article×store assignments.
@@ -31,8 +34,8 @@ Seeded `default` weights (attribute → weight):
 
 ## Status & caveats
 - Score-based engine is **parallel to, not part of** the production Listing→Allocation flow (which is [[Rule Engine (per_opt)]]). Runs write to `alloc_*` tables, not `ARS_ALLOC_*`.
-- Superadmin-only ALC_Fixture pages during rollout.
+- The superadmin-only `/alc-fixture/*` pages were removed 2026-10-14. They were a placeholder, not this engine's UI.
 - This note is scoped from migrations + route signatures; the scoring/cascade internals are not yet deep-read to the level of the [[Allocation Waterfall (Step by Step)]] note. Deep-dive is a good follow-up if this engine goes live.
 
 ## Cross-links
-[[Rule Engine (per_opt)]] (the live engine) · [[Data Model]] (mig 020 tables) · [[Frontend Map]] (ALC_Fixture routes).
+[[Rule Engine (per_opt)]] (the live engine) · [[Data Model]] (mig 020 tables) · [[Frontend Map]] (`/alc-fixture` routes removed 2026-10-14).

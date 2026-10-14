@@ -6,7 +6,7 @@
    only ST_CD + proposed opening date + share date; the rest of the identity
    (name/RDC/hub/status/op-date/priority) is joined LIVE from
    Master_ALC_INPUT_ST_MASTER, and the metrics (MBQ / total stock / SLOC-wise /
-   fill-rate / display qty) are joined LIVE from the latest TREND_ST row per
+   fill-rate / display qty) are joined LIVE from ARS_GRID_MJ summed per
    store. Only the *tracking state* (dates given, remarks, layout) is persisted
    here.
 

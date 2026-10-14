@@ -1,7 +1,7 @@
 ---
 title: Data Model
 tags: [ars, data-model, tables, migrations]
-updated: 2026-07-17
+updated: 2026-10-14
 ---
 
 # Data Model
@@ -21,7 +21,7 @@ Two logical databases on `HOPC866`: **Claude** (system — RBAC/RLS/audit/jobs, 
 | `Master_ALC_INPUT_CO_ART` / `_ST_ART` | MAJ_CAT×10_DIGIT×CLR (+ST) | article cascade: I_ROD, MANUAL_DENSITY, CORE/AUTO/HH flags |
 | `MASTER_GEN_ART_SALE` | ST×MAJ_CAT×GEN_ART×CLR | pre-computed `SAL_PD` |
 | `Master_CONT_<dim>` / `Master_CONT_MERGE_<dim>` | ST×MAJ_CAT×dim | contribution per grain / merged (derived by [[Merge Rules]]) |
-| `Cont_presets` | preset | KPI/contribution presets (JSON) — see [[Contribution and CONT]] |
+| ~~`Cont_presets`~~ | preset | REMOVED 2026-10-14 with Contribution % (see [[Contribution and CONT]]). Table drop pending 040 Part 3 review |
 | `vw_master_product` (view) | ARTICLE_NUMBER | **the product catalogue**; carries MP cols FAB/MACRO_MVGR/MICRO_MVGR/M_VND_CD/RNG_SEG; ATT_TYP 00/02=variants |
 | `et_msa_stk` + `VW_ET_MSA_STK_WITH_MASTER` | DATE×ST_CD×SLOC×ARTICLE | MSA stock source (not `ET_STORE_STOCK`) |
 | `ET_STORE_STOCK` | store stock | store-level `STK_TTL` for Grid/Listing |
@@ -71,13 +71,14 @@ Two logical databases on `HOPC866`: **Claude** (system — RBAC/RLS/audit/jobs, 
 
 - **001–013 (Claude core + MSA):** `001_create_schema` (RBAC/RLS/audit), export/data-change tables, `011` legacy `cl_*` MSA tables + sequence, `013` msa_storage_jobs.
 - **Old 014–017 (RBAC/RLS):** `014_create_ars_msa_tables` (rename `cl_*`→`ARS_MSA_*`), `015_add_category_rls`, `016_sloc_status_column`, `017_add_module_permissions`.
-- **New descriptive 014–021 (highlight these):** `014_create_contribution_tables`; **`015_create_sloc_settings`** (FRESH/GRT pools); **`016_alloc_type_columns`** (ALLOC_TYPE on pend/alloc; widen hold PK); **`017_report_generation`** (report hub); `018_alloc_type_integrity` (CHECK constraints); `019_rename_msa_sloc_settings`; `020_allocation_engine_tables` (score-based `alloc_*` engine — separate from the live pipeline); `021_add_manual_st_priority`.
+- **New descriptive 014–021 (highlight these):** `014_create_contribution_tables` (retired 2026-10-14); **`015_create_sloc_settings`** (FRESH/GRT pools); **`016_alloc_type_columns`** (ALLOC_TYPE on pend/alloc; widen hold PK); **`017_report_generation`** (report hub); `018_alloc_type_integrity` (CHECK constraints); `019_rename_msa_sloc_settings`; `020_allocation_engine_tables` (score-based `alloc_*` engine — separate from the live pipeline); `021_add_manual_st_priority`.
+- **040_retire_removed_modules.sql** (2026-10-14, written, NOT yet run; run AFTER deploy): Part 1 deletes retired `MOD_*` / `PAGE_*` permission rows (Claude DB); Part 2 checks and deletes dictionary rows `STOCK_CONT%` / `SALE_CONT%` / `INITIAL AUTO CONT%` (Rep_Data); Part 3 only generates DROP statements for review.
 - **DB bootstrap:** `create_claude_db.sql`, `create_rep_data_db.sql`, `create_master_gen_art_age.sql`.
 
 ## Gotchas
 - **ALLOC_TYPE sentinels differ:** `ARS_PEND_ALC/ALLOC_HISTORY/ALLOC_WORKING` use NULL for legacy; `ARS_NL_TBL_HOLD_TRACKING` uses `''` (PK member). Code treats both as untyped/both-pools.
 - **`ARS_ALLOC_WORKING` is DROP+SELECT INTO each run** — no persistent constraints/indexes; ALLOC_TYPE normalization enforced in code, not CHECK.
-- **Two allocation engines** — the live Listing→Alloc pipeline vs the score-based `alloc_*` engine (mig 020, ALC_Fixture pages, superadmin-only). Don't conflate.
+- **Two allocation engines** — the live Listing→Alloc pipeline vs the score-based `alloc_*` engine (mig 020; its former ALC_Fixture placeholder UI was removed 2026-10-14). Don't conflate.
 - **MSA result tables grow columns at runtime** (`MSA_Column_Definitions`) — schema not static.
 - **`ARS_PEND_ALC` PK on ID only** — no unique on the logical grain (double-count risk). See [[Known Risks and Doc Drift]].
 

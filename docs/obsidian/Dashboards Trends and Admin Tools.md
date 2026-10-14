@@ -1,12 +1,15 @@
 ---
 title: Dashboards Trends and Admin Tools
 tags: [ars, dashboards, trends, admin]
-updated: 2026-07-17
+updated: 2026-10-14
 ---
 
 # Dashboards, Trends & Admin Tools
 
 The read-side analytics and operator/admin tooling that sit alongside the [[Pipeline Overview|pipeline]] but don't produce allocations. Consolidates the pages/routers not covered by a dedicated stage note. Detail on any of these can graduate to its own note using the `Module Note` template.
+
+> [!warning] Removed 2026-10-14
+> **Trends** (`/trends/*`, `trends.py`, user-created `Trend_*` tables) and **Project Tracker** (`/pt/*`, `PT_*` tables, `backend/pt_attachments/`) were removed from the app; their rows are gone below. UPC Store Tracking never read `TREND_ST`; it reads `ARS_GRID_MJ` summed per store.
 
 ## Analytics / dashboards
 | Tool | Router | Frontend | Purpose |
@@ -14,7 +17,6 @@ The read-side analytics and operator/admin tooling that sit alongside the [[Pipe
 | ARS Dashboard | `/ars-dashboard` | ArsDashboardPage | Unified analytics: summary / breakdown / trend / pending / gap + hierarchical drill-down + hold/pivot |
 | Gap Report | `/gap-report` | GapReportPage | Multi-category algorithm-review GAP tiles + export |
 | Hold Dashboard | `/hold-dashboard` | HoldDashboardPage | HOLD_QTY review — see [[Pending Allocation and Hold]] |
-| Trends | `/trends` | Trend*Page (`/trends/{dashboard,upload,review,admin}`) | Trend tables/schema/upload/review/admin |
 | Pend-Alc Report | `/reports` | PendAlcReportPage | Pending-allocation report data + download |
 
 ## Operator / admin tools
@@ -23,7 +25,6 @@ The read-side analytics and operator/admin tooling that sit alongside the [[Pipe
 | Data Dictionary | `/data-dictionary` | DataDictionaryPage | `ARS_DATA_DICTIONARY` CRUD — column-level reference for every ARS column |
 | Checklist | `/checklist` | ChecklistPage | `ARS_CHECKLIST` — tables the planner must keep current pre-allocation |
 | Activity Log | `/activity-log` | DailyActivityLogPage | Superadmin — rolls `audit_log` + git commits into daily YES/NO-reviewable pointers |
-| Project Tracker | `/project-tracker` | pt/PT*Page | Projects tree / tasks / dashboard |
 | Table Management | `/tables` | TableManagementPage, TablesPage, DataEditorPage | Dynamic CREATE/ALTER/soft-delete, data grid, export/truncate jobs — see [[Platform and Infrastructure]] |
 | Lookup Art Master | `/lookup-art-master` | LookupArtMasterPage | Article-master lookup / preview / download |
 | SLOC Validation | `/sloc-validation` | StoreStockPage | Store-SLOC validation settings |

@@ -6,7 +6,7 @@ ARS V2 Retail Auto Replenishment decides *what stock should go to which store, a
 
 This "Getting Started" section orients a brand-new operator, planner, or admin: how to log in, read the dashboard, and find the pipeline. Everything else in this manual assumes you can reach the screens described here.
 
-The whole system is one pipeline run in order: **MSA Stock → Grid Builder → Merge Rules → Listing & Allocation → Review → Hold → Pending Allocation**. Each has its own section in this manual with a business rationale (BRD), the exact rules and formulas (FSD), a click-by-click walkthrough, and a screenshot gallery.
+The whole system is one pipeline run in order: **MSA Stock → Grid Builder → Merge Rules → Listing & Allocation → Review → Hold → Pending Allocation**. Each has its own section in this manual with a business rationale (BRD), the exact rules and formulas (FSD), and a click-by-click walkthrough.
 
 ## FSD — How it works
 

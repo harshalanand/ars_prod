@@ -1,26 +1,25 @@
 ---
 title: Contribution and CONT
 tags: [ars, contribution, cont]
-updated: 2026-07-17
+updated: 2026-10-14
 ---
 
 # Contribution and CONT
 
 Two related-but-distinct things share the name "contribution". Keep them apart.
 
-## 1. Analytical contribution (`Cont_presets` / auto-contrib)
-The **upstream KPI** that decides each grouping bucket's *share of shelf/allocation* — `INITIAL AUTO CONT%`. Two implementations, same output shape:
-- **Manual / pandas** — `backend/app/api/v1/endpoints/contrib.py`. Reads `COUNT_STOCK_DATA_18M` × `vw_master_product` (SEG APP/GM), computes FIX/DISP_AREA/GM%/STR/SALES-PSF/`STOCK_CONT%`/`SALE_CONT%`/`ALGO` → normalized `INITIAL AUTO CONT%`. Output → `Cont_Percentage_*`.
-- **Auto Cont %** — `backend/app/api/v1/endpoints/auto_contrib.py`. Same KPIs but **in SQL** via `sp_AutoContCompute` (needs the proc installed). Output → `AutoCont_FINAL_<gc>_<ts>` (+ `_CO_`). Richer job control (pause/resume). Emits `autocont.completed` for the [[Report Generation Hub]].
-
-**Config tables (shared):** `Cont_presets` (time window: `months`, `avg_days`, `kpi_type` L7D/L30D/L18M), `Cont_mappings` (SSN→preset-suffix rules), `Cont_mapping_assignments` (which mapping feeds which output column). Flow: **presets → mappings/assignments → execute → review** (frontend `Contrib*Page.jsx` / `AutoCont*Page.jsx`).
+## 1. Analytical contribution: REMOVED 2026-10-14
+> [!warning] Contribution % and Auto Cont % were removed from the app
+> Removed: Contribution % (`/contribution/*`, `contrib.py`, `Cont_presets`, `Cont_mappings`, `Cont_mapping_assignments`, `Cont_jobs`, `Cont_Percentage_*`) and Auto Cont % (`/auto-cont/*`, `auto_contrib.py`, `sp_AutoContCompute`, `AutoCont_*`, event `autocont.completed`). Neither ever fed grid, listing or allocation. The tables are dropped only after reviewing the DROP list from `backend/scripts/040_retire_removed_modules.sql` (Part 3 generates it and does not drop). See [[ARS Work Log]].
+>
+> The Listing RDC stock-vs-alloc chart (`/listing/contribution`) is unrelated and stays. Only the size-level CONT in section 2 is live.
 
 ## 2. Size-level CONT (allocation)
 The **`CONT`** consumed by [[Grid Builder|Grid]]/[[Listing]]/[[Rule Engine (per_opt)|allocation]] — the share of each **size** within an option, summing to 1 per OPT:
 ```
 SZ_MBQ  = ROUND(OPT_MBQ × CONT, 0)     ; OPT_MBQ = Σ SZ_MBQ
 ```
-It lives in the grid/alloc tables (from `Master_CONT_<dim>` / `Master_CONT_MERGE_<dim>`), not in `Cont_presets`. PAK_SZ rounding caps at `SZ_MBQ × I_ROD`.
+It lives in the grid/alloc tables (from `Master_CONT_<dim>` / `Master_CONT_MERGE_<dim>`). It never came from Contribution % (`Cont_presets`), which is removed. PAK_SZ rounding caps at `SZ_MBQ × I_ROD`.
 
 ### CONT fallback ladder (`_stage_b_fill_cont`, all engines delegate here)
 Governed by `docs/2026-07-02-cont-fallback-ladder.md`.

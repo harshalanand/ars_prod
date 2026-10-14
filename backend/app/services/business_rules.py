@@ -297,7 +297,7 @@ ALGO: Dict[str, str] = {
         "the page shows a disabled banner. Currently NO code reads the rule, so\n"
         "the toggle has no effect yet.\n\n"
         "Module recap: upload ST_CD + proposed/share dates, identity from the\n"
-        "store master, live MBQ/stock/SLOC/FR from the latest TREND_ST row,\n"
+        "store master, live MBQ/stock/SLOC/FR from ARS_GRID_MJ (summed per store),\n"
         "event-based date/remark history.\n\n"
         "Example (once wired): admin turns the rule OFF at 10:00 — a user opening\n"
         "/reports/upc-tracking sees 'Module disabled by admin' and an upload\n"

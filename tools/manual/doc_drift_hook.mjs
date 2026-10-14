@@ -37,7 +37,7 @@ process.stdin.on('end', () => {
       `📘 ARS memory reminder — you edited ${hit.label} source.\n` +
       `Update its dossier if the rules/formulas changed: frontend/public/docs/manual/${hit.m}.md ` +
       `(FSD + Recorded rules sections), and keep ARS_DATA_DICTIONARY in sync. ` +
-      `To refresh screenshots + the column sweep, see tools/manual/REFRESH.md.`
+      `To re-sweep the column formulas, see tools/manual/REFRESH.md.`
 
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: msg },

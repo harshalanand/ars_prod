@@ -9,9 +9,9 @@ import {
   LayoutDashboard, Table2, Upload, PackageCheck, Users, Shield, Eye, ScrollText,
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
-  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List,
-  HardDrive, Lock, CalendarDays, History, FolderKanban, ListTodo, GitMerge,
-  AlertTriangle, BookOpen, GitBranch, Sliders, Boxes, Layers, ListOrdered,
+  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, List,
+  HardDrive, Lock, CalendarDays, History, GitMerge,
+  AlertTriangle, BookOpen, GitBranch, Sliders, Layers, ListOrdered,
   XCircle, Store, Sparkles, Container, Server, Ruler,
   DatabaseZap, Snowflake, RefreshCw, FileSpreadsheet, PlugZap,
 } from 'lucide-react'
@@ -81,39 +81,6 @@ const adhocItems = [
   { label: 'Lookup Art Master', path: '/data-prep/lookup-art-master', icon: Search, permission: 'LOOKUP_VIEW' },
 ]
 
-// Contribution Percentage submenu
-const contributionItems = [
-  { label: 'Presets', path: '/contribution/presets', icon: Settings, permission: 'CONTRIB_PRESETS' },
-  { label: 'Mappings', path: '/contribution/mappings', icon: Columns, permission: 'CONTRIB_MAPPINGS' },
-  { label: 'Execute', path: '/contribution/execute', icon: Cpu, permission: 'CONTRIB_EXECUTE' },
-  { label: 'Review', path: '/contribution/review', icon: ClipboardCheck, permission: 'CONTRIB_REVIEW' },
-]
-
-// Auto Cont % — SQL-direct pipeline (superadmin-only during rollout)
-const autoContItems = [
-  { label: 'Presets',  path: '/auto-cont/presets',  icon: Settings,       superadminOnly: true },
-  { label: 'Mappings', path: '/auto-cont/mappings', icon: Columns,        superadminOnly: true },
-  { label: 'Execute',  path: '/auto-cont/execute',  icon: Cpu,            superadminOnly: true },
-  { label: 'Jobs',     path: '/auto-cont/jobs',     icon: Activity,       superadminOnly: true },
-  { label: 'Review',   path: '/auto-cont/review',   icon: ClipboardCheck, superadminOnly: true },
-]
-
-// ALC_Fixture — MSA-STK Allocation Engine (blueprint v1.0, superadmin-only during rollout)
-const alcFixtureItems = [
-  { label: 'Tunables',  path: '/alc-fixture/tunables',  icon: Sliders,         superadminOnly: true },
-  { label: 'Execute',   path: '/alc-fixture/execute',   icon: Cpu,             superadminOnly: true },
-  { label: 'Review',    path: '/alc-fixture/review',    icon: ClipboardCheck,  superadminOnly: true },
-  { label: 'Dashboard', path: '/alc-fixture/dashboard', icon: LayoutDashboard, superadminOnly: true },
-  { label: 'Jobs',      path: '/alc-fixture/jobs',      icon: Activity,        superadminOnly: true },
-]
-
-// Trends submenu
-const trendsItems = [
-  { label: 'Dashboard', path: '/trends/dashboard', icon: BarChart3, permission: 'TRENDS_DASHBOARD' },
-  { label: 'Upload', path: '/trends/upload', icon: FileUp, permission: 'TRENDS_UPLOAD' },
-  { label: 'Review', path: '/trends/review', icon: Eye, permission: 'TRENDS_REVIEW' },
-]
-
 // Reports submenu
 const reportsItems = [
   { label: 'Report Generation', path: '/reports/generation', icon: FileText, permission: 'PAGE_REPORT_GENERATION' },
@@ -179,29 +146,6 @@ const dataValidationItems = [
   { label: 'Data Checklist', path: '/data-validation/checklist', icon: ClipboardCheck, permission: 'CHECKLIST_VIEW' },
 ]
 
-// Project Tracker submenu — enterprise-style task management
-const projectTrackerItems = [
-  { label: 'Dashboard',     path: '/pt',          icon: LayoutDashboard, end: true, permission: 'PAGE_PT_DASHBOARD' },
-  { label: 'All Projects',  path: '/pt/projects', icon: FolderKanban, permission: 'PAGE_PT_PROJECTS' },
-  { label: 'My Tasks',      path: '/pt/my-tasks', icon: ListTodo, permission: 'PAGE_PT_MY_TASKS' },
-]
-
-// Training Manual — the canonical ARS Manual: BRD + FSD + step-by-step +
-// gallery per module. Dossiers in public/docs/manual/ double as Claude's
-// "ARS memory"; images in public/docs/guide/, captions in guideSteps.js.
-const processItems = [
-  { label: 'Screenshot Gallery',          path: '/manual/gallery',    icon: LayoutGrid, permission: 'PAGE_MANUAL_GALLERY' },
-  { label: 'Getting Started',             path: '/manual/start',      icon: BookOpen, permission: 'PAGE_MANUAL_START' },
-  { label: 'Step 1 · MSA Stock',          path: '/manual/msa',        icon: BarChart3, permission: 'PAGE_MANUAL_MSA' },
-  { label: 'Step 2 · Grid Builder',       path: '/manual/grid',       icon: LayoutGrid, permission: 'PAGE_MANUAL_GRID' },
-  { label: 'Step 3 · Merge Rules',        path: '/manual/merge',      icon: GitMerge, permission: 'PAGE_MANUAL_MERGE' },
-  { label: 'Step 4 · Listing & Alloc',    path: '/manual/listing',    icon: List, permission: 'PAGE_MANUAL_LISTING' },
-  { label: 'Step 5 · Review Results',     path: '/manual/review',     icon: ClipboardCheck, permission: 'PAGE_MANUAL_REVIEW' },
-  { label: 'Step 6 · Hold Process',       path: '/manual/hold',       icon: Lock, permission: 'PAGE_MANUAL_HOLD' },
-  { label: 'Step 7 · Pending Allocation', path: '/manual/pendalc',    icon: Truck, permission: 'PAGE_MANUAL_PENDALC' },
-  { label: 'Data Dictionary',             path: '/manual/dictionary', icon: Search, permission: 'PAGE_MANUAL_DICTIONARY' },
-]
-
 // Settings submenu (admin features)
 const settingsItems = [
   { label: 'App Settings', path: '/settings', icon: Cog, permission: 'ADMIN_SETTINGS', end: true },
@@ -225,18 +169,12 @@ export const SECTIONS = [
   { title: 'GRT ALC',           icon: Container,      items: binAllocItems, permission: 'MOD_GRT_ALC' },
   { title: '1SZ ALC',           icon: Ruler,          items: sz1AllocItems, permission: 'MOD_1SZ_ALC' },
   { title: 'Adhoc',             icon: FolderOpen,     items: adhocItems, permission: 'MOD_ADHOC' },
-  { title: 'Contribution %',    icon: BarChart3,      items: contributionItems, permission: 'MOD_CONTRIB' },
-  { title: 'Auto Cont %',       icon: Cpu,            items: autoContItems, permission: 'MOD_AUTO_CONT' },
-  { title: 'ALC_Fixture',       icon: Boxes,          items: alcFixtureItems, permission: 'MOD_ALC_FIXTURE' },
-  { title: 'Trends',            icon: TrendingUp,     items: trendsItems, permission: 'MOD_TRENDS' },
   { title: 'Reports',           icon: Activity,       items: reportsItems, permission: 'MOD_REPORTS' },
   { title: 'Get Data',          icon: DatabaseZap,    items: getDataItems, permission: 'MOD_GET_DATA' },
   { title: 'SAP',               icon: Server,         items: sapItems, permission: 'MOD_SAP' },
   { title: 'FA & CONS',         icon: Store,          items: faConsItems, permission: 'MOD_FA_CONS' },
   { title: 'Pending Allocation',icon: Truck,          items: pendAlcItems, permission: 'MOD_PEND_ALC' },
   { title: 'Data Validation',   icon: ClipboardCheck, items: dataValidationItems, permission: 'MOD_DATA_VALIDATION' },
-  { title: 'Project Tracker',   icon: FolderKanban,   items: projectTrackerItems, permission: 'MOD_PROJECT_TRACKER' },
-  { title: 'Training Manual',   icon: BookOpen,       items: processItems, permission: 'MOD_TRAINING' },
   { title: 'Settings',          icon: Settings,       items: settingsItems, permission: 'MOD_SETTINGS' },
 ]
 
@@ -270,18 +208,12 @@ const MODULE_ROUTE_EXTRAS = {
   MOD_GRT_ALC:         ['/bin-alloc'],
   MOD_1SZ_ALC:         ['/sz1-alloc', ['/sz1-alloc/base', 'PAGE_1SZ_BASE', 'Prepare › Supply'],
                         ['/sz1-alloc/req', 'PAGE_1SZ_REQ', 'Prepare › Demand'], ['/sz1-alloc/gap', 'PAGE_1SZ_GAP', 'Prepare › Gap']],
-  MOD_AUTO_CONT:       ['/auto-cont'],
-  MOD_ALC_FIXTURE:     ['/alc-fixture'],
-  MOD_CONTRIB:         ['/contribution'],
-  MOD_TRENDS:          ['/trends'],
   MOD_REPORTS:         ['/reports'],
   MOD_GET_DATA:        ['/get-data'],
   MOD_SAP:             ['/sap', ['/sap/connection', 'PAGE_SAP_CONNECTION', 'Connection']],
   MOD_FA_CONS:         ['/fa-cons'],
   MOD_PEND_ALC:        ['/pend-alc', ['/reports/open-bdc', 'PAGE_PEND_OPEN_BDC', 'Open BDC Report']],
   MOD_DATA_VALIDATION: ['/data-validation'],
-  MOD_PROJECT_TRACKER: ['/pt'],
-  MOD_TRAINING:        ['/manual', '/process'],
   MOD_SETTINGS:        ['/settings', '/admin'],
 }
 

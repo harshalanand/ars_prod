@@ -1,7 +1,7 @@
 ---
 title: Report Generation Hub
 tags: [ars, reports, scheduler]
-updated: 2026-07-30
+updated: 2026-10-14
 ---
 
 # Report Generation Hub
@@ -13,7 +13,7 @@ A **report** = ordered **steps** + an **output** + a **trigger**.
 
 - **Steps:** `sql` (stored proc → files, `nextset()` for multi result-set), `query` (raw read-only SELECT, guarded by `_DESTRUCTIVE_RE`), or `code` (SAFE registry via `@register_code_step`, e.g. `build_manifest`). Per-step `label` overrides the output filename.
 - **Output ("Deliver to" chips):** Folder / Snowflake / Email → `OUTPUT_TYPE` folder|snowflake|both|email. Folder = `<base>/data/<YYYYMMDD>[/<session_code>]`; `FOLDER_PER_RUN` toggles fresh-vs-reused. Progressive/adaptive `SPLIT_CONFIG` (SEG→DIV→SUB_DIV→MAJ_CAT, then size-chunk `_partN`).
-- **Triggers:** `schedule` (once/daily/weekly/monthly/every-N-hours; multiple times/weekdays/dates; all UTC), `manual` (`POST /reports/{id}/run`), `event` (`emit_event(name)`). Known events: `listing.approved` + `pendalc.approved` (from [[Listing]] approve), `msa.completed` (from [[MSA Stock Calculation]] job), `autocont.completed` (from [[Contribution and CONT|auto-contrib]]). Event runs get a `_<session_id>` filename suffix.
+- **Triggers:** `schedule` (once/daily/weekly/monthly/every-N-hours; multiple times/weekdays/dates; all UTC), `manual` (`POST /reports/{id}/run`), `event` (`emit_event(name)`). Known events: `listing.approved` + `pendalc.approved` (from [[Listing]] approve), `msa.completed` (from [[MSA Stock Calculation]] job). `autocont.completed` was removed from KNOWN_EVENTS on 2026-10-14 with Auto Cont %. Event runs get a `_<session_id>` filename suffix.
 
 ## Tables (Rep_Data, self-healing via `ensure_report_tables()`)
 - `ARS_REPORTS` — definition: `STEPS` json, `OUTPUT_TYPE`, `BASE_DIR`, `FILE_FORMAT`, `FOLDER_PER_RUN`, `SNOWFLAKE/SPLIT/EMAIL_CONFIG`, `TRIGGER_TYPE`, `SCHEDULE_CONFIG`, `TRIGGER_EVENT`, `ENABLED`, `NEXT_RUN_AT`, `LAST_*`.

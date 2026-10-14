@@ -19,12 +19,6 @@ from app.api.v1.endpoints.upload import router as upload_router
 from app.api.v1.endpoints.msa_stock import router as msa_router
 from app.api.v1.endpoints.msa import router as msa_legacy_router
 
-# Phase 4b: Contribution Percentage
-from app.api.v1.endpoints.contrib import router as contrib_router
-
-# Phase 4b·SQL: Auto Cont % (SQL-direct pipeline via sp_AutoContCompute)
-from app.api.v1.endpoints.auto_contrib import router as auto_contrib_router
-
 # Phase 4c: BDC Creation
 from app.api.v1.endpoints.bdc import router as bdc_router
 
@@ -43,9 +37,6 @@ from app.api.v1.endpoints.lookup_art_master import router as lookup_art_master_r
 
 # Data Checklist
 from app.api.v1.endpoints.checklist import router as checklist_router
-
-# Trends
-from app.api.v1.endpoints.trends import router as trends_router
 
 # Reports
 from app.api.v1.endpoints.reports import router as reports_router
@@ -89,12 +80,6 @@ api_router.include_router(upload_router)
 api_router.include_router(msa_router)
 api_router.include_router(msa_legacy_router)
 
-# Phase 4b: Contribution Percentage
-api_router.include_router(contrib_router)
-
-# Phase 4b·SQL: Auto Cont % (SQL-direct pipeline)
-api_router.include_router(auto_contrib_router)
-
 # Phase 4c: BDC Creation
 api_router.include_router(bdc_router)
 
@@ -121,9 +106,6 @@ api_router.include_router(gap_report_router)
 # Data Checklist
 api_router.include_router(checklist_router)
 
-# Trends
-api_router.include_router(trends_router)
-
 # Reports
 api_router.include_router(reports_router)
 
@@ -147,10 +129,6 @@ api_router.include_router(pipeline_router)
 from app.api.v1.endpoints.allocation_engine import router as alloc_engine_router
 api_router.include_router(alloc_engine_router)
 
-# Project Tracker — hierarchical projects, status/priority/phase, dashboard
-from app.api.v1.endpoints.project_tracker import router as project_tracker_router
-api_router.include_router(project_tracker_router)
-
 # Daily Activity Log — audit_log rolled into review-ready daily pointers (superadmin)
 from app.api.v1.endpoints.activity_log import router as activity_log_router
 api_router.include_router(activity_log_router)
@@ -160,7 +138,7 @@ from app.api.v1.endpoints.dev_sync import router as dev_sync_router
 api_router.include_router(dev_sync_router)
 
 # UPC Store Tracking — store-opening lifecycle tracker (dates/remarks history +
-# live MBQ/stock/SLOC/fill-rate from TREND_ST). Replaces the manual xlsx.
+# live MBQ/stock/SLOC/fill-rate from ARS_GRID_MJ). Replaces the manual xlsx.
 from app.api.v1.endpoints.upc_store_track import router as upc_store_track_router
 api_router.include_router(upc_store_track_router)
 

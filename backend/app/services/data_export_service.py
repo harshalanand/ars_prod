@@ -17,7 +17,7 @@ Usage:
     result = export_session_data(
         session_code="20260709_141530_123",
         procedures=[
-            "dbo.sp_AutoContCompute",                               # no params
+            "dbo.usp_example_report",                               # no params
             {"name": "dbo.usp_ars_allocate_majcat",                 # with params
              "params": {"WERKS": "V201", "MAJ_CAT": "SHIRTS"}},
         ],

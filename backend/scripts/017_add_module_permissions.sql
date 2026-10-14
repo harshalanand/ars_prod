@@ -54,36 +54,6 @@ IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'LOOKUP_VI
     INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
     ('View Lookup Art Master', 'LOOKUP_VIEW', 'data_prep', 'READ', 'lookup');
 
--- Contribution
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'CONTRIB_PRESETS')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('Manage Contrib Presets', 'CONTRIB_PRESETS', 'contribution', 'UPDATE', 'contrib_presets');
-
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'CONTRIB_MAPPINGS')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('Manage Contrib Mappings', 'CONTRIB_MAPPINGS', 'contribution', 'UPDATE', 'contrib_mappings');
-
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'CONTRIB_EXECUTE')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('Execute Contribution', 'CONTRIB_EXECUTE', 'contribution', 'CREATE', 'contrib_execute');
-
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'CONTRIB_REVIEW')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('Review Contribution', 'CONTRIB_REVIEW', 'contribution', 'READ', 'contrib_review');
-
--- Trends
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'TRENDS_DASHBOARD')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('View Trends Dashboard', 'TRENDS_DASHBOARD', 'trends', 'READ', 'trends');
-
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'TRENDS_UPLOAD')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('Upload Trend Data', 'TRENDS_UPLOAD', 'trends', 'CREATE', 'trends');
-
-IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'TRENDS_REVIEW')
-    INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES
-    ('Review Trend Data', 'TRENDS_REVIEW', 'trends', 'READ', 'trends');
-
 -- Reports
 IF NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_code = 'REPORTS_PEND_ALC')
     INSERT INTO rbac_permissions (permission_name, permission_code, module, action, resource) VALUES

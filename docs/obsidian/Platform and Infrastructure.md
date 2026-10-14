@@ -1,7 +1,7 @@
 ---
 title: Platform and Infrastructure
 tags: [ars, platform, infra, auth, rbac, rls]
-updated: 2026-07-17
+updated: 2026-10-14
 ---
 
 # Platform and Infrastructure
@@ -12,7 +12,7 @@ The cross-cutting layer under the [[Pipeline Overview|pipeline]]: FastAPI + SQLA
 Lifespan startup: log DB target → `check_db_connection` → `enable_rcsi()` (READ_COMMITTED_SNAPSHOT so readers don't block uploads) → `prewarm_pend_alc_tables` (pre-create hot tables to avoid Sch-M DDL locks) → register models + `create_all` + `reconcile_columns` (ALTER ADD only) → seed super-admin + permissions → mark crashed `MSAStorageJob`s failed → **start daemons: `tempdb_cleaner`, `report_scheduler`**. Middleware order: CORS → request-logging → `auto_free_space_middleware` (post-job DB cleanup) → global exception handler. Static SPA catch-all serves `index.html`. `uvicorn` workers = `1 if DEBUG else 4`.
 
 ## Router map (`/api/v1`)
-`/auth` `/users` `/roles` `/rls` `/audit` `/tables` `/data-ops` `/upload` · `/msa-stock` `/msa` · `/contrib` `/auto-contrib` `/bdc` · `/settings` · `/sloc-validation` `/grid-builder` `/merge-rules` `/data-dictionary` · `/lookup-art-master` · `/dashboard` `/hold-dashboard` `/ars-dashboard` `/gap-report` · `/pend-alc` `/checklist` `/trends` · `/reports` `/report-gen` · `/listing` · `/maintenance` `/pipeline` `/allocation-engine` `/project-tracker` `/activity-log`.
+`/auth` `/users` `/roles` `/rls` `/audit` `/tables` `/data-ops` `/upload` · `/msa-stock` `/msa` · `/bdc` · `/settings` · `/sloc-validation` `/grid-builder` `/merge-rules` `/data-dictionary` · `/lookup-art-master` · `/dashboard` `/hold-dashboard` `/ars-dashboard` `/gap-report` · `/pend-alc` `/checklist` · `/reports` `/report-gen` · `/listing` · `/maintenance` `/pipeline` `/allocation-engine` `/activity-log`. (`/contrib`, `/auto-contrib`, `/trends`, `/project-tracker` removed 2026-10-14.)
 
 ## Auth & security
 JWT (HS256, `app/security/jwt_handler.py`). Login: lookup → bcrypt verify → lock at `MAX_LOGIN_ATTEMPTS`=5 → issue access (480 min: sub/user_id/roles/permissions) + refresh (7 days) → audit. `get_current_user` retries once on a SQL connection drop with a fresh session. **Superadmin is force-unlocked AND its password re-synced from `SUPER_ADMIN_PASSWORD` on every startup** — you can't change it via UI.
@@ -37,12 +37,15 @@ Sync `/upload/` → `FileUploadService` → `UpsertEngine.upsert` (chunked 10k, 
 - **[[Report Generation Hub]]** — scheduler daemon started here.
 - **Reset service** (`reset_service.py`) — `reset_transactional_data`: rediscovers tables via INFORMATION_SCHEMA, classifies transactional (pattern/explicit) vs protected (**protected always wins**), TRUNCATE/DELETE + reseed. Superadmin only.
 - **TempDB cleaner** (`tempdb_cleanup_service.py`) — daemon; skipped on Azure SQL DB.
+- **Retired 2026-10-14:** Contribution %, Auto Cont %, ALC_Fixture, Trends, Project Tracker and the Training Manual viewer were removed (routers, tables, perms, frontend). The permission seed only INSERTS, so retired `MOD_*`/`PAGE_*` rows survive until `backend/scripts/040_retire_removed_modules.sql` Part 1 deletes them. Run it AFTER deploy; before deploy, the old startup seed re-grants them. Part 3 only generates DROPs for review.
 
 ## Config & env (`config.py`)
 System DB `HOPC866`/`Claude`/`sa`; Data DB `Rep_data`. Pool 15/overflow 25/recycle 300/pre_ping. JWT access 480 min / refresh 7 days. `MAX_LOGIN_ATTEMPTS`=5. Upload 100 MB / chunk 10k. `MSA_ALLOWED_ATT_TYP=["00","02"]`. Auto-free-after-job on heavy endpoints. **Hardcoded default secrets** (`DB_PASSWORD`, `SUPER_ADMIN_PASSWORD=Admin@12345`, placeholder `JWT_SECRET_KEY`) — must override in prod.
 
 ## Gotchas
 See [[Known Risks and Doc Drift]] — superadmin password re-sync, broken backup path (`settings.SQL_DATABASE` undefined), `get_system_info` queries non-existent `users` table, RLS string-interpolation, async upload single global thread, report-scheduler settings keys undefined (always default 30s/2).
+
+**Git-history secret (2026-10-14):** `scripts/load_review_findings.py` (deleted) had a hardcoded sa SQL password. It remains in git history, so rotate it.
 
 ## Cross-links
 [[Frontend Map]] · [[Data Model]] · [[ARS Work Log]].
