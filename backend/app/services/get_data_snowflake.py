@@ -69,6 +69,21 @@ def connect(long_running: bool = False):
     return conn
 
 
+def cancel_session_queries(session_id: Optional[int]) -> None:
+    """Cancel every query running in a session — Stop on a sync run. Uses its
+    own connection, since the run's connection is blocked inside the query.
+    The blocked call then fails with 'SQL execution canceled'."""
+    if not session_id:
+        return
+    conn = sfc.connect(require_enabled=True)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT SYSTEM$CANCEL_ALL_QUERIES(%s)", (int(session_id),))
+        logger.info(f"[get-data] Snowflake session {session_id}: {cur.fetchone()[0]}")
+    finally:
+        conn.close()
+
+
 def sf_message(e: Exception) -> str:
     """Snowflake errors carry a code prefix and newlines — keep them readable."""
     return re.sub(r"\s+", " ", str(e)).strip()[:1500]

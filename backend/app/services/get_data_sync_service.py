@@ -18,7 +18,14 @@ One run:
   6. record counts, the Snowflake query id, and the new watermark
 
 A job runs at most once at a time (GD_JOB.LOCK_RUN_ID + heartbeat), across all
-uvicorn workers. Spec: frontend/public/docs/manual/get_data.md.
+uvicorn workers.
+
+Stop: stop_run() marks GD_RUN.STOP_REQUESTED_AT. The worker running it (any
+uvicorn worker — its heartbeat polls the row every few seconds) cancels the
+Snowflake query, kills bcp, drops the stage table and records the run as
+'stopped'. Before the apply step the live table is untouched, so a stopped run
+changes nothing; once the swap / MERGE / INSERT has begun the run finishes.
+Spec: frontend/public/docs/manual/get_data.md.
 """
 import json
 import math
@@ -48,6 +55,8 @@ VALID_FREQ = ("daily", "weekly", "monthly", "every_n_hours")
 FETCH_BATCH = 20000
 LOCK_STALE_MIN = 10
 HEARTBEAT_SEC = 30
+STOP_POLL_SEC = 3          # how often a running run looks for a Stop request
+STOP_ORPHAN_SEC = 180      # a run asked to stop with no heartbeat this long is closed
 MODE_LABEL = {"replace": "full replace", "incremental": "incremental", "append": "append"}
 
 
@@ -55,6 +64,10 @@ class AlreadyRunning(GetDataError):
     def __init__(self, message: str, run_id: Optional[int] = None):
         super().__init__(message)
         self.run_id = run_id
+
+
+class RunStopped(GetDataError):
+    """Raised inside a run once someone pressed Stop."""
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -175,7 +188,8 @@ _JOB_COLS = """j.JOB_ID, j.JOB_NAME, j.DESCRIPTION, j.SOURCE_TYPE, j.SOURCE_OBJE
     j.LAST_STATUS, j.LAST_ROWS, j.LAST_MESSAGE, j.CREATED_BY, j.CREATED_AT,
     j.UPDATED_BY, j.UPDATED_AT,
     r.STEP AS RUN_STEP, r.SOURCE_ROWS AS RUN_SOURCE_ROWS, r.ROWS_LOADED AS RUN_ROWS_LOADED,
-    r.STARTED_AT AS RUN_STARTED_AT, r.RUN_TYPE AS RUN_RUN_TYPE"""
+    r.STARTED_AT AS RUN_STARTED_AT, r.RUN_TYPE AS RUN_RUN_TYPE,
+    r.STOP_REQUESTED_AT AS RUN_STOP_REQUESTED_AT, r.STOP_REQUESTED_BY AS RUN_STOP_REQUESTED_BY"""
 
 
 def list_jobs() -> List[Dict[str, Any]]:
@@ -401,7 +415,7 @@ def delete_job(job_id: int, drop_table: bool, user: str) -> Dict[str, Any]:
     if not job:
         raise KeyError(job_id)
     if job.get("LOCK_RUN_ID") and not _lock_is_stale(job.get("LOCK_HEARTBEAT")):
-        raise GetDataError("The job is running — wait for the run to finish, then delete it.")
+        raise GetDataError("The job is running — stop the run or wait for it to finish, then delete it.")
     with get_data_engine().begin() as c:
         c.execute(text(f"DELETE FROM {JOB_TABLE} WHERE JOB_ID=:id"), {"id": job_id})
         if drop_table:
@@ -526,29 +540,112 @@ def record_skipped(job_id: int, job_name: str, reason: str, run_type: str = "AUT
         """), {"jid": job_id, "jn": job_name, "rt": run_type, "by": user, "m": reason[:4000]})
 
 
+# Runs executing in this process, so a Stop that lands on the same worker acts
+# at once; a Stop on another worker is seen by the run's own poll.
+_LIVE: Dict[int, "_Heartbeat"] = {}
+_LIVE_LOCK = threading.Lock()
+
+
 class _Heartbeat:
-    """Keeps the job lock and the run row alive while a run works, and
-    publishes its step and row progress for the UI."""
+    """Keeps the job lock and the run row alive while a run works, publishes
+    its step and row progress for the UI, and carries Stop into the run:
+    check() raises RunStopped at the next checkpoint, and the on_stop()
+    callbacks break the blocking call in progress (Snowflake query, bcp)."""
 
     def __init__(self, run_id: int, job_id: int):
         self.run_id, self.job_id = run_id, job_id
         self.step_text = "Queued"
         self.source_rows: Optional[int] = None
         self.rows_loaded: Optional[int] = None
+        self.stopped_by: Optional[str] = None     # Stop applied (before the commit point)
+        self.late_stop_by: Optional[str] = None   # Stop that came after it — run finishes
         self._stop = threading.Event()
+        self._stopped = threading.Event()
+        self._committed = False
+        self._aborts: List[Callable[[], None]] = []
+        self._lock = threading.Lock()
         self._t = threading.Thread(target=self._loop, name=f"GdHeartbeat-{run_id}", daemon=True)
 
     def start(self) -> "_Heartbeat":
+        with _LIVE_LOCK:
+            _LIVE[self.run_id] = self
         self._t.start()
         return self
 
     def stop(self) -> None:
         self._stop.set()
+        with _LIVE_LOCK:
+            _LIVE.pop(self.run_id, None)
 
     def step(self, s: str) -> None:
+        self.check()
         self.step_text = s
         self.flush()
 
+    # ── Stop ────────────────────────────────────────────────────────────────
+    @property
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
+    def check(self) -> None:
+        if self._stopped.is_set():
+            raise RunStopped(f"Stopped by {self.stopped_by}.")
+
+    def commit(self) -> None:
+        """The point of no return: the live table is about to change. A Stop
+        after this is noted on the run, but the run finishes."""
+        with self._lock:
+            self.check()
+            self._committed = True
+
+    def on_stop(self, fn: Callable[[], None]) -> Callable[[], None]:
+        """Call fn (on another thread) if Stop is pressed, to break a long
+        blocking call. Returns the undo."""
+        with self._lock:
+            self._aborts.append(fn)
+
+        def undo() -> None:
+            with self._lock:
+                if fn in self._aborts:
+                    self._aborts.remove(fn)
+        return undo
+
+    def request_stop(self, by: Optional[str]) -> None:
+        by = by or "a user"
+        with self._lock:
+            if self._committed:
+                self.late_stop_by = self.late_stop_by or by
+                return
+            if self._stopped.is_set():
+                return
+            self.stopped_by = by
+            self._stopped.set()
+            aborts = list(self._aborts)
+        logger.info(f"[get-data] run {self.run_id}: stop requested by {by} during '{self.step_text}'")
+        if aborts:
+            threading.Thread(target=self._run_aborts, args=(aborts,),
+                             name=f"GdStop-{self.run_id}", daemon=True).start()
+
+    def _run_aborts(self, aborts: List[Callable[[], None]]) -> None:
+        for fn in aborts:
+            try:
+                fn()
+            except Exception as e:
+                logger.warning(f"[get-data] run {self.run_id}: stop action failed: {e}")
+
+    def _poll_stop(self) -> None:
+        try:
+            with get_data_engine().connect() as c:
+                r = c.execute(text(f"""
+                    SELECT STOP_REQUESTED_BY FROM {RUN_TABLE}
+                    WHERE RUN_ID=:rid AND STOP_REQUESTED_AT IS NOT NULL
+                """), {"rid": self.run_id}).fetchone()
+            if r:
+                self.request_stop(r[0])
+        except Exception as e:
+            logger.debug(f"[get-data] stop poll for run {self.run_id} failed: {e}")
+
+    # ── Heartbeat ───────────────────────────────────────────────────────────
     def flush(self) -> None:
         try:
             with get_data_engine().begin() as c:
@@ -567,27 +664,49 @@ class _Heartbeat:
             logger.warning(f"[get-data] heartbeat for run {self.run_id} failed: {e}")
 
     def _loop(self) -> None:
-        while not self._stop.wait(HEARTBEAT_SEC):
-            self.flush()
+        last = time.time()
+        while not self._stop.wait(STOP_POLL_SEC):
+            if not self._stopped.is_set() and not self.late_stop_by:
+                self._poll_stop()
+            if time.time() - last >= HEARTBEAT_SEC:
+                self.flush()
+                last = time.time()
 
 
 def reconcile_stale() -> int:
     """Runs whose heartbeat stopped (worker crashed or restarted) → failed,
     and their job locks released. Safe with several workers: a live run keeps
-    its heartbeat fresh, so only dead runs match."""
+    its heartbeat fresh, so only dead runs match. A run someone asked to stop
+    is closed as 'stopped' sooner (STOP_ORPHAN_SEC) — no worker is left to
+    stop it."""
     try:
         ensure_tables()
         # OUTPUT, not rowcount: rowcount is -1 on a pooled connection that some
         # other code left with SET NOCOUNT ON.
         with get_data_engine().begin() as c:
-            n = len(c.execute(text(f"""
-                UPDATE {RUN_TABLE} SET STATUS='failed', COMPLETED_AT=SYSUTCDATETIME(),
-                    STEP=NULL,
-                    MESSAGE='Stopped responding (server restart or crash). The live table was not changed unless the swap had already finished.'
-                OUTPUT INSERTED.RUN_ID
+            closed = c.execute(text(f"""
+                UPDATE {RUN_TABLE} SET COMPLETED_AT=SYSUTCDATETIME(), STEP=NULL,
+                    STATUS = CASE WHEN STOP_REQUESTED_AT IS NULL THEN 'failed' ELSE 'stopped' END,
+                    MESSAGE = CASE WHEN STOP_REQUESTED_AT IS NULL
+                        THEN 'Stopped responding (server restart or crash). The live table was not changed unless the swap had already finished.'
+                        ELSE CONCAT('Stopped by ', COALESCE(STOP_REQUESTED_BY, 'a user'),
+                            '. The run had stopped responding, so it was closed. The live table was not changed unless the swap had already finished.')
+                        END
+                OUTPUT INSERTED.RUN_ID, INSERTED.JOB_ID, INSERTED.STATUS, INSERTED.MESSAGE
                 WHERE STATUS='running'
-                  AND COALESCE(HEARTBEAT_AT, STARTED_AT) < DATEADD(MINUTE, -{LOCK_STALE_MIN}, SYSUTCDATETIME())
-            """)).fetchall())
+                  AND (COALESCE(HEARTBEAT_AT, STARTED_AT) < DATEADD(MINUTE, -{LOCK_STALE_MIN}, SYSUTCDATETIME())
+                       OR (STOP_REQUESTED_AT IS NOT NULL
+                           AND COALESCE(HEARTBEAT_AT, STARTED_AT) < DATEADD(SECOND, -{STOP_ORPHAN_SEC}, SYSUTCDATETIME())))
+            """)).fetchall()
+            n = len(closed)
+            for rid, jid, st, msg in closed:
+                if st == "stopped":
+                    c.execute(text(f"""
+                        UPDATE {JOB_TABLE} SET LOCK_RUN_ID=NULL, LOCK_HEARTBEAT=NULL,
+                            LAST_RUN_AT=SYSUTCDATETIME(), LAST_STATUS='stopped', LAST_ROWS=NULL,
+                            LAST_MESSAGE=:m
+                        WHERE JOB_ID=:jid AND LOCK_RUN_ID=:rid
+                    """), {"m": (msg or "")[:1000], "jid": jid, "rid": rid})
             c.execute(text(f"""
                 UPDATE {JOB_TABLE} SET LOCK_RUN_ID=NULL, LOCK_HEARTBEAT=NULL,
                     LAST_STATUS = CASE WHEN LAST_STATUS='running' THEN 'failed' ELSE LAST_STATUS END
@@ -596,11 +715,42 @@ def reconcile_stale() -> int:
                        OR LOCK_HEARTBEAT < DATEADD(MINUTE, -{LOCK_STALE_MIN}, SYSUTCDATETIME()))
             """))
         if n:
-            logger.warning(f"[get-data] reconciled {n} stale run(s) → failed")
+            logger.warning(f"[get-data] reconciled {n} stale run(s): "
+                           + ", ".join(f"#{r[0]} {r[2]}" for r in closed))
         return n
     except Exception as e:
         logger.warning(f"[get-data] reconcile skipped: {e}")
         return 0
+
+
+def stop_run(run_id: int, user: str) -> Dict[str, Any]:
+    """Ask a running run to stop. The worker running it acts within
+    STOP_POLL_SEC (at once if it is this process): it cancels the Snowflake
+    query, kills bcp, drops the stage table and records the run 'stopped' —
+    the live table keeps its rows. A Stop after the apply step began is noted
+    and the run finishes. A run whose worker is gone is closed here."""
+    ensure_tables()
+    with get_data_engine().begin() as c:
+        hit = c.execute(text(f"""
+            UPDATE {RUN_TABLE}
+            SET STOP_REQUESTED_AT = COALESCE(STOP_REQUESTED_AT, SYSUTCDATETIME()),
+                STOP_REQUESTED_BY = COALESCE(STOP_REQUESTED_BY, :u)
+            OUTPUT INSERTED.RUN_ID
+            WHERE RUN_ID = :rid AND STATUS = 'running'
+        """), {"u": user, "rid": run_id}).fetchone()
+    if not hit:
+        run = get_run(run_id)
+        if not run:
+            raise KeyError(run_id)
+        raise GetDataError(f"Run #{run_id} is not running any more (status: {run['STATUS']}).")
+    with _LIVE_LOCK:
+        hb = _LIVE.get(run_id)
+    if hb:
+        hb.request_stop(user)
+    reconcile_stale()
+    logger.info(f"[get-data] run {run_id}: stop requested by {user}"
+                f"{' (this worker)' if hb else ''}")
+    return get_run(run_id)
 
 
 # ── SQL Server side of a load ────────────────────────────────────────────────
@@ -675,6 +825,18 @@ def _count(table: str) -> Optional[int]:
 def _drop(table: str) -> None:
     with get_data_engine().begin() as c:
         c.execute(text(f"IF OBJECT_ID('dbo.[{table}]','U') IS NOT NULL DROP TABLE dbo.[{table}]"))
+
+
+def _drop_stage_if_owner(job_id: int, run_id: int, stage: str) -> None:
+    """Drop a failed / stopped run's stage table — only while the run still
+    holds the job lock. If its lock was taken over (it stopped responding),
+    the stage now belongs to the newer run."""
+    with get_data_engine().begin() as c:
+        c.execute(text(f"""
+            IF EXISTS (SELECT 1 FROM {JOB_TABLE} WHERE JOB_ID=:jid AND LOCK_RUN_ID=:rid)
+               AND OBJECT_ID('dbo.[{stage}]','U') IS NOT NULL
+                DROP TABLE dbo.[{stage}]
+        """), {"jid": job_id, "rid": run_id})
 
 
 def _build_specs(metas: List[Dict[str, Any]], profiles: Dict[str, Dict[str, Any]],
@@ -835,6 +997,7 @@ def _load_stage(sf_cur, stage: str, specs: List[Dict[str, Any]], run_id: int,
         mc.fast_executemany = True
         total, last_flush = 0, time.time()
         while True:
+            hb.check()
             batch = sf_cur.fetchmany(FETCH_BATCH)
             if not batch:
                 break
@@ -1051,6 +1214,9 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
 
     hb.step("Reading source columns")
     sfconn = gsf.connect(long_running=True)
+    # Stop cancels whatever this session is running (the data query, the profile).
+    sf_session = getattr(sfconn, "session_id", None)
+    undo_stop = hb.on_stop(lambda: gsf.cancel_session_queries(sf_session))
     try:
         cur = sfconn.cursor()
         try:
@@ -1145,6 +1311,7 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
             stats["LOADER"] = "classic"
             stats["LOADER_NOTE"] = fallback
     finally:
+        undo_stop()
         try:
             sfconn.close()
         except Exception:
@@ -1176,10 +1343,13 @@ def _sync(job: Dict[str, Any], run: Dict[str, Any], hb: _Heartbeat) -> Dict[str,
     stats["WATERMARK_TO"] = new_wm or stats.get("WATERMARK_FROM")
 
     changes: List[str] = []
+    if as_new_table and key_sql:
+        hb.step("Indexing key columns")
+        _index_keys(stage, target, key_sql)
+    # Point of no return: from here the live table changes, so a Stop that
+    # arrives now is noted on the run but the run finishes.
+    hb.commit()
     if as_new_table:
-        if key_sql:
-            hb.step("Indexing key columns")
-            _index_keys(stage, target, key_sql)
         hb.step("Swapping in the new table")
         _swap(stage, target)
         stats.update(ROWS_INSERTED=staged, ROWS_UPDATED=0)
@@ -1244,7 +1414,8 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
     try:
         if slot is not None:
             hb.step("Waiting for a free slot")
-            slot.acquire()
+            while not slot.acquire(timeout=STOP_POLL_SEC):
+                hb.check()
         try:
             job = get_job(job_id, raw=True)
             if not job:
@@ -1255,7 +1426,15 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
             if slot is not None:
                 slot.release()
     except Exception as e:
-        if isinstance(e, GetDataError):
+        if hb.stopped:
+            # Whatever the Stop broke (cancelled query, killed bcp) surfaces here.
+            status = "stopped"
+            message = f"Stopped by {hb.stopped_by} during “{hb.step_text}”."
+            if hb.rows_loaded:
+                message += f" {hb.rows_loaded:,} rows had reached the stage table; it was dropped."
+            message += f" {run['TARGET_TABLE']} was not changed."
+            logger.info(f"[get-data] run {run_id} stopped by {hb.stopped_by} ({type(e).__name__}: {e})")
+        elif isinstance(e, GetDataError):
             message = str(e)
             logger.warning(f"[get-data] run {run_id} failed: {e}")
         else:
@@ -1263,7 +1442,7 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
             logger.exception(f"[get-data] run {run_id} crashed")
         try:
             if job:
-                _drop(f"{job['TARGET_TABLE']}__STG")
+                _drop_stage_if_owner(job_id, run_id, f"{job['TARGET_TABLE']}__STG")
         except Exception:
             pass
     finally:
@@ -1277,6 +1456,9 @@ def execute_run(run_id: int, slot: Optional[threading.Semaphore] = None) -> Dict
         message += f" Retrying once at {_ist_label(retry_at)}."
     if status == "success":
         message += f" Took {_fmt_dur(dur)}."
+        if hb.late_stop_by:
+            message += (f" Stop by {hb.late_stop_by} came after the load had started changing "
+                        f"{run['TARGET_TABLE']}, so the run was finished.")
 
     new_wm = stats.pop("NEW_WATERMARK", None)
     with get_data_engine().begin() as c:
@@ -1339,7 +1521,7 @@ def list_runs(date_from: Optional[str] = None, date_to: Optional[str] = None,
         where.append("JOB_ID = :jid"); params["jid"] = int(job_id)
     if run_type and run_type.upper() in ("AUTO", "MANUAL"):
         where.append("RUN_TYPE = :rt"); params["rt"] = run_type.upper()
-    if status and status.lower() in ("running", "success", "failed", "skipped"):
+    if status and status.lower() in ("running", "success", "failed", "skipped", "stopped"):
         where.append("STATUS = :st"); params["st"] = status.lower()
     w = " AND ".join(where)
     lim = max(1, min(int(limit or 200), 2000))
@@ -1350,7 +1532,7 @@ def list_runs(date_from: Optional[str] = None, date_to: Optional[str] = None,
                    RUN_TYPE, TRIGGERED_BY, ATTEMPT, FULL_RELOAD, STATUS, STEP, SOURCE_ROWS,
                    ROWS_LOADED, ROWS_INSERTED, ROWS_UPDATED, TARGET_ROWS_BEFORE, TARGET_ROWS_AFTER,
                    WATERMARK_FROM, WATERMARK_TO, SF_QUERY_ID, LOADER, STARTED_AT, HEARTBEAT_AT,
-                   COMPLETED_AT, DURATION_MS, MESSAGE
+                   COMPLETED_AT, DURATION_MS, MESSAGE, STOP_REQUESTED_AT, STOP_REQUESTED_BY
             FROM {RUN_TABLE} WHERE {w}
             ORDER BY RUN_ID DESC OFFSET {off} ROWS FETCH NEXT {lim} ROWS ONLY
         """), params).mappings().fetchall()
@@ -1361,6 +1543,7 @@ def list_runs(date_from: Optional[str] = None, date_to: Optional[str] = None,
                    SUM(CASE WHEN STATUS='success' THEN 1 ELSE 0 END) AS success,
                    SUM(CASE WHEN STATUS='failed' THEN 1 ELSE 0 END) AS failed,
                    SUM(CASE WHEN STATUS='skipped' THEN 1 ELSE 0 END) AS skipped,
+                   SUM(CASE WHEN STATUS='stopped' THEN 1 ELSE 0 END) AS stopped,
                    SUM(CASE WHEN STATUS='running' THEN 1 ELSE 0 END) AS running,
                    SUM(CASE WHEN STATUS='success' THEN ROWS_LOADED ELSE 0 END) AS rows_loaded
             FROM {RUN_TABLE} WHERE {w}

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import {
-  RefreshCw, Plus, Play, Pencil, Trash2, Power, X, FlaskConical, RotateCcw, Clock, History,
+  RefreshCw, Plus, Play, Pencil, Trash2, Power, X, FlaskConical, RotateCcw, Clock, History, Square,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { getDataAPI } from '@/services/api'
@@ -133,6 +133,19 @@ export default function GetDataJobsPage() {
     } finally { setBusyId(null) }
   }
 
+  const stop = async (j) => {
+    if (!confirm(`Stop run #${j.LOCK_RUN_ID} of "${j.JOB_NAME}"?\n\nThe load is cancelled and ${j.TARGET_TABLE} keeps the data it has now. A run that has already started swapping or merging into the table can't be stopped and will finish.`)) return
+    setBusyId(j.JOB_ID)
+    try {
+      const { data } = await getDataAPI.stopRun(j.LOCK_RUN_ID)
+      toast.success(data.message || 'Stopping…')
+      load(true)
+    } catch (e) {
+      toast.error(errText(e, 'Could not stop the run'))
+      load(true)
+    } finally { setBusyId(null) }
+  }
+
   const toggle = async (j) => {
     try { await getDataAPI.enableJob(j.JOB_ID, !j.ENABLED); load(true) }
     catch (e) { toast.error(errText(e)) }
@@ -208,27 +221,35 @@ export default function GetDataJobsPage() {
                           <StatusPill status={j.LAST_STATUS}>{j.LAST_STATUS}{j.LAST_STATUS === 'success' && j.LAST_ROWS != null ? ` · ${fmtNum(j.LAST_ROWS)}` : ''}</StatusPill>
                           <div className="text-gray-400 mt-0.5">{fmtIST(j.LAST_RUN_AT)}</div>
                           {j.LAST_STATUS === 'failed' && <div className="text-red-600 line-clamp-2 max-w-xs" title={j.LAST_MESSAGE || ''}>{j.LAST_MESSAGE}</div>}
+                          {j.LAST_STATUS === 'stopped' && <div className="text-orange-700 line-clamp-2 max-w-xs" title={j.LAST_MESSAGE || ''}>{j.LAST_MESSAGE}</div>}
                         </div>
                       ) : <span className="text-gray-400">never run</span>}
                     </td>
                     <td className="px-4 py-2.5">
                       <div className="flex items-center justify-end gap-1">
-                        {canRun && (
-                          <button onClick={() => run(j)} disabled={busyId === j.JOB_ID || !!j.LOCK_RUN_ID} title="Run now"
+                        {canRun && (j.LOCK_RUN_ID ? (
+                          <button onClick={() => stop(j)} disabled={busyId === j.JOB_ID || !!j.RUN_STOP_REQUESTED_AT}
+                            title={j.RUN_STOP_REQUESTED_AT ? 'Stopping…' : `Stop run #${j.LOCK_RUN_ID}`}
+                            className="p-1.5 text-red-600 hover:bg-red-50 rounded disabled:opacity-40">
+                            {busyId === j.JOB_ID ? <RefreshCw size={15} className="animate-spin" /> : <Square size={15} fill="currentColor" />}
+                          </button>
+                        ) : (
+                          <button onClick={() => run(j)} disabled={busyId === j.JOB_ID} title="Run now"
                             className="p-1.5 text-primary-600 hover:bg-primary-50 rounded disabled:opacity-40">
                             {busyId === j.JOB_ID ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}
                           </button>
-                        )}
+                        ))}
                         {canRun && j.LOAD_MODE === 'incremental' && (
                           <button onClick={() => run(j, true)} disabled={!!j.LOCK_RUN_ID} title="Full reload (resets the watermark)"
                             className="p-1.5 text-gray-500 hover:bg-gray-100 rounded disabled:opacity-40"><RotateCcw size={15} /></button>
                         )}
                         <Link to={`/get-data/runs?job_id=${j.JOB_ID}`} title="Run history" className="p-1.5 text-gray-500 hover:bg-gray-100 rounded"><History size={15} /></Link>
                         {canManage && <>
-                          <button onClick={() => toggle(j)} title={j.ENABLED ? 'Disable' : 'Enable'}
+                          <button onClick={() => toggle(j)}
+                            title={j.ENABLED ? 'Disable the schedule (a run in progress keeps going — use Stop for that)' : 'Enable the schedule'}
                             className={`p-1.5 rounded hover:bg-gray-100 ${j.ENABLED ? 'text-green-600' : 'text-gray-400'}`}><Power size={15} /></button>
                           <button onClick={() => openEdit(j)} title="Edit" className="p-1.5 text-gray-500 hover:bg-gray-100 rounded"><Pencil size={15} /></button>
-                          <button onClick={() => setDeleting(j)} title="Delete" disabled={!!j.LOCK_RUN_ID}
+                          <button onClick={() => setDeleting(j)} title={j.LOCK_RUN_ID ? 'Stop the run before deleting' : 'Delete'} disabled={!!j.LOCK_RUN_ID}
                             className="p-1.5 text-red-500 hover:bg-red-50 rounded disabled:opacity-40"><Trash2 size={15} /></button>
                         </>}
                       </div>
@@ -251,8 +272,11 @@ function Progress({ j }) {
   const pct = j.RUN_SOURCE_ROWS ? Math.min(100, Math.round((j.RUN_ROWS_LOADED || 0) / j.RUN_SOURCE_ROWS * 100)) : null
   return (
     <div>
-      <StatusPill status="running">running · #{j.LOCK_RUN_ID}</StatusPill>
+      {j.RUN_STOP_REQUESTED_AT
+        ? <StatusPill status="stopped">stopping · #{j.LOCK_RUN_ID}</StatusPill>
+        : <StatusPill status="running">running · #{j.LOCK_RUN_ID}</StatusPill>}
       <div className="text-gray-600 mt-1">{j.RUN_STEP || 'Starting'}</div>
+      {j.RUN_STOP_REQUESTED_AT && <div className="text-orange-700">Stop requested by {j.RUN_STOP_REQUESTED_BY || 'a user'}</div>}
       {j.RUN_SOURCE_ROWS != null && (
         <>
           <div className="h-1.5 bg-gray-100 rounded mt-1 overflow-hidden"><div className="h-full bg-amber-400" style={{ width: `${pct}%` }} /></div>

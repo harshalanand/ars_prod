@@ -24,8 +24,8 @@ and SAP (phase 4, absorbs SAP → Data Pulls) plug into the same jobs and histor
 |---|---|---|
 | Overview | `/get-data/overview` | Sources, today's runs (auto · manual · success · failed · rows), next scheduled runs, failures in the last 7 days, 7-day table. |
 | Snowflake Views | `/get-data/snowflake/views` | Write a SELECT → Validate → Preview 100 rows → Create view. Browse every schema read-only. |
-| Sync Jobs | `/get-data/snowflake/jobs` | Source → local table, load mode, IST schedule, retry, Run now / Full reload, live progress. |
-| Run History | `/get-data/runs` | Every run with AUTO/MANUAL, run by, Snowflake rows, rows loaded, time, status, details, Excel export. |
+| Sync Jobs | `/get-data/snowflake/jobs` | Source → local table, load mode, IST schedule, retry, Run now / Full reload, **Stop** (■, while a run is live), live progress. |
+| Run History | `/get-data/runs` | Every run with AUTO/MANUAL, run by, Snowflake rows, rows loaded, time, status, details, Excel export; Stop on a running row. |
 | Excel · DataV2 · SAP | `/get-data/excel` … | Placeholders describing the later phases. |
 | Help | `/get-data/help` | Plain-language guide. |
 
@@ -137,6 +137,32 @@ watermark, so the next incremental run loads everything.
 8. **Record** — counts, watermark from → to, duration, message on `GD_RUN`; last status
    / rows / watermark on `GD_JOB`; lock released.
 
+### Stop (a running run)
+- **Stop ≠ Disable.** The Power button only turns the *schedule* off (`ENABLED`); a run
+  already going keeps going. Stop (■ on Sync Jobs, or on a running row in Run History)
+  ends the run itself. Permission: same as Run now.
+- `POST runs/{id}/stop` sets `GD_RUN.STOP_REQUESTED_AT / _BY` (a second Stop keeps the
+  first requester). The worker running it — any of the uvicorn workers — sees it within
+  3 s (its heartbeat polls the row; a Stop that lands on the same worker acts at once)
+  and breaks the blocking call in progress:
+  - Snowflake data query / profile → `SYSTEM$CANCEL_ALL_QUERIES(<session>)` from a second
+    connection; the call fails with `000604 SQL execution canceled`.
+  - Bulk load → every running `bcp` is killed (a chunk is one transaction, so it commits
+    nothing) and no new chunk starts; the Arrow fetch loop exits at the next batch.
+  - Classic load → stops before the next 20,000-row batch.
+  - Waiting for a free slot → leaves the queue.
+  - Verify / index (SQL Server statements) → stop when that statement ends.
+- The stage table is dropped (only while the run still holds the job lock — if its lock
+  was taken over, the stage belongs to the newer run) and the run is recorded
+  **`stopped`**: “Stopped by X during ‘step’. N rows had reached the stage table; it was
+  dropped. GD_SF_… was not changed.” `GD_JOB.LAST_STATUS` = `stopped`. No retry.
+- **Point of no return**: just before step 7 (swap / MERGE / INSERT) the run commits to
+  finishing. A Stop after that is noted in the success message (“Stop by X came after the
+  load had started changing …, so the run was finished”) and the run completes.
+- A run asked to stop whose heartbeat is older than 3 min (its worker is gone) is closed
+  as `stopped` by the next reconcile (every scheduler tick, and at once by the Stop call)
+  and its job lock released — instead of waiting the usual 10 min.
+
 ### Type mapping (Snowflake → SQL Server)
 | Snowflake | Local |
 |---|---|
@@ -172,20 +198,21 @@ watermark, so the next incremental run loads everything.
 
 ### Run history (`GD_RUN`)
 One row per run: `RUN_TYPE` AUTO | MANUAL, `TRIGGERED_BY` (user or `scheduler`),
-`ATTEMPT`, `FULL_RELOAD`, `STATUS` running | success | failed | skipped, `STEP`,
+`ATTEMPT`, `FULL_RELOAD`, `STATUS` running | success | failed | skipped | stopped, `STEP`,
 `SOURCE_ROWS`, `ROWS_LOADED`, `ROWS_INSERTED`, `ROWS_UPDATED`, `TARGET_ROWS_BEFORE`,
 `TARGET_ROWS_AFTER`, `WATERMARK_FROM`, `WATERMARK_TO`, `SF_QUERY_ID`, `STARTED_AT`,
-`HEARTBEAT_AT`, `COMPLETED_AT`, `DURATION_MS`, `MESSAGE`. Job name, source, table and
+`HEARTBEAT_AT`, `COMPLETED_AT`, `DURATION_MS`, `MESSAGE`, `STOP_REQUESTED_AT`,
+`STOP_REQUESTED_BY`. Job name, source, table and
 mode are copied onto the run so history survives a deleted job.
 Filters: IST date range, job, trigger, status. Summary: auto, manual, rows loaded
-(successful runs), failed, skipped.
+(successful runs), failed, skipped, stopped.
 
 ### Permissions
 - Module visibility: `MOD_GET_DATA` (seeded to all active roles once, like every new
   module; untick per role in Settings → Roles).
 - Manage (create/drop views, create/edit/enable/delete jobs): SUPER_ADMIN, ADMIN, or
   `GET_DATA_MANAGE`.
-- Run now / Full reload / Validate / Preview / Check source: the above or `GET_DATA_RUN`.
+- Run now / Full reload / Stop / Validate / Preview / Check source: the above or `GET_DATA_RUN`.
 
 ### Tables (Rep_data, self-healing — `get_data_schema.py`, reference `038_get_data_module.sql`)
 `GD_VIEW`, `GD_VIEW_VERSION`, `GD_JOB`, `GD_RUN`, plus one `GD_SF_*` table per job.
@@ -194,7 +221,8 @@ Filters: IST date range, job, trigger, status. Summary: auto, manual, rows loade
 `GET overview` · `GET snowflake/status|schemas|objects|columns|views|views/{name}` ·
 `POST snowflake/validate|preview|views` · `DELETE snowflake/views/{name}` ·
 `GET|POST jobs` · `POST jobs/test` · `GET|PUT|DELETE jobs/{id}` · `POST jobs/{id}/enable` ·
-`POST jobs/{id}/run?full_reload=` · `GET runs` · `GET runs/{id}` · `GET scheduler/status`.
+`POST jobs/{id}/run?full_reload=` · `GET runs` · `GET runs/{id}` · `POST runs/{id}/stop` ·
+`GET scheduler/status`.
 
 ### Depends on
 - Settings → Snowflake (the single app-wide connection, `snowflake_config_service`),
@@ -271,3 +299,9 @@ Filters: IST date range, job, trigger, status. Summary: auto, manual, rows loade
   (`[ -~\t\r\n]*` — printable, tab, CR, LF), else NVARCHAR. Incremental/append turn a VARCHAR column into NVARCHAR the
   first time a batch carries non-ASCII text, and widen only when the batch's measured
   longest value no longer fits (an all-NULL column never widens anything).
+- 2026-10-14 · Stop on a running run (status `stopped`). Asked for because the only control
+  was Enable/Disable, which leaves a live run going (runs #170/#171 were 12 and 9 crore-row
+  bulk loads with no way to end them). Stop is a flag on `GD_RUN` polled by the run's own
+  worker, so it works across uvicorn workers; it cancels the Snowflake query (verified:
+  `SYSTEM$WAIT(60)` ended with 000604 three seconds after the cancel), kills bcp, drops the stage, and never
+  touches the live table. After the apply step begins, the run finishes instead.

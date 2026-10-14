@@ -5,10 +5,10 @@ Brings data INTO local SQL (Rep_data) from outside sources. Phase 1 = Snowflake:
   • /get-data/overview             — module dashboard
   • /get-data/snowflake/*          — status, browse, validate, preview, views
   • /get-data/jobs                 — sync-job CRUD, test, Run now
-  • /get-data/runs                 — run history (AUTO / MANUAL, row counts)
+  • /get-data/runs                 — run history (AUTO / MANUAL, row counts), Stop
 
 Manage (create views, edit jobs) = SUPER_ADMIN / ADMIN or GET_DATA_MANAGE.
-Run now / preview = the above or GET_DATA_RUN. Spec: docs/manual/get_data.md.
+Run now / Stop / preview = the above or GET_DATA_RUN. Spec: docs/manual/get_data.md.
 """
 from typing import Any, List, Optional
 
@@ -316,3 +316,18 @@ def get_run(run_id: int, current_user: User = Depends(get_current_user)):
     if not r:
         raise HTTPException(404, detail=f"Run {run_id} not found")
     return APIResponse(success=True, message="ok", data=r)
+
+
+@router.post("/runs/{run_id}/stop", response_model=APIResponse)
+def stop_run(run_id: int, current_user: User = Depends(get_current_user)):
+    """Stop a running run: the Snowflake query is cancelled / bcp killed, the
+    stage table dropped, the run recorded as 'stopped' and the live table left
+    as it was. Returns at once; the run ends within a few seconds."""
+    _require_run(current_user)
+    try:
+        r = svc.stop_run(run_id, _uname(current_user))
+        msg = (f"Run #{run_id} stopped" if r and r.get("STATUS") == "stopped"
+               else f"Stopping run #{run_id}…")
+        return APIResponse(success=True, message=msg, data=r)
+    except Exception as e:
+        _fail(e, f"stop run {run_id}")

@@ -849,6 +849,7 @@ export const getDataAPI = _gdChecked({
   runJob:     (id, fullReload) => api.post(`/get-data/jobs/${id}/run`, {}, { ..._GD, params: { full_reload: !!fullReload } }),
   listRuns:   (params)        => api.get('/get-data/runs', { ..._GD, params }),
   getRun:     (id)            => api.get(`/get-data/runs/${id}`, _GD),
+  stopRun:    (id)            => api.post(`/get-data/runs/${id}/stop`, {}, _GD),
 })
 
 // ============== Maintenance (superadmin only) ==============

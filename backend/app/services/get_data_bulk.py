@@ -252,7 +252,49 @@ def _write(path: str, parts) -> None:
 _COPIED = re.compile(r"(\d+) rows copied")
 
 
-def _bcp_chunk(path: str, stage: str, expected: int) -> int:
+class BcpKilled(RuntimeError):
+    """The run was stopped; its bcp processes were killed."""
+
+
+class _Procs:
+    """The bcp processes of one run, so Stop can kill them mid-chunk. A killed
+    chunk commits nothing (one bcp transaction) and no new one starts."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._live: set = set()
+        self.killed = False
+
+    def run(self, cmd: List[str], stdin: Optional[str], timeout: int) -> str:
+        with self._lock:
+            if self.killed:
+                raise BcpKilled("bcp stopped")
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE if stdin is not None else None,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self._live.add(p)
+        try:
+            try:
+                out, err = p.communicate(stdin, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
+                return f"bcp timed out after {timeout}s"
+            return out + err
+        finally:
+            with self._lock:
+                self._live.discard(p)
+
+    def kill_all(self) -> None:
+        with self._lock:
+            self.killed = True
+            for p in self._live:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+
+def _bcp_chunk(path: str, stage: str, expected: int, procs: _Procs) -> int:
     """Load one chunk as a single transaction; retry once if nothing committed."""
     err = path + ".err"
     mode, _ = bcp_auth()
@@ -264,11 +306,9 @@ def _bcp_chunk(path: str, stage: str, expected: int) -> int:
            "-a", "32768", "-m", "1", "-e", err]
     last = ""
     for attempt in (1, 2):
-        try:
-            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=BCP_TIMEOUT_S)
-            out = p.stdout + p.stderr
-        except subprocess.TimeoutExpired:
-            out = f"bcp timed out after {BCP_TIMEOUT_S}s"
+        out = procs.run(cmd, stdin, BCP_TIMEOUT_S)
+        if procs.killed:
+            raise BcpKilled("bcp stopped")
         m = _COPIED.search(out)
         copied = int(m.group(1)) if m else 0
         if copied == expected:
@@ -288,13 +328,16 @@ def _bcp_chunk(path: str, stage: str, expected: int) -> int:
 def load_stage_bulk(sf_cur, stage: str, specs: List[Dict[str, Any]], run_id: int,
                     loaded_at: str, hb) -> int:
     """Stream the open Snowflake result into the (already created, empty) stage
-    table. Returns rows loaded. Raises on any failure; the caller drops the stage."""
+    table. Returns rows loaded. Raises on any failure; the caller drops the stage.
+    Stop (hb) kills the running bcp processes and ends the fetch loop."""
     tmpdir = tempfile.mkdtemp(prefix=f"gd_run{run_id}_")
     lock = threading.Lock()
     loaded = [0]
     pool = ThreadPoolExecutor(max_workers=PARALLEL, thread_name_prefix=f"GdBcp-{run_id}")
     running = set()
     fetched = 0
+    procs = _Procs()
+    undo_stop = hb.on_stop(procs.kill_all)
 
     def submit(parts, n, idx):
         path = os.path.join(tmpdir, f"chunk_{idx:05d}.dat")
@@ -302,7 +345,7 @@ def load_stage_bulk(sf_cur, stage: str, specs: List[Dict[str, Any]], run_id: int
 
         def job():
             try:
-                c = _bcp_chunk(path, stage, n)
+                c = _bcp_chunk(path, stage, n, procs)
             finally:
                 for f in (path, path + ".err"):
                     try:
@@ -325,6 +368,7 @@ def load_stage_bulk(sf_cur, stage: str, specs: List[Dict[str, Any]], run_id: int
     try:
         parts, n, idx, last_flush = [], 0, 0, time.time()
         for tbl in sf_cur.fetch_arrow_batches():
+            hb.check()
             parts.append(_encode(tbl, specs, run_id, loaded_at))
             n += tbl.num_rows
             fetched += tbl.num_rows
@@ -342,7 +386,11 @@ def load_stage_bulk(sf_cur, stage: str, specs: List[Dict[str, Any]], run_id: int
         if loaded[0] != fetched:
             raise RuntimeError(f"bcp loaded {loaded[0]:,} rows but {fetched:,} were fetched")
         return loaded[0]
+    except BaseException:
+        procs.kill_all()     # the stage is dropped or rebuilt by the caller — don't wait on chunks
+        raise
     finally:
+        undo_stop()
         for f in running:
             f.cancel()
         pool.shutdown(wait=True, cancel_futures=True)

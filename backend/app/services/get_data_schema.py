@@ -174,6 +174,13 @@ def ensure_tables(force: bool = False) -> None:
                 IF COL_LENGTH('dbo.{RUN_TABLE}', 'COLUMN_MAP') IS NULL
                 ALTER TABLE dbo.{RUN_TABLE} ADD COLUMN_MAP NVARCHAR(MAX) NULL
             """))
+            # Self-heal: Stop on a running run (STATUS 'stopped'), 2026-10-14.
+            for col, ddl in (("STOP_REQUESTED_AT", "DATETIME2(0) NULL"),
+                             ("STOP_REQUESTED_BY", "NVARCHAR(128) NULL")):
+                c.execute(text(f"""
+                    IF COL_LENGTH('dbo.{RUN_TABLE}', '{col}') IS NULL
+                    ALTER TABLE dbo.{RUN_TABLE} ADD {col} {ddl}
+                """))
             c.execute(text(f"""
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_{RUN_TABLE}_job')
                 CREATE INDEX IX_{RUN_TABLE}_job ON dbo.{RUN_TABLE} (JOB_ID, RUN_ID DESC)

@@ -1,6 +1,6 @@
 // Shared bits for the Get Data module (pages under src/pages/getdata/).
 // Times from the API are UTC ISO strings ending in 'Z'; everything is shown in IST.
-import { CheckCircle, XCircle, Clock, MinusCircle, AlertTriangle } from 'lucide-react'
+import { CheckCircle, XCircle, Clock, MinusCircle, AlertTriangle, Ban } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import useAuthStore from '@/store/authStore'
 
@@ -60,6 +60,7 @@ const PILL = {
   failed: ['bg-red-100 text-red-700', XCircle],
   running: ['bg-amber-100 text-amber-700', Clock],
   skipped: ['bg-gray-100 text-gray-500', MinusCircle],
+  stopped: ['bg-orange-100 text-orange-700', Ban],
 }
 
 export function StatusPill({ status, children }) {

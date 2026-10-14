@@ -1,12 +1,12 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { History, RefreshCw, Download, ChevronDown, ChevronRight, Copy } from 'lucide-react'
+import { History, RefreshCw, Download, ChevronDown, ChevronRight, Copy, Square } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import toast from 'react-hot-toast'
 import { getDataAPI } from '@/services/api'
 import {
   fmtNum, fmtCompact, fmtIST, fmtDur, StatusPill, RunTypePill, MODE_LABEL, errText,
-  istToday, istDaysAgo,
+  istToday, istDaysAgo, useGetDataPerms,
 } from '@/components/getdata/gdUtils'
 
 const PAGE = 200
@@ -21,6 +21,7 @@ function Metric({ label, value, tone }) {
 }
 
 export default function GetDataRunsPage() {
+  const { canRun } = useGetDataPerms()
   const [params] = useSearchParams()
   const [filters, setFilters] = useState({
     date_from: istDaysAgo(6), date_to: istToday(),
@@ -69,6 +70,16 @@ export default function GetDataRunsPage() {
 
   const set = (k, v) => setFilters(f => ({ ...f, [k]: v }))
   const s = data.summary || {}
+
+  const stop = async (r) => {
+    if (!confirm(`Stop run #${r.RUN_ID} of "${r.JOB_NAME}"?\n\nThe load is cancelled and ${r.TARGET_TABLE} keeps the data it has now. A run that has already started swapping or merging into the table can't be stopped and will finish.`)) return
+    try {
+      const { data: res } = await getDataAPI.stopRun(r.RUN_ID)
+      toast.success(res.message || 'Stopping…')
+    } catch (e) {
+      toast.error(errText(e, 'Could not stop the run'))
+    } finally { load(true) }
+  }
 
   const exportXlsx = () => {
     const rows = data.items.map(r => ({
@@ -134,16 +145,18 @@ export default function GetDataRunsPage() {
             <option value="failed">Failed</option>
             <option value="running">Running</option>
             <option value="skipped">Skipped</option>
+            <option value="stopped">Stopped</option>
           </select>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
         <Metric label="Auto runs" value={fmtNum(s.auto_runs)} />
         <Metric label="Manual runs" value={fmtNum(s.manual_runs)} />
         <Metric label="Rows loaded" value={fmtCompact(s.rows_loaded)} />
         <Metric label="Failed" value={fmtNum(s.failed)} tone={s.failed ? 'bad' : undefined} />
         <Metric label="Skipped" value={fmtNum(s.skipped)} />
+        <Metric label="Stopped" value={fmtNum(s.stopped)} />
       </div>
 
       {!loading && data.items.length === 0 ? (
@@ -191,7 +204,15 @@ export default function GetDataRunsPage() {
                         <td className="px-3 py-2 text-right font-mono text-xs">{fmtNum(r.SOURCE_ROWS)}</td>
                         <td className={`px-3 py-2 text-right font-mono text-xs ${mismatch ? 'text-red-600 font-semibold' : ''}`}>{fmtNum(r.ROWS_LOADED)}</td>
                         <td className="px-3 py-2">
-                          <StatusPill status={r.STATUS} />
+                          <div className="flex items-center gap-1.5">
+                            {r.STATUS === 'running' && r.STOP_REQUESTED_AT
+                              ? <StatusPill status="stopped">stopping</StatusPill>
+                              : <StatusPill status={r.STATUS} />}
+                            {canRun && r.STATUS === 'running' && !r.STOP_REQUESTED_AT && (
+                              <button onClick={(e) => { e.stopPropagation(); stop(r) }} title={`Stop run #${r.RUN_ID}`}
+                                className="p-1 text-red-600 hover:bg-red-50 rounded"><Square size={12} fill="currentColor" /></button>
+                            )}
+                          </div>
                           {r.STATUS === 'running' && r.STEP && <div className="text-[11px] text-gray-500 mt-0.5">{r.STEP}</div>}
                         </td>
                       </tr>
@@ -233,7 +254,9 @@ function RunDetail({ r }) {
   return (
     <div className="space-y-2 text-xs">
       {r.MESSAGE && (
-        <div className={`rounded px-3 py-2 ${r.STATUS === 'failed' ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-white border border-gray-200 text-gray-700'}`}>
+        <div className={`rounded px-3 py-2 ${r.STATUS === 'failed' ? 'bg-red-50 text-red-700 border border-red-200'
+          : r.STATUS === 'stopped' ? 'bg-orange-50 text-orange-800 border border-orange-200'
+          : 'bg-white border border-gray-200 text-gray-700'}`}>
           {r.MESSAGE}
         </div>
       )}

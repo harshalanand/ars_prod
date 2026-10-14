@@ -118,7 +118,7 @@ CREATE TABLE dbo.GD_RUN (
     TRIGGERED_BY       NVARCHAR(128)  NULL,
     ATTEMPT            INT            NOT NULL DEFAULT 1,       -- 2 = automatic retry
     FULL_RELOAD        BIT            NOT NULL DEFAULT 0,
-    STATUS             NVARCHAR(20)   NOT NULL DEFAULT 'running', -- running | success | failed | skipped
+    STATUS             NVARCHAR(20)   NOT NULL DEFAULT 'running', -- running | success | failed | skipped | stopped
     STEP               NVARCHAR(200)  NULL,
     SOURCE_ROWS        BIGINT         NULL,                     -- rows Snowflake returned
     ROWS_LOADED        BIGINT         NULL,                     -- rows that reached SQL Server
@@ -139,6 +139,14 @@ GO
 -- 2026-10-01: which loader a run used — bulk (bcp) or classic (parameterised inserts)
 IF COL_LENGTH('dbo.GD_RUN', 'LOADER') IS NULL
 ALTER TABLE dbo.GD_RUN ADD LOADER NVARCHAR(20) NULL;
+GO
+-- 2026-10-14: Stop on a running run. The worker running it polls these; the run
+-- ends as STATUS 'stopped' with the live table unchanged.
+IF COL_LENGTH('dbo.GD_RUN', 'STOP_REQUESTED_AT') IS NULL
+ALTER TABLE dbo.GD_RUN ADD STOP_REQUESTED_AT DATETIME2(0) NULL;
+GO
+IF COL_LENGTH('dbo.GD_RUN', 'STOP_REQUESTED_BY') IS NULL
+ALTER TABLE dbo.GD_RUN ADD STOP_REQUESTED_BY NVARCHAR(128) NULL;
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_GD_RUN_job')
 CREATE INDEX IX_GD_RUN_job ON dbo.GD_RUN (JOB_ID, RUN_ID DESC);
