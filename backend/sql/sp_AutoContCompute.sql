@@ -79,6 +79,7 @@ BEGIN
     DECLARE @Q        FLOAT = 1000.0;     -- qty divisor
     DECLARE @V        FLOAT = 100000.0;   -- value divisor (lakhs)
     DECLARE @gr       FLOAT = CASE WHEN @grouping_column = 'M_VND_CD' THEN 2.0 ELSE 1.0 END;
+    DECLARE @avg_days_f FLOAT = CAST(@avg_days AS FLOAT);  -- EXEC params can't take expressions; precompute
 
     -- ── Date filter clause ──────────────────────────────────────────────────
     DECLARE @date_filter NVARCHAR(1000);
@@ -316,7 +317,7 @@ BEGIN
 
     EXEC sp_executesql @sql,
         N'@qq FLOAT, @vv FLOAT, @ad FLOAT, @gr FLOAT',
-        @qq = @Q, @vv = @V, @ad = CAST(@avg_days AS FLOAT), @gr = @gr;
+        @qq = @Q, @vv = @V, @ad = @avg_days_f, @gr = @gr;
 
     -- ════════════════════════════════════════════════════════════════════════
     -- Step 5: aggregate to company level → @out_company
@@ -436,7 +437,7 @@ BEGIN
 
     EXEC sp_executesql @sql,
         N'@qq FLOAT, @vv FLOAT, @ad FLOAT, @gr FLOAT',
-        @qq = @Q, @vv = @V, @ad = CAST(@avg_days AS FLOAT), @gr = @gr;
+        @qq = @Q, @vv = @V, @ad = @avg_days_f, @gr = @gr;
 
     -- ── cleanup ─────────────────────────────────────────────────────────────
     IF OBJECT_ID('tempdb..#stage')     IS NOT NULL DROP TABLE #stage;

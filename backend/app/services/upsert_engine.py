@@ -348,7 +348,13 @@ class UpsertEngine:
             # batch size. 4000 is the upper bound for non-LOB nvarchar in
             # SQL Server; longer values would need MAX (extremely rare for
             # the data we stage — markers are short, IDs are short).
-            col_defs = ", ".join(f"[{c}] NVARCHAR(4000) NULL" for c in df.columns)
+            # COLLATE DATABASE_DEFAULT: temp tables live in tempdb and otherwise
+            # inherit tempdb's collation, which can differ from the target/user
+            # database. When it does, the PK join below (t.[pk] = s.[pk]) throws
+            # "Cannot resolve the collation conflict" (error 468). Forcing the
+            # current (user) database's collation keeps staging columns aligned
+            # with the target table's columns.
+            col_defs = ", ".join(f"[{c}] NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL" for c in df.columns)
             cursor.execute(f"CREATE TABLE {staging} ({col_defs})")
             t_create = time.time()
 
@@ -682,8 +688,11 @@ class UpsertEngine:
         """
         col_defs = []
         for col in df.columns:
-            # Always use NVARCHAR for temp table to handle special markers
-            col_defs.append(f"[{col}] NVARCHAR(500) NULL")
+            # Always use NVARCHAR for temp table to handle special markers.
+            # COLLATE DATABASE_DEFAULT forces the user DB's collation so the
+            # MERGE join (target.[pk] = source.[pk]) doesn't hit a collation
+            # conflict when tempdb's collation differs from the target DB's.
+            col_defs.append(f"[{col}] NVARCHAR(500) COLLATE DATABASE_DEFAULT NULL")
 
         return f"CREATE TABLE {temp_table} ({', '.join(col_defs)})"
 
@@ -781,7 +790,10 @@ class UpsertEngine:
         # Build output table columns and OUTPUT clause
         if enable_row_audit:
             # Include PK columns for row-level audit
-            pk_output_cols = ", ".join([f"[pk_{pk}] NVARCHAR(MAX)" for pk in primary_key_columns])
+            # COLLATE DATABASE_DEFAULT: these pk columns are later joined against
+            # CAST(target.[pk] AS NVARCHAR(MAX)) in _collect_row_changes; without
+            # forcing the user DB collation that join hits conflict 468 too.
+            pk_output_cols = ", ".join([f"[pk_{pk}] NVARCHAR(MAX) COLLATE DATABASE_DEFAULT" for pk in primary_key_columns])
             output_table_cols = f"action_type NVARCHAR(10), {pk_output_cols}"
             
             pk_inserted_refs = ", ".join([f"inserted.[{pk}]" for pk in primary_key_columns])

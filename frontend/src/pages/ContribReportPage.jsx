@@ -425,6 +425,38 @@ export default function ContribReportPage() {
   // exactly what's currently shown. Reset to [] when the table changes.
   const [selectedCols, setSelectedCols] = useState([])
 
+  // Excel-style per-column widths (px), keyed by column name. Empty = use the
+  // type-based default from defaultColW(). Persisted across tables/pages so a
+  // user's manual sizing sticks; a column drops back to default on dbl-click.
+  const [colWidths, setColWidths] = useState({})
+  const cw = useCallback((c) => colWidths[c] ?? defaultColW(c), [colWidths])
+
+  // Drag a header's right-edge handle to resize. Listeners live on document so
+  // the drag keeps tracking even when the cursor leaves the thin handle.
+  const startResize = useCallback((e, col) => {
+    e.preventDefault(); e.stopPropagation()
+    const thEl = e.currentTarget.parentElement
+    const startX = e.clientX
+    const startW = thEl.getBoundingClientRect().width
+    const onMove = (ev) => {
+      const w = Math.max(48, Math.round(startW + (ev.clientX - startX)))
+      setColWidths(prev => ({ ...prev, [col]: w }))
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }, [])
+  const resetColWidth = useCallback((col) => {
+    setColWidths(prev => { const n = { ...prev }; delete n[col]; return n })
+  }, [])
+
   const handleColFilter = useCallback((col, vals) => {
     setFilters(f => {
       const next = { ...f.byCol }
@@ -582,6 +614,13 @@ export default function ContribReportPage() {
 
   const filterOpts = data.filter_options || {}
 
+  // Sum of column widths drives the fixed-layout table's total width so it
+  // never stretches to fill the container — it scrolls horizontally instead.
+  const totalWidth = useMemo(
+    () => IDX_W + (data.columns || []).reduce((s, c) => s + cw(c), 0),
+    [data.columns, cw],
+  )
+
   return (
     <div style={{ padding: 14, background: C.pageBg, minHeight: '100vh' }}>
       {/* Header */}
@@ -696,14 +735,14 @@ export default function ContribReportPage() {
               ? 'match the current filters.' : 'in this table.'}
           </div>
         ) : (
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+          <table style={{ width: totalWidth, borderCollapse: 'collapse', fontSize: 11, tableLayout: 'fixed' }}>
             <thead style={{ position: 'sticky', top: 0, background: C.headerBg, zIndex: 5 }}>
               <tr>
-                <th style={th}>#</th>
+                <th style={{ ...th, width: IDX_W }}>#</th>
                 {data.columns.map(c => (
-                  <th key={c} style={th}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <span>{c}</span>
+                  <th key={c} style={{ ...th, width: cw(c), position: 'relative' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '0 1 auto', minWidth: 0 }} title={c}>{c}</span>
                       {filterOpts[c] && filterOpts[c].length > 0 && (
                         <FilterDropdown
                           column={c}
@@ -713,6 +752,11 @@ export default function ContribReportPage() {
                         />
                       )}
                     </div>
+                    {/* Excel-style drag handle on the right edge; dbl-click resets */}
+                    <div onMouseDown={(e) => startResize(e, c)}
+                         onDoubleClick={() => resetColWidth(c)}
+                         title="Drag to resize · double-click to reset"
+                         style={resizeHandleStyle} />
                   </th>
                 ))}
               </tr>
@@ -727,7 +771,8 @@ export default function ContribReportPage() {
                     const v = r[c]
                     const isNum = typeof v === 'number'
                     return (
-                      <td key={c} style={{ ...td, textAlign: isNum ? 'right' : 'left',
+                      <td key={c} title={v == null ? '' : String(v)}
+                          style={{ ...td, textAlign: isNum ? 'right' : 'left',
                                             fontVariantNumeric: 'tabular-nums',
                                             fontFamily: isNum ? 'ui-monospace, monospace' : 'inherit' }}>
                         {fmtCell(v, c)}
@@ -773,10 +818,25 @@ export default function ContribReportPage() {
 const th = {
   padding: '6px 8px', borderBottom: `1px solid ${C.cardBorder}`, borderRight: `1px solid ${C.cardBorder}`,
   fontSize: 10, fontWeight: 700, color: C.text, textAlign: 'left', whiteSpace: 'nowrap', background: C.headerBg,
+  // NOTE: no overflow:hidden here — the filter dropdown popup is an absolutely
+  // positioned child of <th>, so clipping the th would clip the popup. Header
+  // text ellipsis is handled on the label <span> instead.
 }
 const td = {
   padding: '4px 8px', borderBottom: `1px solid ${C.cardBorder}`, borderRight: `1px solid ${C.cardBorder}`,
-  whiteSpace: 'nowrap', color: C.text,
+  whiteSpace: 'nowrap', color: C.text, overflow: 'hidden', textOverflow: 'ellipsis',
+}
+
+// Index (#) column width and per-column default widths for the resizable grid.
+const IDX_W = 48
+const defaultColW = (c) =>
+  /NM|NAME/i.test(c)              ? 180 :
+  /MAJ_CAT|SUB_DIV|SSN|STATUS/i.test(c) ? 140 :
+  110
+// Thin invisible strip on a header's right edge — the drag target.
+const resizeHandleStyle = {
+  position: 'absolute', top: 0, right: -2, height: '100%', width: 7,
+  cursor: 'col-resize', userSelect: 'none', zIndex: 6,
 }
 const btn = (variant) => ({
   display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderRadius: 6,

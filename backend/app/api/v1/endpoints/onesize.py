@@ -14,9 +14,11 @@ for full export.
 import csv
 import io
 import math
+import re
 import threading
 import time
 import uuid
+import zipfile
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
@@ -230,12 +232,21 @@ def _persist_onesize_result(
     sequence_id: int,
     job_id: str,
     run_by: Optional[str],
+    cancel_event: Optional[threading.Event] = None,
+    progress: Optional[Any] = None,
 ) -> int:
     """Replace-per-sequence_id write of `df` into ARS_ONESIZE_ALLOCATION.
 
     Atomic: DELETE for this sequence_id and INSERTs of the new rows happen
     inside one transaction so a partial chunk-insert failure rolls back the
     DELETE and leaves the prior data intact.
+
+    Cancellable: `cancel_event` is checked between insert chunks so a user
+    Cancel stops the save promptly (the open transaction rolls back). Without
+    this, a multi-million-row save is one uninterruptible SQL call and Cancel
+    appears to "do nothing" until it finishes. `progress(written, total)` is
+    called after each chunk so the UI can show the save advancing instead of a
+    frozen 100%.
 
     Returns the number of rows inserted.
     """
@@ -260,8 +271,20 @@ def _persist_onesize_result(
     excluded = {"id", "run_at"}
     table_col_lower = {c.lower(): c for c in table_cols if c.lower() not in excluded}
 
-    # Build the insert frame.
+    # Persist ONLY allocated rows (ALLOC > 0). The DB table is the allocation
+    # result; zero-allocation rows (no demand / pool-empty) don't belong there
+    # and are what balloon an All-RDCs run to ~10M rows. The caller's cached df
+    # is untouched, so the CSV/Excel export still contains ALL rows.
     insert_df = df.copy()
+    if "ALLOC" in insert_df.columns:
+        alloc_n = pd.to_numeric(insert_df["ALLOC"], errors="coerce").fillna(0)
+        insert_df = insert_df[alloc_n > 0].copy()
+    if insert_df.empty:
+        logger.info(
+            f"[onesize][persist] no ALLOC>0 rows for sequence_id={sequence_id}; "
+            f"nothing written (export still has all rows)"
+        )
+        return 0
     insert_df["sequence_id"] = int(sequence_id)
     insert_df["job_id"]      = str(job_id)
     insert_df["run_by"]      = run_by
@@ -280,19 +303,34 @@ def _persist_onesize_result(
     # array — not subject to SQL Server's 2100-parameter-per-statement cap.
     # method='multi' would build a single giant INSERT VALUES(...) statement,
     # bypassing fast_executemany and forcing ~28-row chunks. Don't use it.
+    total = len(insert_df)
+    CHUNK = 50_000
+    written = 0
     with engine.begin() as conn:
         conn.execute(
             text(f"DELETE FROM [{ALLOCATION_TABLE}] WHERE sequence_id = :sid"),
             {"sid": int(sequence_id)},
         )
-        insert_df.to_sql(
-            ALLOCATION_TABLE,
-            conn,
-            if_exists="append",
-            index=False,
-            chunksize=20_000,
-        )
-    return len(insert_df)
+        for start in range(0, total, CHUNK):
+            # Cancel checkpoint between chunks — raises out of the `with`, which
+            # rolls the whole transaction back (DELETE included).
+            if cancel_event is not None and cancel_event.is_set():
+                raise OneSizeCancelled()
+            chunk = insert_df.iloc[start:start + CHUNK]
+            chunk.to_sql(
+                ALLOCATION_TABLE,
+                conn,
+                if_exists="append",
+                index=False,
+                chunksize=20_000,
+            )
+            written += len(chunk)
+            if progress is not None:
+                try:
+                    progress(written, total)
+                except Exception:
+                    pass
+    return written
 
 
 def _cache_store(df: "pd.DataFrame", meta: Dict[str, Any]) -> str:
@@ -345,12 +383,19 @@ GEN_ART_GRID_TABLE = "ARS_GRID_MJ_GEN_ART"
 STORE_RANKING_TABLE = "ARS_STORE_RANKING"   # (ST_CD, MAJ_CAT) ranking for allocation order
 AGE_THRESHOLD_DAYS = 15                      # < 15 → new article (include PER_OPT_SALE in MAX)
 
-# Columns the result must surface first (rest of the MSA cols follow).
+# Columns the result must surface first, in this exact left-to-right order
+# (any remaining frame columns follow, then id/sequence_id are stripped).
+# Names that don't exist in a given run are skipped harmlessly, so both the
+# underscore/no-underscore variants (MAJ_CAT/MAJCAT, GEN_ART*) are listed for
+# robustness across data sources.
 PREFERRED_COLS = [
-    # ── A. ARTICLE IDENTITY ────────────────────────────────────────────────
-    "DIV", "SUB_DIV", "MAJCAT", "SSN",
+    # ── A. STORE + ARTICLE IDENTITY ────────────────────────────────────────
+    "RDC", "ST_CD", "ST_NM",
+    "DIV", "SUB_DIV", "SSN",
     "SZ",
-    "MACRO_MVGR", "MICRO_MVGR", "CLR",
+    "MACRO_MVGR", "MICRO_MVGR",
+    "MAJ_CAT", "MAJCAT",               # MAJ_CAT is the live name; MAJCAT = fallback
+    "CLR",
     "GEN_ART", "GEN_ART_NUMBER", "GEN_ART_DESC",
     "ARTICLE_NUMBER", "ARTICLE_DESC",
     "M_VND_CD", "M_VND_NM",
@@ -361,7 +406,7 @@ PREFERRED_COLS = [
     "STK_QTY", "PEND_QTY", "HOLD_QTY", "ARS_PEND", "list",
 
     # ── C. STORE INFO ──────────────────────────────────────────────────────
-    "ST_CD", "ST_NM", "RDC", "ST_STATUS", "ST_RANK", "ST_RANK_STORE", "days",
+    "ST_STATUS", "ST_RANK", "ST_RANK_STORE", "days",
     "PAK_SZ",
     "status",                          # SZ_APPLICABLE
 
@@ -403,6 +448,11 @@ PREFERRED_COLS = [
     "FINAL_ALLOCATION",                # MROUND(ALLOC, PAK_SZ) — whole-carton qty
     "REMAIN_AFTER",                    # CHECK REM MSA (after this row)
     "DEMAND_SRC",
+
+    # ── J. MERGE ARTIFACTS (pinned last) ───────────────────────────────────
+    # ARS_PEND collided during a join and got pandas _x/_y suffixes. Kept at
+    # the end so they never displace real columns; worth de-duping upstream.
+    "ARS_PEND_x", "ARS_PEND_y",
 ]
 
 
@@ -534,6 +584,38 @@ def _compute_onesize(
             "stores": 0,
             "stages": stages,
         }
+
+    # ---- Stage 2b: drop MSA rows with FNL_Q <= 0 ------------------------
+    # Business rule: don't use MSA stock where final available qty is 0 (or
+    # negative). FNL_Q = max(STK - PEND - HOLD, 0), so 0 means nothing left to
+    # distribute. Dropping here keeps these rows out of every downstream step
+    # (counts, cross-join, pool, allocation).
+    if qty_col:
+        before_fnlq = len(msa_df)
+        fnlq_n = pd.to_numeric(msa_df[qty_col], errors="coerce").fillna(0)
+        msa_df = msa_df[fnlq_n > 0].copy()
+        dropped_fnlq = before_fnlq - len(msa_df)
+        stages.append({
+            "stage": "drop_fnl_q_zero",
+            "rows_before": before_fnlq,
+            "rows": len(msa_df),
+            "dropped": dropped_fnlq,
+            "qty_col": qty_col,
+            "rule": f"keep iff {qty_col} > 0",
+        })
+        logger.info(
+            f"[onesize] dropped {dropped_fnlq} MSA rows with {qty_col} <= 0 "
+            f"({before_fnlq}→{len(msa_df)})"
+        )
+        if msa_df.empty:
+            return {
+                "sequence_id": sequence_id,
+                "total_rows": 0,
+                "columns": [],
+                "rows": [],
+                "stores": 0,
+                "stages": stages,
+            }
 
     # ---- Stage 3: filter to applicable MAJCATs --------------------------
     app_cols = _table_columns(db, SZ_APPLICABLE_TABLE)
@@ -689,6 +771,7 @@ def _compute_onesize(
     # row is final_msa='Y' by construction; no post-cross-join filter needed.
     rows_before_row_or = len(msa_df)
     msa_df = msa_df[msa_df["row_or"] == True].copy()
+    msa_df.to_csv("msa_df_after_row_or_filter.csv", index=False)  # Debugging output
     msa_df = msa_df.drop(columns=["row_or"])
     stages.append({
         "stage":         "drop_row_or_false",
@@ -724,6 +807,7 @@ def _compute_onesize(
         sz_norm = msa_df[sz_col].astype(str).str.strip().str.upper()
         mask_drop = mask_drop | (sz_norm == placeholder)
     msa_df = msa_df[~mask_drop].copy()
+    msa_df.to_csv("msa_df_after_placeholder_filter.csv", index=False)  # Debugging output
     stages.append({
         "stage": "filter_placeholder",
         "rows": len(msa_df),
@@ -829,12 +913,32 @@ def _compute_onesize(
     stores_df = pd.read_sql(text(stores_sql), db.bind)
     if "days" not in stores_df.columns:
         stores_df["days"] = None
-    # ST_STATUS is loaded for visibility in the result but no longer used
-    # for filtering — the OR-block is now purely row-level (count, maj_gen_cl_q,
-    # maj_cat_q) and was applied pre-cross-join in Stage 5b.
+
+    # ---- Keep only OLD stores; exclude UPC ------------------------------
+    # Business rule: OneSize allocates to established (OLD) stores only.
+    # Upcoming (UPC) stores must not enter the calculation or consume the
+    # warehouse pool. Filter is skipped when the status column is missing
+    # (all ST_STATUS NULL) so we never silently drop every store.
+    stores_before_status = len(stores_df)
+    dropped_non_old = 0
+    if c_status:
+        _st_norm = stores_df["ST_STATUS"].astype(str).str.strip().str.upper()
+        stores_df = stores_df[_st_norm == "OLD"].copy()
+        dropped_non_old = stores_before_status - len(stores_df)
+        logger.info(
+            f"[onesize] ST_STATUS filter: kept {len(stores_df)} OLD stores, "
+            f"dropped {dropped_non_old} non-OLD (e.g. UPC)"
+        )
+
+    # ST_STATUS is now used to keep OLD stores only (UPC excluded above).
+    # It is NOT part of the row-level OR-block — that gate is purely
+    # (count, maj_gen_cl_q, maj_cat_q) and was applied pre-cross-join in Stage 5b.
     stages.append({
         "stage": "load_stores",
         "stores": len(stores_df),
+        "stores_before_status_filter": stores_before_status,
+        "dropped_non_old": dropped_non_old,
+        "status_filter": "ST_STATUS = 'OLD' (UPC excluded)" if c_status else "(no status col — filter skipped)",
         "rdc_col":      st_rdc   or "(missing)",
         "sl_cvr_col":   c_slcvr  or "(missing)",
         "int_days_col": c_intd   or "(missing)",
@@ -2517,23 +2621,25 @@ def _compute_onesize(
         flush=True,
     )
 
-    # ---- Stage 18b: drop ALLOC=0 rows (POOL_EMPTY / BOTH_CAP_0) ---------
-    # After allocation, the only zero-ALLOC rows are pool-drained ones (a
-    # higher-ranked store took all the stock). User chose to drop those too,
-    # so the final output contains ONLY rows that actually received stock.
+    # ---- Stage 18b: keep ALL rows (ALLOC=0 no longer dropped) ------------
+    # Per user request, zero-allocation rows are RETAINED so the output shows
+    # every store/size the pipeline evaluated — including no-demand skips
+    # (NONE / NO_REQ / NO_VAR_REQ) and pool-missed rows (POOL_EMPTY /
+    # BOTH_CAP_0). DEMAND_SRC on each row explains why ALLOC is 0.
     rows_before_alloc_filter = len(cross)
     alloc_n = pd.to_numeric(cross["ALLOC"], errors="coerce").fillna(0)
-    cross = cross[alloc_n > 0].copy()
+    zero_alloc_rows = int((alloc_n <= 0).sum())
     stages.append({
-        "stage":         "drop_alloc_zero",
+        "stage":         "keep_alloc_zero",
         "rows_before":   rows_before_alloc_filter,
         "rows":          len(cross),
-        "dropped":       rows_before_alloc_filter - len(cross),
-        "rule":          "keep iff ALLOC > 0 (drops POOL_EMPTY + BOTH_CAP_0)",
+        "dropped":       0,
+        "zero_alloc_kept": zero_alloc_rows,
+        "rule":          "keep ALL rows (ALLOC=0 retained; see DEMAND_SRC for reason)",
     })
     logger.info(
-        f"[onesize] dropped {rows_before_alloc_filter - len(cross)} ALLOC=0 rows "
-        f"({rows_before_alloc_filter}→{len(cross)}; pool-drained rows removed)"
+        f"[onesize] retained all {len(cross)} rows "
+        f"({zero_alloc_rows} have ALLOC=0, kept per user request)"
     )
 
     # Reorder columns: preferred first, then everything else (drop internal keys)
@@ -2615,17 +2721,34 @@ def _run_job(
         if df is not None and not df.empty and seq_id_for_persist is not None:
             # Visible to pollers so the UI shows the job is in the save phase
             # (a cancel here raises OneSizeCancelled before we touch the table).
-            job["stages"].append({
+            # Only ALLOC>0 rows are persisted; report that count (not the full
+            # df) so the UI shows what's actually being saved.
+            _alloc_rows = int((pd.to_numeric(df.get("ALLOC"), errors="coerce")
+                               .fillna(0) > 0).sum()) if "ALLOC" in df.columns else int(len(df))
+            persist_stage = {
                 "stage": "persist_to_db",
                 "table": ALLOCATION_TABLE,
-                "rows": int(len(df)),
-            })
+                "rows": _alloc_rows,
+                "total_result_rows": int(len(df)),
+                "written": 0,
+            }
+            job["stages"].append(persist_stage)
+            cancel_event = job.get("cancel_event")
+
+            def _persist_progress(written: int, total: int) -> None:
+                # Mutate the already-appended stage in place so pollers see the
+                # save advancing (e.g. 250000/2290000) instead of a frozen 100%.
+                persist_stage["written"] = int(written)
+                persist_stage["total"] = int(total)
+
             try:
                 persisted_rows = _persist_onesize_result(
                     db.bind, df,
                     sequence_id=seq_id_for_persist,
                     job_id=job_id,
                     run_by=username,
+                    cancel_event=cancel_event,
+                    progress=_persist_progress,
                 )
                 logger.info(
                     f"[onesize][job {job_id}] persisted {persisted_rows} rows to "
@@ -2814,22 +2937,50 @@ def list_onesize_jobs(
     return APIResponse(data={"jobs": snaps}, message=f"{len(snaps)} jobs")
 
 
+# Excel caps a worksheet at 1,048,576 rows (incl. header). Keep data rows
+# comfortably under that so a division CSV always opens fully in Excel.
+EXCEL_ROW_LIMIT = 1_000_000
+
+
+def _safe_filename_part(value: str) -> str:
+    """Turn a DIV value into a filesystem/zip-safe filename fragment."""
+    s = str(value).strip() or "UNSPECIFIED"
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+    return s[:60] or "UNSPECIFIED"
+
+
+def _resolve_df_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Case-insensitive lookup of the first candidate column present in df."""
+    lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+
 @router.get(
     "/export.csv",
-    summary="Stream OneSize result as CSV",
+    summary="Stream OneSize result as CSV (split by division into a ZIP by default)",
 )
 def export_onesize_csv(
     cache_key: str = Query("", description="UUID returned by /run; if present and valid, skip recompute"),
     rdc: List[str] = Query(default=[]),
     ssn: List[str] = Query(default=DEFAULT_SSNS),
+    split_by: str = Query("DIV", description="Column to split the export by (one CSV per value, zipped). Empty = single CSV."),
     db: Session = Depends(get_data_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Stream the OneSize result as a CSV download.
+    """Download the OneSize result.
+
+    Because the result can exceed Excel's ~1,048,576-row limit, by default we
+    split it into one CSV per `split_by` value (DIV: MENS / LADIES / KIDS / …)
+    and return a ZIP so every file opens in Excel. Any single division that
+    still exceeds the row limit is further chunked into `_part2`, `_part3`, ….
+
+    Pass `split_by=` (empty) to force a single flat CSV instead.
 
     If `cache_key` is supplied and still valid, the cached dataframe from a
-    prior `/run` is streamed directly — no recompute. Otherwise the full
-    pipeline runs from scratch (same as /run does internally).
+    prior `/run` is streamed directly — no recompute.
     """
     try:
         df: Optional[pd.DataFrame] = None
@@ -2853,17 +3004,55 @@ def export_onesize_csv(
             if df is None or df.empty:
                 df = pd.DataFrame(columns=result.get("columns") or PREFERRED_COLS)
 
-        buf = io.StringIO()
-        df.to_csv(buf, index=False, quoting=csv.QUOTE_MINIMAL)
-        buf.seek(0)
-        filename = f"onesize_seq{sequence_id}.csv"
+        # Resolve the split column (only when the user asked for a split).
+        split_col = _resolve_df_col(df, [split_by]) if split_by.strip() else None
+
+        # ── Single-CSV path: no split requested, column missing, or small enough ──
+        if split_col is None or len(df) <= EXCEL_ROW_LIMIT:
+            buf = io.StringIO()
+            df.to_csv(buf, index=False, quoting=csv.QUOTE_MINIMAL)
+            filename = f"onesize_seq{sequence_id}.csv"
+            reason = ("no split_col" if split_col is None
+                      else f"fits in one sheet ({len(df)} rows)")
+            logger.info(f"[onesize][export] single CSV {len(df)} rows ({source}; {reason}) → {filename}")
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        # ── Split path: one CSV per division value, zipped ──────────────────
+        # compresslevel=1: on a ~500MB CSV the default DEFLATE level (6) is the
+        # dominant cost of the export. Level 1 is several times faster for only
+        # a modest size increase — the right trade for an interactive download.
+        zip_buf = io.BytesIO()
+        file_manifest: List[str] = []
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            # Preserve a stable, readable order: biggest divisions first.
+            groups = list(df.groupby(df[split_col].fillna("UNSPECIFIED"), sort=False))
+            for div_value, gdf in groups:
+                base = _safe_filename_part(div_value)
+                n = len(gdf)
+                # Chunk a division that alone still busts Excel's limit.
+                n_parts = max(1, math.ceil(n / EXCEL_ROW_LIMIT))
+                for part in range(n_parts):
+                    chunk = gdf.iloc[part * EXCEL_ROW_LIMIT:(part + 1) * EXCEL_ROW_LIMIT]
+                    suffix = f"_part{part + 1}" if n_parts > 1 else ""
+                    name = f"onesize_seq{sequence_id}_{base}{suffix}.csv"
+                    cbuf = io.StringIO()
+                    chunk.to_csv(cbuf, index=False, quoting=csv.QUOTE_MINIMAL)
+                    zf.writestr(name, cbuf.getvalue())
+                    file_manifest.append(f"{name} ({len(chunk)} rows)")
+        zip_buf.seek(0)
+        zip_name = f"onesize_seq{sequence_id}_by_{_safe_filename_part(split_col)}.zip"
         logger.info(
-            f"[onesize][export] streaming {len(df)} rows ({source}) → {filename}"
+            f"[onesize][export] split by {split_col}: {len(df)} rows ({source}) → "
+            f"{zip_name} with {len(file_manifest)} files: {file_manifest}"
         )
         return StreamingResponse(
-            iter([buf.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            iter([zip_buf.getvalue()]),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
         )
     except HTTPException:
         raise

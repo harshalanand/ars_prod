@@ -44,7 +44,7 @@ const STAGE_LABELS = {
   enrich_msa_remain_and_rank: 'Loading MSA_REMAIN pool + store ranks (ARS_STORE_RANKING)',
   drop_zero_demand:     'Dropping rows where REQ=0 OR VAR_REQ=0 (zero-demand candidates) BEFORE allocation',
   compute_allocation:   'Allocating MIN(VAR_REQ, REQ, MSA_REMAIN) — strict: BOTH REQ>0 AND VAR_REQ>0 required',
-  drop_alloc_zero:      'Dropping ALLOC=0 rows (POOL_EMPTY) — final output has only rows that received stock',
+  keep_alloc_zero:      'Keeping ALL rows — ALLOC=0 rows retained (see DEMAND_SRC for why)',
 }
 
 function ProgressBar({ stages, running }) {
@@ -426,11 +426,21 @@ export default function OneSizePage() {
     try {
       const cacheKey = result?.cache_key || ''
       const res = await oneSizeAPI.exportCsvBlob(cacheKey, selectedRdcs, selectedSsns)
-      const blob = new Blob([res.data], { type: 'text/csv' })
+      // The server splits large results into a ZIP of per-division CSVs, or
+      // returns a single CSV when it fits. Honor whatever it sent: derive the
+      // filename from Content-Disposition and the MIME type from Content-Type,
+      // so a .zip is never saved as .csv (which would refuse to open).
+      const ctype = res.headers?.['content-type'] || 'application/octet-stream'
+      const cdisp = res.headers?.['content-disposition'] || ''
+      const m = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(cdisp)
+      const isZip = ctype.includes('zip')
+      const fallback = `onesize_seq${sequenceId ?? 'latest'}.${isZip ? 'zip' : 'csv'}`
+      const filename = (m ? decodeURIComponent(m[1].trim()) : '') || fallback
+      const blob = new Blob([res.data], { type: ctype })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `onesize_seq${sequenceId ?? 'latest'}.csv`
+      a.download = filename
       document.body.appendChild(a)
       a.click()
       a.remove()

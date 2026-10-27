@@ -35,6 +35,7 @@ Output: one row per `(ST_CD, MAJ_CAT, GEN_ART, CLR, SZ)` with the qty to ship.
 ┌──────────────────────────────────┐
 │ Master_ALC_INPUT_ST_MASTER       │  stores + RDC + days
 └─────────┬────────────────────────┘
+          ▼  keep ST_STATUS='OLD' only (UPC excluded)
           ▼  user RDC filter (optional)
           ▼  INNER JOIN on RDC
           ▼
@@ -128,9 +129,16 @@ Survivors → `status = '1sz'`.
 |---|---|
 | Table | `Master_ALC_INPUT_ST_MASTER` |
 | Required | `ST_CD` (or `WERKS`/`STORE_CODE`) |
-| Optional | `ST_NM`, `RDC` (or `WAREHOUSE`/`HUB`/`WH_CD`), `SL_CVR`, `INT_DAYS`, `PRD_DAYS` |
+| Optional | `ST_NM`, `RDC` (or `WAREHOUSE`/`HUB`/`WH_CD`), `SL_CVR`, `INT_DAYS`, `PRD_DAYS`, `ST_STATUS` |
 | **`days` formula** | `SUM(ISNULL(SL_CVR,0)) + SUM(ISNULL(INT_DAYS,0)) + SUM(ISNULL(PRD_DAYS,0))` per store |
-| Aggregation | `GROUP BY ST_CD, ST_NM, RDC` |
+| Aggregation | `GROUP BY ST_CD, ST_NM, RDC, ST_STATUS` |
+| **OLD-only filter** | After load, keep only rows where `UPPER(TRIM(ST_STATUS)) = 'OLD'`. **UPC (upcoming) stores are excluded** from the entire calculation — they never enter the cross-join, get no demand computed, and never consume the pool. |
+
+**Why OLD-only:** business rule — OneSize replenishes established stores only. `ST_STATUS` has two values in `Master_ALC_INPUT_ST_MASTER`: `OLD` (~381 stores) and `UPC` (~35 upcoming stores). Only `OLD` participates.
+
+**Safety:** the filter is **skipped** when the status column can't be resolved (all `ST_STATUS` NULL), so a store table without a status column never silently drops every store. Diagnostics (`dropped_non_old`, `status_filter`) report exactly what was removed.
+
+> Note: this is distinct from the *removed* `ST_STATUS='OLD'` OR-clause. That old clause let a row **pass the size gate** just for joining an OLD store; it was removed (Stage 5a/5b are now purely row-level). This new filter instead **restricts which stores exist at all** — a separate, store-level cut applied at load time.
 
 ### Stage 7a — `apply_rdc_filter` (UI selection)
 - Empty selection → all RDCs
@@ -448,7 +456,7 @@ Every stage emits a row in the `stages[]` array of the API response, surfaced in
 |---|---|
 | `load_msa` | `rows`, `ssn_filter` |
 | `applicable_majcats` | `count` |
-| `load_stores` | `stores`, `rdc_col`, `sl_cvr_col`, `int_days_col`, `prd_days_col`, `days_components` |
+| `load_stores` | `stores`, `stores_before_status_filter`, `dropped_non_old`, `status_filter`, `rdc_col`, `sl_cvr_col`, `int_days_col`, `prd_days_col`, `days_components` |
 | `apply_rdc_filter` | `selected`, `msa_rows_in/out`, `stores_in/out` |
 | `cross_join` | `mode` (`inner_on_rdc` / `cartesian_fallback`), `matched_rdcs`, `stores_per_matched_rdc`, `selected_rdcs` |
 | `enrich_cont` | `lookup_rows`, `matched_rows`, `unmatched_rows` |
@@ -488,6 +496,7 @@ Loud backend breadcrumbs (`[onesize][<stage>][<checkpoint>] key=value, ...`) als
 | HTTP 404 `No data found in ARS_MSA_TOTAL` | No MSA save yet | Run MSA Stock Calculation first |
 | HTTP 500 `MASTER_SZ_APPLICABLE missing required columns…` | Column names don't match resolver candidates | Rename or extend resolver |
 | `cross_join.mode = cartesian_fallback` | RDC missing from `Master_ALC_INPUT_ST_MASTER` | Add RDC column or accept cartesian |
+| Fewer stores than expected / a store missing from output | Store has `ST_STATUS != 'OLD'` (e.g. `UPC`) — excluded by the OLD-only filter | Working as designed. Check `load_stores.dropped_non_old`; set the store's status to `OLD` if it should participate |
 | `cont = NULL` rows everywhere | `Master_CONT_SZ` is empty or keys don't match | Verify table has data; check `enrich_cont.matched_rows` |
 | `MAX_DAILY_SALE` empty for all rows | `SAL_PD` is empty AND L-7 fallback failed | Run Contribution calc to fill `SAL_PD`; check `enrich_listing.auto_non_null` |
 | `MBQ_VAR = 0` everywhere even though `SAL_PD` and `cont` look fine | `var_art_disp = 0` because `ACS_D = 0` for that row | Verify `ARS_GRID_MJ.ACS_D > 0`; remember the rule is strict — **either** input being 0 zeros `MBQ_VAR` |

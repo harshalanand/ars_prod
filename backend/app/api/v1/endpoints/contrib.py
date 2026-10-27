@@ -51,7 +51,7 @@ MAPPING_TABLE      = "Cont_mappings"
 ASSIGNMENT_TABLE   = "Cont_mapping_assignments"
 JOB_TABLE          = "Cont_jobs"
 NUMERIC_SQL_TYPES  = {'int','bigint','smallint','tinyint','numeric','decimal','float','real','money','smallmoney'}
-VALID_GROUPING     = ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02')
+VALID_GROUPING     = ('CLR','SZ','RNG_SEG','M_VND_CD','MACRO_MVGR','MICRO_MVGR','FAB','WEAVE_2','M_YARN_02','FIT', 'BODY')
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -2937,12 +2937,12 @@ def report_page(table: str = Query(...),
     # Distinct filter options (for in-header multi-select) — computed on first
     # page request only. We cover low-cardinality identity-style columns plus
     # the table's grouping column (vendor_col) so the user can filter on
-    # MAJ_CAT / SEG / STATUS / SSN / ACT_INACT / DIV / SUB_DIV / RNG_SEG /
-    # RDC_CD / <grouping column> when they exist in the table.
+    # ST_CD / ST_NM / MAJ_CAT / SEG / STATUS / SSN / ACT_INACT / DIV / SUB_DIV /
+    # RNG_SEG / RDC_CD / <grouping column> when they exist in the table.
     filter_options = {}
     if page == 1:
-        filterable_cols = ['SEG', 'MAJ_CAT', 'STATUS', 'SSN', 'ACT_INACT',
-                           'DIV', 'SUB_DIV', 'RNG_SEG', 'RDC_CD']
+        filterable_cols = ['ST_CD', 'ST_NM', 'SEG', 'MAJ_CAT', 'STATUS', 'SSN',
+                           'ACT_INACT', 'DIV', 'SUB_DIV', 'RNG_SEG', 'RDC_CD']
         if vendor_col and vendor_col not in filterable_cols:
             filterable_cols.append(vendor_col)
         with engine.connect() as c:
